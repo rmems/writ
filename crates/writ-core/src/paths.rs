@@ -48,9 +48,9 @@ pub fn user_data_dir() -> PathBuf {
     }
 }
 
-/// Named root for worktrees-hives durable state under the user data directory.
+/// Named root for writ durable state under the user data directory.
 ///
-/// Default layout: `{user_data_dir}/worktrees-hives/`.
+/// Default layout: `{user_data_dir}/writ/`.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct StateRoot {
     path: PathBuf,
@@ -61,7 +61,7 @@ impl StateRoot {
     #[must_use]
     pub fn default_root() -> Self {
         Self {
-            path: user_data_dir().join("worktrees-hives"),
+            path: user_data_dir().join("writ"),
         }
     }
 
@@ -84,16 +84,16 @@ impl StateRoot {
     }
 }
 
-/// Resolve the watched-jobs state path from an optional `WH_STATE_PATH` override.
+/// Resolve the watched-jobs state path from an optional `WRIT_STATE_PATH` override.
 ///
-/// When `wh_state_path` is `Some` and non-empty, that value is used (same as setting the
+/// When `writ_state_path` is `Some` and non-empty, that value is used (same as setting the
 /// env var). Empty overrides are treated as unset. Non-UTF-8 paths are preserved via
 /// [`OsStr`].
 ///
 /// Otherwise defaults to [`StateRoot::default_root()`]'s `watched.json`.
 #[must_use]
-pub fn resolve_state_path(wh_state_path: Option<&OsStr>) -> PathBuf {
-    if let Some(custom) = wh_state_path.filter(|v| !v.is_empty()) {
+pub fn resolve_state_path(writ_state_path: Option<&OsStr>) -> PathBuf {
+    if let Some(custom) = writ_state_path.filter(|v| !v.is_empty()) {
         return PathBuf::from(custom);
     }
     StateRoot::default_root().watched_json()
@@ -101,24 +101,24 @@ pub fn resolve_state_path(wh_state_path: Option<&OsStr>) -> PathBuf {
 
 /// Resolve the path to the watched-jobs state file.
 ///
-/// Honours `WH_STATE_PATH` if set (including non-UTF-8 values on Unix); otherwise defaults
+/// Honours `WRIT_STATE_PATH` if set (including non-UTF-8 values on Unix); otherwise defaults
 /// to [`StateRoot::default_root()`]'s `watched.json`. Empty values are treated as unset.
 #[must_use]
 pub fn state_path() -> PathBuf {
-    resolve_state_path(std::env::var_os("WH_STATE_PATH").as_deref())
+    resolve_state_path(std::env::var_os("WRIT_STATE_PATH").as_deref())
 }
 
-const WORKTREE_BASE_ENV: &str = "WH_WORKTREE_BASE";
+const WORKTREE_BASE_ENV: &str = "WRIT_WORKTREE_BASE";
 
 /// Resolve the configured worktree base path.
 ///
-/// Uses `WH_WORKTREE_BASE` when set, otherwise
-/// `{user_data_dir}/worktrees-hives/worktrees`.
+/// Uses `WRIT_WORKTREE_BASE` when set, otherwise
+/// `{user_data_dir}/writ/worktrees`.
 pub fn worktree_base_path() -> crate::error::Result<PathBuf> {
     if let Some(value) = std::env::var_os(WORKTREE_BASE_ENV).filter(|v| !v.is_empty()) {
         return Ok(PathBuf::from(value));
     }
-    Ok(user_data_dir().join("worktrees-hives").join("worktrees"))
+    Ok(user_data_dir().join("writ").join("worktrees"))
 }
 
 /// Derive a sandboxed worktree path: `{base}/{owner}/{repo}/{job_id}`.
@@ -228,10 +228,10 @@ mod tests {
 
     #[test]
     fn state_root_watched_json_joins_filename() {
-        let root = StateRoot::from_path("/tmp/wh-state");
+        let root = StateRoot::from_path("/tmp/writ-state");
         assert_eq!(
             root.watched_json(),
-            PathBuf::from("/tmp/wh-state/watched.json")
+            PathBuf::from("/tmp/writ-state/watched.json")
         );
     }
 
@@ -244,19 +244,13 @@ mod tests {
     #[test]
     fn resolve_state_path_empty_override_uses_default() {
         let path = resolve_state_path(Some(OsStr::new("")));
-        assert!(
-            path.ends_with("worktrees-hives/watched.json")
-                || path.ends_with("worktrees-hives\\watched.json")
-        );
+        assert!(path.ends_with("writ/watched.json") || path.ends_with("writ\\watched.json"));
     }
 
     #[test]
     fn resolve_state_path_default_uses_state_root() {
         let path = resolve_state_path(None);
-        assert!(
-            path.ends_with("worktrees-hives/watched.json")
-                || path.ends_with("worktrees-hives\\watched.json")
-        );
+        assert!(path.ends_with("writ/watched.json") || path.ends_with("writ\\watched.json"));
     }
 
     #[test]

@@ -438,27 +438,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccf3ec651a847eb01de73ccad15eb7d99f80485de043efb2f370cd654f4ea44b"
 
 [[package]]
-name = "wh"
-version = "0.2.0"
-dependencies = [
- "clap",
- "serde_json",
- "tokio",
- "wh-core",
-]
-
-[[package]]
-name = "wh-core"
-version = "0.2.0"
-dependencies = [
- "libc",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
-]
-
-[[package]]
 name = "windows-link"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -471,6 +450,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
 dependencies = [
  "windows-link",
+]
+
+[[package]]
+name = "writ"
+version = "0.2.0"
+dependencies = [
+ "clap",
+ "serde_json",
+ "tokio",
+ "writ-core",
+]
+
+[[package]]
+name = "writ-core"
+version = "0.2.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

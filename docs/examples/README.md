@@ -1,6 +1,6 @@
 # Response envelope examples
 
-Every fixture here is captured from the `wh` binary and then pretty-printed.
+Every fixture here is captured from the `writ` binary and then pretty-printed.
 Re-capture rather than hand-editing — three fixtures that previously lived here
 were fiction, and nothing caught it because nothing compared them to real output:
 
@@ -28,11 +28,11 @@ All of them, under `--json`:
 with exit code 2 instead of an envelope:
 
 ```console
-$ wh --json git-safe push --force
-wh: policy violation [BARE_FORCE_PUSH]: bare --force/-f is not allowed; use --force-with-lease only
+$ writ --json git-safe push --force
+writ: policy violation [BARE_FORCE_PUSH]: bare --force/-f is not allowed; use --force-with-lease only
 
-$ wh --json gh-safe pr merge 1
-wh: policy violation [MERGE_BLOCKED]: `gh pr merge` is not allowed
+$ writ --json gh-safe pr merge 1
+writ: policy violation [MERGE_BLOCKED]: `gh pr merge` is not allowed
 ```
 
 So `git-safe` and `gh-safe` *do* emit `git.safe` / `gh.safe` envelopes on success —
@@ -40,17 +40,17 @@ see `git-safe-success.json` — but a rejected command is not reported that way.
 bracketed token is the stable `PolicyCode`; parse that rather than the prose.
 
 An earlier revision of this file claimed those two commands never emit an envelope
-at all, and that `cli.bootstrap` did not exist. Both were wrong: `wh --json` with
+at all, and that `cli.bootstrap` did not exist. Both were wrong: `writ --json` with
 no subcommand emits `cli.bootstrap`, which is what `bootstrap.json` records.
 
 ## Regenerating
 
 ```bash
 cargo build
-wh --json                                   # cli.bootstrap
-wh --json status                            # cli.status
-wh --json git-safe --repo <repo> rev-parse --is-inside-work-tree   # git.safe
-wh --json worktree list                     # worktree.list
+writ --json                                   # cli.bootstrap
+writ --json status                            # cli.status
+writ --json git-safe --repo <repo> rev-parse --is-inside-work-tree   # git.safe
+writ --json worktree list                     # worktree.list
 # error envelope, no repository mutation:
-wh --json worktree create --schema-version 2 --repo <repo> <owner> <repo-name> <job> <branch>
+writ --json worktree create --schema-version 2 --repo <repo> <owner> <repo-name> <job> <branch>
 ```

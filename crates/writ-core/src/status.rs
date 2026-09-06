@@ -62,7 +62,7 @@ impl fmt::Display for CiClass {
 /// Status of a single watched job.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct JobStatus {
-    /// Unique job identifier (e.g. `wh-347`).
+    /// Unique job identifier (e.g. `writ-347`).
     pub job_id: String,
     /// Repository owner (e.g. `acme`).
     pub owner: String,
@@ -87,14 +87,14 @@ pub struct JobStatus {
     pub ci_class: CiClass,
 }
 
-/// Payload for `wh status` and `wh jobs` v1 envelope responses.
+/// Payload for `writ status` and `writ jobs` v1 envelope responses.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct JobsData {
     /// List of job statuses (may be empty when no jobs are watched).
     pub jobs: Vec<JobStatus>,
 }
 
-/// Named envelope type for `wh status --json` / `wh jobs --json` responses.
+/// Named envelope type for `writ status --json` / `writ jobs --json` responses.
 pub type StatusReport = Response<JobsData>;
 
 /// Build a successful v1 envelope response for the given command and job list.
@@ -130,12 +130,12 @@ mod tests {
 
     fn sample_job() -> JobStatus {
         JobStatus {
-            job_id: "wh-100".to_owned(),
+            job_id: "writ-100".to_owned(),
             owner: "acme".to_owned(),
             repo: "example-org".to_owned(),
             issue_number: Some(29),
             pr_number: Some(42),
-            worktree_path: "/tmp/worktrees/acme/example-org/wh-100".to_owned(),
+            worktree_path: "/tmp/worktrees/acme/example-org/writ-100".to_owned(),
             branch: "feature/status-json-cli".to_owned(),
             process_state: ProcessState::Running,
             last_error: None,
@@ -152,7 +152,7 @@ mod tests {
         let json = serde_json::to_string(&job).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(v.get("job_id").expect("missing job_id"), "wh-100");
+        assert_eq!(v.get("job_id").expect("missing job_id"), "writ-100");
         assert_eq!(
             v.get("process_state").expect("missing process_state"),
             "running"
@@ -252,7 +252,7 @@ mod tests {
             .as_array()
             .expect("data.jobs must be an array");
         assert_eq!(jobs.len(), 1);
-        assert_eq!(jobs[0].get("job_id").expect("missing job_id"), "wh-100");
+        assert_eq!(jobs[0].get("job_id").expect("missing job_id"), "writ-100");
         assert_eq!(
             jobs[0].get("branch").expect("missing branch"),
             "feature/status-json-cli"

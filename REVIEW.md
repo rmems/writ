@@ -1,6 +1,6 @@
 # Review guide
 
-This guide defines the review and pull-request lifecycle for `worktrees-hives`. It applies to human-authored and agent-authored changes.
+This guide defines the review and pull-request lifecycle for `writ`. It applies to human-authored and agent-authored changes.
 
 ## Lifecycle
 
@@ -48,13 +48,13 @@ For stacked pull requests, review and fix the bottom PR before its children. Re-
 
 ## Language-specific review notes
 
-worktrees-hives is a Rust workspace. Each area has distinct review concerns:
+`writ` is a Rust workspace. Each area has distinct review concerns:
 
 ### Rust review notes
 
 Rust owns the hard safety boundary. Reviewers should check:
 
-- Policy is enforced in `wh-core`, not only in `clap` argument definitions.
+- Policy is enforced in `writ-core`, not only in `clap` argument definitions.
 - Git and GitHub operations use explicit allowlists and structured argument vectors rather than shell command strings.
 - `gh pr merge` and merge-oriented `gh api` requests are impossible through product runtime public interfaces.
 - Branch verification occurs immediately before mutation to reduce time-of-check/time-of-use risk.

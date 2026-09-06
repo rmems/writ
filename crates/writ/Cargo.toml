@@ -1,6 +1,6 @@
 [package]
-name = "wh"
-description = "Command-line interface for worktrees-hives"
+name = "writ"
+description = "Command-line interface for writ"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,7 +11,7 @@ repository.workspace = true
 clap.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
-wh-core = { path = "../wh-core" }
+writ-core = { path = "../writ-core" }
 
 [lints]
 workspace = true

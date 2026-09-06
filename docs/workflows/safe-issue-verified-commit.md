@@ -14,16 +14,16 @@ Contracts: isolation [#6](https://github.com/rmems/writ/issues/6), skill/procedu
 | `owner` / `repo` | no | If omitted, resolve from `git remote` in the current repository |
 | `dry_run` | no | Intake + isolate + plan only. No commit, push, or issue comment |
 
-Do not hard-code an owner. Multi-repo discovery and scheduling still use `WH_ALLOWED_OWNERS` / explicit API args.
+Do not hard-code an owner. Multi-repo discovery and scheduling still use `WRIT_ALLOWED_OWNERS` / explicit API args.
 
 ## Hard stops
 
 Abort and report if any of these fail:
 
 - Issue is closed, is a pull request, or has no actionable acceptance criteria
-- Owner is outside the configured allowlist (unless the operator named this repo/job explicitly). **No code enforces this today** -- `WH_ALLOWED_OWNERS` has no reader under `crates/` since the Python layer was removed, so this stop depends on the operator, not the boundary (#146).
+- Owner is outside the configured allowlist (unless the operator named this repo/job explicitly). **No code enforces this today** -- `WRIT_ALLOWED_OWNERS` has no reader under `crates/` since the Python layer was removed, so this stop depends on the operator, not the boundary (#146).
 - Unsafe identity or path mismatch, a genuine ownership collision, or a non-recoverable cleanliness/remote check. Exact remote-base equality applies only to a newly created, unpublished assigned branch. A published branch must have the expected upstream and local/remote relationship instead. Repair a clean bootstrap source or unpublished verified-base alignment before editing; do not abort isolated work because a primary checkout is dirty or stale.
-- `wh` is missing and no enforcing wrapper is available (mutating runs). An "enforcing wrapper" means a wrapper that routes the mutation through `wh-core`'s allowlist and branch verification; a wrapper that merely calls `git` directly is not one, and does not satisfy this check.
+- `writ` is missing and no enforcing wrapper is available (mutating runs). An "enforcing wrapper" means a wrapper that routes the mutation through `writ-core`'s allowlist and branch verification; a wrapper that merely calls `git` directly is not one, and does not satisfy this check.
 - Any required quality gate fails or times out
 - A deny-listed command would be required (GitHub merge, local merge of another PR or stacked/peer branch, bare `--force` / `-f`)
 - `git push` exits non-zero or the remote rejects the push
@@ -42,9 +42,9 @@ Abort and report if any of these fail:
 1. If this repo uses Beads, run `bd prime`, inspect `bd ready`, and claim the relevant bead.
 2. Start from an up-to-date base. Never edit `main` or `master`.
 3. Create or reuse a dedicated branch and isolated worktree:
-   - Required: `wh --json worktree create --schema-version 2 --repo <repo> --start-point <exact-commit-or-ref> <owner> <repo-name> <job-id> <branch>` (`WH_BIN` or `PATH`). Never omit the caller-selected boundary version/start point or derive it from the source checkout's ambient `HEAD`.
-   - If `wh` is missing, stop, unless a wrapper routes the mutation through `wh-core` -- the same definition as the hard stop above. A wrapper that re-implements the checks itself and then calls `git` directly does **not** qualify: re-implemented policy is prompt-level text, not the code-enforced boundary.
-   - What routing through `wh-core` actually gets you, so the promise is not larger than the code: the git/gh argv allowlist, no merge path, force-with-lease only, sandboxed path derivation with symlink rejection, exact-base resolution, branch and `HEAD` postcondition verification, supervised child processes, and origin-slug matching for `gh -R`. **Owner-allowlist enforcement is not among them.** `WH_ALLOWED_OWNERS` has no reader anywhere under `crates/`; it was enforced in the Python layer this PR deletes, so it is currently policy text with no code behind it.
+   - Required: `writ --json worktree create --schema-version 2 --repo <repo> --start-point <exact-commit-or-ref> <owner> <repo-name> <job-id> <branch>` (`WRIT_BIN` or `PATH`). Never omit the caller-selected boundary version/start point or derive it from the source checkout's ambient `HEAD`.
+   - If `writ` is missing, stop, unless a wrapper routes the mutation through `writ-core` -- the same definition as the hard stop above. A wrapper that re-implements the checks itself and then calls `git` directly does **not** qualify: re-implemented policy is prompt-level text, not the code-enforced boundary.
+   - What routing through `writ-core` actually gets you, so the promise is not larger than the code: the git/gh argv allowlist, no merge path, force-with-lease only, sandboxed path derivation with symlink rejection, exact-base resolution, branch and `HEAD` postcondition verification, supervised child processes, and origin-slug matching for `gh -R`. **Owner-allowlist enforcement is not among them.** `WRIT_ALLOWED_OWNERS` has no reader anywhere under `crates/`; it was enforced in the Python layer this PR deletes, so it is currently policy text with no code behind it.
    - Raw `git worktree add` is forbidden on mutating runs.
 4. Suggested issue branch: `hive/issue-<n>-<short-slug>` (document any local override).
 5. For a newly created, unpublished assigned branch, fetch the intended remote base and prove that the branch equals that exact remote-base commit before edits. It may have no upstream only for this creation proof; never use an ambient or stale `HEAD` as the base.

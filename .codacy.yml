@@ -18,7 +18,7 @@
 # `metric` is Codacy's official cyclomatic-complexity engine name; `complexity`
 # and `lizard` are included so either Cloud spelling still applies.
 #
-# Paths use globs so the pending `wh` -> `writ` crate rename (#145) does not
+# Paths use globs so the `wh` -> `writ` crate rename did not
 # invalidate this file.
 ---
 exclude_paths:

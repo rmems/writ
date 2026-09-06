@@ -1,5 +1,5 @@
 # =============================================================================
-# worktrees-hives — Python/Rust hybrid + agentic / IDE tooling
+# writ — Rust workspace + agentic / IDE tooling
 # =============================================================================
 
 # -----------------------------------------------------------------------------
@@ -249,12 +249,12 @@ kilo-code/
 .kiro-cache/
 
 # -----------------------------------------------------------------------------
-# Local agent / hive runtime (worktrees-hives project state)
+# Local agent runtime (writ project state)
 # -----------------------------------------------------------------------------
-.worktrees-hives/
-.wh/
-**/wh-state/
-.local/share/worktrees-hives/
+.writ-state/
+.writ/
+**/writ-state/
+.local/share/writ/
 # ad-hoc worktrees if created under the repo
 .worktrees/
 worktrees/
