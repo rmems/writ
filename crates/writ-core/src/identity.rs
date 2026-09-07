@@ -189,3 +189,156 @@ fn rev_parse_error(stderr: GitErrorText) -> Error {
 }
 
 struct GitErrorText(String);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SHA1: &str = "e5389f2c530e6d6a298b9bdd7b3b44616154104e";
+    const SHA256: &str = "898ba747a8267a634ad8c578eee74e4c93772150898ba747a8267a634ad8c578";
+
+    fn prefix_of(text: &str) -> Option<&str> {
+        leading_hex_oid_prefix(StartPoint(text)).map(HexOidPrefix::as_str)
+    }
+
+    // --- leading_hex_oid_prefix: what counts as an object-id selector ---
+
+    #[test]
+    fn bare_hex_run_is_a_selector() {
+        assert_eq!(prefix_of(SHA1), Some(SHA1));
+        assert_eq!(prefix_of("deadbeef"), Some("deadbeef"));
+    }
+
+    #[test]
+    fn commit_ish_decorations_still_expose_the_hex_prefix() {
+        // This is the abbreviated-OID smuggling case: the decoration must not
+        // hide the leading hex from the full-length check.
+        for suffix in ["~0", "~1", "^0", "^{commit}", "@{0}", "@{upstream}"] {
+            let text = format!("deadbeef{suffix}");
+            assert_eq!(
+                prefix_of(&text),
+                Some("deadbeef"),
+                "decoration {suffix:?} should not hide the hex prefix"
+            );
+        }
+    }
+
+    #[test]
+    fn symbolic_refs_are_left_alone() {
+        // `develop` starts with two hex characters (d, e) but does not continue
+        // into a decoration, so it is not an object-id selector.
+        for text in [
+            "develop~1",
+            "refs/heads/main",
+            "refs/tags/v1",
+            "main",
+            "feature/abc123",
+            "origin/main",
+        ] {
+            assert_eq!(
+                prefix_of(text),
+                None,
+                "{text:?} should not look like an OID"
+            );
+        }
+    }
+
+    #[test]
+    fn at_without_a_brace_is_not_a_decoration() {
+        // Only `@{` opens a reflog selector. A bare `@` does not, so the value
+        // is a symbolic name and passes through to git untouched.
+        assert_eq!(prefix_of("deadbeef@x"), None);
+        assert_eq!(prefix_of("deadbeef@"), None);
+        assert_eq!(prefix_of("deadbeef-tag"), None);
+    }
+
+    #[test]
+    fn empty_input_has_no_prefix() {
+        assert_eq!(prefix_of(""), None);
+    }
+
+    // --- reject_non_full_hex_oid: only full-width object ids are accepted ---
+
+    #[test]
+    fn full_width_object_ids_are_accepted() {
+        assert!(reject_non_full_hex_oid(HexOidPrefix(SHA1)).is_ok());
+        assert!(reject_non_full_hex_oid(HexOidPrefix(SHA256)).is_ok());
+    }
+
+    #[test]
+    fn off_by_one_widths_are_rejected() {
+        // The boundary either side of both accepted widths.
+        for len in [39, 41, 63, 65] {
+            let text = "a".repeat(len);
+            assert!(
+                reject_non_full_hex_oid(HexOidPrefix(&text)).is_err(),
+                "{len}-character hex must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn a_short_all_hex_branch_name_is_rejected_as_an_object_id() {
+        // Documents a deliberate fail-closed trade: a branch named `cafe` is
+        // all-hex, so it is treated as a malformed object id rather than a ref.
+        // Fully qualifying it (`refs/heads/cafe`) is the supported escape.
+        assert_eq!(prefix_of("cafe"), Some("cafe"));
+        assert!(reject_non_full_hex_oid(HexOidPrefix("cafe")).is_err());
+        assert_eq!(prefix_of("refs/heads/cafe"), None);
+    }
+
+    // --- hex_oid_matches_commit: exact, case-insensitive, width-sensitive ---
+
+    #[test]
+    fn object_id_comparison_ignores_case() {
+        let upper = SHA1.to_ascii_uppercase();
+        assert!(hex_oid_matches_commit(HexOidPrefix(&upper), CommitId(SHA1)));
+    }
+
+    #[test]
+    fn a_sha1_width_prefix_never_matches_a_sha256_commit() {
+        // The width check is what stops a 40-character prefix of a 64-character
+        // object id from being accepted as that commit.
+        assert!(!hex_oid_matches_commit(
+            HexOidPrefix(&SHA256[..40]),
+            CommitId(SHA256)
+        ));
+    }
+
+    #[test]
+    fn a_different_object_id_of_equal_width_is_rejected() {
+        let other = "f".repeat(40);
+        assert!(!hex_oid_matches_commit(
+            HexOidPrefix(&other),
+            CommitId(SHA1)
+        ));
+    }
+
+    // --- enforce_leading_hex_oid: the composed gate ---
+
+    #[test]
+    fn decorated_abbreviation_is_rejected_before_any_resolution() {
+        // `resolved: None` is the pre-git call. Catching it here is what keeps
+        // the check ahead of repository mutation.
+        let err = enforce_leading_hex_oid(StartPoint("deadbeef~0"), None).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("full 40- or 64-character object id"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_symbolic_ref_passes_the_gate_at_both_stages() {
+        assert!(enforce_leading_hex_oid(StartPoint("refs/heads/main"), None).is_ok());
+        assert!(
+            enforce_leading_hex_oid(StartPoint("refs/heads/main"), Some(CommitId(SHA1))).is_ok()
+        );
+    }
+
+    #[test]
+    fn a_full_object_id_must_equal_the_resolved_commit() {
+        assert!(enforce_leading_hex_oid(StartPoint(SHA1), Some(CommitId(SHA1))).is_ok());
+        let other = "f".repeat(40);
+        assert!(enforce_leading_hex_oid(StartPoint(&other), Some(CommitId(SHA1))).is_err());
+    }
+}
