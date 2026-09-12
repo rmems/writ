@@ -112,6 +112,7 @@ ipython_config.py
 !.env.example
 .envrc
 .venv
+# Leftover local Qodana venv from the retired paid gate. Not a required check.
 .qodana-venv
 env/
 venv/
@@ -296,6 +297,7 @@ SKILL-grok-linear.md
 
 # OpenCode agent skills / local tooling (not product)
 .opencode/
+# Leftover local Qodana output dir from the retired paid gate. Not a required check.
 qodana/
 
 # Local agent / IDE MCP scratch (never commit)
