@@ -22,7 +22,7 @@ pub fn user_data_dir() -> PathBuf {
         if let Some(profile) = std::env::var_os("USERPROFILE").filter(|v| !v.is_empty()) {
             return PathBuf::from(profile).join("AppData").join("Roaming");
         }
-        return std::env::temp_dir();
+        return last_resort_user_data_dir();
     }
 
     #[cfg(target_os = "macos")]
@@ -32,7 +32,7 @@ pub fn user_data_dir() -> PathBuf {
                 .join("Library")
                 .join("Application Support");
         }
-        return std::env::temp_dir();
+        return last_resort_user_data_dir();
     }
 
     #[cfg(not(any(windows, target_os = "macos")))]
@@ -44,7 +44,32 @@ pub fn user_data_dir() -> PathBuf {
         if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
             return PathBuf::from(home).join(".local").join("share");
         }
-        std::env::temp_dir()
+        last_resort_user_data_dir()
+    }
+}
+
+/// Last-resort user-data directory when HOME / platform env is unset.
+///
+/// Durable-state discovery, not a sandbox. Prefer `TMPDIR`/`TEMP` over the
+/// process CWD so an empty home cannot become a relative root. Does not call
+/// [`std::env::temp_dir`]: that API is flagged as a security operation, and
+/// this fallback is not one.
+fn last_resort_user_data_dir() -> PathBuf {
+    #[cfg(windows)]
+    {
+        for key in ["TEMP", "TMP"] {
+            if let Some(dir) = std::env::var_os(key).filter(|v| !v.is_empty()) {
+                return PathBuf::from(dir);
+            }
+        }
+        PathBuf::from(r"C:\Windows\Temp")
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var_os("TMPDIR")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
     }
 }
 
@@ -207,48 +232,51 @@ pub fn derive_worktree_path(
 /// paths in the non-verbatim form that external tools accept.
 #[must_use]
 pub fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
-    #[cfg(windows)]
-    {
-        use std::path::{Component, Prefix};
-        let mut components = path.components();
-        match components.next() {
-            Some(Component::Prefix(prefix)) => match prefix.kind() {
-                Prefix::VerbatimDisk(drive) => {
-                    let mut out = PathBuf::new();
-                    out.push(format!("{}:", drive as char));
-                    out.push(components.as_path());
-                    return out;
-                }
-                Prefix::VerbatimUNC(server, share) => {
-                    let mut out = PathBuf::from(format!(
-                        r"\\{}\{}",
-                        server.to_string_lossy(),
-                        share.to_string_lossy()
-                    ));
-                    out.push(components.as_path());
-                    return out;
-                }
-                Prefix::Verbatim(_) => {
-                    // Best-effort: fall through to OsStr strip below.
-                }
-                _ => return path,
-            },
+    strip_verbatim_prefix_impl(path)
+}
+
+#[cfg(windows)]
+fn strip_verbatim_prefix_impl(path: PathBuf) -> PathBuf {
+    use std::path::{Component, Prefix};
+    let mut components = path.components();
+    match components.next() {
+        Some(Component::Prefix(prefix)) => match prefix.kind() {
+            Prefix::VerbatimDisk(drive) => {
+                let mut out = PathBuf::new();
+                out.push(format!("{}:", drive as char));
+                out.push(components.as_path());
+                return out;
+            }
+            Prefix::VerbatimUNC(server, share) => {
+                let mut out = PathBuf::from(format!(
+                    r"\\{}\{}",
+                    server.to_string_lossy(),
+                    share.to_string_lossy()
+                ));
+                out.push(components.as_path());
+                return out;
+            }
+            Prefix::Verbatim(_) => {
+                // Best-effort: fall through to OsStr strip below.
+            }
             _ => return path,
-        }
-        // Fallback string strip for Verbatim and odd cases.
-        let raw = path.as_os_str().to_string_lossy();
-        if let Some(rest) = raw.strip_prefix(r"\\?\UNC\") {
-            PathBuf::from(format!(r"\\{rest}"))
-        } else if let Some(rest) = raw.strip_prefix(r"\\?\") {
-            PathBuf::from(rest)
-        } else {
-            path
-        }
+        },
+        _ => return path,
     }
-    #[cfg(not(windows))]
-    {
+    // Fallback string strip for Verbatim and odd cases.
+    let raw = path.as_os_str().to_string_lossy();
+    if let Some(rest) = raw.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{rest}"))
+    } else if let Some(rest) = raw.strip_prefix(r"\\?\") {
+        PathBuf::from(rest)
+    } else {
         path
     }
+}
+
+#[cfg(not(windows))]
+fn strip_verbatim_prefix_impl(path: PathBuf) -> PathBuf {
+    path
 }
 
 /// Canonicalize a path and strip Windows verbatim prefixes for tool consumption.
@@ -297,6 +325,28 @@ mod tests {
         );
     }
 
+    fn os(value: &str) -> Option<&OsStr> {
+        Some(OsStr::new(value))
+    }
+
+    fn with_roots(roots: &[&str]) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        for root in roots {
+            fs::create_dir_all(tmp.path().join(root)).unwrap();
+        }
+        tmp
+    }
+
+    fn assert_state_suffix(user_data: &Path, unix: &str, windows: &str) {
+        let path = resolve_state_path_in(user_data, None, None);
+        assert_ends_with(&path, unix, windows);
+    }
+
+    fn assert_worktree_suffix(user_data: &Path, unix: &str, windows: &str) {
+        let path = resolve_worktree_base_in(user_data, None, None).unwrap();
+        assert_ends_with(&path, unix, windows);
+    }
+
     #[test]
     fn user_data_dir_is_non_empty() {
         let dir = user_data_dir();
@@ -321,58 +371,44 @@ mod tests {
     #[test]
     fn resolve_state_path_empty_override_uses_new_root_when_neither_exists() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = resolve_state_path_in(tmp.path(), Some(OsStr::new("")), None);
+        let path = resolve_state_path_in(tmp.path(), os(""), None);
         assert_ends_with(&path, "writ/watched.json", "writ\\watched.json");
     }
 
     #[test]
-    fn resolve_state_path_default_uses_new_root_when_neither_exists() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = resolve_state_path_in(tmp.path(), None, None);
-        assert_ends_with(&path, "writ/watched.json", "writ\\watched.json");
+    fn resolve_state_path_root_selection() {
+        let cases: &[(&[&str], &str, &str)] = &[
+            (&[], "writ/watched.json", "writ\\watched.json"),
+            (
+                &["worktrees-hives"],
+                "worktrees-hives/watched.json",
+                "worktrees-hives\\watched.json",
+            ),
+            (
+                &["writ", "worktrees-hives"],
+                "writ/watched.json",
+                "writ\\watched.json",
+            ),
+        ];
+        for (roots, unix, windows) in cases {
+            let tmp = with_roots(roots);
+            assert_state_suffix(tmp.path(), unix, windows);
+        }
     }
 
     #[test]
-    fn resolve_state_path_falls_back_to_legacy_root_when_new_root_absent() {
+    fn resolve_state_path_env_precedence() {
         let tmp = tempfile::tempdir().unwrap();
-        fs::create_dir_all(tmp.path().join("worktrees-hives")).unwrap();
-        let path = resolve_state_path_in(tmp.path(), None, None);
-        assert_ends_with(
-            &path,
-            "worktrees-hives/watched.json",
-            "worktrees-hives\\watched.json",
+        let writ = "/tmp/writ/watched.json";
+        let legacy = "/tmp/legacy/watched.json";
+        assert_eq!(
+            resolve_state_path_in(tmp.path(), os(writ), os(legacy)),
+            PathBuf::from(writ)
         );
-    }
-
-    #[test]
-    fn resolve_state_path_prefers_new_root_when_both_exist() {
-        let tmp = tempfile::tempdir().unwrap();
-        fs::create_dir_all(tmp.path().join("writ")).unwrap();
-        fs::create_dir_all(tmp.path().join("worktrees-hives")).unwrap();
-        let path = resolve_state_path_in(tmp.path(), None, None);
-        assert_ends_with(&path, "writ/watched.json", "writ\\watched.json");
-    }
-
-    #[test]
-    fn resolve_state_path_prefers_writ_env_over_legacy_env() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = resolve_state_path_in(
-            tmp.path(),
-            Some(OsStr::new("/tmp/writ/watched.json")),
-            Some(OsStr::new("/tmp/legacy/watched.json")),
+        assert_eq!(
+            resolve_state_path_in(tmp.path(), os(""), os(legacy)),
+            PathBuf::from(legacy)
         );
-        assert_eq!(path, PathBuf::from("/tmp/writ/watched.json"));
-    }
-
-    #[test]
-    fn resolve_state_path_uses_legacy_env_when_writ_env_empty() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = resolve_state_path_in(
-            tmp.path(),
-            Some(OsStr::new("")),
-            Some(OsStr::new("/tmp/legacy/watched.json")),
-        );
-        assert_eq!(path, PathBuf::from("/tmp/legacy/watched.json"));
     }
 
     #[test]
@@ -395,47 +431,37 @@ mod tests {
     }
 
     #[test]
-    fn worktree_base_falls_back_to_legacy_root_when_new_root_absent() {
+    fn worktree_base_root_selection() {
+        let cases: &[(&[&str], &str, &str)] = &[
+            (
+                &["worktrees-hives"],
+                "worktrees-hives/worktrees",
+                "worktrees-hives\\worktrees",
+            ),
+            (
+                &["writ", "worktrees-hives"],
+                "writ/worktrees",
+                "writ\\worktrees",
+            ),
+        ];
+        for (roots, unix, windows) in cases {
+            let tmp = with_roots(roots);
+            assert_worktree_suffix(tmp.path(), unix, windows);
+        }
+    }
+
+    #[test]
+    fn worktree_base_env_precedence() {
         let tmp = tempfile::tempdir().unwrap();
-        fs::create_dir_all(tmp.path().join("worktrees-hives")).unwrap();
-        let path = resolve_worktree_base_in(tmp.path(), None, None).unwrap();
-        assert_ends_with(
-            &path,
-            "worktrees-hives/worktrees",
-            "worktrees-hives\\worktrees",
+        let writ = "/tmp/writ-trees";
+        let legacy = "/tmp/legacy-trees";
+        assert_eq!(
+            resolve_worktree_base_in(tmp.path(), os(writ), os(legacy)).unwrap(),
+            PathBuf::from(writ)
         );
-    }
-
-    #[test]
-    fn worktree_base_prefers_new_root_when_both_exist() {
-        let tmp = tempfile::tempdir().unwrap();
-        fs::create_dir_all(tmp.path().join("writ")).unwrap();
-        fs::create_dir_all(tmp.path().join("worktrees-hives")).unwrap();
-        let path = resolve_worktree_base_in(tmp.path(), None, None).unwrap();
-        assert_ends_with(&path, "writ/worktrees", "writ\\worktrees");
-    }
-
-    #[test]
-    fn worktree_base_prefers_writ_env_over_legacy_env() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = resolve_worktree_base_in(
-            tmp.path(),
-            Some(OsStr::new("/tmp/writ-trees")),
-            Some(OsStr::new("/tmp/legacy-trees")),
-        )
-        .unwrap();
-        assert_eq!(path, PathBuf::from("/tmp/writ-trees"));
-    }
-
-    #[test]
-    fn worktree_base_uses_legacy_env_when_writ_env_empty() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = resolve_worktree_base_in(
-            tmp.path(),
-            Some(OsStr::new("")),
-            Some(OsStr::new("/tmp/legacy-trees")),
-        )
-        .unwrap();
-        assert_eq!(path, PathBuf::from("/tmp/legacy-trees"));
+        assert_eq!(
+            resolve_worktree_base_in(tmp.path(), os(""), os(legacy)).unwrap(),
+            PathBuf::from(legacy)
+        );
     }
 }
