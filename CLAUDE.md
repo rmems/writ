@@ -13,8 +13,8 @@ Use these `AGENTS.md` sections as the single source of truth:
 - [Attribution semantics](AGENTS.md#attribution-semantics)
 - [Human-authorized one-shot merge protocol](AGENTS.md#human-authorized-one-shot-merge-protocol)
 
-Interactive PR monitoring belongs to the installed companion `babysit-pr` skill. That skill is portable operator guidance, not a security boundary. Rust `wh-core` remains the hard code-enforced boundary for worktree, branch, path, process, push, runtime no-merge, auto-merge, and merge-queue controls.
+Interactive PR monitoring belongs to the installed companion `babysit-pr` skill. That skill is portable operator guidance, not a security boundary. Rust `writ-core` remains the hard code-enforced boundary for worktree, branch, path, process, push, runtime no-merge, auto-merge, and merge-queue controls.
 
 ## Claude-specific delegation
 
-When Claude delegates writable work, give each worker its own `wh`-created assigned worktree and branch. The controller coordinates results and retains publication authority; it never gives two writable workers a shared worktree. Use the portable worker prompt and lifecycle in [`SKILL.md`](SKILL.md), and the shared review checklist in [`REVIEW.md`](REVIEW.md).
+When Claude delegates writable work, give each worker its own `writ`-created assigned worktree and branch. The controller coordinates results and retains publication authority; it never gives two writable workers a shared worktree. Use the portable worker prompt and lifecycle in [`SKILL.md`](SKILL.md), and the shared review checklist in [`REVIEW.md`](REVIEW.md).

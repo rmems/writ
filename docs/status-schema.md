@@ -1,22 +1,22 @@
 # Status JSON Schema
 
 > [!WARNING]
-> **Both commands return an empty `jobs` array unless something outside this workspace supplies the state file.** `crates/wh-core/src/state.rs` has a read path and no writer, so nothing here creates `watched.json`, and with the file absent -- the normal case -- the output is empty. Verified:
+> **Both commands return an empty `jobs` array unless something outside this workspace supplies the state file.** `crates/writ-core/src/state.rs` has a read path and no writer, so nothing here creates `watched.json`, and with the file absent -- the normal case -- the output is empty. Verified:
 >
 > ```console
-> $ wh --json status
+> $ writ --json status
 > {"ok":true,"schema_version":1,"command":"cli.status","data":{"jobs":[]},"error":null}
 > ```
 >
-> The populated shapes below are still reachable, so consumers must handle them: `load_jobs_from` returns an empty vec only when the file is missing, and parses and returns any file that *is* present -- placed there externally, or pointed at via `WH_STATE_PATH`. What is missing is the writer, not the read path.
+> The populated shapes below are still reachable, so consumers must handle them: `load_jobs_from` returns an empty vec only when the file is missing, and parses and returns any file that *is* present -- placed there externally, or pointed at via `WRIT_STATE_PATH`. What is missing is the writer, not the read path.
 >
 > The store is superseded rather than unfinished: the SQLite lease store in [#124](https://github.com/rmems/writ/issues/124) replaces it, with crash consistency in [#136](https://github.com/rmems/writ/issues/136).
 
-This document defines the JSON schema emitted by `wh status --json` and `wh jobs --json`.
+This document defines the JSON schema emitted by `writ status --json` and `writ jobs --json`.
 
 ## Envelope
 
-All status responses use the shared v1 envelope defined in the `Response<T>` type (`crates/wh-core/src/contract.rs`):
+All status responses use the shared v1 envelope defined in the `Response<T>` type (`crates/writ-core/src/contract.rs`):
 
 | Field | Type | Description |
 | --- | --- | --- |
@@ -54,7 +54,7 @@ Each entry in the `jobs` array has these fields:
 
 | Field | Type | Nullable | Description |
 | --- | --- | --- | --- |
-| `job_id` | `string` | no | Unique job identifier (e.g. `wh-347`). |
+| `job_id` | `string` | no | Unique job identifier (e.g. `writ-347`). |
 | `owner` | `string` | no | Repository owner (e.g. `acme`). |
 | `repo` | `string` | no | Repository name (e.g. `example-org`). |
 | `issue_number` | `u64` | yes | Linked GitHub issue number. Omitted when absent. |
@@ -112,22 +112,22 @@ Serialized as a lowercase snake_case string.
   "data": {
     "jobs": [
       {
-        "job_id": "wh-100",
+        "job_id": "writ-100",
         "owner": "acme",
         "repo": "example-org",
         "issue_number": 29,
         "pr_number": 42,
-        "worktree_path": "/home/user/.local/share/worktrees-hives/worktrees/acme/example-org/wh-100",
+        "worktree_path": "/home/user/.local/share/writ/worktrees/acme/example-org/writ-100",
         "branch": "feature/status-json-cli",
         "process_state": "running",
         "ci_class": "pending"
       },
       {
-        "job_id": "wh-101",
+        "job_id": "writ-101",
         "owner": "acme",
         "repo": "example-org",
         "issue_number": 30,
-        "worktree_path": "/home/user/.local/share/worktrees-hives/worktrees/acme/example-org/wh-101",
+        "worktree_path": "/home/user/.local/share/writ/worktrees/acme/example-org/writ-101",
         "branch": "feature/python-bridge",
         "process_state": "failed",
         "last_error": "git command failed (`git push`): permission denied",
@@ -164,8 +164,8 @@ The `schema_version` field is backward-compatible. Additive fields will be intro
 
 | Command | Description |
 | --- | --- |
-| `wh status --json` | Emit a status report for all watched jobs. |
-| `wh jobs --json` | Alias for `wh status --json`. |
+| `writ status --json` | Emit a status report for all watched jobs. |
+| `writ jobs --json` | Alias for `writ status --json`. |
 
 Without `--json`, both commands print a brief human-readable summary to standard output.
 
@@ -179,13 +179,13 @@ import subprocess
 import sys
 
 result = subprocess.run(
-    ["wh", "status", "--json"],
+    ["writ", "status", "--json"],
     capture_output=True,
     text=True,
     check=False,  # load failures exit non-zero but still write a v1 envelope
 )
 if not result.stdout.strip():
-    print(result.stderr or "wh status produced no output", file=sys.stderr)
+    print(result.stderr or "writ status produced no output", file=sys.stderr)
     sys.exit(result.returncode or 1)
 
 report = json.loads(result.stdout)
@@ -208,7 +208,7 @@ import subprocess
 
 try:
     result = subprocess.run(
-        ["wh", "status", "--json"],
+        ["writ", "status", "--json"],
         capture_output=True,
         text=True,
         check=True,

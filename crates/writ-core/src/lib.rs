@@ -1,4 +1,4 @@
-//! Safety-focused core primitives for `worktrees-hives`.
+//! Safety-focused core primitives for `writ`.
 //!
 //! The module boundaries are established in the R1 scaffold. Their behavior is
 //! implemented by the linked foundation issues.

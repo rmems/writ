@@ -4,8 +4,8 @@
   "command": "worktree.list",
   "data": {
     "worktrees": [
-      { "path": "/home/user/.local/share/worktrees-hives/worktrees/acme/example-repo/wh-123", "branch": "feature/fix" },
-      { "path": "/home/user/.local/share/worktrees-hives/worktrees/acme/example-repo/wh-124", "branch": "feature/other" }
+      { "path": "/home/user/.local/share/writ/worktrees/acme/example-repo/writ-123", "branch": "feature/fix" },
+      { "path": "/home/user/.local/share/writ/worktrees/acme/example-repo/writ-124", "branch": "feature/other" }
     ]
   },
   "error": null

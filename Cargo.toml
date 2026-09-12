@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/wh-core", "crates/wh"]
+members = ["crates/writ-core", "crates/writ"]
 resolver = "2"
 
 [workspace.package]
@@ -7,7 +7,7 @@ version = "0.2.0"
 edition = "2024"
 rust-version = "1.97.1"
 license = "Apache-2.0"
-repository = "https://github.com/rmems/worktrees-hives"
+repository = "https://github.com/rmems/writ"
 
 [workspace.dependencies]
 clap = { version = "4.6", features = ["derive"] }

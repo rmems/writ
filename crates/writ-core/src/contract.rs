@@ -38,7 +38,7 @@ pub struct Response<T> {
 }
 
 impl Response<EmptyData> {
-    /// Build the scaffold success envelope emitted by `wh --json`.
+    /// Build the scaffold success envelope emitted by `writ --json`.
     #[must_use]
     pub fn bootstrap_success() -> Self {
         Self {

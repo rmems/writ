@@ -1,9 +1,9 @@
-# worktrees-hives → `writ`
+# writ
 
 A Rust safety core for coding-agent fleets: exact-base worktree verification, `git`/`gh` mutation allowlists, path sandboxing, process containment, and **no runtime merge path at all**.
 
 > [!IMPORTANT]
-> **This repository is mid-pivot.** It is becoming **`writ`** — the enforcement and admission-control layer for agent fleets. See [#1](https://github.com/rmems/writ/issues/1) for the product epic and [#124](https://github.com/rmems/writ/issues/124) for the current phase. The crate is still named `wh`; that rename is tracked under milestone M2. The GitHub repository rename has already landed.
+> **This repository is mid-pivot.** It is becoming **`writ`** — the enforcement and admission-control layer for agent fleets. See [#1](https://github.com/rmems/writ/issues/1) for the product epic and [#124](https://github.com/rmems/writ/issues/124) for the current phase. The crate rename and the GitHub repository rename have both landed under milestone M2.
 
 ## What this is for
 
@@ -21,8 +21,8 @@ Claude Code agent teams have real coordination and [documented zero isolation](h
 
 > [!NOTE]
 > **Status: the enforcement core is real; the hook layer is not built yet.**
-> Shipping today are the `git`/`gh` allowlists, exact-base worktree verification, path sandboxing, process supervision, and the absence of any merge path — reachable through the `wh` CLI, including `wh worktree create`, which remains supported.
-> Not yet built: the `PreToolUse`/`WorktreeCreate` hook dispatcher, `wh install`, and the SQLite lease store. Those are milestone **M1** ([#124](https://github.com/rmems/writ/issues/124)). Until they land, enforcement applies only to commands routed through `wh` deliberately — it is **opt-in, not unbypassable**.
+> Shipping today are the `git`/`gh` allowlists, exact-base worktree verification, path sandboxing, process supervision, and the absence of any merge path — reachable through the `writ` CLI, including `writ worktree create`, which remains supported.
+> Not yet built: the `PreToolUse`/`WorktreeCreate` hook dispatcher, `writ install`, and the SQLite lease store. Those are milestone **M1** ([#124](https://github.com/rmems/writ/issues/124)). Until they land, enforcement applies only to commands routed through `writ` deliberately — it is **opt-in, not unbypassable**.
 
 ## Architecture
 
@@ -62,12 +62,12 @@ Soft prompt text is not runtime enforcement. Hard stops live in Rust, at the bin
 ## Owner allowlist — not currently enforced
 
 > [!WARNING]
-> **`WH_ALLOWED_OWNERS` has no reader anywhere under `crates/`.** It was enforced in the Python layer this repository just removed, so owner scoping is presently a stated requirement with no code behind it. Do not rely on it as an access control. Tracked in [#146](https://github.com/rmems/writ/issues/146).
+> **`WRIT_ALLOWED_OWNERS` has no reader anywhere under `crates/`.** It was enforced in the Python layer this repository just removed, so owner scoping is presently a stated requirement with no code behind it. Do not rely on it as an access control. Tracked in [#146](https://github.com/rmems/writ/issues/146).
 
 The intended contract, for when enforcement lands:
 
 - Repository access is controlled by a configured owner allowlist, not a built-in org list.
-- Set `WH_ALLOWED_OWNERS=acme,example-org` (comma-separated), or pass explicit owners at the API boundary.
+- Set `WRIT_ALLOWED_OWNERS=acme,example-org` (comma-separated), or pass explicit owners at the API boundary.
 - An empty allowlist denies multi-owner operations rather than permitting them.
 
 Examples use generic owners such as `acme` and `example-org`.
@@ -79,8 +79,8 @@ Prerequisites: stable Rust from [rustup](https://rustup.rs/), Git, and the GitHu
 ```bash
 cargo build --workspace
 cargo test --workspace
-cargo install --path crates/wh
-wh --help
+cargo install --path crates/writ
+writ --help
 ```
 
 Contributor quality gates — these are canonical, and external analyzers are advisory until reproduced:

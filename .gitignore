@@ -1,5 +1,5 @@
 # =============================================================================
-# worktrees-hives — Python/Rust hybrid + agentic / IDE tooling
+# writ — Rust workspace + agentic / IDE tooling
 # =============================================================================
 
 # -----------------------------------------------------------------------------
@@ -112,6 +112,7 @@ ipython_config.py
 !.env.example
 .envrc
 .venv
+# Leftover local Qodana venv from the retired paid gate. Not a required check.
 .qodana-venv
 env/
 venv/
@@ -250,11 +251,18 @@ kilo-code/
 .kiro-cache/
 
 # -----------------------------------------------------------------------------
-# Local agent / hive runtime (worktrees-hives project state)
+# Local agent runtime (writ project state)
 # -----------------------------------------------------------------------------
+.writ-state/
+.writ/
+**/writ-state/
+.local/share/writ/
+# Legacy names from the pre-rename `wh` / worktrees-hives runtime so existing
+# local dirs stay untracked after upgrade.
 .worktrees-hives/
 .wh/
 **/wh-state/
+wh-state/
 .local/share/worktrees-hives/
 # ad-hoc worktrees if created under the repo
 .worktrees/
@@ -289,6 +297,7 @@ SKILL-grok-linear.md
 
 # OpenCode agent skills / local tooling (not product)
 .opencode/
+# Leftover local Qodana output dir from the retired paid gate. Not a required check.
 qodana/
 
 # Local agent / IDE MCP scratch (never commit)

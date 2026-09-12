@@ -3,7 +3,7 @@
   "schema_version": 2,
   "command": "worktree.create",
   "data": {
-    "path": "/home/user/.local/share/worktrees-hives/worktrees/acme/example-repo/wh-123",
+    "path": "/home/user/.local/share/writ/worktrees/acme/example-repo/writ-123",
     "branch": "feature/fix",
     "branch_ref": "refs/heads/feature/fix",
     "repo_root": "/path/to/repo",

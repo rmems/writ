@@ -21,7 +21,7 @@ body:
   attributes:
     label: Steps to reproduce (required) — include agent commands, CLI args, GitHub/Linear issue numbers? 
     description: |
-      List exactly what the subagent did wrong. If it involves CLI tooling (`wh status`, `wh git-safe push`), specify command output + exit codes too!
+      List exactly what the subagent did wrong. If it involves CLI tooling (`writ status`, `writ git-safe push`), specify command output + exit codes too!
 
 - type: textarea
   attributes:

@@ -2119,7 +2119,7 @@ mod tests {
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "wh-core-git-safe-{}-{}-{}",
+            "writ-core-git-safe-{}-{}-{}",
             std::process::id(),
             seq,
             std::time::SystemTime::now()
@@ -2154,7 +2154,7 @@ mod tests {
         git(&["init"]);
         git(&["checkout", "-b", branch]);
         git(&["config", "user.email", "test@example.com"]);
-        git(&["config", "user.name", "wh-core-test"]);
+        git(&["config", "user.name", "writ-core-test"]);
         std::fs::write(
             dir.join("README"),
             "init

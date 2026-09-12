@@ -7,7 +7,7 @@ use clap::{Parser, Subcommand};
 
 /// Manage isolated issue-to-PR jobs and their durable state.
 #[derive(Debug, Parser)]
-#[command(name = "wh", version, about, long_about = None)]
+#[command(name = "writ", version, about, long_about = None)]
 struct Cli {
     /// Emit responses as versioned JSON envelopes.
     #[arg(long, global = true)]
@@ -79,7 +79,7 @@ enum WorktreeAction {
         /// Boundary schema: v1 returns an upgrade error; select v2 to create.
         #[arg(
             long,
-            default_value_t = wh_core::contract::SCHEMA_VERSION,
+            default_value_t = writ_core::contract::SCHEMA_VERSION,
             value_parser = clap::value_parser!(u8).range(1..=2)
         )]
         schema_version: u8,
@@ -118,7 +118,7 @@ enum SupervisorAction {
         repo: Option<PathBuf>,
 
         /// Max concurrent supervised children **in this process** (default 1).
-        /// Does not coordinate across separate `wh` processes.
+        /// Does not coordinate across separate `writ` processes.
         #[arg(long, default_value = "1")]
         max_parallel: usize,
 
@@ -139,12 +139,12 @@ async fn main() -> ExitCode {
         Ok(code) => code,
         Err(error) => {
             if json && let Some(command) = worktree_command {
-                let response = wh_core::contract::Response {
+                let response = writ_core::contract::Response {
                     ok: false,
                     schema_version: worktree_schema_version,
                     command,
                     data: worktree_error_data(&error),
-                    error: Some(wh_core::contract::ErrorData {
+                    error: Some(writ_core::contract::ErrorData {
                         code: error.code().to_owned(),
                         message: error.to_string(),
                     }),
@@ -154,21 +154,21 @@ async fn main() -> ExitCode {
                     let _ = stdout.write_all(b"\n");
                 }
             }
-            let _ = writeln!(io::stderr(), "wh: {error}");
+            let _ = writeln!(io::stderr(), "writ: {error}");
             ExitCode::from(error.exit_code())
         }
     }
 }
 
-fn worktree_error_data(error: &wh_core::error::Error) -> serde_json::Value {
+fn worktree_error_data(error: &writ_core::error::Error) -> serde_json::Value {
     match error {
-        wh_core::error::Error::ContractUpgradeRequired {
+        writ_core::error::Error::ContractUpgradeRequired {
             required_schema_version,
         } => serde_json::json!({
             "required_schema_version": required_schema_version,
         }),
-        wh_core::error::Error::WorktreeCreationFailed(failure) => {
-            let wh_core::error::WorktreeCreationFailure {
+        writ_core::error::Error::WorktreeCreationFailed(failure) => {
+            let writ_core::error::WorktreeCreationFailure {
                 path,
                 branch,
                 path_exists,
@@ -187,8 +187,8 @@ fn worktree_error_data(error: &wh_core::error::Error) -> serde_json::Value {
             "cleanup_performed": false,
             })
         }
-        wh_core::error::Error::WorktreePostconditionFailed(failure) => {
-            let wh_core::error::WorktreePostconditionFailure {
+        writ_core::error::Error::WorktreePostconditionFailed(failure) => {
+            let writ_core::error::WorktreePostconditionFailure {
                 path,
                 branch,
                 expected_commit,
@@ -220,7 +220,7 @@ fn worktree_schema_version(cli: &Cli) -> u8 {
         Some(Command::Worktree {
             action: WorktreeAction::Create { schema_version, .. },
         }) => *schema_version,
-        _ => wh_core::contract::SCHEMA_VERSION,
+        _ => writ_core::contract::SCHEMA_VERSION,
     }
 }
 
@@ -238,9 +238,9 @@ fn worktree_command_name(cli: &Cli) -> Option<&'static str> {
 
 fn worktree_response(
     action: WorktreeAction,
-) -> wh_core::error::Result<wh_core::contract::Response<serde_json::Value>> {
-    use wh_core::contract::Response;
-    use wh_core::worktree::{WorktreeCreateRequest, WorktreeManager};
+) -> writ_core::error::Result<writ_core::contract::Response<serde_json::Value>> {
+    use writ_core::contract::Response;
+    use writ_core::worktree::{WorktreeCreateRequest, WorktreeManager};
 
     match action {
         WorktreeAction::Create {
@@ -252,12 +252,12 @@ fn worktree_response(
             start_point,
             schema_version,
         } => {
-            if schema_version == wh_core::contract::SCHEMA_VERSION {
-                return Err(wh_core::error::Error::ContractUpgradeRequired {
-                    required_schema_version: wh_core::contract::EXACT_BASE_SCHEMA_VERSION,
+            if schema_version == writ_core::contract::SCHEMA_VERSION {
+                return Err(writ_core::error::Error::ContractUpgradeRequired {
+                    required_schema_version: writ_core::contract::EXACT_BASE_SCHEMA_VERSION,
                 });
             }
-            let start_point = start_point.ok_or(wh_core::error::Error::StartPointRequired)?;
+            let start_point = start_point.ok_or(writ_core::error::Error::StartPointRequired)?;
             let manager = WorktreeManager::new()?;
             let wt = manager.create_with_request(WorktreeCreateRequest {
                 repo_root: &repo,
@@ -314,7 +314,7 @@ fn run_worktree(
     action: WorktreeAction,
     json: bool,
     stdout: &mut impl Write,
-) -> wh_core::error::Result<ExitCode> {
+) -> writ_core::error::Result<ExitCode> {
     let response = worktree_response(action)?;
 
     if json {
@@ -327,14 +327,19 @@ fn run_worktree(
 }
 
 /// Entry point for CLI commands (status/jobs, git/gh-safe, supervisor, worktree).
-async fn run(cli: Cli, stdout: &mut impl Write) -> wh_core::error::Result<ExitCode> {
+async fn run(cli: Cli, stdout: &mut impl Write) -> writ_core::error::Result<ExitCode> {
     match cli.command {
         Some(Command::Status) => {
-            run_status(cli.json, "cli.status", wh_core::state::load_jobs(), stdout)?;
+            run_status(
+                cli.json,
+                "cli.status",
+                writ_core::state::load_jobs(),
+                stdout,
+            )?;
             Ok(ExitCode::SUCCESS)
         }
         Some(Command::Jobs) => {
-            run_status(cli.json, "cli.jobs", wh_core::state::load_jobs(), stdout)?;
+            run_status(cli.json, "cli.jobs", writ_core::state::load_jobs(), stdout)?;
             Ok(ExitCode::SUCCESS)
         }
         Some(Command::GitSafe {
@@ -368,7 +373,7 @@ async fn run(cli: Cli, stdout: &mut impl Write) -> wh_core::error::Result<ExitCo
             if cli.json {
                 serde_json::to_writer(
                     &mut *stdout,
-                    &wh_core::contract::Response::bootstrap_success(),
+                    &writ_core::contract::Response::bootstrap_success(),
                 )
                 .map_err(io::Error::other)?;
                 stdout.write_all(b"\n")?;
@@ -378,7 +383,7 @@ async fn run(cli: Cli, stdout: &mut impl Write) -> wh_core::error::Result<ExitCo
     }
 }
 
-/// Run `wh supervisor run` with policy-checked core supervisor and consistent JSON envelopes.
+/// Run `writ supervisor run` with policy-checked core supervisor and consistent JSON envelopes.
 async fn run_supervisor(
     json: bool,
     timeout_secs: u64,
@@ -387,7 +392,7 @@ async fn run_supervisor(
     max_parallel: usize,
     cmd: Vec<String>,
     stdout: &mut impl Write,
-) -> wh_core::error::Result<ExitCode> {
+) -> writ_core::error::Result<ExitCode> {
     let program = match cmd.first() {
         Some(p) => p.as_str(),
         None => {
@@ -399,7 +404,7 @@ async fn run_supervisor(
         }
     };
     let args: Vec<&str> = cmd[1..].iter().map(|s| s.as_str()).collect();
-    let options = wh_core::supervisor::RunOptions {
+    let options = writ_core::supervisor::RunOptions {
         expected_branch,
         repo,
     };
@@ -411,7 +416,7 @@ async fn run_supervisor(
 
     // One-shot CLI: a single awaited child cannot contend with itself.
     // Library callers may still use Supervisor::new(n) for in-process fan-out.
-    let supervisor = wh_core::supervisor::Supervisor::new(max_parallel.max(1));
+    let supervisor = writ_core::supervisor::Supervisor::new(max_parallel.max(1));
     match supervisor.run(program, &args, timeout, &options).await {
         Ok(output) => {
             write_supervisor_result(json, Ok(&output), stdout)?;
@@ -432,7 +437,7 @@ async fn run_supervisor(
 
 fn write_supervisor_result(
     json: bool,
-    result: Result<&wh_core::supervisor::SupervisedOutput, &wh_core::error::Error>,
+    result: Result<&writ_core::supervisor::SupervisedOutput, &writ_core::error::Error>,
     stdout: &mut impl Write,
 ) -> io::Result<()> {
     if !json {
@@ -449,10 +454,10 @@ fn write_supervisor_result(
             let data = serde_json::to_value(output).map_err(io::Error::other)?;
             (true, data, None)
         }
-        Err(wh_core::error::Error::PolicyViolation { code, message }) => (
+        Err(writ_core::error::Error::PolicyViolation { code, message }) => (
             false,
             serde_json::json!({}),
-            Some(wh_core::contract::ErrorData {
+            Some(writ_core::contract::ErrorData {
                 code: code.as_str().to_owned(),
                 message: message.clone(),
             }),
@@ -460,16 +465,16 @@ fn write_supervisor_result(
         Err(other) => (
             false,
             serde_json::json!({}),
-            Some(wh_core::contract::ErrorData {
+            Some(writ_core::contract::ErrorData {
                 code: "SUPERVISOR_ERROR".to_owned(),
                 message: other.to_string(),
             }),
         ),
     };
 
-    let response = wh_core::contract::Response {
+    let response = writ_core::contract::Response {
         ok,
-        schema_version: wh_core::contract::SCHEMA_VERSION,
+        schema_version: writ_core::contract::SCHEMA_VERSION,
         command: "supervisor.run",
         data,
         error,
@@ -484,7 +489,7 @@ fn write_supervisor_result(
 /// - spawn failure → non-zero
 /// - timed_out / killed → non-zero
 /// - otherwise propagate child exit code when present
-fn supervised_exit_code(output: &wh_core::supervisor::SupervisedOutput) -> ExitCode {
+fn supervised_exit_code(output: &writ_core::supervisor::SupervisedOutput) -> ExitCode {
     if output.spawn_failed() {
         return ExitCode::FAILURE;
     }
@@ -503,7 +508,7 @@ fn supervised_exit_code(output: &wh_core::supervisor::SupervisedOutput) -> ExitC
 fn run_status(
     json: bool,
     command_name: &'static str,
-    jobs_result: Result<Vec<wh_core::status::JobStatus>, String>,
+    jobs_result: Result<Vec<writ_core::status::JobStatus>, String>,
     stdout: &mut impl Write,
 ) -> io::Result<()> {
     match jobs_result {
@@ -512,7 +517,7 @@ fn run_status(
             if json {
                 // JSON path: write ok:false envelope, then exit non-zero.
                 // Consumers should parse stdout even on CalledProcessError (see docs/status-schema.md).
-                let response = wh_core::status::status_error(command_name, e.clone());
+                let response = writ_core::status::status_error(command_name, e.clone());
                 serde_json::to_writer(&mut *stdout, &response).map_err(io::Error::other)?;
                 stdout.write_all(b"\n")?;
             }
@@ -526,11 +531,11 @@ fn run_status(
 fn run_with_jobs(
     json: bool,
     command_name: &'static str,
-    jobs: Vec<wh_core::status::JobStatus>,
+    jobs: Vec<writ_core::status::JobStatus>,
     stdout: &mut impl Write,
 ) -> io::Result<()> {
     if json {
-        let response = wh_core::status::status_response(command_name, jobs);
+        let response = writ_core::status::status_response(command_name, jobs);
         serde_json::to_writer(&mut *stdout, &response).map_err(io::Error::other)?;
         stdout.write_all(b"\n")?;
     } else if jobs.is_empty() {
@@ -553,8 +558,8 @@ fn run_git_safe(
     repo: Option<PathBuf>,
     json: bool,
     stdout: &mut impl Write,
-) -> wh_core::error::Result<ExitCode> {
-    let cmd = wh_core::git_safe::SafeGitCommand::new(args)?;
+) -> writ_core::error::Result<ExitCode> {
+    let cmd = writ_core::git_safe::SafeGitCommand::new(args)?;
     let repo_dir = repo.unwrap_or_else(|| PathBuf::from("."));
     let output = cmd.run(&repo_dir, expected_branch)?;
 
@@ -566,8 +571,8 @@ fn run_gh_safe(
     args: &[String],
     json: bool,
     stdout: &mut impl Write,
-) -> wh_core::error::Result<ExitCode> {
-    let cmd = wh_core::git_safe::SafeGhCommand::new(args)?;
+) -> writ_core::error::Result<ExitCode> {
+    let cmd = writ_core::git_safe::SafeGhCommand::new(args)?;
     let output = cmd.run()?;
 
     write_safe_result("gh.safe", cmd.args(), &output, json, stdout)?;
@@ -577,10 +582,10 @@ fn run_gh_safe(
 fn write_safe_result(
     command: &'static str,
     args: &[String],
-    output: &wh_core::git_safe::GitOutput,
+    output: &writ_core::git_safe::GitOutput,
     json: bool,
     stdout: &mut impl Write,
-) -> wh_core::error::Result<()> {
+) -> writ_core::error::Result<()> {
     if json {
         let data = serde_json::json!({
             "args": args,
@@ -588,7 +593,7 @@ fn write_safe_result(
             "stdout": output.stdout,
             "stderr": output.stderr,
         });
-        let response = wh_core::contract::Response::success(command, data);
+        let response = writ_core::contract::Response::success(command, data);
         serde_json::to_writer(&mut *stdout, &response).map_err(io::Error::other)?;
         stdout.write_all(b"\n")?;
     } else {
@@ -630,18 +635,18 @@ mod tests {
     use std::str;
 
     use clap::{CommandFactory, Parser};
-    use wh_core::status::{CiClass, JobStatus, ProcessState};
+    use writ_core::status::{CiClass, JobStatus, ProcessState};
 
     use super::{Cli, run, run_status, run_with_jobs, supervised_exit_code};
 
     fn sample_job() -> JobStatus {
         JobStatus {
-            job_id: "wh-1".to_owned(),
+            job_id: "writ-1".to_owned(),
             owner: "acme".to_owned(),
             repo: "example-org".to_owned(),
             issue_number: Some(29),
             pr_number: None,
-            worktree_path: "/tmp/wt/wh-1".to_owned(),
+            worktree_path: "/tmp/wt/writ-1".to_owned(),
             branch: "feature/foo".to_owned(),
             process_state: ProcessState::Running,
             last_error: None,
@@ -657,7 +662,7 @@ mod tests {
     #[test]
     fn worktree_create_parser_distinguishes_v1_migration_from_v2_exact_base() {
         let missing = Cli::try_parse_from([
-            "wh", "worktree", "create", "--repo", ".", "acme", "repo", "job", "branch",
+            "writ", "worktree", "create", "--repo", ".", "acme", "repo", "job", "branch",
         ])
         .unwrap();
         let Some(super::Command::Worktree {
@@ -673,7 +678,7 @@ mod tests {
         };
 
         let parsed = Cli::try_parse_from([
-            "wh",
+            "writ",
             "worktree",
             "create",
             "--schema-version",
@@ -775,7 +780,7 @@ mod tests {
             .as_array()
             .expect("data.jobs must be an array");
         assert_eq!(jobs.len(), 1);
-        assert_eq!(jobs[0].get("job_id").expect("missing job_id"), "wh-1");
+        assert_eq!(jobs[0].get("job_id").expect("missing job_id"), "writ-1");
         assert_eq!(
             jobs[0].get("process_state").expect("missing process_state"),
             "running"
@@ -833,7 +838,7 @@ mod tests {
         run_with_jobs(false, "cli.status", vec![sample_job()], &mut stdout).unwrap();
 
         let output = str::from_utf8(&stdout).unwrap();
-        assert!(output.contains("wh-1"));
+        assert!(output.contains("writ-1"));
         assert!(output.contains("running"));
         assert!(output.contains("feature/foo"));
     }
@@ -946,8 +951,8 @@ mod tests {
         let err = run(cli, &mut stdout).await.unwrap_err();
         assert!(matches!(
             err,
-            wh_core::error::Error::PolicyViolation {
-                code: wh_core::error::PolicyCode::BareForcePush,
+            writ_core::error::Error::PolicyViolation {
+                code: writ_core::error::PolicyCode::BareForcePush,
                 ..
             }
         ));
@@ -976,8 +981,8 @@ mod tests {
         let err = run(cli, &mut stdout).await.unwrap_err();
         assert!(matches!(
             err,
-            wh_core::error::Error::PolicyViolation {
-                code: wh_core::error::PolicyCode::BareForcePush,
+            writ_core::error::Error::PolicyViolation {
+                code: writ_core::error::PolicyCode::BareForcePush,
                 ..
             }
         ));
@@ -1069,8 +1074,8 @@ mod tests {
         let err = run(cli, &mut stdout).await.unwrap_err();
         assert!(matches!(
             err,
-            wh_core::error::Error::PolicyViolation {
-                code: wh_core::error::PolicyCode::MergeBlocked,
+            writ_core::error::Error::PolicyViolation {
+                code: writ_core::error::PolicyCode::MergeBlocked,
                 ..
             }
         ));
@@ -1119,7 +1124,7 @@ mod tests {
 
     #[test]
     fn supervised_exit_code_maps_timeout_and_kill() {
-        let timed_out = wh_core::supervisor::SupervisedOutput {
+        let timed_out = writ_core::supervisor::SupervisedOutput {
             exit_code: None,
             timed_out: true,
             killed: true,
@@ -1131,7 +1136,7 @@ mod tests {
         };
         assert_eq!(supervised_exit_code(&timed_out), ExitCode::from(124));
 
-        let child_fail = wh_core::supervisor::SupervisedOutput {
+        let child_fail = writ_core::supervisor::SupervisedOutput {
             exit_code: Some(7),
             timed_out: false,
             killed: false,
@@ -1207,8 +1212,8 @@ mod tests {
         let err = run(cli, &mut stdout).await.unwrap_err();
         assert!(matches!(
             err,
-            wh_core::error::Error::PolicyViolation {
-                code: wh_core::error::PolicyCode::MergeBlocked,
+            writ_core::error::Error::PolicyViolation {
+                code: writ_core::error::PolicyCode::MergeBlocked,
                 ..
             }
         ));
@@ -1229,8 +1234,8 @@ mod tests {
         let err = run(cli, &mut stdout).await.unwrap_err();
         assert!(matches!(
             err,
-            wh_core::error::Error::PolicyViolation {
-                code: wh_core::error::PolicyCode::BareForcePush,
+            writ_core::error::Error::PolicyViolation {
+                code: writ_core::error::PolicyCode::BareForcePush,
                 ..
             }
         ));
@@ -1241,7 +1246,7 @@ mod tests {
         // Subcommand-only merge detection: a branch argument named `merge` is fine.
         // Policy-only check — do not execute checkout (would require a real ref / switch).
         let cmd =
-            wh_core::git_safe::SafeGitCommand::new(&["checkout".to_owned(), "merge".to_owned()])
+            writ_core::git_safe::SafeGitCommand::new(&["checkout".to_owned(), "merge".to_owned()])
                 .expect("checkout of branch named merge must not be MergeBlocked");
         assert_eq!(cmd.subcommand(), "checkout");
         assert_eq!(cmd.args(), &["checkout", "merge"]);
@@ -1260,8 +1265,8 @@ mod tests {
         let err = run(cli, &mut stdout).await.unwrap_err();
         assert!(matches!(
             err,
-            wh_core::error::Error::PolicyViolation {
-                code: wh_core::error::PolicyCode::MergeBlocked,
+            writ_core::error::Error::PolicyViolation {
+                code: writ_core::error::PolicyCode::MergeBlocked,
                 ..
             }
         ));
@@ -1280,8 +1285,8 @@ mod tests {
         let err = run(cli, &mut stdout).await.unwrap_err();
         assert!(matches!(
             err,
-            wh_core::error::Error::PolicyViolation {
-                code: wh_core::error::PolicyCode::GhSubcommandNotAllowed,
+            writ_core::error::Error::PolicyViolation {
+                code: writ_core::error::PolicyCode::GhSubcommandNotAllowed,
                 ..
             }
         ));
@@ -1302,10 +1307,10 @@ mod tests {
                 let output = str::from_utf8(&stdout).unwrap();
                 assert!(output.contains("\"command\":\"gh.safe\""));
             }
-            Err(wh_core::error::Error::PolicyViolation { .. }) => {
+            Err(writ_core::error::Error::PolicyViolation { .. }) => {
                 panic!("pr view must pass policy")
             }
-            Err(wh_core::error::Error::Io { .. }) => {
+            Err(writ_core::error::Error::Io { .. }) => {
                 // gh binary missing is acceptable in constrained envs
             }
             Err(e) => panic!("unexpected error: {e}"),
