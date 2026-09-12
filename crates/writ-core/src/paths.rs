@@ -369,45 +369,60 @@ mod tests {
     }
 
     #[test]
-    fn resolve_state_path_empty_override_uses_new_root_when_neither_exists() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = resolve_state_path_in(tmp.path(), os(""), None);
-        assert_ends_with(&path, "writ/watched.json", "writ\\watched.json");
-    }
-
-    #[test]
-    fn resolve_state_path_root_selection() {
-        let cases: &[(&[&str], &str, &str)] = &[
-            (&[], "writ/watched.json", "writ\\watched.json"),
+    fn legacy_upgrade_discovery_matrix() {
+        let root_cases: &[(&[&str], &str, &str, &str, &str)] = &[
+            (
+                &[],
+                "writ/watched.json",
+                "writ\\watched.json",
+                "writ/worktrees",
+                "writ\\worktrees",
+            ),
             (
                 &["worktrees-hives"],
                 "worktrees-hives/watched.json",
                 "worktrees-hives\\watched.json",
+                "worktrees-hives/worktrees",
+                "worktrees-hives\\worktrees",
             ),
             (
                 &["writ", "worktrees-hives"],
                 "writ/watched.json",
                 "writ\\watched.json",
+                "writ/worktrees",
+                "writ\\worktrees",
             ),
         ];
-        for (roots, unix, windows) in cases {
+        for (roots, state_unix, state_win, worktree_unix, worktree_win) in root_cases {
             let tmp = with_roots(roots);
-            assert_state_suffix(tmp.path(), unix, windows);
+            assert_state_suffix(tmp.path(), state_unix, state_win);
+            assert_worktree_suffix(tmp.path(), worktree_unix, worktree_win);
         }
-    }
 
-    #[test]
-    fn resolve_state_path_env_precedence() {
         let tmp = tempfile::tempdir().unwrap();
-        let writ = "/tmp/writ/watched.json";
-        let legacy = "/tmp/legacy/watched.json";
+        let path = resolve_state_path_in(tmp.path(), os(""), None);
+        assert_ends_with(&path, "writ/watched.json", "writ\\watched.json");
+
+        let writ_state = "/tmp/writ/watched.json";
+        let legacy_state = "/tmp/legacy/watched.json";
         assert_eq!(
-            resolve_state_path_in(tmp.path(), os(writ), os(legacy)),
-            PathBuf::from(writ)
+            resolve_state_path_in(tmp.path(), os(writ_state), os(legacy_state)),
+            PathBuf::from(writ_state)
         );
         assert_eq!(
-            resolve_state_path_in(tmp.path(), os(""), os(legacy)),
-            PathBuf::from(legacy)
+            resolve_state_path_in(tmp.path(), os(""), os(legacy_state)),
+            PathBuf::from(legacy_state)
+        );
+
+        let writ_trees = "/tmp/writ-trees";
+        let legacy_trees = "/tmp/legacy-trees";
+        assert_eq!(
+            resolve_worktree_base_in(tmp.path(), os(writ_trees), os(legacy_trees)).unwrap(),
+            PathBuf::from(writ_trees)
+        );
+        assert_eq!(
+            resolve_worktree_base_in(tmp.path(), os(""), os(legacy_trees)).unwrap(),
+            PathBuf::from(legacy_trees)
         );
     }
 
@@ -428,40 +443,5 @@ mod tests {
         // Ensure no override for this process snapshot (may already be set in CI).
         let path = worktree_base_path().unwrap();
         assert!(!path.as_os_str().is_empty());
-    }
-
-    #[test]
-    fn worktree_base_root_selection() {
-        let cases: &[(&[&str], &str, &str)] = &[
-            (
-                &["worktrees-hives"],
-                "worktrees-hives/worktrees",
-                "worktrees-hives\\worktrees",
-            ),
-            (
-                &["writ", "worktrees-hives"],
-                "writ/worktrees",
-                "writ\\worktrees",
-            ),
-        ];
-        for (roots, unix, windows) in cases {
-            let tmp = with_roots(roots);
-            assert_worktree_suffix(tmp.path(), unix, windows);
-        }
-    }
-
-    #[test]
-    fn worktree_base_env_precedence() {
-        let tmp = tempfile::tempdir().unwrap();
-        let writ = "/tmp/writ-trees";
-        let legacy = "/tmp/legacy-trees";
-        assert_eq!(
-            resolve_worktree_base_in(tmp.path(), os(writ), os(legacy)).unwrap(),
-            PathBuf::from(writ)
-        );
-        assert_eq!(
-            resolve_worktree_base_in(tmp.path(), os(""), os(legacy)).unwrap(),
-            PathBuf::from(legacy)
-        );
     }
 }
