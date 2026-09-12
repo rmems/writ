@@ -8,7 +8,8 @@
 //! That is not the same as "always empty". `load_jobs_from` returns an empty vec
 //! only on `NotFound`; a file that does exist at the resolved path is parsed and
 //! returned as-is. So populated output is reachable when something outside this
-//! workspace writes the file, or when `WRIT_STATE_PATH` points at one. The gap is
+//! workspace writes the file, or when `WRIT_STATE_PATH` (or legacy `WH_STATE_PATH`)
+//! points at one. The gap is
 //! the missing writer, not a guarantee about the value.
 //!
 //! GitHub #26 ("R3: Job/state store") is closed as completed and an earlier
@@ -35,7 +36,7 @@ use crate::status::JobStatus;
 /// Returns `Err` when the file exists but cannot be read or parsed,
 /// so callers can surface the failure instead of silently masking it.
 ///
-/// Path resolution honours `WRIT_STATE_PATH` via [`crate::paths::state_path`].
+/// Path resolution honours `WRIT_STATE_PATH` (then `WH_STATE_PATH`) via [`crate::paths::state_path`].
 pub fn load_jobs() -> Result<Vec<JobStatus>, String> {
     load_jobs_from(&state_path())
 }

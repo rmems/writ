@@ -44,7 +44,7 @@ Abort and report if any of these fail:
 3. Create or reuse a dedicated branch and isolated worktree:
    - Required: `writ --json worktree create --schema-version 2 --repo <repo> --start-point <exact-commit-or-ref> <owner> <repo-name> <job-id> <branch>` (`WRIT_BIN` or `PATH`). Never omit the caller-selected boundary version/start point or derive it from the source checkout's ambient `HEAD`.
    - If `writ` is missing, stop, unless a wrapper routes the mutation through `writ-core` -- the same definition as the hard stop above. A wrapper that re-implements the checks itself and then calls `git` directly does **not** qualify: re-implemented policy is prompt-level text, not the code-enforced boundary.
-   - What routing through `writ-core` actually gets you, so the promise is not larger than the code: the git/gh argv allowlist, no merge path, force-with-lease only, sandboxed path derivation with symlink rejection, exact-base resolution, branch and `HEAD` postcondition verification, supervised child processes, and origin-slug matching for `gh -R`. **Owner-allowlist enforcement is not among them.** `WRIT_ALLOWED_OWNERS` has no reader anywhere under `crates/`; it was enforced in the Python layer this PR deletes, so it is currently policy text with no code behind it.
+   - What routing through `writ-core` actually gets you, so the promise is not larger than the code: the git/gh argv allowlist, no merge path, force-with-lease only, sandboxed path derivation with symlink rejection, exact-base resolution, branch and `HEAD` postcondition verification, supervised child processes, and origin-slug matching for `gh -R`. **Owner-allowlist enforcement is not among them.** `WRIT_ALLOWED_OWNERS` has no reader anywhere under `crates/`; it was enforced in the Python layer removed by [#144](https://github.com/rmems/writ/issues/144), so it is currently policy text with no code behind it.
    - Raw `git worktree add` is forbidden on mutating runs.
 4. Suggested issue branch: `hive/issue-<n>-<short-slug>` (document any local override).
 5. For a newly created, unpublished assigned branch, fetch the intended remote base and prove that the branch equals that exact remote-base commit before edits. It may have no upstream only for this creation proof; never use an ambient or stale `HEAD` as the base.
@@ -55,7 +55,7 @@ Abort and report if any of these fail:
 ### 3. Implement
 
 - Change only that worktree and branch.
-- Stay inside Rust / Python / skill ownership (`AGENTS.md`).
+- Stay inside Rust / skill ownership (`AGENTS.md`).
 - No drive-by refactors. No files outside the worktree.
 
 ### 4. Focused validation during implementation (fail-closed)
@@ -72,9 +72,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-If `python/` changed, also run the Python test extra documented in `README.md`.
-
-Run every `cargo` and Python check under an explicit process timeout supplied by the host (orchestrator supervisor, CI job timeout, or equivalent). Do not use a Linux-only timeout command as the contract.
+Run every `cargo` check under an explicit process timeout supplied by the host (orchestrator supervisor, CI job timeout, or equivalent). Do not use a Linux-only timeout command as the contract.
 
 If a focused required gate fails or the process is killed for time, **do not advance to the final publication sequence**. Report the failure or timeout as a residual on the issue. A hang or timeout is not a license to skip the gate and push anyway.
 

@@ -255,6 +255,13 @@ kilo-code/
 .writ/
 **/writ-state/
 .local/share/writ/
+# Legacy names from the pre-rename `wh` / worktrees-hives runtime so existing
+# local dirs stay untracked after upgrade.
+.worktrees-hives/
+.wh/
+**/wh-state/
+wh-state/
+.local/share/worktrees-hives/
 # ad-hoc worktrees if created under the repo
 .worktrees/
 worktrees/
