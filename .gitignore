@@ -112,7 +112,6 @@ ipython_config.py
 !.env.example
 .envrc
 .venv
-.qodana-venv
 env/
 venv/
 ENV/
@@ -289,7 +288,6 @@ SKILL-grok-linear.md
 
 # OpenCode agent skills / local tooling (not product)
 .opencode/
-qodana/
 
 # Local agent / IDE MCP scratch (never commit)
 .chroma_recall_status.json
