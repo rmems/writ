@@ -1,0 +1,74 @@
+# Dependency updates.
+#
+# Every GitHub Action in this repository is pinned to a full commit SHA with a
+# version comment, e.g.
+#
+#   uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+#
+# That is the right supply-chain posture -- a tag can be moved, a SHA cannot --
+# but on its own it is a one-way ratchet: a pinned SHA never picks up a
+# security fix, and nothing was watching these pins. Dependabot is the other
+# half of that trade. It rewrites both the SHA and the trailing version comment,
+# so the pins stay pinned and stay current.
+#
+# Cargo is covered for the same reason. `cargo audit` in security.yml reports
+# advisories against the committed Cargo.lock but does not update it, so an
+# advisory would sit red until someone bumped the lockfile by hand.
+#
+# Updates are grouped so a routine week produces one PR per ecosystem instead of
+# one per dependency. Major versions are deliberately left ungrouped: an action
+# major bump can change inputs or runtime and deserves its own PR and its own
+# review.
+
+version: 2
+
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      # Matches the weekly cargo-audit scan in security.yml, so dependency
+      # news arrives on one day rather than two.
+      time: "08:00"
+      timezone: "Etc/UTC"
+    # 10, not the default 5, because majors are deliberately ungrouped below.
+    # Each major update takes a slot of its own, so a low limit can be filled
+    # entirely by majors awaiting review -- and the grouped minor/patch PR, the
+    # one carrying routine security fixes, is then never opened. The headroom
+    # keeps the fast lane open while the slow lane is backed up.
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "ci"
+    groups:
+      github-actions:
+        applies-to: version-updates
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "08:00"
+      timezone: "Etc/UTC"
+    # 10, not the default 5, because majors are deliberately ungrouped below.
+    # Each major update takes a slot of its own, so a low limit can be filled
+    # entirely by majors awaiting review -- and the grouped minor/patch PR, the
+    # one carrying routine security fixes, is then never opened. The headroom
+    # keeps the fast lane open while the slow lane is backed up.
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "deps"
+    groups:
+      cargo:
+        applies-to: version-updates
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
