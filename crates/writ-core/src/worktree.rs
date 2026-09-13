@@ -276,6 +276,26 @@ impl WorktreeManager {
 
     /// Prune worktree administrative files (stale entries).
     pub fn prune(&self, repo_root: &Path) -> Result<()> {
+        // No validation here, deliberately. `create` calls `validate_repo_root` and
+        // `remove` checks sandbox containment, so the absence looks like an
+        // oversight and has been flagged as one. It is not, and adding a check
+        // would be theatre:
+        //
+        // - `validate_repo_root` only rejects "not a git repository", which git
+        //   itself already rejects with the same `Error::GitCommand` shape. The
+        //   tests below pass with or without such a call -- verified by removing
+        //   it and re-running.
+        // - It would *accept* any repository outside the sandbox, so it does not
+        //   constrain which repository can be targeted. The perceived gap stays
+        //   open either way.
+        // - Sandbox containment is the wrong invariant: `prune` takes a repository
+        //   root, not a worktree path, and the primary checkout legitimately lives
+        //   outside the worktree base.
+        //
+        // `git worktree prune` removes administrative entries for worktrees whose
+        // directories are already gone. It cannot delete a live worktree or any
+        // user content, which is why this is an asymmetry rather than a hole.
+        // If that ever stops being true, the guard belongs here.
         let output = Command::new("git")
             .arg("-C")
             .arg(repo_root)
@@ -1403,5 +1423,45 @@ mod tests {
             matches!(result, Err(Error::SandboxViolation { .. })),
             "expected SandboxViolation, got {result:?}"
         );
+    }
+
+    #[test]
+    fn prune_on_a_non_repository_errors_rather_than_acting() {
+        let harness = Harness::sha1();
+        let not_a_repo = harness.temp.path().join("not-a-repo");
+        fs::create_dir_all(&not_a_repo).unwrap();
+
+        let err = harness.manager.prune(&not_a_repo).unwrap_err();
+        match err {
+            Error::GitCommand { args, stderr } => {
+                assert_eq!(args, vec!["worktree".to_owned(), "prune".to_owned()]);
+                assert!(stderr.contains("not a git repository"), "stderr: {stderr}");
+            }
+            other => panic!("expected GitCommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prune_does_not_touch_a_directory_it_rejects() {
+        let harness = Harness::sha1();
+        let not_a_repo = harness.temp.path().join("bystander");
+        fs::create_dir_all(&not_a_repo).unwrap();
+        let canary = not_a_repo.join("keep-me");
+        fs::write(&canary, b"untouched").unwrap();
+
+        assert!(harness.manager.prune(&not_a_repo).is_err());
+
+        // The point of this lock: a rejected prune leaves the directory alone.
+        // It passes today without any guard in `prune`, because git refuses
+        // first -- that is the evidence the guard would be redundant.
+        assert!(canary.exists());
+        assert_eq!(fs::read(&canary).unwrap(), b"untouched");
+        assert!(!not_a_repo.join(".git").exists());
+    }
+
+    #[test]
+    fn prune_succeeds_on_a_real_repository() {
+        let harness = Harness::sha1();
+        harness.manager.prune(&harness.repo_root).unwrap();
     }
 }

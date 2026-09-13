@@ -1,6 +1,6 @@
 [package]
-name = "wh-core"
-description = "Safety-focused core primitives for worktrees-hives"
+name = "writ-core"
+description = "Safety-focused core primitives for writ"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

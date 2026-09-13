@@ -2,13 +2,14 @@
 //!
 //! There is no writer. This module exposes `load_jobs` and nothing that
 //! persists, so nothing in this workspace ever creates `watched.json`. With the
-//! file absent -- the normal case -- `wh status` and `wh jobs` return an empty
+//! file absent -- the normal case -- `writ status` and `writ jobs` return an empty
 //! array.
 //!
 //! That is not the same as "always empty". `load_jobs_from` returns an empty vec
 //! only on `NotFound`; a file that does exist at the resolved path is parsed and
 //! returned as-is. So populated output is reachable when something outside this
-//! workspace writes the file, or when `WH_STATE_PATH` points at one. The gap is
+//! workspace writes the file, or when `WRIT_STATE_PATH` (or legacy `WH_STATE_PATH`)
+//! points at one. The gap is
 //! the missing writer, not a guarantee about the value.
 //!
 //! GitHub #26 ("R3: Job/state store") is closed as completed and an earlier
@@ -35,7 +36,7 @@ use crate::status::JobStatus;
 /// Returns `Err` when the file exists but cannot be read or parsed,
 /// so callers can surface the failure instead of silently masking it.
 ///
-/// Path resolution honours `WH_STATE_PATH` via [`crate::paths::state_path`].
+/// Path resolution honours `WRIT_STATE_PATH` (then `WH_STATE_PATH`) via [`crate::paths::state_path`].
 pub fn load_jobs() -> Result<Vec<JobStatus>, String> {
     load_jobs_from(&state_path())
 }
@@ -43,7 +44,7 @@ pub fn load_jobs() -> Result<Vec<JobStatus>, String> {
 /// Load jobs from an explicit state file path (used by tests and future callers).
 ///
 /// This is the implementation behind [`load_jobs`] and is the seam used to test
-/// success and malformed-JSON behaviour for the `WH_STATE_PATH` store without
+/// success and malformed-JSON behaviour for the `WRIT_STATE_PATH` store without
 /// mutating process environment (workspace forbids `unsafe-code`).
 pub fn load_jobs_from(path: &Path) -> Result<Vec<JobStatus>, String> {
     let data = match fs::read_to_string(path) {
@@ -64,12 +65,12 @@ mod tests {
 
     fn sample_job() -> JobStatus {
         JobStatus {
-            job_id: "wh-1".to_owned(),
+            job_id: "writ-1".to_owned(),
             owner: "acme".to_owned(),
             repo: "example-org".to_owned(),
             issue_number: Some(1),
             pr_number: None,
-            worktree_path: "/tmp/worktrees/acme/example-org/wh-1".to_owned(),
+            worktree_path: "/tmp/worktrees/acme/example-org/writ-1".to_owned(),
             branch: "feature/status".to_owned(),
             process_state: ProcessState::Running,
             last_error: None,
@@ -89,9 +90,9 @@ mod tests {
     }
 
     #[test]
-    fn wh_state_path_load_success() {
-        // Simulate WH_STATE_PATH pointing at a valid watched.json.
-        let path = resolve_state_path(Some(unique_path("wh-state-ok").as_os_str()));
+    fn writ_state_path_load_success() {
+        // Simulate WRIT_STATE_PATH pointing at a valid watched.json.
+        let path = resolve_state_path(Some(unique_path("writ-state-ok").as_os_str()));
         let jobs = vec![sample_job()];
         fs::write(&path, serde_json::to_string(&jobs).unwrap()).unwrap();
 
@@ -99,15 +100,15 @@ mod tests {
         let _ = fs::remove_file(&path);
 
         assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].job_id, "wh-1");
+        assert_eq!(loaded[0].job_id, "writ-1");
         assert_eq!(loaded[0].owner, "acme");
         assert_eq!(loaded[0].repo, "example-org");
     }
 
     #[test]
-    fn wh_state_path_load_malformed_json() {
-        // Simulate WH_STATE_PATH pointing at a corrupt watched.json.
-        let path = resolve_state_path(Some(unique_path("wh-state-bad").as_os_str()));
+    fn writ_state_path_load_malformed_json() {
+        // Simulate WRIT_STATE_PATH pointing at a corrupt watched.json.
+        let path = resolve_state_path(Some(unique_path("writ-state-bad").as_os_str()));
         fs::write(&path, "{not valid json").unwrap();
 
         let err = load_jobs_from(&path).expect_err("malformed JSON must fail");
@@ -121,7 +122,7 @@ mod tests {
 
     #[test]
     fn load_jobs_from_missing_file_returns_empty() {
-        let path = unique_path("wh-state-missing");
+        let path = unique_path("writ-state-missing");
         let _ = fs::remove_file(&path);
         let loaded = load_jobs_from(&path).expect("missing is empty");
         assert!(loaded.is_empty());

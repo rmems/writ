@@ -11,7 +11,7 @@ impl TestDir {
     fn new() -> Self {
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let path =
-            std::env::temp_dir().join(format!("wh-worktree-cli-{}-{id}", std::process::id()));
+            std::env::temp_dir().join(format!("writ-worktree-cli-{}-{id}", std::process::id()));
         fs::create_dir_all(&path).unwrap();
         Self(path)
     }
@@ -60,9 +60,9 @@ struct CreateRequest<'a> {
     start: &'a str,
 }
 
-fn wh_cmd(root: &Path, create_args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_wh"))
-        .env("WH_WORKTREE_BASE", root.join("worktrees"))
+fn writ_cmd(root: &Path, create_args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_writ"))
+        .env("WRIT_WORKTREE_BASE", root.join("worktrees"))
         .args(["--json", "worktree", "create"])
         .args(create_args)
         .output()
@@ -84,8 +84,8 @@ fn identity_args<'a>(repo: &'a Path, request: &CreateRequest<'a>) -> Vec<&'a str
     ]
 }
 
-fn wh_create(root: &Path, repo: &Path, request: CreateRequest<'_>) -> Output {
-    wh_cmd(root, &identity_args(repo, &request))
+fn writ_create(root: &Path, repo: &Path, request: CreateRequest<'_>) -> Output {
+    writ_cmd(root, &identity_args(repo, &request))
 }
 
 fn json(output: &Output) -> serde_json::Value {
@@ -149,7 +149,7 @@ fn reject_without_mutation(
     create_args: &[&str],
     case: RejectCase<'_>,
 ) -> serde_json::Value {
-    let output = wh_cmd(root, create_args);
+    let output = writ_cmd(root, create_args);
     let envelope = assert_error_envelope(&output, case.exit, case.schema, case.code);
     assert_uncreated(root, repo, case.job, case.branch);
     envelope
@@ -209,7 +209,7 @@ fn v2_create_without_start_point_fails_with_machine_readable_error_without_mutat
 #[test]
 fn invalid_start_point_emits_v2_error_envelope_with_exit_1() {
     let (root, repo) = primed();
-    let output = wh_create(
+    let output = writ_create(
         &root.0,
         &repo,
         CreateRequest {
@@ -228,7 +228,7 @@ fn existing_branch_policy_emits_v2_error_envelope_with_exit_2() {
     let start = git(&repo, &["rev-parse", "HEAD"]);
     git(&repo, &["branch", "feature/existing", &start]);
 
-    let output = wh_create(
+    let output = writ_create(
         &root.0,
         &repo,
         CreateRequest {
@@ -244,7 +244,7 @@ fn existing_branch_policy_emits_v2_error_envelope_with_exit_2() {
 fn v2_success_reports_verified_path_ref_commit_and_registration_identity() {
     let (root, repo) = primed();
     let start = git(&repo, &["rev-parse", "HEAD"]);
-    let output = wh_create(
+    let output = writ_create(
         &root.0,
         &repo,
         CreateRequest {
@@ -259,7 +259,7 @@ fn v2_success_reports_verified_path_ref_commit_and_registration_identity() {
     // Match WorktreeManager::with_base: join each identity segment, then
     // canonicalize so macOS /var vs /private/var and Windows 8.3 vs long-name
     // spellings compare equal to the verified success payload.
-    let expected_path = wh_core::paths::canonicalize_for_tools(
+    let expected_path = writ_core::paths::canonicalize_for_tools(
         &root
             .0
             .join("worktrees")
@@ -302,7 +302,7 @@ fn partial_create_failure_reports_residual_state_without_deleting_branch() {
     fs::create_dir_all(&target).unwrap();
     fs::write(target.join("occupied"), "keep\n").unwrap();
 
-    let output = wh_create(
+    let output = writ_create(
         &root.0,
         &repo,
         CreateRequest {

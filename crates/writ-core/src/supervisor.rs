@@ -3,7 +3,7 @@
 //! # Concurrency model
 //!
 //! `--max-parallel` / [`Supervisor::new`] limits concurrent supervised children **within a
-//! single process**. Each `wh` CLI invocation constructs its own supervisor, so independent
+//! single process**. Each `writ` CLI invocation constructs its own supervisor, so independent
 //! processes do not share a global permit pool. Callers that need host-wide throttling must
 //! coordinate externally (or share one long-lived `Supervisor` instance).
 //!
@@ -663,8 +663,8 @@ fn is_forbidden_wrapper(name: &str) -> bool {
 ///
 /// - Rejects `..` path components in the input.
 /// - Canonicalizes to an existing directory.
-/// - Requires the path to stay under `WH_WORKTREE_BASE` when set, otherwise under
-///   the documented default `{user_data_dir}/worktrees-hives/worktrees` root.
+/// - Requires the path to stay under `WRIT_WORKTREE_BASE` when set, otherwise under
+///   the documented default `{user_data_dir}/writ/worktrees` root.
 fn verify_repo_branch(repo: &std::path::Path, expected_branch: &str) -> Result<()> {
     let cmd = SafeGitCommand::new(&["rev-parse".to_owned(), "HEAD".to_owned()])?;
     cmd.verify_branch(repo, expected_branch)
@@ -673,7 +673,7 @@ fn verify_repo_branch(repo: &std::path::Path, expected_branch: &str) -> Result<(
 fn resolve_supervised_repo(repo: Option<&std::path::Path>) -> Result<PathBuf> {
     use std::path::{Component, Path};
 
-    let worktree_base = supervised_worktree_base();
+    let worktree_base = crate::paths::worktree_base_path()?;
 
     let raw = repo.unwrap_or_else(|| Path::new("."));
     if raw.components().any(|c| matches!(c, Component::ParentDir)) {
@@ -710,17 +710,6 @@ fn resolve_supervised_repo(repo: Option<&std::path::Path>) -> Result<PathBuf> {
     }
 
     Ok(canon)
-}
-
-fn supervised_worktree_base() -> PathBuf {
-    std::env::var_os("WH_WORKTREE_BASE")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            crate::paths::user_data_dir()
-                .join("worktrees-hives")
-                .join("worktrees")
-        })
 }
 
 fn normalize_existing_or_future_dir(path: &std::path::Path) -> Result<PathBuf> {
@@ -1270,7 +1259,7 @@ mod tests {
         let supervisor = Supervisor::new(1);
         let output = supervisor
             .run(
-                "wh-nonexistent-binary-xyz",
+                "writ-nonexistent-binary-xyz",
                 &[],
                 None,
                 &RunOptions::default(),

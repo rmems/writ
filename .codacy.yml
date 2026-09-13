@@ -18,7 +18,7 @@
 # `metric` is Codacy's official cyclomatic-complexity engine name; `complexity`
 # and `lizard` are included so either Cloud spelling still applies.
 #
-# Paths use globs so the pending `wh` -> `writ` crate rename (#145) does not
+# Paths use globs so the `wh` -> `writ` crate rename did not
 # invalidate this file.
 ---
 exclude_paths:
@@ -39,10 +39,17 @@ engines:
       - "**/target/**"
   # `supervisor.rs` is deliberately absent from these three engine blocks even
   # though the sibling `.qlty/qlty.toml` records complexity findings there.
-  # Codacy has not reproduced any, and Codacy passes on this PR. Per AGENTS.md an
-  # analyzer finding is advisory until reproduced, so this exclusion list tracks
-  # what actually fired rather than pre-empting what might. Add
-  # `crates/*/src/supervisor.rs` if Codacy ever reports it.
+  # Codacy has not reproduced any. Per AGENTS.md an analyzer finding is advisory
+  # until reproduced, so this exclusion list tracks what actually fired rather
+  # than pre-empting what might. Add `crates/*/src/supervisor.rs` if Codacy ever
+  # reports it.
+  #
+  # `paths.rs` is included because Codacy's complexity engine does not parse
+  # `#[cfg]` and reported `strip_verbatim_prefix` as 231 LOC (the rest of the
+  # file) on the rename PR. The Windows body is split out so a working parser
+  # stays under the limit; the exclusion keeps the same parser artifact from
+  # blocking a rename-as-new-file scan. Security engines stay enabled on this
+  # file.
   complexity:
     exclude_paths:
       - "crates/*/tests/**"
@@ -50,6 +57,7 @@ engines:
       - "crates/*/src/error.rs"
       - "crates/*/src/git_safe.rs"
       - "crates/*/src/main.rs"
+      - "crates/*/src/paths.rs"
   metric:
     exclude_paths:
       - "crates/*/tests/**"
@@ -57,6 +65,7 @@ engines:
       - "crates/*/src/error.rs"
       - "crates/*/src/git_safe.rs"
       - "crates/*/src/main.rs"
+      - "crates/*/src/paths.rs"
   lizard:
     exclude_paths:
       - "crates/*/tests/**"
@@ -64,3 +73,4 @@ engines:
       - "crates/*/src/error.rs"
       - "crates/*/src/git_safe.rs"
       - "crates/*/src/main.rs"
+      - "crates/*/src/paths.rs"
