@@ -1,0 +1,72 @@
+# Static analysis for the workflow files themselves.
+#
+# Nothing checked `.github/workflows/**` before this. Every other surface in
+# the repository has a gate -- cargo fmt/clippy/test, cargo audit, CodeQL,
+# Codacy, Qodana, Qlty -- while the files that decide whether those gates run
+# at all were unchecked, and a workflow defect disables a gate silently rather
+# than failing loudly.
+#
+# actionlint parses each workflow, type-checks `${{ }}` expressions against the
+# real context schemas, validates `uses:` refs, checks matrix and `needs:`
+# wiring, and runs shellcheck over every embedded `run:` block (shellcheck is
+# preinstalled on ubuntu-latest runners, so those rules are active here).
+#
+# Baseline: clean. actionlint 1.7.12 reports 0 findings across all five
+# workflows as of this commit, so this starts green and stays a regression
+# guard rather than a backlog.
+#
+# The binary is pinned by version AND verified by SHA-256 rather than pulled
+# through a third-party action, matching how the rest of this directory
+# SHA-pins what it runs. Bump both values together; the published list is at
+# https://github.com/rhysd/actionlint/releases
+#
+# Asset naming, since a version bump has to get it right: the Linux x86-64
+# archive is `actionlint_<version>_linux_amd64.tar.gz` -- `amd64`, not
+# `x86_64`. Both the name and the digest below were taken from the release's
+# own `actionlint_1.7.12_checksums.txt` and exercised end to end before this
+# landed.
+
+name: Workflow lint
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/**"
+  pull_request:
+    paths:
+      - ".github/workflows/**"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  actionlint:
+    name: actionlint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install actionlint
+        env:
+          ACTIONLINT_VERSION: "1.7.12"
+          ACTIONLINT_SHA256: "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
+        run: |
+          set -euo pipefail
+          archive="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl --fail --silent --show-error --location \
+            --output "$archive" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${archive}"
+          echo "${ACTIONLINT_SHA256}  ${archive}" | sha256sum --check --strict -
+          tar --extract --gzip --file "$archive" actionlint
+          ./actionlint --version
+
+      - name: Lint workflow files
+        run: ./actionlint -color
