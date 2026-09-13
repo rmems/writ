@@ -51,8 +51,15 @@ jobs:
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
+      # Prebuilt binary, not `cargo install`. Building cargo-llvm-cov from
+      # source cost minutes on every run and is not cached by rust-cache
+      # (which caches the workspace target dir, not ~/.cargo/bin). The sibling
+      # `cargo audit` job in security.yml already installs this way.
       - name: Install cargo-llvm-cov
-        run: cargo install cargo-llvm-cov
+        uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b # v2.87.4
+        with:
+          tool: cargo-llvm-cov
+          fallback: none
 
       # cargo llvm-cov builds and runs the workspace tests itself, so this
       # single invocation is both the test gate and the coverage report.

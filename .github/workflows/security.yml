@@ -1,3 +1,13 @@
+# Security gates for the Rust workspace: dependency advisories and CodeQL.
+#
+# Coverage deliberately does NOT live here. This file used to carry a
+# `coverage` job that built cargo-tarpaulin from source and uploaded a
+# cobertura.xml artifact that nothing ever downloaded -- a second coverage
+# tool measuring the same workspace as `test (ubuntu-latest)` in rust.yml,
+# which already produces lcov and reports it to Codecov. It was the slowest
+# job in CI (~3m30s, most of it compiling the tool) for no consumed output.
+# Coverage has one owner: `cargo llvm-cov` in rust.yml.
+
 name: Security
 
 on:
@@ -61,30 +71,3 @@ jobs:
 
       - name: Perform CodeQL analysis
         uses: github/codeql-action/analyze@02c5e83432fe5497fd85b873b6c9f16a8578e1d9 # v3
-
-  coverage:
-    name: code coverage
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          persist-credentials: false
-
-      - name: Install stable Rust
-        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
-
-      - name: Install cargo-tarpaulin
-        run: cargo install cargo-tarpaulin
-
-      - name: Cache Cargo artifacts
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-
-      - name: Generate coverage report
-        run: cargo tarpaulin --workspace --out xml --output-dir coverage
-
-      - name: Upload coverage report
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: coverage-report
-          path: coverage/cobertura.xml
