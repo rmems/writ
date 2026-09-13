@@ -673,7 +673,7 @@ fn verify_repo_branch(repo: &std::path::Path, expected_branch: &str) -> Result<(
 fn resolve_supervised_repo(repo: Option<&std::path::Path>) -> Result<PathBuf> {
     use std::path::{Component, Path};
 
-    let worktree_base = supervised_worktree_base();
+    let worktree_base = crate::paths::worktree_base_path()?;
 
     let raw = repo.unwrap_or_else(|| Path::new("."));
     if raw.components().any(|c| matches!(c, Component::ParentDir)) {
@@ -710,13 +710,6 @@ fn resolve_supervised_repo(repo: Option<&std::path::Path>) -> Result<PathBuf> {
     }
 
     Ok(canon)
-}
-
-fn supervised_worktree_base() -> PathBuf {
-    std::env::var_os("WRIT_WORKTREE_BASE")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| crate::paths::user_data_dir().join("writ").join("worktrees"))
 }
 
 fn normalize_existing_or_future_dir(path: &std::path::Path) -> Result<PathBuf> {
