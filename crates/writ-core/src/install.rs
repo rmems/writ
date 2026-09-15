@@ -184,7 +184,7 @@ fn ensure_unmatched_event(
     true
 }
 
-fn event_groups<'a>(hooks: &'a mut Value, event: HookEventName) -> &'a mut Vec<Value> {
+fn event_groups(hooks: &mut Value, event: HookEventName) -> &mut Vec<Value> {
     ensure_array(hooks, event.as_str())
 }
 
