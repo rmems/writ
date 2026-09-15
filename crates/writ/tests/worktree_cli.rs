@@ -336,3 +336,107 @@ fn partial_create_failure_reports_residual_state_without_deleting_branch() {
         "keep\n"
     );
 }
+
+fn collision_repo(root: &Path) -> (PathBuf, String, String) {
+    let repo = init_repo(root);
+    let branch_commit = git(&repo, &["rev-parse", "HEAD"]);
+    git(&repo, &["branch", "collision", &branch_commit]);
+    git(&repo, &["commit", "--allow-empty", "-m", "second"]);
+    let tag_commit = git(&repo, &["rev-parse", "HEAD"]);
+    git(&repo, &["tag", "collision", &tag_commit]);
+    git(&repo, &["config", "core.warnAmbiguousRefs", "false"]);
+    (repo, branch_commit, tag_commit)
+}
+
+#[test]
+fn ambiguous_unqualified_start_point_emits_v2_error_without_mutation() {
+    let root = TestDir::new();
+    let (repo, branch_commit, tag_commit) = collision_repo(&root.0);
+    let envelope = reject_without_mutation(
+        &root.0,
+        &repo,
+        &identity_args(
+            &repo,
+            &CreateRequest {
+                job: "ambiguous",
+                branch: "feature/selected",
+                start: "collision",
+            },
+        ),
+        RejectCase {
+            job: "ambiguous",
+            branch: "feature/selected",
+            exit: 1,
+            schema: 2,
+            code: "AMBIGUOUS_START_POINT",
+        },
+    );
+
+    assert_eq!(envelope["data"]["start_point"], "collision");
+    let refs = envelope["data"]["refs"].as_array().expect("refs array");
+    let names: Vec<&str> = refs
+        .iter()
+        .filter_map(|value| value["refname"].as_str())
+        .collect();
+    assert!(names.contains(&"refs/heads/collision"), "{names:?}");
+    assert!(names.contains(&"refs/tags/collision"), "{names:?}");
+    let message = envelope["error"]["message"].as_str().unwrap();
+    assert!(message.contains("collision"), "{message}");
+    assert!(message.contains(&branch_commit), "{message}");
+    assert!(message.contains(&tag_commit), "{message}");
+}
+
+#[test]
+fn fully_qualified_collision_refs_and_full_object_id_succeed() {
+    let root = TestDir::new();
+    let (repo, branch_commit, tag_commit) = collision_repo(&root.0);
+
+    let from_heads = writ_create(
+        &root.0,
+        &repo,
+        CreateRequest {
+            job: "from-heads",
+            branch: "feature/from-heads",
+            start: "refs/heads/collision",
+        },
+    );
+    assert!(
+        from_heads.status.success(),
+        "stderr={:?}",
+        String::from_utf8_lossy(&from_heads.stderr)
+    );
+    assert_eq!(json(&from_heads)["data"]["start_commit"], branch_commit);
+
+    let from_tag = writ_create(
+        &root.0,
+        &repo,
+        CreateRequest {
+            job: "from-tag",
+            branch: "feature/from-tag",
+            start: "refs/tags/collision",
+        },
+    );
+    assert!(
+        from_tag.status.success(),
+        "stderr={:?}",
+        String::from_utf8_lossy(&from_tag.stderr)
+    );
+    assert_eq!(json(&from_tag)["data"]["start_commit"], tag_commit);
+
+    let uppercase = branch_commit.to_ascii_uppercase();
+    let from_oid = writ_create(
+        &root.0,
+        &repo,
+        CreateRequest {
+            job: "from-oid",
+            branch: "feature/from-oid",
+            start: &uppercase,
+        },
+    );
+    assert!(
+        from_oid.status.success(),
+        "stderr={:?}",
+        String::from_utf8_lossy(&from_oid.stderr)
+    );
+    assert_eq!(json(&from_oid)["data"]["start_commit"], branch_commit);
+}

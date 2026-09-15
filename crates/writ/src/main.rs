@@ -187,6 +187,18 @@ fn worktree_error_data(error: &writ_core::error::Error) -> serde_json::Value {
             "cleanup_performed": false,
             })
         }
+        writ_core::error::Error::AmbiguousStartPoint {
+            start_point,
+            refs,
+            git_warning,
+        } => serde_json::json!({
+            "start_point": start_point,
+            "refs": refs.iter().map(|colliding| serde_json::json!({
+                "refname": colliding.refname,
+                "commit": colliding.commit,
+            })).collect::<Vec<_>>(),
+            "git_warning": git_warning,
+        }),
         writ_core::error::Error::WorktreePostconditionFailed(failure) => {
             let writ_core::error::WorktreePostconditionFailure {
                 path,

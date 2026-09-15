@@ -1020,8 +1020,11 @@ mod tests {
         let expected_path = harness.job_path(job_id);
         let result = harness.create(job_id, branch, start_point);
         assert!(
-            matches!(result, Err(Error::GitCommand { .. })),
-            "expected GitCommand reject for {start_point:?}, got {result:?}"
+            matches!(
+                result,
+                Err(Error::GitCommand { .. }) | Err(Error::AmbiguousStartPoint { .. })
+            ),
+            "expected start-point reject for {start_point:?}, got {result:?}"
         );
         assert!(
             git_output(&harness.repo_root, &["branch", "--list", branch])
@@ -1332,6 +1335,75 @@ mod tests {
             .create("job-full-oid", "feature/full-oid", &full_commit)
             .unwrap();
         assert_eq!(from_oid.start_commit.as_deref(), Some(full_commit.as_str()));
+    }
+
+    #[test]
+    fn create_rejects_ambiguous_unqualified_start_point_without_mutation() {
+        let harness = Harness::sha1();
+        let branch_commit = harness.head();
+        harness.git(&["branch", "collision", &branch_commit]);
+        let tag_commit = harness.commit_file("tag.txt", "tag\n", "tag target");
+        harness.git(&["tag", "collision", &tag_commit]);
+        harness.git(&["config", "core.warnAmbiguousRefs", "false"]);
+
+        let expected_path = harness.job_path("job-ambiguous");
+        let result = harness.create("job-ambiguous", "feature/selected", "collision");
+        match result {
+            Err(Error::AmbiguousStartPoint {
+                start_point, refs, ..
+            }) => {
+                assert_eq!(start_point, "collision");
+                let names: Vec<&str> = refs.iter().map(|r| r.refname.as_str()).collect();
+                assert!(names.contains(&"refs/heads/collision"), "{names:?}");
+                assert!(names.contains(&"refs/tags/collision"), "{names:?}");
+                let head_hit = refs
+                    .iter()
+                    .find(|r| r.refname == "refs/heads/collision")
+                    .unwrap();
+                let tag_hit = refs
+                    .iter()
+                    .find(|r| r.refname == "refs/tags/collision")
+                    .unwrap();
+                assert_eq!(head_hit.commit, branch_commit);
+                assert_eq!(tag_hit.commit, tag_commit);
+                assert_ne!(head_hit.commit, tag_hit.commit);
+            }
+            other => panic!("expected AmbiguousStartPoint, got {other:?}"),
+        }
+        assert!(
+            git_output(
+                &harness.repo_root,
+                &["branch", "--list", "feature/selected"]
+            )
+            .trim()
+            .is_empty()
+        );
+        assert!(!expected_path.exists());
+
+        let from_heads = harness
+            .create("job-heads", "feature/from-heads", "refs/heads/collision")
+            .unwrap();
+        assert_eq!(
+            from_heads.start_commit.as_deref(),
+            Some(branch_commit.as_str())
+        );
+
+        let from_tag = harness
+            .create("job-tag", "feature/from-tag", "refs/tags/collision")
+            .unwrap();
+        assert_eq!(from_tag.start_commit.as_deref(), Some(tag_commit.as_str()));
+
+        let from_oid = harness
+            .create(
+                "job-oid",
+                "feature/from-oid",
+                &branch_commit.to_ascii_uppercase(),
+            )
+            .unwrap();
+        assert_eq!(
+            from_oid.start_commit.as_deref(),
+            Some(branch_commit.as_str())
+        );
     }
 
     #[test]
