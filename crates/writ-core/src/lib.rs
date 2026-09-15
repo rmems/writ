@@ -6,8 +6,12 @@
 pub mod contract;
 pub mod error;
 pub mod git_safe;
-mod identity;
+pub mod hook;
+pub mod identity;
+pub mod install;
+pub mod lease;
 pub mod paths;
+pub mod porcelain;
 pub mod state;
 pub mod status;
 pub mod supervisor;
