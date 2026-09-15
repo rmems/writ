@@ -74,6 +74,7 @@ mod tests {
             branch: "feature/status".to_owned(),
             process_state: ProcessState::Running,
             last_error: None,
+            timeout_residual: None,
             ci_class: CiClass::Pending,
         }
     }

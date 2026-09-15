@@ -1,5 +1,10 @@
 //! Process supervisor with timeouts, process-group isolation, and max-parallel enforcement.
 //!
+//! Hang recovery follows the playbook in [`crate::timeout_policy`] and
+//! `docs/supervisor-timeouts.md`: graceful cancel → kill → residual. The supervisor
+//! never redispatches a child, never merges, never bare-force-pushes, and never
+//! emits a commit SHA on a timeout residual.
+//!
 //! # Concurrency model
 //!
 //! `--max-parallel` / [`Supervisor::new`] limits concurrent supervised children **within a
@@ -9,16 +14,20 @@
 //!
 //! # Platform notes
 //!
-//! On **Unix**, timeout and kill paths send `SIGKILL` to the entire process group
-//! (`kill(-pid, SIGKILL)` after spawning with `process_group(0)`), so descendants
-//! started by the child are cleaned up with the supervised process.
+//! On **Unix**, timeout and kill paths send `SIGTERM` (graceful cancel) then `SIGKILL`
+//! to the entire process group (`kill(-pid, SIG*)` after spawning with `process_group(0)`),
+//! so descendants started by the child are cleaned up with the supervised process.
 //!
 //! On **Windows**, only the direct child process is killed (`kill_on_drop` + `child.kill()`).
-//! There is **no kill-tree / job-object** yet: grandchild processes may outlive the
-//! supervisor. Tracking full Windows job-object support is deferred (documented limitation).
+//! There is **no kill-tree / job-object** and **no graceful-cancel equivalent**: the
+//! recovery playbook maps graceful cancel to the same hard kill. Grandchild processes
+//! may outlive the supervisor. Tracking full Windows job-object support is deferred
+//! (documented limitation).
 
+use std::fmt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use serde::Serialize;
@@ -30,6 +39,10 @@ use tokio::time::Instant;
 
 use crate::error::{Error, PolicyCode, Result};
 use crate::git_safe::{SafeGhCommand, SafeGitCommand};
+use crate::timeout_policy::{
+    ProgressCallback, ProgressReport, RecoveryStage, StuckReason, TimeoutPolicy, TimeoutResidual,
+    WaitPhase,
+};
 
 /// How long to wait for the child to exit after a timeout kill.
 const POST_KILL_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -49,12 +62,14 @@ pub enum SupervisorErrorCode {
     TimedOut,
     /// Child terminated by signal / kill without a classified timeout.
     Killed,
+    /// Stall detector fired (no child output for the configured stall window).
+    Stalled,
     /// Child exited with a non-zero status.
     NonZeroExit,
 }
 
 /// Outcome of a supervised process execution.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct SupervisedOutput {
     /// Process exit code, or `None` if terminated by signal / timeout / spawn failure.
     pub exit_code: Option<i32>,
@@ -75,6 +90,9 @@ pub struct SupervisedOutput {
     /// Structured failure code when the run is not a clean success.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_code: Option<SupervisorErrorCode>,
+    /// Timeout / hang residual (watchlist field). Omitted on success.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub residual: Option<TimeoutResidual>,
 }
 
 impl SupervisedOutput {
@@ -94,15 +112,43 @@ impl SupervisedOutput {
         self.error_code = Some(code);
         self
     }
+
+    fn with_residual(mut self, residual: TimeoutResidual) -> Self {
+        if residual.reason == StuckReason::Stall {
+            self.error_code = Some(SupervisorErrorCode::Stalled);
+        } else {
+            self.error_code = Some(SupervisorErrorCode::TimedOut);
+        }
+        self.residual = Some(residual);
+        self
+    }
 }
 
 /// Options for a policy-checked supervised run.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct RunOptions {
     /// When supervising `git` mutations, require this branch (verified before spawn).
     pub expected_branch: Option<String>,
     /// Repository working tree for git branch verification and `git -C` (default: `.`).
     pub repo: Option<PathBuf>,
+    /// Timeout / hang-recovery knobs. Library default is kill-immediately (no grace).
+    pub timeout_policy: TimeoutPolicy,
+    /// Optional wait-progress callback (CLI prints to stderr).
+    pub on_progress: Option<ProgressCallback>,
+}
+
+impl fmt::Debug for RunOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RunOptions")
+            .field("expected_branch", &self.expected_branch)
+            .field("repo", &self.repo)
+            .field("timeout_policy", &self.timeout_policy)
+            .field(
+                "on_progress",
+                &self.on_progress.as_ref().map(|_| "<callback>"),
+            )
+            .finish()
+    }
 }
 
 /// Configuration for the process supervisor.
@@ -183,7 +229,9 @@ impl Supervisor {
     ///   **after** acquiring a permit (and immediately before spawn), and runs with
     ///   `current_dir` set to the verified repo.
     /// - Spawns with process-group isolation where the OS allows; Drop/timeout kill the group.
-    /// - Enforces wall-clock timeout; kills the process group on expiry (Unix).
+    /// - Enforces wall-clock timeout (and optional stall detection); recovers with
+    ///   graceful cancel then kill. See [`crate::timeout_policy`] and
+    ///   `docs/supervisor-timeouts.md`.
     /// - Acquires a permit from the **process-local** max-parallel semaphore before spawning.
     pub async fn run(
         &self,
@@ -195,52 +243,49 @@ impl Supervisor {
         // Allowlist / structural validation only (no branch TOCTOU window before queue).
         let prepared = prepare_supervised_command(program, args, options)?;
         let started = Instant::now();
+        let deadline = timeout.map(|limit| started + limit);
 
         // Wall-clock timeout includes permit wait so saturated pools still time out.
-        let permit = match timeout {
-            Some(limit) => match tokio::time::timeout(limit, self.semaphore.acquire()).await {
-                Ok(Ok(p)) => p,
-                Ok(Err(_)) => panic!("supervisor semaphore closed"),
-                Err(_) => {
-                    return Ok(SupervisedOutput {
-                        exit_code: None,
-                        timed_out: true,
-                        killed: false,
-                        stdout: String::new(),
-                        stderr: "timed out waiting for max-parallel permit".to_owned(),
-                        stdout_truncated: false,
-                        stderr_truncated: false,
-                        error_code: Some(SupervisorErrorCode::TimedOut),
-                    });
+        let acquire = self.semaphore.acquire();
+        tokio::pin!(acquire);
+        let mut progress = interval_opt(options.timeout_policy.progress);
+        let permit = loop {
+            tokio::select! {
+                biased;
+                permit = &mut acquire => {
+                    break permit.expect("supervisor semaphore closed");
                 }
-            },
-            None => self
-                .semaphore
-                .acquire()
-                .await
-                .expect("supervisor semaphore closed"),
+                _ = sleep_until_opt(deadline) => {
+                    return Ok(permit_wait_timeout(
+                        started,
+                        &options.timeout_policy,
+                        "timed out waiting for max-parallel permit",
+                    ));
+                }
+                _ = wait_interval(&mut progress) => {
+                    emit_progress(
+                        options.on_progress.as_ref(),
+                        progress_report(
+                            started,
+                            deadline,
+                            None,
+                            WaitPhase::PermitWait,
+                            self.active(),
+                        ),
+                    );
+                }
+            }
         };
         let _permit = permit;
 
         // Remaining time for the child after queueing (if any).
-        let child_timeout = timeout.map(|limit| {
-            let elapsed = started.elapsed();
-            if elapsed >= limit {
-                return Duration::from_millis(0);
-            }
-            limit.saturating_sub(elapsed)
-        });
+        let child_timeout = deadline.map(|at| at.saturating_duration_since(Instant::now()));
         if child_timeout == Some(Duration::from_millis(0)) {
-            return Ok(SupervisedOutput {
-                exit_code: None,
-                timed_out: true,
-                killed: false,
-                stdout: String::new(),
-                stderr: "timed out waiting for max-parallel permit".to_owned(),
-                stdout_truncated: false,
-                stderr_truncated: false,
-                error_code: Some(SupervisorErrorCode::TimedOut),
-            });
+            return Ok(permit_wait_timeout(
+                started,
+                &options.timeout_policy,
+                "timed out waiting for max-parallel permit",
+            ));
         }
 
         // Branch check immediately before spawn, while holding the permit.
@@ -255,7 +300,13 @@ impl Supervisor {
                 &prepared.program,
                 &prepared.args,
                 prepared.cwd.as_deref(),
-                child_timeout,
+                WaitContext {
+                    started,
+                    deadline,
+                    policy: &options.timeout_policy,
+                    on_progress: options.on_progress.as_ref(),
+                    active: self.active(),
+                },
             )
             .await;
         guard.defuse();
@@ -270,14 +321,43 @@ impl Supervisor {
         args: &[&str],
         timeout: Option<Duration>,
     ) -> SupervisedOutput {
+        self.run_unchecked_with(program, args, timeout, &TimeoutPolicy::default(), None)
+            .await
+    }
+
+    /// Test helper with hang-recovery knobs and a progress callback.
+    #[cfg(test)]
+    async fn run_unchecked_with(
+        &self,
+        program: &str,
+        args: &[&str],
+        timeout: Option<Duration>,
+        policy: &TimeoutPolicy,
+        on_progress: Option<ProgressCallback>,
+    ) -> SupervisedOutput {
         let owned: Vec<String> = args.iter().map(|s| (*s).to_owned()).collect();
+        let started = Instant::now();
+        let deadline = timeout.map(|limit| started + limit);
         let _permit = self
             .semaphore
             .acquire()
             .await
             .expect("supervisor semaphore closed");
         let guard = ActiveGuard::arm(self);
-        let output = self.run_with_permit(program, &owned, None, timeout).await;
+        let output = self
+            .run_with_permit(
+                program,
+                &owned,
+                None,
+                WaitContext {
+                    started,
+                    deadline,
+                    policy,
+                    on_progress: on_progress.as_ref(),
+                    active: self.active(),
+                },
+            )
+            .await;
         guard.defuse();
         output
     }
@@ -287,7 +367,7 @@ impl Supervisor {
         program: &str,
         args: &[String],
         cwd: Option<&std::path::Path>,
-        timeout: Option<Duration>,
+        wait: WaitContext<'_>,
     ) -> SupervisedOutput {
         let mut cmd = Command::new(program);
         cmd.args(args);
@@ -305,14 +385,9 @@ impl Supervisor {
             Ok(child) => child,
             Err(e) => {
                 return SupervisedOutput {
-                    exit_code: None,
-                    timed_out: false,
-                    killed: false,
-                    stdout: String::new(),
                     stderr: format!("failed to spawn: {e}"),
-                    stdout_truncated: false,
-                    stderr_truncated: false,
                     error_code: Some(SupervisorErrorCode::SpawnFailed),
+                    ..SupervisedOutput::default()
                 };
             }
         };
@@ -321,74 +396,277 @@ impl Supervisor {
         let pid = child.id();
         let mut child = ProcessGroupChild { child, pid };
 
+        let origin = wait.started;
+        let last_byte_ms = Arc::new(AtomicU64::new(0));
         // Start reading pipes concurrently to prevent deadlock when
         // the child fills the OS pipe buffer before exiting.
         let mut child_stdout = child.child.stdout.take();
         let mut child_stderr = child.child.stderr.take();
+        let stdout_stamp = Arc::clone(&last_byte_ms);
+        let stderr_stamp = Arc::clone(&last_byte_ms);
         let stdout_handle: JoinHandle<Vec<u8>> =
-            tokio::spawn(async move { read_pipe(&mut child_stdout).await });
+            tokio::spawn(
+                async move { read_pipe(&mut child_stdout, Some(stdout_stamp), origin).await },
+            );
         let stderr_handle: JoinHandle<Vec<u8>> =
-            tokio::spawn(async move { read_pipe(&mut child_stderr).await });
+            tokio::spawn(
+                async move { read_pipe(&mut child_stderr, Some(stderr_stamp), origin).await },
+            );
 
-        if let Some(timeout) = timeout {
-            let deadline_at = Instant::now() + timeout;
-            let deadline = tokio::time::sleep_until(deadline_at);
-            tokio::pin!(deadline);
+        wait_supervised_child(&mut child, stdout_handle, stderr_handle, wait, last_byte_ms).await
+    }
+}
 
-            tokio::select! {
-                biased;
-                _ = &mut deadline => {
-                    timeout_output(&mut child, stdout_handle, stderr_handle).await
-                }
-                status = child.wait() => {
-                    match status {
-                        Ok(s) => {
-                            match drain_pipes_until(deadline_at, pid, stdout_handle, stderr_handle).await {
-                                Ok((stdout, stderr)) => output_to_supervised(s, &stdout, &stderr),
-                                Err((stdout, stderr)) => SupervisedOutput {
-                                    exit_code: None,
-                                    timed_out: true,
-                                    killed: true,
-                                    stdout: String::from_utf8_lossy(&stdout).into_owned(),
-                                    stderr: String::from_utf8_lossy(&stderr).into_owned(),
-                                    stdout_truncated: stdout.len() >= MAX_CAPTURE_BYTES,
-                                    stderr_truncated: stderr.len() >= MAX_CAPTURE_BYTES,
-                                    error_code: Some(SupervisorErrorCode::TimedOut),
-                                },
-                            }
-                        }
-                        Err(e) => SupervisedOutput {
-                            exit_code: None,
-                            timed_out: false,
-                            killed: false,
-                            stdout: String::new(),
-                            stderr: format!("process error: {e}"),
-                            stdout_truncated: false,
-                            stderr_truncated: false,
-                            error_code: Some(SupervisorErrorCode::WaitFailed),
-                        },
-                    }
+#[derive(Clone, Copy)]
+struct WaitContext<'a> {
+    started: Instant,
+    deadline: Option<Instant>,
+    policy: &'a TimeoutPolicy,
+    on_progress: Option<&'a ProgressCallback>,
+    active: usize,
+}
+
+fn permit_wait_timeout(started: Instant, policy: &TimeoutPolicy, stderr: &str) -> SupervisedOutput {
+    SupervisedOutput {
+        timed_out: true,
+        stderr: stderr.to_owned(),
+        ..SupervisedOutput::default()
+    }
+    .with_residual(TimeoutResidual {
+        reason: StuckReason::PermitWait,
+        recovery_stage: RecoveryStage::None,
+        redispatch_count: 0,
+        max_redispatch_per_item: policy.max_redispatch_per_item,
+        elapsed_ms: elapsed_ms(started),
+        last_output_ms: None,
+    })
+}
+
+async fn wait_supervised_child(
+    child: &mut ProcessGroupChild,
+    stdout_handle: JoinHandle<Vec<u8>>,
+    stderr_handle: JoinHandle<Vec<u8>>,
+    wait: WaitContext<'_>,
+    last_byte_ms: Arc<AtomicU64>,
+) -> SupervisedOutput {
+    let pid = child.pid;
+    let deadline_at = wait.deadline;
+    let mut progress = interval_opt(wait.policy.progress);
+    let mut stall_poll = interval_opt(wait.policy.stall.map(|_| Duration::from_millis(50)));
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = sleep_until_opt(deadline_at) => {
+                return recover_child(
+                    child,
+                    stdout_handle,
+                    stderr_handle,
+                    wait,
+                    last_byte_ms,
+                    StuckReason::WallClock,
+                )
+                .await;
+            }
+            _ = wait_interval(&mut stall_poll) => {
+                if stalled(&last_byte_ms, wait.started, wait.policy.stall) {
+                    return recover_child(
+                        child,
+                        stdout_handle,
+                        stderr_handle,
+                        wait,
+                        last_byte_ms,
+                        StuckReason::Stall,
+                    )
+                    .await;
                 }
             }
-        } else {
-            match child.wait().await {
-                Ok(status) => {
-                    let stdout = stdout_handle.await.unwrap_or_default();
-                    let stderr = stderr_handle.await.unwrap_or_default();
-                    output_to_supervised(status, &stdout, &stderr)
-                }
-                Err(e) => SupervisedOutput {
-                    exit_code: None,
-                    timed_out: false,
-                    killed: false,
-                    stdout: String::new(),
-                    stderr: format!("process error: {e}"),
-                    stdout_truncated: false,
-                    stderr_truncated: false,
-                    error_code: Some(SupervisorErrorCode::WaitFailed),
-                },
+            _ = wait_interval(&mut progress) => {
+                let last = nonzero_ms(&last_byte_ms);
+                emit_progress(
+                    wait.on_progress,
+                    progress_report(wait.started, deadline_at, last, WaitPhase::Child, wait.active),
+                );
+            }
+            status = child.wait() => {
+                return match status {
+                    Ok(s) => match drain_pipes_until(
+                        wait.deadline,
+                        pid,
+                        stdout_handle,
+                        stderr_handle,
+                    )
+                    .await
+                    {
+                        Ok((stdout, stderr)) => output_to_supervised(s, &stdout, &stderr),
+                        Err((stdout, stderr)) => SupervisedOutput {
+                            timed_out: true,
+                            killed: true,
+                            stdout: String::from_utf8_lossy(&stdout).into_owned(),
+                            stderr: String::from_utf8_lossy(&stderr).into_owned(),
+                            stdout_truncated: stdout.len() >= MAX_CAPTURE_BYTES,
+                            stderr_truncated: stderr.len() >= MAX_CAPTURE_BYTES,
+                            ..SupervisedOutput::default()
+                        }
+                        .with_residual(TimeoutResidual {
+                            reason: StuckReason::WallClock,
+                            recovery_stage: RecoveryStage::Kill,
+                            redispatch_count: 0,
+                            max_redispatch_per_item: wait.policy.max_redispatch_per_item,
+                            elapsed_ms: elapsed_ms(wait.started),
+                            last_output_ms: nonzero_ms(&last_byte_ms),
+                        }),
+                    },
+                    Err(e) => SupervisedOutput {
+                        stderr: format!("process error: {e}"),
+                        error_code: Some(SupervisorErrorCode::WaitFailed),
+                        ..SupervisedOutput::default()
+                    },
+                };
             }
         }
+    }
+}
+
+async fn recover_child(
+    child: &mut ProcessGroupChild,
+    stdout_handle: JoinHandle<Vec<u8>>,
+    stderr_handle: JoinHandle<Vec<u8>>,
+    wait: WaitContext<'_>,
+    last_byte_ms: Arc<AtomicU64>,
+    reason: StuckReason,
+) -> SupervisedOutput {
+    let grace = wait.policy.grace;
+    let stage = if graceful_cancel_supported() && !grace.is_zero() {
+        request_graceful_cancel(child.pid);
+        match tokio::time::timeout(grace, child.wait()).await {
+            Ok(Ok(_)) => RecoveryStage::GracefulCancel,
+            _ => {
+                let _ = child.kill().await;
+                RecoveryStage::Kill
+            }
+        }
+    } else {
+        let _ = child.kill().await;
+        RecoveryStage::Kill
+    };
+
+    let _ = tokio::time::timeout(POST_KILL_JOIN_TIMEOUT, child.wait()).await;
+    let stdout = join_with_timeout(stdout_handle).await;
+    let stderr = join_with_timeout(stderr_handle).await;
+    SupervisedOutput {
+        timed_out: true,
+        killed: stage == RecoveryStage::Kill,
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        stdout_truncated: stdout.len() >= MAX_CAPTURE_BYTES,
+        stderr_truncated: stderr.len() >= MAX_CAPTURE_BYTES,
+        ..SupervisedOutput::default()
+    }
+    .with_residual(TimeoutResidual {
+        reason,
+        recovery_stage: stage,
+        redispatch_count: 0,
+        max_redispatch_per_item: wait.policy.max_redispatch_per_item,
+        elapsed_ms: elapsed_ms(wait.started),
+        last_output_ms: nonzero_ms(&last_byte_ms),
+    })
+}
+
+fn graceful_cancel_supported() -> bool {
+    cfg!(unix)
+}
+
+fn request_graceful_cancel(pid: Option<u32>) {
+    #[cfg(unix)]
+    {
+        request_graceful_cancel_unix(pid);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+    }
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn request_graceful_cancel_unix(pid: Option<u32>) {
+    if let Some(pid) = pid {
+        // SAFETY: kill(2) is async-signal-safe and only sends SIGTERM to the group.
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGTERM);
+        }
+    }
+}
+
+fn stalled(last_byte_ms: &AtomicU64, started: Instant, stall: Option<Duration>) -> bool {
+    let Some(window) = stall else {
+        return false;
+    };
+    let quiet = match nonzero_ms(last_byte_ms) {
+        Some(ms) => started.elapsed().saturating_sub(Duration::from_millis(ms)),
+        None => started.elapsed(),
+    };
+    quiet >= window
+}
+
+fn nonzero_ms(stamp: &AtomicU64) -> Option<u64> {
+    let v = stamp.load(Ordering::Relaxed);
+    (v > 0).then_some(v)
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn progress_report(
+    started: Instant,
+    deadline: Option<Instant>,
+    last_output_ms: Option<u64>,
+    wait_phase: WaitPhase,
+    active: usize,
+) -> ProgressReport {
+    let remaining_ms = deadline.map(|at| {
+        u64::try_from(at.saturating_duration_since(Instant::now()).as_millis()).unwrap_or(0)
+    });
+    ProgressReport {
+        elapsed_ms: elapsed_ms(started),
+        remaining_ms,
+        last_output_ms,
+        wait_phase,
+        active,
+    }
+}
+
+fn emit_progress(cb: Option<&ProgressCallback>, report: ProgressReport) {
+    if let Some(cb) = cb {
+        cb(&report);
+    }
+}
+
+struct OptionalInterval(Option<tokio::time::Interval>);
+
+fn interval_opt(period: Option<Duration>) -> OptionalInterval {
+    OptionalInterval(period.filter(|d| !d.is_zero()).map(|d| {
+        let mut interval = tokio::time::interval_at(Instant::now() + d, d);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        interval
+    }))
+}
+
+async fn wait_interval(interval: &mut OptionalInterval) {
+    match interval.0.as_mut() {
+        Some(int) => {
+            int.tick().await;
+        }
+        None => std::future::pending::<()>().await,
+    }
+}
+
+async fn sleep_until_opt(deadline: Option<Instant>) {
+    match deadline {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending::<()>().await,
     }
 }
 
@@ -731,32 +1009,8 @@ fn normalize_existing_or_future_dir(path: &std::path::Path) -> Result<PathBuf> {
     }
 }
 
-async fn timeout_output(
-    child: &mut ProcessGroupChild,
-    stdout_handle: JoinHandle<Vec<u8>>,
-    stderr_handle: JoinHandle<Vec<u8>>,
-) -> SupervisedOutput {
-    let _ = child.kill().await;
-    // Bound how long we wait for the killed child and pipe readers.
-    // Prefer letting readers finish after pipes close so partial output is preserved.
-    let _ = tokio::time::timeout(POST_KILL_JOIN_TIMEOUT, child.wait()).await;
-    let stdout = join_with_timeout(stdout_handle).await;
-    let stderr = join_with_timeout(stderr_handle).await;
-    SupervisedOutput {
-        exit_code: None,
-        timed_out: true,
-        killed: true,
-        stdout: String::from_utf8_lossy(&stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&stderr).into_owned(),
-        // Same capture-cap heuristic as successful completions / drain timeout path.
-        stdout_truncated: stdout.len() >= MAX_CAPTURE_BYTES,
-        stderr_truncated: stderr.len() >= MAX_CAPTURE_BYTES,
-        error_code: Some(SupervisorErrorCode::TimedOut),
-    }
-}
-
 async fn drain_pipes_until(
-    deadline_at: Instant,
+    deadline_at: Option<Instant>,
     pid: Option<u32>,
     stdout_handle: JoinHandle<Vec<u8>>,
     stderr_handle: JoinHandle<Vec<u8>>,
@@ -771,7 +1025,7 @@ async fn drain_pipes_until(
     tokio::pin!(drain);
     tokio::select! {
         biased;
-        _ = tokio::time::sleep_until(deadline_at) => {
+        _ = sleep_until_opt(deadline_at) => {
             kill_process_group(pid);
             // Do not abort pipe readers: after the kill, pipes close and readers finish.
             // Preserve any bytes already captured (Codex: empty output on drain timeout).
@@ -792,7 +1046,11 @@ async fn join_with_timeout(handle: JoinHandle<Vec<u8>>) -> Vec<u8> {
     }
 }
 
-async fn read_pipe<R: AsyncReadExt + Unpin>(pipe: &mut Option<R>) -> Vec<u8> {
+async fn read_pipe<R: AsyncReadExt + Unpin>(
+    pipe: &mut Option<R>,
+    last_byte_ms: Option<Arc<AtomicU64>>,
+    origin: Instant,
+) -> Vec<u8> {
     match pipe.as_mut() {
         Some(reader) => {
             let mut buf = Vec::new();
@@ -802,6 +1060,11 @@ async fn read_pipe<R: AsyncReadExt + Unpin>(pipe: &mut Option<R>) -> Vec<u8> {
                 match reader.read(&mut chunk).await {
                     Ok(0) => break,
                     Ok(n) => {
+                        if n > 0 {
+                            if let Some(stamp) = &last_byte_ms {
+                                stamp.store(elapsed_ms(origin), Ordering::Relaxed);
+                            }
+                        }
                         if !capped {
                             let room = MAX_CAPTURE_BYTES.saturating_sub(buf.len());
                             if room > 0 {
@@ -852,6 +1115,7 @@ fn output_to_supervised(
         stdout_truncated: stdout.len() >= MAX_CAPTURE_BYTES,
         stderr_truncated: stderr.len() >= MAX_CAPTURE_BYTES,
         error_code: None,
+        residual: None,
     };
     if killed {
         out = out.with_error(SupervisorErrorCode::Killed);
@@ -884,6 +1148,9 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::timeout_policy::{
+        ProgressCallback, ProgressReport, RecoveryStage, StuckReason, TimeoutPolicy, WaitPhase,
+    };
 
     /// Portable shell invocation for tests (`sh -c` / `cmd /C`).
     fn shell_program() -> &'static str {
@@ -1056,6 +1323,7 @@ mod tests {
             &RunOptions {
                 expected_branch: Some("feature".to_owned()),
                 repo: Some(repo),
+                ..RunOptions::default()
             },
         )
         .unwrap_err();
@@ -1222,6 +1490,7 @@ mod tests {
             stdout_truncated: false,
             stderr_truncated: false,
             error_code: None,
+            residual: None,
         };
 
         let json = serde_json::to_string(&output).unwrap();
@@ -1252,6 +1521,18 @@ mod tests {
         assert!(json.contains("\"killed\":true"), "{json}");
         assert!(json.contains("\"exit_code\":null"), "{json}");
         assert!(json.contains("TIMED_OUT"), "{json}");
+        let residual = output.residual.expect("timeout residual");
+        assert_eq!(residual.reason, StuckReason::WallClock);
+        assert_eq!(residual.redispatch_count, 0);
+        assert_eq!(residual.max_redispatch_per_item, 1);
+        let rv = serde_json::to_value(&residual).unwrap();
+        for key in rv.as_object().unwrap().keys() {
+            let lower = key.to_ascii_lowercase();
+            assert!(
+                !lower.contains("sha") && !lower.contains("commit"),
+                "residual must not carry `{key}`"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1282,6 +1563,163 @@ mod tests {
             err,
             Error::PolicyViolation {
                 code: PolicyCode::MergeBlocked,
+                ..
+            }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stall_detects_silent_child_without_wall_clock() {
+        let supervisor = Supervisor::new(1);
+        let policy = TimeoutPolicy {
+            grace: Duration::ZERO,
+            stall: Some(Duration::from_millis(200)),
+            progress: None,
+            max_redispatch_per_item: 1,
+        };
+        let started = Instant::now();
+        let output = supervisor
+            .run_unchecked_with(
+                shell_program(),
+                &[shell_flag(), "sleep 60"],
+                None,
+                &policy,
+                None,
+            )
+            .await;
+        assert!(output.timed_out, "stderr={}", output.stderr);
+        assert_eq!(output.error_code, Some(SupervisorErrorCode::Stalled));
+        assert_eq!(
+            output.residual.as_ref().map(|r| r.reason),
+            Some(StuckReason::Stall)
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "stall detector hung"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn graceful_cancel_then_kill_when_term_ignored() {
+        let supervisor = Supervisor::new(1);
+        let policy = TimeoutPolicy {
+            grace: Duration::from_millis(200),
+            stall: None,
+            progress: None,
+            max_redispatch_per_item: 1,
+        };
+        let output = supervisor
+            .run_unchecked_with(
+                shell_program(),
+                &[shell_flag(), "trap '' TERM; sleep 60"],
+                Some(Duration::from_millis(200)),
+                &policy,
+                None,
+            )
+            .await;
+        assert!(output.timed_out, "stderr={}", output.stderr);
+        assert_eq!(
+            output.residual.as_ref().map(|r| r.recovery_stage),
+            Some(RecoveryStage::Kill)
+        );
+        assert!(output.killed);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn graceful_cancel_reaps_term_sensitive_child() {
+        let supervisor = Supervisor::new(1);
+        let policy = TimeoutPolicy {
+            grace: Duration::from_secs(2),
+            stall: None,
+            progress: None,
+            max_redispatch_per_item: 1,
+        };
+        let output = supervisor
+            .run_unchecked_with(
+                shell_program(),
+                &[
+                    shell_flag(),
+                    "trap 'exit 0' TERM; while true; do sleep 0.05; done",
+                ],
+                Some(Duration::from_millis(200)),
+                &policy,
+                None,
+            )
+            .await;
+        assert!(output.timed_out, "output={output:?}");
+        assert_eq!(
+            output.residual.as_ref().map(|r| r.recovery_stage),
+            Some(RecoveryStage::GracefulCancel)
+        );
+        assert!(!output.killed);
+    }
+
+    #[tokio::test]
+    async fn progress_callback_fires_while_waiting() {
+        let supervisor = Supervisor::new(1);
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let events_cb = Arc::clone(&events);
+        let cb: ProgressCallback = Arc::new(move |p: &ProgressReport| {
+            events_cb.lock().unwrap().push(p.wait_phase);
+        });
+        let policy = TimeoutPolicy {
+            grace: Duration::ZERO,
+            stall: None,
+            progress: Some(Duration::from_millis(50)),
+            max_redispatch_per_item: 1,
+        };
+        let output = supervisor
+            .run_unchecked_with(
+                shell_program(),
+                &[shell_flag(), "sleep 0.25"],
+                None,
+                &policy,
+                Some(cb),
+            )
+            .await;
+        assert_eq!(output.exit_code, Some(0), "stderr={}", output.stderr);
+        let phases = events.lock().unwrap().clone();
+        assert!(
+            phases.iter().any(|phase| *phase == WaitPhase::Child),
+            "expected child progress heartbeats, got {phases:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_never_runs_merge_or_bare_force_push() {
+        let supervisor = Supervisor::new(1);
+        let merge = supervisor
+            .run(
+                "gh",
+                &["pr", "merge"],
+                Some(Duration::from_secs(1)),
+                &RunOptions::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            merge,
+            Error::PolicyViolation {
+                code: PolicyCode::MergeBlocked,
+                ..
+            }
+        ));
+        let force = supervisor
+            .run(
+                "git",
+                &["push", "--force"],
+                Some(Duration::from_secs(1)),
+                &RunOptions::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            force,
+            Error::PolicyViolation {
+                code: PolicyCode::BareForcePush,
                 ..
             }
         ));

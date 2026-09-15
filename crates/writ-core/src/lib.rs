@@ -11,6 +11,7 @@ pub mod paths;
 pub mod state;
 pub mod status;
 pub mod supervisor;
+pub mod timeout_policy;
 pub mod worktree;
 
 /// Version shared by the core library and CLI workspace packages.

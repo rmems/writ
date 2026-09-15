@@ -5,6 +5,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::contract::Response;
+use crate::timeout_policy::TimeoutResidual;
 
 /// Lifecycle state of a watched job process.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -83,6 +84,12 @@ pub struct JobStatus {
     /// Last error message, if the job is in `Failed` state.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    /// Timeout / hang residual when the job stopped because a worker was stuck.
+    ///
+    /// Specified for watchlist / aggregate reports (GitHub #12 / #16). Hosts
+    /// persist this additive v1 field; `writ` has no state writer today.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_residual: Option<TimeoutResidual>,
     /// CI classification for the job's head commit.
     pub ci_class: CiClass,
 }
@@ -139,6 +146,7 @@ mod tests {
             branch: "feature/status-json-cli".to_owned(),
             process_state: ProcessState::Running,
             last_error: None,
+            timeout_residual: None,
             ci_class: CiClass::Pending,
         }
     }
@@ -180,6 +188,30 @@ mod tests {
         assert!(v.get("issue_number").is_none());
         assert!(v.get("pr_number").is_none());
         assert!(v.get("last_error").is_none());
+        assert!(v.get("timeout_residual").is_none());
+    }
+
+    #[test]
+    fn timeout_residual_serializes_on_failed_job() {
+        use crate::timeout_policy::{RecoveryStage, StuckReason, TimeoutResidual};
+        let job = JobStatus {
+            process_state: ProcessState::Failed,
+            last_error: Some("timed out: wall_clock".to_owned()),
+            timeout_residual: Some(TimeoutResidual {
+                reason: StuckReason::WallClock,
+                recovery_stage: RecoveryStage::Kill,
+                redispatch_count: 1,
+                max_redispatch_per_item: 1,
+                elapsed_ms: 1_800_000,
+                last_output_ms: None,
+            }),
+            ..sample_job()
+        };
+        let v = serde_json::to_value(&job).unwrap();
+        assert_eq!(v["timeout_residual"]["reason"], "wall_clock");
+        assert_eq!(v["timeout_residual"]["recovery_stage"], "kill");
+        assert_eq!(v["timeout_residual"]["max_redispatch_per_item"], 1);
+        assert!(v["timeout_residual"].get("sha").is_none());
     }
 
     #[test]
