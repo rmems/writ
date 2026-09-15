@@ -47,6 +47,10 @@ use crate::timeout_policy::{
 /// How long to wait for the child to exit after a timeout kill.
 const POST_KILL_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// When no wall-clock deadline is set, still bound pipe drain so inherited
+/// stdout/stderr from background descendants cannot hang the supervisor forever.
+const ORPHAN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Cap captured stdout/stderr per stream to avoid memory exhaustion.
 const MAX_CAPTURE_BYTES: usize = 1_048_576;
 
@@ -280,7 +284,7 @@ impl Supervisor {
 
         // Remaining time for the child after queueing (if any).
         let child_timeout = deadline.map(|at| at.saturating_duration_since(Instant::now()));
-        if child_timeout == Some(Duration::from_millis(0)) {
+        if child_timeout == Some(Duration::ZERO) {
             return Ok(permit_wait_timeout(
                 started,
                 &options.timeout_policy,
@@ -302,6 +306,7 @@ impl Supervisor {
                 prepared.cwd.as_deref(),
                 WaitContext {
                     started,
+                    stall_origin: started,
                     deadline,
                     policy: &options.timeout_policy,
                     on_progress: options.on_progress.as_ref(),
@@ -351,6 +356,7 @@ impl Supervisor {
                 None,
                 WaitContext {
                     started,
+                    stall_origin: started,
                     deadline,
                     policy,
                     on_progress: on_progress.as_ref(),
@@ -396,6 +402,9 @@ impl Supervisor {
         let pid = child.id();
         let mut child = ProcessGroupChild { child, pid };
 
+        // Stall detection starts at spawn, not at permit-wait (queue time is not silence).
+        let mut wait = wait;
+        wait.stall_origin = Instant::now();
         let origin = wait.started;
         let last_byte_ms = Arc::new(AtomicU64::new(0));
         // Start reading pipes concurrently to prevent deadlock when
@@ -420,6 +429,8 @@ impl Supervisor {
 #[derive(Clone, Copy)]
 struct WaitContext<'a> {
     started: Instant,
+    /// Instant the child was spawned; stall quiet-time is measured from here.
+    stall_origin: Instant,
     deadline: Option<Instant>,
     policy: &'a TimeoutPolicy,
     on_progress: Option<&'a ProgressCallback>,
@@ -468,30 +479,11 @@ async fn wait_supervised_child(
                 )
                 .await;
             }
-            _ = wait_interval(&mut stall_poll) => {
-                if stalled(&last_byte_ms, wait.started, wait.policy.stall) {
-                    return recover_child(
-                        child,
-                        stdout_handle,
-                        stderr_handle,
-                        wait,
-                        last_byte_ms,
-                        StuckReason::Stall,
-                    )
-                    .await;
-                }
-            }
-            _ = wait_interval(&mut progress) => {
-                let last = nonzero_ms(&last_byte_ms);
-                emit_progress(
-                    wait.on_progress,
-                    progress_report(wait.started, deadline_at, last, WaitPhase::Child, wait.active),
-                );
-            }
             status = child.wait() => {
+                child.disarm();
                 return match status {
                     Ok(s) => match drain_pipes_until(
-                        wait.deadline,
+                        drain_deadline(wait.deadline),
                         pid,
                         stdout_handle,
                         stderr_handle,
@@ -524,6 +516,34 @@ async fn wait_supervised_child(
                     },
                 };
             }
+            _ = wait_interval(&mut stall_poll) => {
+                if stalled(
+                    &last_byte_ms,
+                    wait.started,
+                    wait.stall_origin,
+                    wait.policy.stall,
+                ) {
+                    if let Ok(Some(_)) = child.try_wait() {
+                        continue;
+                    }
+                    return recover_child(
+                        child,
+                        stdout_handle,
+                        stderr_handle,
+                        wait,
+                        last_byte_ms,
+                        StuckReason::Stall,
+                    )
+                    .await;
+                }
+            }
+            _ = wait_interval(&mut progress) => {
+                let last = nonzero_ms(&last_byte_ms);
+                emit_progress(
+                    wait.on_progress,
+                    progress_report(wait.started, deadline_at, last, WaitPhase::Child, wait.active),
+                );
+            }
         }
     }
 }
@@ -552,6 +572,7 @@ async fn recover_child(
     };
 
     let _ = tokio::time::timeout(POST_KILL_JOIN_TIMEOUT, child.wait()).await;
+    child.disarm();
     let stdout = join_with_timeout(stdout_handle).await;
     let stderr = join_with_timeout(stderr_handle).await;
     SupervisedOutput {
@@ -599,13 +620,18 @@ fn request_graceful_cancel_unix(pid: Option<u32>) {
     }
 }
 
-fn stalled(last_byte_ms: &AtomicU64, started: Instant, stall: Option<Duration>) -> bool {
+fn stalled(
+    last_byte_ms: &AtomicU64,
+    started: Instant,
+    stall_origin: Instant,
+    stall: Option<Duration>,
+) -> bool {
     let Some(window) = stall else {
         return false;
     };
     let quiet = match nonzero_ms(last_byte_ms) {
         Some(ms) => started.elapsed().saturating_sub(Duration::from_millis(ms)),
-        None => started.elapsed(),
+        None => stall_origin.elapsed(),
     };
     quiet >= window
 }
@@ -679,6 +705,14 @@ struct ProcessGroupChild {
 impl ProcessGroupChild {
     async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
         self.child.wait().await
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.child.try_wait()
+    }
+
+    fn disarm(&mut self) {
+        self.pid = None;
     }
 
     async fn kill(&mut self) -> std::io::Result<()> {
@@ -1010,13 +1044,13 @@ fn normalize_existing_or_future_dir(path: &std::path::Path) -> Result<PathBuf> {
 }
 
 async fn drain_pipes_until(
-    deadline_at: Option<Instant>,
+    deadline_at: Instant,
     pid: Option<u32>,
     stdout_handle: JoinHandle<Vec<u8>>,
     stderr_handle: JoinHandle<Vec<u8>>,
 ) -> std::result::Result<(Vec<u8>, Vec<u8>), (Vec<u8>, Vec<u8>)> {
-    // Keep the original deadline active while draining: descendants that inherit
-    // stdout/stderr (e.g. `sh -c 'sleep 60 &'`) must not hang the supervisor forever.
+    // Bound drain by the wall-clock deadline, or by ORPHAN_DRAIN_TIMEOUT when
+    // the caller used unlimited timeout, so inherited pipes cannot hang forever.
     let drain = async {
         let stdout = stdout_handle.await.unwrap_or_default();
         let stderr = stderr_handle.await.unwrap_or_default();
@@ -1025,7 +1059,7 @@ async fn drain_pipes_until(
     tokio::pin!(drain);
     tokio::select! {
         biased;
-        _ = sleep_until_opt(deadline_at) => {
+        _ = tokio::time::sleep_until(deadline_at) => {
             kill_process_group(pid);
             // Do not abort pipe readers: after the kill, pipes close and readers finish.
             // Preserve any bytes already captured (Codex: empty output on drain timeout).
@@ -1036,6 +1070,10 @@ async fn drain_pipes_until(
         }
         out = &mut drain => Ok(out),
     }
+}
+
+fn drain_deadline(deadline: Option<Instant>) -> Instant {
+    deadline.unwrap_or_else(|| Instant::now() + ORPHAN_DRAIN_TIMEOUT)
 }
 
 async fn join_with_timeout(handle: JoinHandle<Vec<u8>>) -> Vec<u8> {
@@ -1063,7 +1101,7 @@ async fn read_pipe<R: AsyncReadExt + Unpin>(
                         if n > 0
                             && let Some(stamp) = &last_byte_ms
                         {
-                            stamp.store(elapsed_ms(origin), Ordering::Relaxed);
+                            stamp.store(elapsed_ms(origin).max(1), Ordering::Relaxed);
                         }
                         if !capped {
                             let room = MAX_CAPTURE_BYTES.saturating_sub(buf.len());
@@ -1613,7 +1651,7 @@ mod tests {
         let output = supervisor
             .run_unchecked_with(
                 shell_program(),
-                &[shell_flag(), "trap '' TERM; sleep 60"],
+                &[shell_flag(), "trap '' TERM; while true; do :; done"],
                 Some(Duration::from_millis(200)),
                 &policy,
                 None,
@@ -1655,6 +1693,39 @@ mod tests {
             Some(RecoveryStage::GracefulCancel)
         );
         assert!(!output.killed);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn permit_wait_timeout_records_residual_without_spawn() {
+        let supervisor = Arc::new(Supervisor::new(1));
+        let blocker = Arc::clone(&supervisor);
+        let handle = tokio::spawn(async move {
+            blocker
+                .run_unchecked(shell_program(), &[shell_flag(), "sleep 2"], None)
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let output = supervisor
+            .run(
+                "true",
+                &[],
+                Some(Duration::from_millis(200)),
+                &RunOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert!(output.timed_out, "stderr={}", output.stderr);
+        assert!(!output.killed);
+        assert_eq!(
+            output.residual.as_ref().map(|r| r.reason),
+            Some(StuckReason::PermitWait)
+        );
+        assert_eq!(
+            output.residual.as_ref().map(|r| r.recovery_stage),
+            Some(RecoveryStage::None)
+        );
+        let _ = handle.await;
     }
 
     #[tokio::test]

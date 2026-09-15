@@ -39,7 +39,8 @@ A child is stuck when **any** of these fire:
    `run` started, including time spent waiting for a process-local
    `--max-parallel` permit (`StuckReason::wall_clock` or `permit_wait`).
 2. **Stall** — optional, off by default. No captured stdout/stderr bytes for
-   `--stall` seconds while the child is still running (`StuckReason::stall`).
+   `--stall` seconds **after the child is spawned** (`StuckReason::stall`).
+   Time spent waiting for a max-parallel permit does not count as silence.
    Silent-but-healthy compiles should leave stall disabled or set it above
    the longest expected quiet period.
 
@@ -54,10 +55,16 @@ Wall-clock remains the primary bound. Stall is the beyond-naive detector.
 3. **Re-dispatch or residual** (host): `writ` does **not** respawn the
    command. The residual records `redispatch_count: 0` for this invocation
    and `max_redispatch_per_item` from config. The host calls
-   `RedispatchBudget::try_acquire` before a retry. When the budget is
+   `RedispatchBudget::try_acquire` before a retry. A `writ supervisor run`
+   residual always has `redispatch_count: 0`; do not treat that as unused
+   budget — persist host-side usage, or use `max_redispatch_per_item == 0`
+   to forbid retries. When the budget is
    exhausted, mark the item residual, free the slot, and stop.
-4. **Safe cleanup**: process-group kill on Unix Drop; pipes are drained
-   with a bounded join. Worktree paths are not deleted by recovery.
+4. **Safe cleanup**: process-group kill on Unix Drop until the child is
+   reaped (`disarm` after wait/recovery to avoid a PID-reuse SIGKILL).
+   Pipe drain is bounded by the wall-clock deadline, or by 30s when no
+   deadline is set, so inherited pipes from background descendants cannot
+   hang the supervisor. Worktree paths are not deleted by recovery.
 
 Safety cross-checks, enforced in `writ-core` on every attempt:
 

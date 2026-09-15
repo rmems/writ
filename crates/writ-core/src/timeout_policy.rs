@@ -70,8 +70,8 @@ pub struct TimeoutResidual {
     pub reason: StuckReason,
     /// Last recovery action taken by the supervisor.
     pub recovery_stage: RecoveryStage,
-    /// Redispatches already consumed for this item by the **host**. Always `0`
-    /// for a single `writ supervisor run` invocation — the binary does not retry.
+    /// Hosts must use [`RedispatchBudget`], not this field, to cap retries.
+    /// A single `writ supervisor run` always reports `redispatch_count: 0`.
     pub redispatch_count: u32,
     /// Configured host cap (`max_redispatch_per_item`).
     pub max_redispatch_per_item: u32,
@@ -83,10 +83,14 @@ pub struct TimeoutResidual {
 }
 
 impl TimeoutResidual {
-    /// True when the host must **not** retry this item.
+    /// True when the configured cap forbids any host retry (`max == 0`).
+    ///
+    /// Do **not** treat `redispatch_count` from a `writ supervisor run` residual
+    /// as consumed budget — that field is always `0` because writ does not retry.
+    /// Hosts must call [`RedispatchBudget::try_acquire`] themselves.
     #[must_use]
-    pub fn redispatch_exhausted(&self) -> bool {
-        self.redispatch_count >= self.max_redispatch_per_item
+    pub fn redispatch_forbidden(&self) -> bool {
+        self.max_redispatch_per_item == 0
     }
 }
 
@@ -352,12 +356,12 @@ mod tests {
                 "timeout residual must not carry identity field `{key}`"
             );
         }
-        assert!(!residual.redispatch_exhausted());
+        assert!(!residual.redispatch_forbidden());
         let exhausted = TimeoutResidual {
-            redispatch_count: 1,
+            max_redispatch_per_item: 0,
             ..residual.clone()
         };
-        assert!(exhausted.redispatch_exhausted());
+        assert!(exhausted.redispatch_forbidden());
     }
 
     #[test]
