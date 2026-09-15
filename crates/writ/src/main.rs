@@ -397,16 +397,20 @@ async fn run(cli: Cli, stdout: &mut impl Write) -> writ_core::error::Result<Exit
                 cmd,
             } => {
                 run_supervisor(
-                    cli.json,
-                    timeout,
-                    grace,
-                    stall,
-                    progress,
-                    max_redispatch,
-                    expected_branch,
-                    repo,
-                    max_parallel,
-                    cmd,
+                    SupervisorRunRequest {
+                        json: cli.json,
+                        timeout_secs: timeout,
+                        expected_branch,
+                        repo,
+                        max_parallel,
+                        cmd,
+                        timeout_policy: writ_core::timeout_policy::TimeoutPolicy::from_seconds(
+                            grace,
+                            stall,
+                            progress,
+                            max_redispatch,
+                        ),
+                    },
                     stdout,
                 )
                 .await
@@ -427,20 +431,30 @@ async fn run(cli: Cli, stdout: &mut impl Write) -> writ_core::error::Result<Exit
     }
 }
 
-/// Run `writ supervisor run` with policy-checked core supervisor and consistent JSON envelopes.
-async fn run_supervisor(
+struct SupervisorRunRequest {
     json: bool,
     timeout_secs: u64,
-    grace_secs: u64,
-    stall_secs: u64,
-    progress_secs: u64,
-    max_redispatch: u32,
     expected_branch: Option<String>,
     repo: Option<PathBuf>,
     max_parallel: usize,
     cmd: Vec<String>,
+    timeout_policy: writ_core::timeout_policy::TimeoutPolicy,
+}
+
+/// Run `writ supervisor run` with policy-checked core supervisor and consistent JSON envelopes.
+async fn run_supervisor(
+    request: SupervisorRunRequest,
     stdout: &mut impl Write,
 ) -> writ_core::error::Result<ExitCode> {
+    let SupervisorRunRequest {
+        json,
+        timeout_secs,
+        expected_branch,
+        repo,
+        max_parallel,
+        cmd,
+        timeout_policy,
+    } = request;
     let program = match cmd.first() {
         Some(p) => p.as_str(),
         None => {
@@ -452,12 +466,6 @@ async fn run_supervisor(
         }
     };
     let args: Vec<&str> = cmd[1..].iter().map(|s| s.as_str()).collect();
-    let timeout_policy = writ_core::timeout_policy::TimeoutPolicy::from_seconds(
-        grace_secs,
-        stall_secs,
-        progress_secs,
-        max_redispatch,
-    );
     let on_progress = timeout_policy.progress.map(|_| {
         std::sync::Arc::new(|report: &writ_core::timeout_policy::ProgressReport| {
             eprintln!(

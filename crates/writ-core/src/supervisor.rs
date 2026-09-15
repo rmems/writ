@@ -1060,10 +1060,10 @@ async fn read_pipe<R: AsyncReadExt + Unpin>(
                 match reader.read(&mut chunk).await {
                     Ok(0) => break,
                     Ok(n) => {
-                        if n > 0 {
-                            if let Some(stamp) = &last_byte_ms {
-                                stamp.store(elapsed_ms(origin), Ordering::Relaxed);
-                            }
+                        if n > 0
+                            && let Some(stamp) = &last_byte_ms
+                        {
+                            stamp.store(elapsed_ms(origin), Ordering::Relaxed);
                         }
                         if !capped {
                             let room = MAX_CAPTURE_BYTES.saturating_sub(buf.len());
@@ -1683,7 +1683,7 @@ mod tests {
         assert_eq!(output.exit_code, Some(0), "stderr={}", output.stderr);
         let phases = events.lock().unwrap().clone();
         assert!(
-            phases.iter().any(|phase| *phase == WaitPhase::Child),
+            phases.contains(&WaitPhase::Child),
             "expected child progress heartbeats, got {phases:?}"
         );
     }
