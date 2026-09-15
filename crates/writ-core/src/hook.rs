@@ -306,7 +306,6 @@ pub fn validate_bash_command(command: &str) -> Result<()> {
 mod tests {
     use super::*;
     use std::fs;
-    use std::process::Command;
     use tempfile::tempdir;
 
     fn assert_bash_hook_blocks(command: &str, needle: &str) {
@@ -458,38 +457,38 @@ mod tests {
         );
     }
 
+    fn git_stdout(repo: &Path, args: &[&str]) -> String {
+        let output = crate::git_cmd::git_in(repo, args).unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    fn two_commit_repo(repo: &Path) -> (String, String) {
+        git_stdout(repo, &["init", "-b", "main"]);
+        git_stdout(repo, &["config", "user.email", "test@example.com"]);
+        git_stdout(repo, &["config", "user.name", "Test"]);
+        fs::write(repo.join("README"), "one\n").unwrap();
+        git_stdout(repo, &["add", "README"]);
+        git_stdout(repo, &["commit", "-m", "first"]);
+        let first = git_stdout(repo, &["rev-parse", "HEAD"]);
+        fs::write(repo.join("README"), "two\n").unwrap();
+        git_stdout(repo, &["add", "README"]);
+        git_stdout(repo, &["commit", "-m", "second"]);
+        let second = git_stdout(repo, &["rev-parse", "HEAD"]);
+        (first, second)
+    }
+
     #[test]
     fn worktree_create_uses_source_ref_not_ambient_head() {
         let temp = tempdir().unwrap();
         let repo = temp.path().join("repo");
         fs::create_dir(&repo).unwrap();
-        let git = |args: &[&str]| {
-            let output = Command::new("git")
-                .arg("-C")
-                .arg(&repo)
-                .args(args)
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "git {args:?}: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            String::from_utf8_lossy(&output.stdout).trim().to_owned()
-        };
-        git(&["init", "-b", "main"]);
-        git(&["config", "user.email", "test@example.com"]);
-        git(&["config", "user.name", "Test"]);
-        fs::write(repo.join("README"), "one\n").unwrap();
-        git(&["add", "README"]);
-        git(&["commit", "-m", "first"]);
-        let first = git(&["rev-parse", "HEAD"]);
-        fs::write(repo.join("README"), "two\n").unwrap();
-        git(&["add", "README"]);
-        git(&["commit", "-m", "second"]);
-        let second = git(&["rev-parse", "HEAD"]);
+        let (first, second) = two_commit_repo(&repo);
         assert_ne!(first, second);
-
         let runtime = HookRuntime {
             worktree_base: Some(temp.path().join("worktrees")),
             lease_path: Some(temp.path().join("leases.db")),
@@ -506,17 +505,9 @@ mod tests {
         let code = dispatch(&payload, &runtime, &mut stdout, &mut stderr);
         assert_eq!(code, 0, "stderr={}", String::from_utf8_lossy(&stderr));
         let created = String::from_utf8_lossy(&stdout).trim().to_owned();
-        assert!(!created.is_empty());
-        let wt_head = Command::new("git")
-            .arg("-C")
-            .arg(&created)
-            .args(["rev-parse", "HEAD"])
-            .output()
-            .unwrap();
-        assert!(wt_head.status.success());
         assert_eq!(
-            String::from_utf8_lossy(&wt_head.stdout).trim(),
-            first.as_str()
+            git_stdout(Path::new(&created), &["rev-parse", "HEAD"]),
+            first
         );
     }
 
