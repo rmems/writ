@@ -1337,36 +1337,35 @@ mod tests {
         assert_eq!(from_oid.start_commit.as_deref(), Some(full_commit.as_str()));
     }
 
-    #[test]
-    fn create_rejects_ambiguous_unqualified_start_point_without_mutation() {
-        let harness = Harness::sha1();
+    fn setup_divergent_name_collision(harness: &Harness) -> (String, String) {
         let branch_commit = harness.head();
         harness.git(&["branch", "collision", &branch_commit]);
         let tag_commit = harness.commit_file("tag.txt", "tag\n", "tag target");
         harness.git(&["tag", "collision", &tag_commit]);
         harness.git(&["config", "core.warnAmbiguousRefs", "false"]);
+        (branch_commit, tag_commit)
+    }
 
-        let expected_path = harness.job_path("job-ambiguous");
+    #[test]
+    fn create_rejects_ambiguous_unqualified_start_point_without_mutation() {
+        let harness = Harness::sha1();
+        let (branch_commit, tag_commit) = setup_divergent_name_collision(&harness);
         let result = harness.create("job-ambiguous", "feature/selected", "collision");
         match result {
             Err(Error::AmbiguousStartPoint {
                 start_point, refs, ..
             }) => {
                 assert_eq!(start_point, "collision");
-                let names: Vec<&str> = refs.iter().map(|r| r.refname.as_str()).collect();
-                assert!(names.contains(&"refs/heads/collision"), "{names:?}");
-                assert!(names.contains(&"refs/tags/collision"), "{names:?}");
                 let head_hit = refs
                     .iter()
                     .find(|r| r.refname == "refs/heads/collision")
-                    .unwrap();
+                    .expect("heads collision");
                 let tag_hit = refs
                     .iter()
                     .find(|r| r.refname == "refs/tags/collision")
-                    .unwrap();
+                    .expect("tags collision");
                 assert_eq!(head_hit.commit, branch_commit);
                 assert_eq!(tag_hit.commit, tag_commit);
-                assert_ne!(head_hit.commit, tag_hit.commit);
             }
             other => panic!("expected AmbiguousStartPoint, got {other:?}"),
         }
@@ -1378,25 +1377,25 @@ mod tests {
             .trim()
             .is_empty()
         );
-        assert!(!expected_path.exists());
+        assert!(!harness.job_path("job-ambiguous").exists());
+    }
 
-        let decorated = harness.create("job-decorated", "feature/decorated", "collision~1");
-        match decorated {
-            Err(Error::AmbiguousStartPoint { start_point, .. }) => {
-                assert_eq!(start_point, "collision~1");
-            }
-            other => panic!("expected AmbiguousStartPoint for collision~1, got {other:?}"),
-        }
-        assert!(
-            git_output(
-                &harness.repo_root,
-                &["branch", "--list", "feature/decorated"]
-            )
-            .trim()
-            .is_empty()
+    #[test]
+    fn create_rejects_decorated_ambiguous_start_point_without_mutation() {
+        let harness = Harness::sha1();
+        let _ = setup_divergent_name_collision(&harness);
+        assert_create_rejects_start_point_without_mutation(
+            &harness,
+            "collision~1",
+            "job-decorated",
+            "feature/decorated",
         );
-        assert!(!harness.job_path("job-decorated").exists());
+    }
 
+    #[test]
+    fn create_accepts_qualified_collision_refs_and_full_object_id() {
+        let harness = Harness::sha1();
+        let (branch_commit, tag_commit) = setup_divergent_name_collision(&harness);
         let from_heads = harness
             .create("job-heads", "feature/from-heads", "refs/heads/collision")
             .unwrap();
@@ -1404,12 +1403,10 @@ mod tests {
             from_heads.start_commit.as_deref(),
             Some(branch_commit.as_str())
         );
-
         let from_tag = harness
             .create("job-tag", "feature/from-tag", "refs/tags/collision")
             .unwrap();
         assert_eq!(from_tag.start_commit.as_deref(), Some(tag_commit.as_str()));
-
         let from_oid = harness
             .create(
                 "job-oid",
