@@ -9,15 +9,13 @@ use crate::identity::{
     BranchName, BranchRef, CommitId, JobId, Owner, Repo, StartPoint, resolve_start_commit,
 };
 use crate::paths::{canonicalize_for_tools, derive_worktree_path, worktree_base_path};
+use crate::porcelain;
 
 #[derive(Clone, Copy)]
 struct GitArgList<'a>(&'a [&'a str]);
 
 #[derive(Clone, Copy)]
 struct IoContext(&'static str);
-
-#[derive(Clone, Copy)]
-struct PorcelainListing<'a>(&'a str);
 
 #[derive(Clone, Copy)]
 struct PostconditionCause<'a>(&'a str);
@@ -550,9 +548,9 @@ impl CreationPostconditions<'_> {
         actual_branch_ref: BranchRef<'_>,
         head_commit: CommitId<'_>,
     ) -> Result<()> {
-        let listing = git_stdout(
+        let listing = git_stdout_bytes(
             self.repo_root,
-            GitArgList(&["worktree", "list", "--porcelain"]),
+            GitArgList(&["worktree", "list", "--porcelain", "-z"]),
             IoContext("verify created worktree registration"),
         )
         .map_err(|error| {
@@ -561,11 +559,13 @@ impl CreationPostconditions<'_> {
                 PostconditionCause(&error.to_string()),
             )
         })?;
-        if !worktree_registration_matches(
-            PorcelainListing(&listing),
-            self.worktree_path,
-            actual_branch_ref,
-            head_commit,
+        if !porcelain::registration_matches(
+            &listing,
+            porcelain::RegistrationIdentity {
+                path: self.worktree_path,
+                branch_ref: actual_branch_ref,
+                head: head_commit,
+            },
         ) {
             return Err(self.failure(
                 Some(actual_branch_ref),
@@ -612,59 +612,49 @@ fn verify_creation_postconditions(postconditions: CreationPostconditions<'_>) ->
     Ok(head_commit)
 }
 
-fn worktree_registration_matches(
-    listing: PorcelainListing<'_>,
-    expected_path: &Path,
-    expected_branch_ref: BranchRef<'_>,
-    expected_head: CommitId<'_>,
-) -> bool {
-    listing.0.split("\n\n").any(|entry| {
-        let mut path = None;
-        let mut branch = None;
-        let mut head = None;
-        for line in entry.lines() {
-            if let Some(value) = line.strip_prefix("worktree ") {
-                path = Some(Path::new(value));
-            } else if let Some(value) = line.strip_prefix("branch ") {
-                branch = Some(value);
-            } else if let Some(value) = line.strip_prefix("HEAD ") {
-                head = Some(value);
-            }
-        }
-        path == Some(expected_path)
-            && branch == Some(expected_branch_ref.as_str())
-            && head == Some(expected_head.as_str())
-    })
-}
-
-fn git_stdout(repo: &Path, args: GitArgList<'_>, context: IoContext) -> Result<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args.0)
-        .output()
-        .map_err(|e| Error::Io {
-            context: context.0,
-            source: e,
-        })?;
-    if !output.status.success() {
-        return Err(Error::GitCommand {
-            args: args.0.iter().map(|arg| (*arg).to_owned()).collect(),
-            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-        });
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
-}
-
-fn optional_git_stdout(repo: &Path, args: GitArgList<'_>) -> Option<String> {
+fn spawn_git(repo: &Path, args: GitArgList<'_>) -> std::io::Result<std::process::Output> {
     Command::new("git")
         .arg("-C")
         .arg(repo)
         .args(args.0)
         .output()
+}
+
+fn git_output_checked(repo: &Path, args: GitArgList<'_>, context: IoContext) -> Result<Vec<u8>> {
+    let output = spawn_git(repo, args).map_err(|e| Error::Io {
+        context: context.0,
+        source: e,
+    })?;
+    if output.status.success() {
+        return Ok(output.stdout);
+    }
+    Err(Error::GitCommand {
+        args: args.0.iter().map(|arg| (*arg).to_owned()).collect(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+    })
+}
+
+fn trim_stdout(stdout: &[u8]) -> String {
+    String::from_utf8_lossy(stdout).trim().to_owned()
+}
+
+fn git_stdout(repo: &Path, args: GitArgList<'_>, context: IoContext) -> Result<String> {
+    Ok(trim_stdout(&git_output_checked(repo, args, context)?))
+}
+
+fn git_stdout_bytes(repo: &Path, args: GitArgList<'_>, context: IoContext) -> Result<Vec<u8>> {
+    git_output_checked(repo, args, context)
+}
+
+fn optional_git_stdout(repo: &Path, args: GitArgList<'_>) -> Option<String> {
+    optional_git_stdout_bytes(repo, args).map(|stdout| trim_stdout(&stdout))
+}
+
+fn optional_git_stdout_bytes(repo: &Path, args: GitArgList<'_>) -> Option<Vec<u8>> {
+    spawn_git(repo, args)
         .ok()
         .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .map(|output| output.stdout)
 }
 
 struct ResidualState {
@@ -691,14 +681,11 @@ fn inspect_residual_state(
         worktree_path,
         GitArgList(&["rev-parse", "--verify", "HEAD^{commit}"]),
     );
-    let worktree_registered =
-        optional_git_stdout(repo_root, GitArgList(&["worktree", "list", "--porcelain"]))
-            .is_some_and(|listing| {
-                listing.lines().any(|line| {
-                    line.strip_prefix("worktree ")
-                        .is_some_and(|path| Path::new(path) == worktree_path)
-                })
-            });
+    let worktree_registered = optional_git_stdout_bytes(
+        repo_root,
+        GitArgList(&["worktree", "list", "--porcelain", "-z"]),
+    )
+    .is_some_and(|listing| porcelain::path_is_registered(&listing, worktree_path));
     ResidualState {
         path_exists: worktree_path.exists(),
         branch_commit,
@@ -1176,28 +1163,24 @@ mod tests {
     }
 
     #[test]
-    fn registration_identity_requires_matching_path_branch_and_head() {
-        let path = Path::new("/tmp/hive/job");
-        let expected_head = "a".repeat(40);
-        let correct = format!(
-            "worktree /tmp/hive/job\nHEAD {expected_head}\nbranch refs/heads/feature/job\n\n"
+    fn successful_create_reports_registered_residual_state() {
+        let harness = Harness::sha1();
+        let start_commit = harness.head();
+        let wt = harness
+            .create("job-registered", "feature/registered", &start_commit)
+            .unwrap();
+        let residual = inspect_residual_state(
+            &harness.repo_root,
+            &wt.path,
+            BranchName("feature/registered"),
         );
-        let wrong_branch = format!(
-            "worktree /tmp/hive/job\nHEAD {expected_head}\nbranch refs/heads/feature/other\n\n"
+        assert!(residual.path_exists);
+        assert!(residual.worktree_registered);
+        assert_eq!(
+            residual.branch_commit.as_deref(),
+            Some(start_commit.as_str())
         );
-
-        assert!(worktree_registration_matches(
-            PorcelainListing(&correct),
-            path,
-            BranchRef("refs/heads/feature/job"),
-            CommitId(&expected_head),
-        ));
-        assert!(!worktree_registration_matches(
-            PorcelainListing(&wrong_branch),
-            path,
-            BranchRef("refs/heads/feature/job"),
-            CommitId(&expected_head),
-        ));
+        assert_eq!(residual.head_commit.as_deref(), Some(start_commit.as_str()));
     }
 
     #[test]
@@ -1463,5 +1446,56 @@ mod tests {
     fn prune_succeeds_on_a_real_repository() {
         let harness = Harness::sha1();
         harness.manager.prune(&harness.repo_root).unwrap();
+    }
+
+    // Windows rejects newline in directory names (ERROR_INVALID_NAME).
+    // Parser coverage in `porcelain::tests` still runs on every OS.
+    #[cfg(unix)]
+    #[test]
+    fn newline_worktree_path_registers_as_one_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        fs::create_dir(&repo).unwrap();
+        let repo_root = init_test_repo_with_object_format(&repo, None).unwrap();
+        let base = temp.path().join("work\ntrees");
+        let manager = WorktreeManager::with_base(base).unwrap();
+        let start = git_output(&repo_root, &["rev-parse", "HEAD"]);
+        let wt = manager
+            .create_with_request(WorktreeCreateRequest {
+                repo_root: &repo_root,
+                owner: "acme",
+                repo: "test-repo",
+                job_id: "job-nl",
+                branch: "feature/newline",
+                start_point: &start,
+            })
+            .unwrap();
+
+        let listing = Command::new("git")
+            .arg("-C")
+            .arg(&repo_root)
+            .args(["worktree", "list", "--porcelain", "-z"])
+            .output()
+            .unwrap();
+        assert!(listing.status.success());
+        assert!(
+            porcelain::registration_matches(
+                &listing.stdout,
+                porcelain::RegistrationIdentity {
+                    path: &wt.path,
+                    branch_ref: BranchRef("refs/heads/feature/newline"),
+                    head: CommitId(&start),
+                },
+            ),
+            "newline-containing worktree path must stay in one porcelain record"
+        );
+
+        let residual = inspect_residual_state(&repo_root, &wt.path, BranchName("feature/newline"));
+        assert!(
+            residual.worktree_registered,
+            "newline-path creation must report worktree_registered rather than a false postcondition miss"
+        );
+        assert_eq!(wt.start_commit.as_deref(), Some(start.as_str()));
+        assert_eq!(wt.head_commit.as_deref(), Some(start.as_str()));
     }
 }

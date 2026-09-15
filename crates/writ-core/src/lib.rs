@@ -8,6 +8,7 @@ pub mod error;
 pub mod git_safe;
 mod identity;
 pub mod paths;
+mod porcelain;
 pub mod state;
 pub mod status;
 pub mod supervisor;
