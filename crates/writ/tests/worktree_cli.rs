@@ -384,6 +384,26 @@ fn ambiguous_unqualified_start_point_emits_v2_error_without_mutation() {
     assert!(message.contains("collision"), "{message}");
     assert!(message.contains(&branch_commit), "{message}");
     assert!(message.contains(&tag_commit), "{message}");
+
+    reject_without_mutation(
+        &root.0,
+        &repo,
+        &identity_args(
+            &repo,
+            &CreateRequest {
+                job: "decorated",
+                branch: "feature/decorated",
+                start: "collision~1",
+            },
+        ),
+        RejectCase {
+            job: "decorated",
+            branch: "feature/decorated",
+            exit: 1,
+            schema: 2,
+            code: "AMBIGUOUS_START_POINT",
+        },
+    );
 }
 
 #[test]

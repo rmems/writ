@@ -179,10 +179,21 @@ fn dwim_hits_for_unqualified(
     repo_root: &Path,
     start_point: StartPoint<'_>,
 ) -> Result<Vec<AmbiguousRef>> {
-    if start_point_skips_dwim_scan(start_point) {
+    let Some(name) = unqualified_dwim_name(start_point) else {
         return Ok(Vec::new());
+    };
+    collect_dwim_hits(repo_root, name)
+}
+
+fn unqualified_dwim_name(start_point: StartPoint<'_>) -> Option<&str> {
+    if start_point_skips_dwim_scan(start_point) {
+        return None;
     }
-    collect_dwim_hits(repo_root, start_point.as_str())
+    let name = refname_before_selector(start_point.as_str());
+    if name.is_empty() {
+        return None;
+    }
+    Some(name)
 }
 
 fn start_point_skips_dwim_scan(start_point: StartPoint<'_>) -> bool {
@@ -194,6 +205,22 @@ fn start_point_skips_dwim_scan(start_point: StartPoint<'_>) -> bool {
         Some(prefix) => prefix.as_str().len() == text.len(),
         None => false,
     }
+}
+
+/// Strip commit-ish decorations (`~`, `^`, `@{`) so `collision~1` still
+/// collides with `refs/heads/collision` and `refs/tags/collision`.
+fn refname_before_selector(text: &str) -> &str {
+    let mut end = text.len();
+    if let Some(i) = text.find('~') {
+        end = end.min(i);
+    }
+    if let Some(i) = text.find('^') {
+        end = end.min(i);
+    }
+    if let Some(i) = text.find("@{") {
+        end = end.min(i);
+    }
+    &text[..end]
 }
 
 fn collect_dwim_hits(repo_root: &Path, name: &str) -> Result<Vec<AmbiguousRef>> {
@@ -481,6 +508,22 @@ mod tests {
         assert!(!start_point_skips_dwim_scan(StartPoint("main")));
     }
 
+    #[test]
+    fn decorations_are_stripped_before_dwim_scan() {
+        assert_eq!(refname_before_selector("collision~1"), "collision");
+        assert_eq!(refname_before_selector("collision^0"), "collision");
+        assert_eq!(refname_before_selector("collision^{commit}"), "collision");
+        assert_eq!(refname_before_selector("collision@{0}"), "collision");
+        assert_eq!(
+            unqualified_dwim_name(StartPoint("collision~1")),
+            Some("collision")
+        );
+        assert_eq!(
+            unqualified_dwim_name(StartPoint("refs/heads/collision~1")),
+            None
+        );
+    }
+
     struct CollisionRepo {
         _temp: tempfile::TempDir,
         repo: std::path::PathBuf,
@@ -557,6 +600,7 @@ mod tests {
         let repo = CollisionRepo::with_divergent_commits();
         git(&repo.repo, &["config", "core.warnAmbiguousRefs", "false"]);
         assert_ambiguous(repo.resolve("collision"), "collision");
+        assert_ambiguous(repo.resolve("collision~1"), "collision~1");
     }
 
     #[test]

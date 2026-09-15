@@ -1380,6 +1380,23 @@ mod tests {
         );
         assert!(!expected_path.exists());
 
+        let decorated = harness.create("job-decorated", "feature/decorated", "collision~1");
+        match decorated {
+            Err(Error::AmbiguousStartPoint { start_point, .. }) => {
+                assert_eq!(start_point, "collision~1");
+            }
+            other => panic!("expected AmbiguousStartPoint for collision~1, got {other:?}"),
+        }
+        assert!(
+            git_output(
+                &harness.repo_root,
+                &["branch", "--list", "feature/decorated"]
+            )
+            .trim()
+            .is_empty()
+        );
+        assert!(!harness.job_path("job-decorated").exists());
+
         let from_heads = harness
             .create("job-heads", "feature/from-heads", "refs/heads/collision")
             .unwrap();
