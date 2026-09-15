@@ -97,14 +97,14 @@ Skill directories are not standardized. Common roots include `~/.agents/skills`,
 
 ## Quick start
 
-Until M1 hooks land, every mutating command must go through `writ` on purpose.
+Until M1 hooks land, git and GitHub commands that `writ` can admit must go through `writ` on purpose. Merge is not among them: the runtime has no merge path. A primary agent may perform one human-authorized merge only through the host connector, after the [protocol in `AGENTS.md`](AGENTS.md#human-authorized-one-shot-merge-protocol).
 
 1. Install the binary and skill as above.
-2. Isolate a job worktree from a known start point (never from a dirty ambient `HEAD`):
+2. Isolate a job worktree from a known start point (never from a dirty ambient `HEAD`). `acme` / `example-org` are sandbox path segments; they must match the GitHub slug you pass to `gh-safe`, not this repository's clone path:
 
    ```bash
    writ --json worktree create --schema-version 2 \
-     --repo "$HOME/src/writ" --start-point origin/main \
+     --repo /path/to/repo --start-point origin/main \
      acme example-org job-42 hive/issue-42-example
    ```
 
@@ -121,7 +121,7 @@ Until M1 hooks land, every mutating command must go through `writ` on purpose.
    writ --json status
    ```
 
-Do not expect a `discover` → `add` → `check-all` → `list` hive loop. Those were scaffold-era skill stubs and were removed with the Python orchestrator. Current operator flow is: isolate a worktree, implement in that tree, open a PR, optionally hand it to `babysit-pr`, and leave the merge to a human.
+Do not expect a `discover` → `add` → `check-all` → `list` hive loop. Those were scaffold-era skill stubs and were removed with the Python orchestrator. Current operator flow is: isolate a worktree, implement in that tree, open a PR, optionally hand it to `babysit-pr`, and leave the merge to a human — or to an explicitly authorized one-shot merge through the host connector.
 
 ## Architecture
 
@@ -195,7 +195,7 @@ Implemented `writ` surface (`writ --help` is authoritative):
 | `writ status` / `writ jobs` | Implemented (read-only) | Show watched jobs. Empty unless an external process wrote the state file. See [`docs/status-schema.md`](docs/status-schema.md). |
 | `writ git-safe …` | Implemented | Run a git command after the allowlist and, for mutations, expected-branch checks. |
 | `writ gh-safe …` | Implemented | Run a `gh` command after the allowlist. Merge operations are rejected. |
-| `writ supervisor run --timeout <secs> …` | Implemented | Spawn a child with wall-clock timeout and process-group isolation. |
+| `writ supervisor run --timeout <secs> …` | Implemented | Spawn a child with wall-clock timeout. Unix kills the process group; Windows kills only the direct child (grandchildren may survive). |
 | `writ worktree create\|list\|remove\|prune` | Implemented | Isolated worktree lifecycle. `create` requires `--schema-version 2` and `--start-point`. |
 | `writ --json` | Implemented | Version-1 JSON envelopes on stdout; diagnostics on stderr. Fixtures: [`docs/examples/`](docs/examples/). |
 | `writ install` / hook dispatcher | **Planned (M1)** | Register unbypassable hooks. Not a command today. |
