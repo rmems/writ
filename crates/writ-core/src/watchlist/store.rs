@@ -136,7 +136,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), WatchlistError> {
         file.write_all(b"\n")?;
         file.sync_all()?;
         set_private_mode(&tmp)?;
-        fs::rename(&tmp, path)?;
+        replace_file(&tmp, path)?;
         set_private_mode(path)?;
         Ok(())
     })();
@@ -149,6 +149,23 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), WatchlistError> {
         path: path.to_path_buf(),
         source: err,
     })
+}
+
+/// Replace `to` with `from`. POSIX `rename` replaces a file atomically. On
+/// Windows, remove the destination first so an existing `watchlist.json` does
+/// not make the write fail.
+fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        if to.exists() {
+            fs::remove_file(to)?;
+        }
+        fs::rename(from, to)
+    }
+    #[cfg(not(windows))]
+    {
+        fs::rename(from, to)
+    }
 }
 
 fn set_private_mode(path: &Path) -> io::Result<()> {

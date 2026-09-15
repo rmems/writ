@@ -9,7 +9,8 @@ use serde::Deserialize;
 use super::WatchlistError;
 use super::schema::{StackGroup, WatchEntry, WatchKind, WatchStatus, Watchlist, owner_of_repo};
 use super::store::{
-    load_allowed_owners, load_watchlist, mutate_watchlist, owner_is_allowed, utc_now_rfc3339,
+    load_allowed_owners, load_watchlist, mutate_watchlist, owner_is_allowed, save_watchlist,
+    utc_now_rfc3339,
 };
 use crate::git_safe::SafeGhCommand;
 
@@ -295,8 +296,40 @@ pub fn check_prs(
     numbers: Option<&[u64]>,
     allowed_owners: &[String],
 ) -> Result<CheckReport, WatchlistError> {
-    let now = utc_now_rfc3339();
-    let mut targets: Vec<(String, u64)> = ordered_identities(list)
+    let targets = select_check_targets(list, owner, repo, numbers, allowed_owners)?;
+    refresh_targets(list, probe, &targets)
+}
+
+fn select_check_targets(
+    list: &Watchlist,
+    owner: Option<&str>,
+    repo: Option<&str>,
+    numbers: Option<&[u64]>,
+    allowed_owners: &[String],
+) -> Result<Vec<(String, u64)>, WatchlistError> {
+    if repo.is_none() && owner.is_none() && numbers.is_none() {
+        if allowed_owners.is_empty() {
+            return Err(WatchlistError::AllowlistRequired);
+        }
+    } else if !allowed_owners.is_empty() {
+        if let Some(repo) = repo
+            && let Some(have) = owner_of_repo(repo)
+            && !owner_is_allowed(have, allowed_owners)
+        {
+            return Err(WatchlistError::OwnerNotAllowed {
+                owner: have.to_owned(),
+            });
+        }
+        if let Some(owner) = owner
+            && !owner_is_allowed(owner, allowed_owners)
+        {
+            return Err(WatchlistError::OwnerNotAllowed {
+                owner: owner.to_owned(),
+            });
+        }
+    }
+
+    Ok(ordered_identities(list)
         .into_iter()
         .filter(|(target_repo, number)| {
             repo.is_none_or(|want| target_repo == want)
@@ -305,60 +338,98 @@ pub fn check_prs(
                 })
                 && numbers.is_none_or(|want| want.contains(number))
         })
-        .collect();
+        .filter(|(target_repo, _)| {
+            if repo.is_none() && owner.is_none() && numbers.is_none() {
+                owner_of_repo(target_repo)
+                    .is_some_and(|have| owner_is_allowed(have, allowed_owners))
+            } else {
+                true
+            }
+        })
+        .collect())
+}
 
-    if repo.is_none() && owner.is_none() && numbers.is_none() {
-        // Multi-owner check-all requires an allowlist.
-        if allowed_owners.is_empty() {
-            return Err(WatchlistError::AllowlistRequired);
-        }
-        targets.retain(|(target_repo, _)| {
-            owner_of_repo(target_repo).is_some_and(|have| owner_is_allowed(have, allowed_owners))
-        });
-    } else if !allowed_owners.is_empty() {
-        targets.retain(|(target_repo, _)| {
-            owner_of_repo(target_repo).is_some_and(|have| owner_is_allowed(have, allowed_owners))
-        });
-    }
-
+fn refresh_targets(
+    list: &mut Watchlist,
+    probe: &impl PrProbe,
+    targets: &[(String, u64)],
+) -> Result<CheckReport, WatchlistError> {
+    let now = utc_now_rfc3339();
     let mut pruned = Vec::new();
     let mut checked = Vec::new();
     for (target_repo, number) in targets {
-        match probe.view(&target_repo, number) {
-            Ok(snapshot) => {
-                let github_state = snapshot.state.to_ascii_uppercase();
-                if github_state == "MERGED" || github_state == "CLOSED" {
-                    let _ = remove_pr(list, &target_repo, number);
-                    pruned.push((target_repo, number, snapshot.state));
-                    continue;
-                }
-                let (status, blockers) = classify_snapshot(&snapshot);
-                if let Some(entry) = list.get_mut(&target_repo, number) {
-                    entry.branch = snapshot.branch;
-                    entry.base = Some(snapshot.base);
-                    entry.title = Some(snapshot.title);
-                    entry.url = Some(snapshot.url);
-                    entry.status = status;
-                    entry.residual_blockers = blockers;
-                    entry.last_checked = now.clone();
-                    entry.check_count = Some(entry.check_count.unwrap_or(0).saturating_add(1));
-                    checked.push(entry.clone());
-                }
-            }
-            Err(WatchlistError::Timeout { .. }) => {
-                if let Some(entry) = list.get_mut(&target_repo, number) {
-                    entry.status = WatchStatus::Timeout;
-                    entry.residual_blockers = vec!["timeout:gh".to_owned()];
-                    entry.last_checked = now.clone();
-                    entry.check_count = Some(entry.check_count.unwrap_or(0).saturating_add(1));
-                    checked.push(entry.clone());
-                }
-            }
-            Err(err) => return Err(err),
+        match refresh_one(list, probe, target_repo, *number, &now)? {
+            RefreshOutcome::Checked(entry) => checked.push(*entry),
+            RefreshOutcome::Pruned {
+                repo,
+                number,
+                state,
+            } => pruned.push((repo, number, state)),
         }
     }
     detect_stacks(list);
     Ok(CheckReport { checked, pruned })
+}
+
+enum RefreshOutcome {
+    Checked(Box<WatchEntry>),
+    Pruned {
+        repo: String,
+        number: u64,
+        state: String,
+    },
+}
+
+fn refresh_one(
+    list: &mut Watchlist,
+    probe: &impl PrProbe,
+    target_repo: &str,
+    number: u64,
+    now: &str,
+) -> Result<RefreshOutcome, WatchlistError> {
+    match probe.view(target_repo, number) {
+        Ok(snapshot) => {
+            let github_state = snapshot.state.to_ascii_uppercase();
+            if github_state == "MERGED" || github_state == "CLOSED" {
+                let _ = remove_pr(list, target_repo, number);
+                return Ok(RefreshOutcome::Pruned {
+                    repo: target_repo.to_owned(),
+                    number,
+                    state: snapshot.state,
+                });
+            }
+            let (status, blockers) = classify_snapshot(&snapshot);
+            let Some(entry) = list.get_mut(target_repo, number) else {
+                return Err(WatchlistError::NotFound {
+                    repo: target_repo.to_owned(),
+                    number,
+                });
+            };
+            entry.branch = snapshot.branch;
+            entry.base = Some(snapshot.base);
+            entry.title = Some(snapshot.title);
+            entry.url = Some(snapshot.url);
+            entry.status = status;
+            entry.residual_blockers = blockers;
+            entry.last_checked = now.to_owned();
+            entry.check_count = Some(entry.check_count.unwrap_or(0).saturating_add(1));
+            Ok(RefreshOutcome::Checked(Box::new(entry.clone())))
+        }
+        Err(WatchlistError::Timeout { .. }) => {
+            let Some(entry) = list.get_mut(target_repo, number) else {
+                return Err(WatchlistError::NotFound {
+                    repo: target_repo.to_owned(),
+                    number,
+                });
+            };
+            entry.status = WatchStatus::Timeout;
+            entry.residual_blockers = vec!["timeout:gh".to_owned()];
+            entry.last_checked = now.to_owned();
+            entry.check_count = Some(entry.check_count.unwrap_or(0).saturating_add(1));
+            Ok(RefreshOutcome::Checked(Box::new(entry.clone())))
+        }
+        Err(err) => Err(err),
+    }
 }
 
 /// Persist `add_prs` against `path`.
@@ -406,9 +477,29 @@ pub fn check_prs_at(
     let owners = allowed_owners
         .map(ToOwned::to_owned)
         .unwrap_or_else(load_allowed_owners);
-    mutate_watchlist(path, |list| {
-        check_prs(list, probe, owner, repo, numbers, &owners)
-    })
+    let mut list = load_watchlist(path)?;
+    let targets = select_check_targets(&list, owner, repo, numbers, &owners)?;
+    let now = utc_now_rfc3339();
+    let mut pruned = Vec::new();
+    let mut checked = Vec::new();
+    for (target_repo, number) in targets {
+        match refresh_one(&mut list, probe, &target_repo, number, &now) {
+            Ok(RefreshOutcome::Checked(entry)) => checked.push(*entry),
+            Ok(RefreshOutcome::Pruned {
+                repo,
+                number,
+                state,
+            }) => pruned.push((repo, number, state)),
+            Err(err) => {
+                detect_stacks(&mut list);
+                save_watchlist(path, &list)?;
+                return Err(err);
+            }
+        }
+        detect_stacks(&mut list);
+        save_watchlist(path, &list)?;
+    }
+    Ok(CheckReport { checked, pruned })
 }
 
 /// Read-only import from a pr-babysit `watched-prs.json`. The source file is
@@ -534,10 +625,12 @@ pub(crate) fn classify_snapshot(snapshot: &PrSnapshot) -> (WatchStatus, Vec<Stri
         let state = check.state.to_ascii_uppercase();
         if matches!(
             state.as_str(),
-            "FAILURE" | "FAIL" | "ERROR" | "TIMED_OUT" | "ACTION_REQUIRED" | "CANCELLED"
+            "FAILURE" | "FAIL" | "ERROR" | "TIMED_OUT" | "CANCELLED"
         ) {
             failed = true;
             blockers.push(format!("class_a:{}", sanitize_token(&check.name)));
+        } else if state == "ACTION_REQUIRED" {
+            blockers.push(format!("class_b:{}", sanitize_token(&check.name)));
         } else if matches!(
             state.as_str(),
             "PENDING" | "IN_PROGRESS" | "QUEUED" | "EXPECTED" | "UNKNOWN"
@@ -556,7 +649,7 @@ pub(crate) fn classify_snapshot(snapshot: &PrSnapshot) -> (WatchStatus, Vec<Stri
 
     if failed {
         (WatchStatus::Failed, blockers)
-    } else if pending {
+    } else if pending || (snapshot.checks.is_empty() && blockers.is_empty()) {
         (WatchStatus::Pending, blockers)
     } else if !blockers.is_empty() {
         (WatchStatus::Residual, blockers)
@@ -624,41 +717,48 @@ fn ordered_identities(list: &Watchlist) -> Vec<(String, u64)> {
 }
 
 fn detect_stacks(list: &mut Watchlist) {
-    for index in 0..list.prs.len() {
-        let Some(base) = list.prs[index].base.clone() else {
+    let n = list.prs.len();
+    let mut parent: Vec<Option<usize>> = vec![None; n];
+    for (i, entry) in list.prs.iter().enumerate() {
+        let Some(base) = entry.base.as_deref() else {
             continue;
         };
-        let repo = list.prs[index].repo.clone();
-        let parent = list
-            .prs
-            .iter()
-            .enumerate()
-            .find(|(other, entry)| *other != index && entry.repo == repo && entry.branch == base)
-            .map(|(_, entry)| {
-                (
-                    entry.stack_id.clone(),
-                    entry.stack_position.unwrap_or(0),
-                    entry.number,
-                )
-            });
-        let Some((parent_stack, parent_pos, parent_number)) = parent else {
+        parent[i] = list.prs.iter().enumerate().find_map(|(j, other)| {
+            (j != i && other.repo == entry.repo && other.branch == base).then_some(j)
+        });
+    }
+    let mut has_child = vec![false; n];
+    for parent_idx in parent.iter().flatten() {
+        has_child[*parent_idx] = true;
+    }
+    let preserved: Vec<Option<String>> = list
+        .prs
+        .iter()
+        .map(|entry| entry.stack_id.clone().filter(|id| !id.is_empty()))
+        .collect();
+
+    for i in 0..n {
+        if parent[i].is_none() && !has_child[i] {
+            list.prs[i].stack_id = None;
+            list.prs[i].stack_position = None;
             continue;
-        };
-        let stack_id = parent_stack.unwrap_or_else(|| format!("{repo}#{parent_number}"));
-        if list.prs[index]
-            .stack_id
-            .as_ref()
-            .is_none_or(|id| id.is_empty())
-        {
-            list.prs[index].stack_id = Some(stack_id.clone());
-            list.prs[index].stack_position = Some(parent_pos.saturating_add(1));
         }
-        if let Some(parent_entry) = list.prs.iter_mut().find(|entry| {
-            entry.repo == repo && entry.number == parent_number && entry.stack_id.is_none()
-        }) {
-            parent_entry.stack_id = Some(stack_id);
-            parent_entry.stack_position = Some(parent_pos);
+        let mut root = i;
+        let mut pos = 0_u32;
+        let mut seen = vec![false; n];
+        while let Some(next) = parent[root] {
+            if seen[root] {
+                break;
+            }
+            seen[root] = true;
+            root = next;
+            pos = pos.saturating_add(1);
         }
+        let stack_id = preserved[root]
+            .clone()
+            .unwrap_or_else(|| format!("{}#{}", list.prs[root].repo, list.prs[root].number));
+        list.prs[i].stack_id = Some(stack_id);
+        list.prs[i].stack_position = Some(pos);
     }
     rebuild_groups(list);
 }
@@ -723,7 +823,10 @@ mod tests {
             state: "OPEN".to_owned(),
             mergeable: Some("MERGEABLE".to_owned()),
             review_decision: None,
-            checks: Vec::new(),
+            checks: vec![CheckSnapshot {
+                name: "ci".to_owned(),
+                state: "SUCCESS".to_owned(),
+            }],
         }
     }
 
@@ -929,6 +1032,105 @@ mod tests {
         let (status, blockers) = classify_snapshot(&snap);
         assert_eq!(status, WatchStatus::Failed);
         assert_eq!(blockers, vec!["class_a:ci___test".to_owned()]);
+
+        snap.checks = vec![CheckSnapshot {
+            name: "codacy".to_owned(),
+            state: "ACTION_REQUIRED".to_owned(),
+        }];
+        let (status, blockers) = classify_snapshot(&snap);
+        assert_eq!(status, WatchStatus::Residual);
+        assert_eq!(blockers, vec!["class_b:codacy".to_owned()]);
+    }
+
+    #[test]
+    fn classify_empty_rollup_is_pending() {
+        let mut snap = open_snap("acme/widgets", 1, "feat/a", "main");
+        snap.checks.clear();
+        let (status, blockers) = classify_snapshot(&snap);
+        assert_eq!(status, WatchStatus::Pending);
+        assert!(blockers.is_empty());
+
+        snap.review_decision = Some("REVIEW_REQUIRED".to_owned());
+        let (status, blockers) = classify_snapshot(&snap);
+        assert_eq!(status, WatchStatus::Residual);
+        assert_eq!(blockers, vec!["review:review_required".to_owned()]);
+    }
+
+    #[test]
+    fn three_deep_stack_is_stable_regardless_of_add_order() {
+        let mut probe = MapProbe {
+            snaps: BTreeMap::new(),
+        };
+        probe.snaps.insert(
+            ("acme/widgets".to_owned(), 3),
+            open_snap("acme/widgets", 3, "feat/top", "feat/mid"),
+        );
+        probe.snaps.insert(
+            ("acme/widgets".to_owned(), 2),
+            open_snap("acme/widgets", 2, "feat/mid", "feat/base"),
+        );
+        probe.snaps.insert(
+            ("acme/widgets".to_owned(), 1),
+            open_snap("acme/widgets", 1, "feat/base", "main"),
+        );
+        let mut list = Watchlist::default();
+        add_prs(
+            &mut list,
+            &probe,
+            "acme/widgets",
+            &[3, 2, 1],
+            WatchKind::PrBabysit,
+            false,
+            &[],
+        )
+        .unwrap();
+        let bottom = list.get("acme/widgets", 1).unwrap();
+        let mid = list.get("acme/widgets", 2).unwrap();
+        let top = list.get("acme/widgets", 3).unwrap();
+        assert_eq!(bottom.stack_id, mid.stack_id);
+        assert_eq!(mid.stack_id, top.stack_id);
+        assert_eq!(bottom.stack_position, Some(0));
+        assert_eq!(mid.stack_position, Some(1));
+        assert_eq!(top.stack_position, Some(2));
+        let group = list.groups.get(bottom.stack_id.as_ref().unwrap()).unwrap();
+        assert_eq!(group.numbers, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn filtered_check_rejects_disallowed_owner() {
+        let probe = MapProbe {
+            snaps: BTreeMap::new(),
+        };
+        let mut list = Watchlist::default();
+        list.prs.push(WatchEntry {
+            repo: "evil/repo".to_owned(),
+            number: 1,
+            branch: "feat/x".to_owned(),
+            status: WatchStatus::Pending,
+            last_checked: "2026-01-01T00:00:00Z".to_owned(),
+            fix_count: 0,
+            residual_blockers: Vec::new(),
+            stack_id: None,
+            stack_type: None,
+            stack_position: None,
+            base: None,
+            title: None,
+            added_at: None,
+            check_count: Some(0),
+            url: None,
+            kind: None,
+            extra: serde_json::Map::new(),
+        });
+        let err = check_prs(
+            &mut list,
+            &probe,
+            None,
+            Some("evil/repo"),
+            None,
+            &["acme".to_owned()],
+        )
+        .unwrap_err();
+        assert!(matches!(err, WatchlistError::OwnerNotAllowed { .. }));
     }
 
     #[test]
@@ -968,5 +1170,92 @@ mod tests {
         assert_eq!(list.prs.len(), 2);
         assert_eq!(list.filtered(Some("acme"), None).len(), 1);
         assert_eq!(list.filtered(None, Some("example-org/core")).len(), 1);
+    }
+
+    struct FailSecondProbe {
+        first: PrSnapshot,
+    }
+
+    impl PrProbe for FailSecondProbe {
+        fn view(&self, repo: &str, number: u64) -> Result<PrSnapshot, WatchlistError> {
+            if number == 1 {
+                Ok(self.first.clone())
+            } else {
+                Err(WatchlistError::Gh {
+                    repo: repo.to_owned(),
+                    number,
+                    message: "boom".to_owned(),
+                })
+            }
+        }
+    }
+
+    #[test]
+    fn check_persists_completed_entries_before_gh_failure() {
+        let dir = std::env::temp_dir().join(format!(
+            "watchlist-partial-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("watchlist.json");
+        let mut list = Watchlist::default();
+        list.prs.push(WatchEntry {
+            repo: "acme/widgets".to_owned(),
+            number: 1,
+            branch: "feat/a".to_owned(),
+            status: WatchStatus::Pending,
+            last_checked: "2026-01-01T00:00:00Z".to_owned(),
+            fix_count: 0,
+            residual_blockers: Vec::new(),
+            stack_id: None,
+            stack_type: None,
+            stack_position: None,
+            base: None,
+            title: None,
+            added_at: None,
+            check_count: Some(0),
+            url: None,
+            kind: None,
+            extra: serde_json::Map::new(),
+        });
+        list.prs.push(WatchEntry {
+            repo: "acme/widgets".to_owned(),
+            number: 2,
+            branch: "feat/b".to_owned(),
+            status: WatchStatus::Pending,
+            last_checked: "2026-01-01T00:00:00Z".to_owned(),
+            fix_count: 0,
+            residual_blockers: Vec::new(),
+            stack_id: None,
+            stack_type: None,
+            stack_position: None,
+            base: None,
+            title: None,
+            added_at: None,
+            check_count: Some(0),
+            url: None,
+            kind: None,
+            extra: serde_json::Map::new(),
+        });
+        crate::watchlist::save_watchlist(&path, &list).unwrap();
+        let probe = FailSecondProbe {
+            first: open_snap("acme/widgets", 1, "feat/a", "main"),
+        };
+        let err =
+            check_prs_at(&path, &probe, None, Some("acme/widgets"), None, Some(&[])).unwrap_err();
+        assert!(matches!(err, WatchlistError::Gh { number: 2, .. }));
+        let loaded = crate::watchlist::load_watchlist(&path).unwrap();
+        let first = loaded.get("acme/widgets", 1).unwrap();
+        assert_eq!(first.status, WatchStatus::Healthy);
+        assert_eq!(first.check_count, Some(1));
+        assert_eq!(
+            loaded.get("acme/widgets", 2).unwrap().status,
+            WatchStatus::Pending
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -89,7 +89,7 @@ Unknown additive fields on the document or on an entry are preserved on write.
 | Value | Meaning |
 | --- | --- |
 | `healthy` | Checks passed, no residuals |
-| `pending` | Checks still running |
+| `pending` | Checks still running, or GitHub returned no status checks yet |
 | `failed` | At least one failing check (`class_a:…`) |
 | `residual` | Leftovers such as review (`review:…`) or class B/C |
 | `conflict` | GitHub `mergeable=CONFLICTING` |
@@ -118,7 +118,8 @@ the allowlist is set and does not include that owner.
 
 ## Integrity
 
-- Writes are a temp file in the same directory plus `rename`.
+- Writes are a temp file in the same directory plus `rename`. On Windows the
+  destination is removed first so an existing file can be replaced.
 - Missing file → empty watchlist (not an error).
 - Corrupt JSON → quarantine to `watchlist.json.corrupt.<stamp>`, warn, exit
   non-zero. The next command sees a missing file (empty list). The original
