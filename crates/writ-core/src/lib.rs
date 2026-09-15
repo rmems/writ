@@ -3,6 +3,7 @@
 //! The module boundaries are established in the R1 scaffold. Their behavior is
 //! implemented by the linked foundation issues.
 
+pub mod claim;
 pub mod contract;
 pub mod error;
 pub mod git_safe;

@@ -161,6 +161,45 @@ impl WorktreeManager {
         })
     }
 
+    /// Check out an existing branch in a new worktree without renaming it.
+    ///
+    /// The branch must already exist, must currently point at the resolved
+    /// `start_point`, and must not be checked out in another worktree. This is
+    /// the PR-babysit path: attach to the published head as-is.
+    pub fn attach_with_request(&self, request: WorktreeCreateRequest<'_>) -> Result<Worktree> {
+        let branch = BranchName(request.branch);
+        let start_point = StartPoint(request.start_point);
+        validate_worktree_branch(branch)?;
+        let base = self.base_path()?;
+        validate_repo_root(request.repo_root)?;
+
+        let start_commit = resolve_start_commit(request.repo_root, start_point)?;
+        let worktree_path = prepare_worktree_path(
+            base,
+            Owner(request.owner),
+            Repo(request.repo),
+            JobId(request.job_id),
+        )?;
+        reject_existing_job_path(&worktree_path)?;
+        require_existing_branch_at_commit(&request, CommitId(&start_commit))?;
+        add_existing_worktree(&request, &worktree_path)?;
+
+        let head_commit = verify_creation_postconditions(CreationPostconditions {
+            repo_root: request.repo_root,
+            worktree_path: &worktree_path,
+            expected_branch: branch,
+            expected_commit: CommitId(&start_commit),
+        })?;
+
+        Ok(Worktree {
+            path: worktree_path,
+            branch: request.branch.to_owned(),
+            repo_root: request.repo_root.to_path_buf(),
+            start_commit: Some(start_commit),
+            head_commit: Some(head_commit),
+        })
+    }
+
     /// List all hive worktrees under the base path.
     pub fn list(&self) -> Result<Vec<Worktree>> {
         let base = self.base_path()?;
@@ -366,6 +405,72 @@ fn validate_repo_root(repo_root: &Path) -> Result<()> {
     })
 }
 
+fn reject_existing_job_path(worktree_path: &Path) -> Result<()> {
+    if worktree_path.exists() {
+        return Err(Error::PolicyViolation {
+            code: PolicyCode::WorktreeAlreadyClaimed,
+            message: format!(
+                "worktree already exists for this job: {}",
+                worktree_path.display()
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn require_existing_branch_at_commit(
+    request: &WorktreeCreateRequest<'_>,
+    start_commit: CommitId<'_>,
+) -> Result<()> {
+    let branch = BranchName(request.branch);
+    if !branch_exists_in_repo(request.repo_root, branch)? {
+        return Err(Error::PolicyViolation {
+            code: PolicyCode::WorktreeAttachMissingBranch,
+            message: format!(
+                "refusing to attach missing branch {:?} at requested commit {}",
+                branch.as_str(),
+                start_commit.as_str()
+            ),
+        });
+    }
+    let branch_ref = format!("refs/heads/{}^{{commit}}", branch.as_str());
+    let branch_commit = git_stdout(
+        request.repo_root,
+        GitArgList(&["rev-parse", "--verify", "--end-of-options", &branch_ref]),
+        IoContext("verify existing branch commit for attach"),
+    )?;
+    if branch_commit != start_commit.as_str() {
+        return Err(Error::PolicyViolation {
+            code: PolicyCode::WorktreeAttachMismatch,
+            message: format!(
+                "existing branch {:?} is at {branch_commit} but start_point resolved to {}",
+                branch.as_str(),
+                start_commit.as_str()
+            ),
+        });
+    }
+    if branch_is_checked_out(request.repo_root, branch)? {
+        return Err(Error::PolicyViolation {
+            code: PolicyCode::WorktreeBranchInUse,
+            message: format!(
+                "branch {:?} is already checked out in another worktree",
+                branch.as_str()
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn branch_is_checked_out(repo_root: &Path, branch: BranchName<'_>) -> Result<bool> {
+    let listing = git_stdout(
+        repo_root,
+        GitArgList(&["worktree", "list", "--porcelain"]),
+        IoContext("list worktrees for attach occupancy"),
+    )?;
+    let expected = format!("branch refs/heads/{}", branch.as_str());
+    Ok(listing.lines().any(|line| line == expected))
+}
+
 fn reject_unproven_resume(
     request: &WorktreeCreateRequest<'_>,
     start_commit: CommitId<'_>,
@@ -406,6 +511,39 @@ fn add_worktree(
         .output()
         .map_err(|e| Error::Io {
             context: "spawn git worktree add",
+            source: e,
+        })?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+    let residual = inspect_residual_state(request.repo_root, worktree_path, branch);
+    Err(Error::WorktreeCreationFailed(Box::new(
+        WorktreeCreationFailure {
+            path: worktree_path.to_path_buf(),
+            branch: branch.as_str().to_owned(),
+            path_exists: residual.path_exists,
+            branch_commit: residual.branch_commit,
+            head_commit: residual.head_commit,
+            worktree_registered: residual.worktree_registered,
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        },
+    )))
+}
+
+fn add_existing_worktree(request: &WorktreeCreateRequest<'_>, worktree_path: &Path) -> Result<()> {
+    let branch = BranchName(request.branch);
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(request.repo_root)
+        .arg("worktree")
+        .arg("add")
+        .arg("--")
+        .arg(worktree_path)
+        .arg(branch.as_str())
+        .output()
+        .map_err(|e| Error::Io {
+            context: "spawn git worktree add for existing branch",
             source: e,
         })?;
 
@@ -991,6 +1129,16 @@ mod tests {
                 .create_with_request(self.request(job_id, branch, start_point))
         }
 
+        fn attach<'a>(
+            &'a self,
+            job_id: &'a str,
+            branch: &'a str,
+            start_point: &'a str,
+        ) -> Result<Worktree> {
+            self.manager
+                .attach_with_request(self.request(job_id, branch, start_point))
+        }
+
         fn job_path(&self, job_id: &str) -> PathBuf {
             self.manager
                 .base_path()
@@ -1463,5 +1611,122 @@ mod tests {
     fn prune_succeeds_on_a_real_repository() {
         let harness = Harness::sha1();
         harness.manager.prune(&harness.repo_root).unwrap();
+    }
+
+    #[test]
+    fn attach_checks_out_existing_branch_without_renaming() {
+        let harness = Harness::sha1();
+        let start_commit = harness.head();
+        harness.git(&["branch", "feature/pr-head", &start_commit]);
+        let wt = harness
+            .attach("job-attach", "feature/pr-head", &start_commit)
+            .unwrap();
+
+        assert_eq!(wt.branch, "feature/pr-head");
+        assert_eq!(wt.start_commit.as_deref(), Some(start_commit.as_str()));
+        assert_eq!(wt.head_commit.as_deref(), Some(start_commit.as_str()));
+        assert_eq!(
+            git_output(&wt.path, &["symbolic-ref", "--quiet", "HEAD"]),
+            "refs/heads/feature/pr-head"
+        );
+        assert_eq!(
+            git_output(
+                &harness.repo_root,
+                &["rev-parse", "refs/heads/feature/pr-head"]
+            ),
+            start_commit
+        );
+    }
+
+    #[test]
+    fn attach_rejects_missing_branch_without_creating_a_worktree() {
+        let harness = Harness::sha1();
+        let start_commit = harness.head();
+        let result = harness.attach("job-missing", "feature/missing", &start_commit);
+        assert!(matches!(
+            result,
+            Err(Error::PolicyViolation {
+                code: PolicyCode::WorktreeAttachMissingBranch,
+                ..
+            })
+        ));
+        assert!(!harness.job_path("job-missing").exists());
+    }
+
+    #[test]
+    fn attach_rejects_branch_tip_mismatch_without_moving_the_branch() {
+        let harness = Harness::sha1();
+        let original = harness.head();
+        harness.git(&["branch", "feature/mismatch", &original]);
+        let later = harness.commit_file("later.txt", "moved\n", "advance HEAD");
+        let result = harness.attach("job-mismatch", "feature/mismatch", &later);
+        assert!(matches!(
+            result,
+            Err(Error::PolicyViolation {
+                code: PolicyCode::WorktreeAttachMismatch,
+                ..
+            })
+        ));
+        assert_eq!(
+            harness.git(&["rev-parse", "refs/heads/feature/mismatch"]),
+            original
+        );
+        assert!(!harness.job_path("job-mismatch").exists());
+    }
+
+    #[test]
+    fn attach_rejects_branch_already_checked_out() {
+        let harness = Harness::sha1();
+        let start_commit = harness.head();
+        harness
+            .create("job-first", "feature/shared", &start_commit)
+            .unwrap();
+        let result = harness.attach("job-second", "feature/shared", &start_commit);
+        assert!(matches!(
+            result,
+            Err(Error::PolicyViolation {
+                code: PolicyCode::WorktreeBranchInUse,
+                ..
+            })
+        ));
+        assert!(!harness.job_path("job-second").exists());
+    }
+
+    #[test]
+    fn attach_rejects_existing_job_path() {
+        let harness = Harness::sha1();
+        let start_commit = harness.head();
+        harness.git(&["branch", "feature/occupied", &start_commit]);
+        let target = harness.job_path("job-occupied");
+        fs::create_dir_all(&target).unwrap();
+        let result = harness.attach("job-occupied", "feature/occupied", &start_commit);
+        assert!(matches!(
+            result,
+            Err(Error::PolicyViolation {
+                code: PolicyCode::WorktreeAlreadyClaimed,
+                ..
+            })
+        ));
+        assert_eq!(
+            harness.git(&["rev-parse", "refs/heads/feature/occupied"]),
+            start_commit
+        );
+    }
+
+    #[test]
+    fn attach_ignores_dirty_primary_checkout() {
+        let harness = Harness::sha1();
+        let start_commit = harness.head();
+        harness.git(&["branch", "feature/dirty-ok", &start_commit]);
+        fs::write(harness.repo_root.join("wip.txt"), "uncommitted\n").unwrap();
+        let wt = harness
+            .attach("job-dirty", "feature/dirty-ok", &start_commit)
+            .unwrap();
+        assert_eq!(wt.head_commit.as_deref(), Some(start_commit.as_str()));
+        assert!(!wt.path.join("wip.txt").exists());
+        assert_eq!(
+            fs::read_to_string(harness.repo_root.join("wip.txt")).unwrap(),
+            "uncommitted\n"
+        );
     }
 }
