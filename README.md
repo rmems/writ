@@ -96,6 +96,8 @@ cargo test --workspace
 - [`AGENTS.md`](AGENTS.md) — the authoritative contribution, autonomy, and safety contract
 - [`SKILL.md`](SKILL.md) — portable agent procedure (guidance, not a security boundary)
 - [`REVIEW.md`](REVIEW.md) — pull-request lifecycle and review checklist
+- [`docs/status-schema.md`](docs/status-schema.md) — `writ status` / `writ jobs` JSON
+- [`docs/watchlist-schema.md`](docs/watchlist-schema.md) — `writ watchlist` persistence
 - [`docs/workflows/safe-issue-verified-commit.md`](docs/workflows/safe-issue-verified-commit.md) — issue → verified push
 - [`docs/workflows/safe-verified-commit-to-pr.md`](docs/workflows/safe-verified-commit-to-pr.md) — verified push → PR handoff (never merges)
 - Product epic: [#1](https://github.com/rmems/writ/issues/1) · Current phase: [#124](https://github.com/rmems/writ/issues/124)

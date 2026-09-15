@@ -23,6 +23,7 @@ All of them, under `--json`:
 | `status` / `jobs` | `cli.status` / `cli.jobs` |
 | `git-safe` / `gh-safe` | `git.safe` / `gh.safe` |
 | `worktree create\|list\|remove\|prune` | `worktree.create` etc. |
+| `watchlist add\|remove\|list\|check\|check-all\|import-pr-babysit` | `watchlist.add` etc. |
 
 **The exception is the policy-violation path**, which prints plain text on stderr
 with exit code 2 instead of an envelope:
@@ -51,6 +52,7 @@ writ --json                                   # cli.bootstrap
 writ --json status                            # cli.status
 writ --json git-safe --repo <repo> rev-parse --is-inside-work-tree   # git.safe
 writ --json worktree list                     # worktree.list
+writ --json watchlist list --state /tmp/missing.json   # watchlist.list (empty)
 # error envelope, no repository mutation:
 writ --json worktree create --schema-version 2 --repo <repo> <owner> <repo-name> <job> <branch>
 ```

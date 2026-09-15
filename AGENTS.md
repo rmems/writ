@@ -200,7 +200,8 @@ GitHub is the product issue source. Linear may mirror product planning for the o
 | --- | --- | --- |
 | Worktree root | `~/.local/share/writ/worktrees` | `WRIT_WORKTREE_BASE`, else `WH_WORKTREE_BASE` |
 | Job worktree | `{worktree root}/{owner}/{repo}/{job_id}` | Derived only; must remain sandboxed |
-| Watched state | `~/.local/share/writ/watched.json` | `WRIT_STATE_PATH`, else `WH_STATE_PATH` |
+| Watched job status | `~/.local/share/writ/watched.json` | `WRIT_STATE_PATH`, else `WH_STATE_PATH` |
+| PR watchlist | `~/.local/share/writ/watchlist.json` | `WRIT_WATCHLIST_PATH`, else `WH_WATCHLIST_PATH` |
 | Rust binary resolution | `writ` from `PATH` | `WRIT_BIN` |
 
 If the new `writ` root is absent and a pre-rename `worktrees-hives` root still exists, the path resolver keeps using the legacy root so an upgrade does not hide existing state or worktrees. This is a read/fallback, not an automatic directory move. `WH_STATE_PATH` and `WH_WORKTREE_BASE` are honoured when the corresponding `WRIT_*` variable is unset. The supervisor still has its own `WRIT_WORKTREE_BASE` resolver until [#152](https://github.com/rmems/writ/issues/152).
