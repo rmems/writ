@@ -105,6 +105,11 @@ pub enum Error {
         /// Human-readable explanation.
         message: String,
     },
+    /// Hook stdin could not be used; the boundary fails closed rather than allowing.
+    HookFailClosed {
+        /// Why the payload was unusable.
+        reason: String,
+    },
 }
 
 /// Machine-readable error codes for policy violations.
@@ -128,6 +133,8 @@ pub enum PolicyCode {
     PathNotAllowed,
     /// An existing worktree branch lacks a durable identity proving safe resume ownership.
     WorktreeResumeUnproven,
+    /// A mutation or lease targeted hook configuration or the enforcer binary.
+    ProtectedPath,
 }
 
 impl PolicyCode {
@@ -144,6 +151,7 @@ impl PolicyCode {
             Self::GhFlagNotAllowed => "GH_FLAG_NOT_ALLOWED",
             Self::PathNotAllowed => "PATH_NOT_ALLOWED",
             Self::WorktreeResumeUnproven => "WORKTREE_RESUME_UNPROVEN",
+            Self::ProtectedPath => "PROTECTED_PATH",
         }
     }
 }
@@ -195,6 +203,9 @@ impl Display for Error {
             Self::PolicyViolation { code, message } => {
                 write!(f, "policy violation [{code}]: {message}")
             }
+            Self::HookFailClosed { reason } => {
+                write!(f, "hook failed closed: {reason}")
+            }
         }
     }
 }
@@ -222,6 +233,7 @@ impl Error {
             Self::ContractUpgradeRequired { .. } => "CONTRACT_UPGRADE_REQUIRED",
             Self::StartPointRequired => "START_POINT_REQUIRED",
             Self::PolicyViolation { code, .. } => code.as_str(),
+            Self::HookFailClosed { .. } => "HOOK_FAIL_CLOSED",
         }
     }
 
@@ -229,7 +241,7 @@ impl Error {
     #[must_use]
     pub const fn exit_code(&self) -> u8 {
         match self {
-            Self::PolicyViolation { .. } => 2,
+            Self::PolicyViolation { .. } | Self::HookFailClosed { .. } => 2,
             _ => 1,
         }
     }

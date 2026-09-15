@@ -6,7 +6,9 @@
 pub mod contract;
 pub mod error;
 pub mod git_safe;
+pub mod hook;
 mod identity;
+pub mod lease;
 pub mod paths;
 pub mod state;
 pub mod status;

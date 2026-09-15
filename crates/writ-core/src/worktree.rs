@@ -17,7 +17,7 @@ struct GitArgList<'a>(&'a [&'a str]);
 struct IoContext(&'static str);
 
 #[derive(Clone, Copy)]
-struct PorcelainListing<'a>(&'a str);
+struct PorcelainListing<'a>(&'a [u8]);
 
 #[derive(Clone, Copy)]
 struct PostconditionCause<'a>(&'a str);
@@ -142,6 +142,11 @@ impl WorktreeManager {
             Repo(request.repo),
             JobId(request.job_id),
         )?;
+        if let Some(existing) =
+            try_verified_reuse(&request, &worktree_path, CommitId(&start_commit))?
+        {
+            return Ok(existing);
+        }
         reject_unproven_resume(&request, CommitId(&start_commit))?;
         add_worktree(&request, &worktree_path, CommitId(&start_commit))?;
 
@@ -366,6 +371,43 @@ fn validate_repo_root(repo_root: &Path) -> Result<()> {
     })
 }
 
+fn try_verified_reuse(
+    request: &WorktreeCreateRequest<'_>,
+    worktree_path: &Path,
+    start_commit: CommitId<'_>,
+) -> Result<Option<Worktree>> {
+    let branch = BranchName(request.branch);
+    if !branch_exists_in_repo(request.repo_root, branch)? {
+        return Ok(None);
+    }
+    if !worktree_path.exists() {
+        return Ok(None);
+    }
+    match verify_creation_postconditions(CreationPostconditions {
+        repo_root: request.repo_root,
+        worktree_path,
+        expected_branch: branch,
+        expected_commit: start_commit,
+    }) {
+        Ok(head_commit) => Ok(Some(Worktree {
+            path: worktree_path.to_path_buf(),
+            branch: request.branch.to_owned(),
+            repo_root: request.repo_root.to_path_buf(),
+            start_commit: Some(start_commit.as_str().to_owned()),
+            head_commit: Some(head_commit),
+        })),
+        Err(_) => Err(Error::PolicyViolation {
+            code: PolicyCode::WorktreeResumeUnproven,
+            message: format!(
+                "refusing to reuse existing branch {:?} at requested commit \
+                 {}: existing worktree identity is unproven",
+                branch.as_str(),
+                start_commit.as_str()
+            ),
+        }),
+    }
+}
+
 fn reject_unproven_resume(
     request: &WorktreeCreateRequest<'_>,
     start_commit: CommitId<'_>,
@@ -550,9 +592,9 @@ impl CreationPostconditions<'_> {
         actual_branch_ref: BranchRef<'_>,
         head_commit: CommitId<'_>,
     ) -> Result<()> {
-        let listing = git_stdout(
+        let listing = git_stdout_bytes(
             self.repo_root,
-            GitArgList(&["worktree", "list", "--porcelain"]),
+            GitArgList(&["worktree", "list", "--porcelain", "-z"]),
             IoContext("verify created worktree registration"),
         )
         .map_err(|error| {
@@ -618,26 +660,91 @@ fn worktree_registration_matches(
     expected_branch_ref: BranchRef<'_>,
     expected_head: CommitId<'_>,
 ) -> bool {
-    listing.0.split("\n\n").any(|entry| {
-        let mut path = None;
-        let mut branch = None;
-        let mut head = None;
-        for line in entry.lines() {
-            if let Some(value) = line.strip_prefix("worktree ") {
-                path = Some(Path::new(value));
-            } else if let Some(value) = line.strip_prefix("branch ") {
-                branch = Some(value);
-            } else if let Some(value) = line.strip_prefix("HEAD ") {
-                head = Some(value);
-            }
-        }
-        path == Some(expected_path)
-            && branch == Some(expected_branch_ref.as_str())
-            && head == Some(expected_head.as_str())
+    parse_worktree_porcelain(listing.0).any(|record| {
+        record.path.as_deref() == Some(expected_path)
+            && record.branch.as_deref() == Some(expected_branch_ref.as_str())
+            && record.head.as_deref() == Some(expected_head.as_str())
     })
 }
 
+struct PorcelainRecord<'a> {
+    path: Option<std::borrow::Cow<'a, Path>>,
+    branch: Option<std::borrow::Cow<'a, str>>,
+    head: Option<std::borrow::Cow<'a, str>>,
+}
+
+/// Parse `git worktree list --porcelain` (newline) or `--porcelain -z` (NUL).
+fn parse_worktree_porcelain(listing: &[u8]) -> impl Iterator<Item = PorcelainRecord<'_>> {
+    let nul = listing.contains(&0);
+    let records: Vec<&[u8]> = if nul {
+        split_on(listing, b"\0\0")
+    } else {
+        split_on(listing, b"\n\n")
+    };
+    let field_sep: &[u8] = if nul { b"\0" } else { b"\n" };
+    records
+        .into_iter()
+        .filter(|r| !r.is_empty())
+        .map(move |record| {
+            let mut parsed = PorcelainRecord {
+                path: None,
+                branch: None,
+                head: None,
+            };
+            for field in split_on(record, field_sep) {
+                if let Some(value) = field.strip_prefix(b"worktree ") {
+                    parsed.path = Some(path_from_bytes(value));
+                } else if let Some(value) = field.strip_prefix(b"branch ") {
+                    parsed.branch = std::str::from_utf8(value)
+                        .ok()
+                        .map(std::borrow::Cow::Borrowed);
+                } else if let Some(value) = field.strip_prefix(b"HEAD ") {
+                    parsed.head = std::str::from_utf8(value)
+                        .ok()
+                        .map(std::borrow::Cow::Borrowed);
+                }
+            }
+            parsed
+        })
+}
+
+fn split_on<'a>(haystack: &'a [u8], sep: &[u8]) -> Vec<&'a [u8]> {
+    if sep.is_empty() {
+        return vec![haystack];
+    }
+    let mut parts = Vec::new();
+    let mut rest = haystack;
+    while let Some(index) = rest.windows(sep.len()).position(|window| window == sep) {
+        parts.push(&rest[..index]);
+        rest = &rest[index + sep.len()..];
+    }
+    parts.push(rest);
+    parts
+}
+
+fn path_from_bytes(bytes: &[u8]) -> std::borrow::Cow<'_, Path> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        std::borrow::Cow::Borrowed(Path::new(std::ffi::OsStr::from_bytes(bytes)))
+    }
+    #[cfg(windows)]
+    {
+        match std::str::from_utf8(bytes) {
+            Ok(text) => std::borrow::Cow::Borrowed(Path::new(text)),
+            Err(_) => {
+                std::borrow::Cow::Owned(PathBuf::from(String::from_utf8_lossy(bytes).as_ref()))
+            }
+        }
+    }
+}
+
 fn git_stdout(repo: &Path, args: GitArgList<'_>, context: IoContext) -> Result<String> {
+    let bytes = git_stdout_bytes(repo, args, context)?;
+    Ok(String::from_utf8_lossy(&bytes).trim().to_owned())
+}
+
+fn git_stdout_bytes(repo: &Path, args: GitArgList<'_>, context: IoContext) -> Result<Vec<u8>> {
     let output = Command::new("git")
         .arg("-C")
         .arg(repo)
@@ -653,10 +760,14 @@ fn git_stdout(repo: &Path, args: GitArgList<'_>, context: IoContext) -> Result<S
             stderr: String::from_utf8_lossy(&output.stderr).to_string(),
         });
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    Ok(output.stdout)
 }
 
 fn optional_git_stdout(repo: &Path, args: GitArgList<'_>) -> Option<String> {
+    optional_git_bytes(repo, args).map(|bytes| String::from_utf8_lossy(&bytes).trim().to_owned())
+}
+
+fn optional_git_bytes(repo: &Path, args: GitArgList<'_>) -> Option<Vec<u8>> {
     Command::new("git")
         .arg("-C")
         .arg(repo)
@@ -664,7 +775,7 @@ fn optional_git_stdout(repo: &Path, args: GitArgList<'_>) -> Option<String> {
         .output()
         .ok()
         .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .map(|output| output.stdout)
 }
 
 struct ResidualState {
@@ -691,14 +802,14 @@ fn inspect_residual_state(
         worktree_path,
         GitArgList(&["rev-parse", "--verify", "HEAD^{commit}"]),
     );
-    let worktree_registered =
-        optional_git_stdout(repo_root, GitArgList(&["worktree", "list", "--porcelain"]))
-            .is_some_and(|listing| {
-                listing.lines().any(|line| {
-                    line.strip_prefix("worktree ")
-                        .is_some_and(|path| Path::new(path) == worktree_path)
-                })
-            });
+    let worktree_registered = optional_git_bytes(
+        repo_root,
+        GitArgList(&["worktree", "list", "--porcelain", "-z"]),
+    )
+    .is_some_and(|listing| {
+        parse_worktree_porcelain(&listing)
+            .any(|record| record.path.as_deref() == Some(worktree_path))
+    });
     ResidualState {
         path_exists: worktree_path.exists(),
         branch_commit,
@@ -1187,15 +1298,31 @@ mod tests {
         );
 
         assert!(worktree_registration_matches(
-            PorcelainListing(&correct),
+            PorcelainListing(correct.as_bytes()),
             path,
             BranchRef("refs/heads/feature/job"),
             CommitId(&expected_head),
         ));
         assert!(!worktree_registration_matches(
-            PorcelainListing(&wrong_branch),
+            PorcelainListing(wrong_branch.as_bytes()),
             path,
             BranchRef("refs/heads/feature/job"),
+            CommitId(&expected_head),
+        ));
+    }
+
+    #[test]
+    fn nul_porcelain_preserves_a_newline_in_the_worktree_path() {
+        let path = Path::new("/tmp/foo\nbar");
+        let expected_head = "b".repeat(40);
+        let mut listing = Vec::new();
+        listing.extend(b"worktree /tmp/foo\nbar\0HEAD ");
+        listing.extend(expected_head.as_bytes());
+        listing.extend(b"\0branch refs/heads/feature/nl\0\0");
+        assert!(worktree_registration_matches(
+            PorcelainListing(&listing),
+            path,
+            BranchRef("refs/heads/feature/nl"),
             CommitId(&expected_head),
         ));
     }
@@ -1370,6 +1497,60 @@ mod tests {
         assert_eq!(
             fs::read_to_string(target.join("occupied")).unwrap(),
             "force worktree add failure\n"
+        );
+    }
+
+    #[test]
+    fn create_reuses_worktree_when_identity_is_already_proven() {
+        let harness = Harness::sha1();
+        let start_commit = harness.head();
+        let first = harness
+            .create("job-reuse", "feature/reuse", &start_commit)
+            .unwrap();
+        let reused = harness
+            .create("job-reuse", "feature/reuse", &start_commit)
+            .unwrap();
+        assert_eq!(reused.path, first.path);
+        assert_eq!(reused.head_commit.as_deref(), Some(start_commit.as_str()));
+    }
+
+    #[test]
+    fn create_rejects_existing_worktree_when_head_moved() {
+        let harness = Harness::sha1();
+        let start_commit = harness.head();
+        let wt = harness
+            .create("job-moved-reuse", "feature/moved-reuse", &start_commit)
+            .unwrap();
+        let moved = harness.commit_file("moved-reuse.txt", "moved\n", "move");
+        harness.git(&["update-ref", "refs/heads/feature/moved-reuse", &moved]);
+        let result = harness.create("job-moved-reuse", "feature/moved-reuse", &start_commit);
+        assert_unproven_resume(result);
+        assert!(wt.path.exists());
+    }
+
+    #[test]
+    fn create_rejects_ambiguous_unqualified_start_point() {
+        let harness = Harness::sha1();
+        let branch_commit = harness.head();
+        let tag_commit = harness.commit_file("tag.txt", "tag\n", "tag commit");
+        harness.git(&["branch", "collision-name", &branch_commit]);
+        harness.git(&["tag", "collision-name", &tag_commit]);
+        assert_create_rejects_start_point_without_mutation(
+            &harness,
+            "collision-name",
+            "job-ambiguous",
+            "feature/ambiguous",
+        );
+        let qualified = harness
+            .create(
+                "job-ambiguous-ok",
+                "feature/ambiguous-ok",
+                "refs/heads/collision-name",
+            )
+            .unwrap();
+        assert_eq!(
+            qualified.start_commit.as_deref(),
+            Some(branch_commit.as_str())
         );
     }
 

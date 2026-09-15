@@ -20,9 +20,9 @@ Claude Code agent teams have real coordination and [documented zero isolation](h
 `writ` fills that gap. It does not assign work. It **admits writes**.
 
 > [!NOTE]
-> **Status: the enforcement core is real; the hook layer is not built yet.**
-> Shipping today are the `git`/`gh` allowlists, exact-base worktree verification, path sandboxing, process supervision, and the absence of any merge path — reachable through the `writ` CLI, including `writ worktree create`, which remains supported.
-> Not yet built: the `PreToolUse`/`WorktreeCreate` hook dispatcher, `writ install`, and the SQLite lease store. Those are milestone **M1** ([#124](https://github.com/rmems/writ/issues/124)). Until they land, enforcement applies only to commands routed through `writ` deliberately — it is **opt-in, not unbypassable**.
+> **Status: the enforcement core and `writ hook` dispatcher exist; they are not yet installed as Claude Code hooks.**
+> Shipping today are the `git`/`gh` allowlists, exact-base worktree verification, path sandboxing, process supervision, the absence of any merge path, and `writ hook` (JSON on stdin, exit 0 or 2). Contract tests for that boundary live in [`docs/hook-boundary.md`](docs/hook-boundary.md) ([#81](https://github.com/rmems/writ/issues/81)).
+> Not yet built: `writ install` (writing the hook block into `.claude/settings.json`). Until a repo registers `writ hook`, enforcement is still opt-in for any command that does not go through `writ`. Milestone **M1** is [#124](https://github.com/rmems/writ/issues/124).
 
 ## Architecture
 
@@ -34,14 +34,14 @@ Two layers, one binary.
 | **Coordination state** (cross-repo) *(planned, M1)* | Agents, leases with path scopes, ownership, blockers, freeze modes. SQLite, single file, derived from `git`/`gh`/disk. Not implemented yet | Task decomposition or scheduling |
 | `git`, `gh`, OS | Version-control, GitHub, and process primitives, invoked through allowlists | Policy |
 
-Leases are intended to be the join: coordination state that the enforcement layer will check at write time. No lease store exists yet (M1).
+Leases join the two layers: `WorktreeCreate` writes a SQLite row (`WRIT_LEASE_PATH`, default `{state_root}/leases.sqlite`) that `WorktreeRemove` releases. Path scopes and the rest of the coordination schema are still Phase 4 ([#124](https://github.com/rmems/writ/issues/124)).
 
-### Why hooks (planned — M1)
+### Why hooks (M1 — dispatcher shipped, not yet installed)
 
-Enforcement is designed to run as [Claude Code hooks](https://code.claude.com/docs/en/hooks). None of the hooks below are registered yet: `.claude/settings.json` currently registers only `SessionStart` and `PreCompact`. This section states the target design and the contract it relies on, not current behavior.
+Enforcement is designed to run as [Claude Code hooks](https://code.claude.com/docs/en/hooks). `writ hook` is the dispatcher: JSON on stdin, exit 0 or 2. None of the hooks below are registered yet: `.claude/settings.json` currently registers only `SessionStart` and `PreCompact`. `writ install` is still unbuilt. This section states the target registration and the contract it relies on.
 
-- **`PreToolUse`** — "Exit 2 means a blocking error… exit 2 blocks whether or not you print JSON: even a JSON `permissionDecision` of `allow` can't override it."
-- **`WorktreeCreate`** — "Any non-zero exit code aborts worktree creation." This is the lease-admission seam.
+- **`PreToolUse`** — Exit 2 blocks whether or not you print JSON: even a JSON `permissionDecision` of `allow` can't override it. Proven in CI against a competing allow hook via [`docs/hook-boundary.md`](docs/hook-boundary.md).
+- **`WorktreeCreate`** — Any non-zero exit code aborts worktree creation. Exit 0 prints the path and grants a lease row.
 - **`WorktreeRemove`**, **`SubagentStart`/`SubagentStop`** — lease release and agent registry.
 
 This inverts the usual failure mode. Safety is normally opt-in: a tool must be *called* to help — which is exactly the position `writ` is in today. Once registered as a hook, it will apply regardless of whether the agent cooperates. That gap is the point of M1, and it is the honest reason the "unbypassable" property is described here as a design goal rather than a current guarantee.
