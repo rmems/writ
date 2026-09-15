@@ -106,7 +106,7 @@ impl ScanBuf {
     fn step_body(&mut self, ch: char, chars: &mut Peekable<Chars<'_>>, kind: ScanKind) {
         match kind {
             ScanKind::Statements => self.step_statement(ch, chars),
-            ScanKind::Tokens => self.step_token(ch),
+            ScanKind::Tokens => self.step_token(ch, chars),
         }
     }
 
@@ -122,16 +122,30 @@ impl ScanBuf {
         self.current.push(ch);
     }
 
-    fn step_token(&mut self, ch: char) {
-        if !ch.is_whitespace() {
-            self.current.push(ch);
-            return;
-        }
+    fn step_token(&mut self, ch: char, chars: &mut Peekable<Chars<'_>>) {
         if self.quotes.quoted() {
             self.current.push(ch);
             return;
         }
+        if ch.is_whitespace() {
+            self.emit_raw();
+            return;
+        }
+        if is_redir_start(ch) {
+            self.take_redir(ch, chars);
+            return;
+        }
+        self.current.push(ch);
+    }
+
+    fn take_redir(&mut self, ch: char, chars: &mut Peekable<Chars<'_>>) {
         self.emit_raw();
+        let mut op = String::from(ch);
+        if chars.peek() == Some(&ch) {
+            op.push(ch);
+            chars.next();
+        }
+        self.out.push(op);
     }
 
     fn emit_trimmed(&mut self) {
@@ -193,6 +207,29 @@ fn consume_repeat(chars: &mut Peekable<Chars<'_>>, expected: char) {
     if chars.peek() == Some(&expected) {
         chars.next();
     }
+}
+
+fn is_redir_start(ch: char) -> bool {
+    ch == '<' || ch == '>'
+}
+
+fn is_redir_token(token: ArgToken<'_>) -> bool {
+    token.0.starts_with('<') || token.0.starts_with('>')
+}
+
+fn tokens_define_git_or_gh(tokens: Argv<'_>) -> bool {
+    tokens.0.iter().any(|token| {
+        let stem = token.trim_end_matches('{');
+        stem.starts_with("git()") || stem.starts_with("gh()")
+    })
+}
+
+fn opaque_git_gh_shell(tokens: Argv<'_>) -> bool {
+    if tokens_define_git_or_gh(tokens) {
+        return true;
+    }
+    let has_redir = tokens.0.iter().any(|token| is_redir_token(ArgToken(token)));
+    has_redir && invocation_from_tokens(tokens.0).is_some()
 }
 
 #[derive(Clone, Copy)]
@@ -298,7 +335,7 @@ pub(crate) fn git_gh_invocations(
 ) -> Result<Vec<GitGhInvocation>, UnparsedCommand<'_>> {
     let mut found = Vec::new();
     for statement in split_shell_statements(command) {
-        collect_from_statement(ShellText(&statement), &mut found);
+        collect_from_statement(command, ShellText(&statement), &mut found)?;
     }
     if found.is_empty() && mentions_git_or_gh(command) {
         return Err(UnparsedCommand(command));
@@ -306,13 +343,22 @@ pub(crate) fn git_gh_invocations(
     Ok(found)
 }
 
-fn collect_from_statement(statement: ShellText<'_>, found: &mut Vec<GitGhInvocation>) {
+fn collect_from_statement<'c>(
+    command: ShellText<'c>,
+    statement: ShellText<'_>,
+    found: &mut Vec<GitGhInvocation>,
+) -> Result<(), UnparsedCommand<'c>> {
     for inner in extract_substitutions(statement) {
-        collect_from_statement(ShellText(&inner), found);
+        collect_from_statement(command, ShellText(&inner), found)?;
     }
-    if let Some(invocation) = invocation_from_tokens(&tokenize_shell(statement)) {
+    let tokens = tokenize_shell(statement);
+    if opaque_git_gh_shell(Argv(&tokens)) {
+        return Err(UnparsedCommand(command));
+    }
+    if let Some(invocation) = invocation_from_tokens(&tokens) {
         found.push(invocation);
     }
+    Ok(())
 }
 
 fn invocation_from_tokens(tokens: &[String]) -> Option<GitGhInvocation> {
@@ -460,5 +506,28 @@ mod tests {
             skip_git_globals(Argv(&["--".to_owned(), "status".to_owned()])),
             ["status"]
         );
+    }
+
+    #[test]
+    fn tokenize_splits_unquoted_redirection_and_keeps_quoted() {
+        assert_eq!(
+            tokenize_shell(ShellText("git status > /tmp/out")),
+            ["git", "status", ">", "/tmp/out"]
+        );
+        assert_eq!(
+            tokenize_shell(ShellText("git status>/tmp/out")),
+            ["git", "status", ">", "/tmp/out"]
+        );
+        assert_eq!(
+            tokenize_shell(ShellText("git commit -m 'a > b'")),
+            ["git", "commit", "-m", "a > b"]
+        );
+    }
+
+    #[test]
+    fn git_gh_invocations_fail_closed_on_redir_and_function_def() {
+        assert!(git_gh_invocations(ShellText("git status > /tmp/out")).is_err());
+        assert!(git_gh_invocations(ShellText("git() { :; }; git status")).is_err());
+        assert!(git_gh_invocations(ShellText("git status")).is_ok());
     }
 }

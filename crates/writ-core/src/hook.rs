@@ -348,6 +348,27 @@ mod tests {
         validate_bash_command("/usr/bin/git status").unwrap();
         validate_bash_command("git -C /tmp/repo status").unwrap();
         validate_bash_command("git -- status").unwrap();
+        validate_bash_command("git commit -m 'a > b'").unwrap();
+    }
+
+    #[test]
+    fn pre_tool_use_blocks_redirection_and_git_function_def() {
+        let redir = validate_bash_command("git status > /tmp/out").unwrap_err();
+        assert!(matches!(
+            redir,
+            Error::PolicyViolation {
+                code: PolicyCode::SubcommandNotAllowed,
+                ..
+            }
+        ));
+        let shadowed = validate_bash_command("git() { :; }; git status").unwrap_err();
+        assert!(matches!(
+            shadowed,
+            Error::PolicyViolation {
+                code: PolicyCode::SubcommandNotAllowed,
+                ..
+            }
+        ));
     }
 
     #[test]
