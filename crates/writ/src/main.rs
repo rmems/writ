@@ -368,21 +368,15 @@ fn run_attribution(
             pr_comment,
         } => {
             let mut config = writ_core::attribution::AttributionConfig::from_env();
-            if let Some(id) = agent_id {
-                let id = id.trim();
-                if !id.is_empty() {
-                    config.agent_id = id.to_owned();
-                }
+            if let Some(id) = agent_id.as_deref().filter(|id| !id.trim().is_empty()) {
+                config.agent_id = writ_core::attribution::canonicalize_agent_id(id);
             }
             if let Some(placement) = placement {
                 config.placement = writ_core::attribution::AttributionPlacement::coerce(&placement);
             }
-            let text = writ_core::attribution::format_reply(
-                body,
-                Some(&config),
-                commit_sha.as_deref(),
-                !pr_comment,
-            );
+            let commit_sha = writ_core::attribution::sanitize_commit_sha(commit_sha.as_deref());
+            let text =
+                writ_core::attribution::format_reply(body, Some(&config), commit_sha, !pr_comment);
             if json {
                 let response = writ_core::contract::Response::success(
                     "attribution.format",
@@ -391,7 +385,7 @@ fn run_attribution(
                         "agent_id": config.agent_id,
                         "include_sha_on_fix": config.include_sha_on_fix,
                         "placement": config.placement,
-                        "commit_sha": commit_sha.as_deref().map(str::trim).filter(|s| !s.is_empty()),
+                        "commit_sha": commit_sha,
                         "is_thread_reply": !pr_comment,
                     }),
                 );

@@ -77,7 +77,7 @@ Platforms set identity without forking these templates. Empty values fall back t
 | Key | Env | Type | Default | Purpose |
 | --- | --- | --- | --- | --- |
 | `agent_id` / `attribution` | `WRIT_AGENT_ID`, else `WRIT_ATTRIBUTION` | string | `worktrees-hives agent` | Identity line on replies |
-| `include_sha_on_fix` | `WRIT_INCLUDE_SHA_ON_FIX` | bool | `true` | Callers attach a SHA after code fixes |
+| `include_sha_on_fix` | `WRIT_INCLUDE_SHA_ON_FIX` | bool | `true` | Callers intend to attach a SHA after code fixes. Review replies after a successful push still include the SHA. |
 | `attribution_placement` | `WRIT_ATTRIBUTION_PLACEMENT` | `footer` \| `header` | `footer` | Where the line goes |
 
 Override `agent_id` with `WRIT_AGENT_ID` (or `writ attribution format --agent-id ...`). Do not copy this skill to change the label.
@@ -135,7 +135,7 @@ worktrees-hives agent: fixed in abc1234
 
 `--placement header` puts the identity line above the body. `--agent-id` overrides the env default for one reply.
 
-Ordering: **push success → then reply with the pushed SHA**. If `include_sha_on_fix` is false, omit `--commit-sha`. If a SHA is passed to the formatter, it is always rendered so a real fix cannot be dropped.
+Ordering: **push success → then reply with the pushed SHA**. Review replies that report a code fix must include that SHA (`--commit-sha`); do not omit it after a successful push. When no code change landed, omit `--commit-sha` so a SHA is not invented. If a SHA is passed to the formatter, it is always rendered so a real fix cannot be dropped.
 
 ### Platform-neutral worker prompt template
 
