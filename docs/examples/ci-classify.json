@@ -1,0 +1,94 @@
+{
+    "ok": true,
+    "schema_version": 1,
+    "command": "ci.classify",
+    "data": {
+        "all_passed": false,
+        "checks": [
+            {
+                "check_class": "A",
+                "entry": {
+                    "conclusion": "failure",
+                    "description": "",
+                    "details_url": "https://github.com/acme/example-org/actions/runs/12345",
+                    "name": "Build & Test",
+                    "run_id": 12345,
+                    "status": "completed",
+                    "workflow_name": "CI"
+                },
+                "policies": [
+                    "fix_source",
+                    "reply_with_sha",
+                    "forbid_empty_commit",
+                    "forbid_ignore"
+                ],
+                "reason": "Class A first-party CI 'Build & Test' \u2014 fix source or `gh run rerun`; never empty-commit",
+                "recommended_action": {
+                    "kind": "fix_source"
+                }
+            },
+            {
+                "check_class": "B",
+                "entry": {
+                    "conclusion": "failure",
+                    "description": "",
+                    "details_url": "https://app.codacy.com/gh/acme/example-org/pull-requests/12",
+                    "name": "Codacy Static Code Analysis",
+                    "run_id": null,
+                    "status": "completed",
+                    "workflow_name": ""
+                },
+                "policies": [
+                    "fix_source",
+                    "reply_with_sha",
+                    "forbid_empty_commit",
+                    "forbid_ignore"
+                ],
+                "reason": "Class B quality gate 'Codacy Static Code Analysis' \u2014 fix real findings; residual human gate if ACTION_REQUIRED",
+                "recommended_action": {
+                    "kind": "fix_source"
+                }
+            },
+            {
+                "check_class": "C",
+                "entry": {
+                    "conclusion": "pending",
+                    "description": "",
+                    "details_url": "https://app.kilo.ai/review/1",
+                    "name": "Kilo Code Review",
+                    "run_id": null,
+                    "status": "pending",
+                    "workflow_name": ""
+                },
+                "policies": [],
+                "reason": "Class C third-party review 'Kilo Code Review' \u2014 report residual; never empty-commit to retrigger",
+                "recommended_action": {
+                    "kind": "wait"
+                },
+                "residual_code": "class_c:kilo_pending"
+            },
+            {
+                "check_class": "C",
+                "entry": {
+                    "conclusion": "skipped",
+                    "description": "",
+                    "details_url": "",
+                    "name": "Supabase Preview",
+                    "run_id": null,
+                    "status": "completed",
+                    "workflow_name": ""
+                },
+                "policies": [],
+                "reason": "Class C third-party review 'Supabase Preview' \u2014 report residual; never empty-commit to retrigger",
+                "recommended_action": {
+                    "kind": "ignore"
+                }
+            }
+        ],
+        "fixable_failure_count": 2,
+        "residual_codes": [
+            "class_c:kilo_pending"
+        ]
+    },
+    "error": null
+}

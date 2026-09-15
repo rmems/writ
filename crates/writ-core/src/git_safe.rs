@@ -5,6 +5,8 @@
 //! - Bare `--force` / `-f` is always rejected; only `--force-with-lease` is permitted.
 //! - Merge is blocked only when it is the git subcommand (branch names like `merge` are allowed).
 //! - `gh pr merge` and merge-related flags are blocked; `gh api` is not allowlisted.
+//! - `gh run` is allowlisted only for `view`, `list`, `watch`, `rerun`, and `download`
+//!   (Class A log fetch and official flake rerun). `run delete` / `run cancel` are rejected.
 //! - Mutating commands verify the current branch when `expected_branch` is provided to `run`.
 //! - All policy violations carry stable structured error codes.
 
@@ -73,10 +75,18 @@ const MUTATING_SUBCOMMANDS: &[&str] = &[
 ///
 /// Note: `api` is intentionally excluded so merge-related REST/GraphQL cannot be
 /// invoked through `gh api` (e.g. `mergePullRequest` / REST merge endpoints).
+/// `run` is allowlisted so official Actions log views and flake reruns can go
+/// through this boundary; nested `run` verbs are restricted separately.
 const ALLOWED_GH_SUBCOMMANDS: &[&str] = &[
-    "auth", "browse", "gist", "issue", "label", "pr", "release", "repo", "secret", "ssh-key",
-    "variable", "workflow",
+    "auth", "browse", "gist", "issue", "label", "pr", "release", "repo", "run", "secret",
+    "ssh-key", "variable", "workflow",
 ];
+
+/// `gh run` verbs that fetch logs or perform an official rerun.
+///
+/// `delete` and `cancel` stay blocked: they are destructive and are not the
+/// Class A flake path (`gh run rerun` / `gh run view --log-failed`).
+const ALLOWED_GH_RUN_SUBSUBCOMMANDS: &[&str] = &["download", "list", "rerun", "view", "watch"];
 
 /// `gh pr` sub-subcommands that are blocked (merge / merge-like updates).
 ///
@@ -373,6 +383,29 @@ impl SafeGhCommand {
                     code: PolicyCode::MergeBlocked,
                     message: format!("`gh pr {pr_sub}` is not allowed"),
                 });
+            }
+        }
+
+        if subcommand == "run" {
+            match first_positional_after(&args[1..]) {
+                Some(run_sub) => {
+                    let allowed_run: HashSet<&str> =
+                        ALLOWED_GH_RUN_SUBSUBCOMMANDS.iter().copied().collect();
+                    if !allowed_run.contains(run_sub) {
+                        return Err(Error::PolicyViolation {
+                            code: PolicyCode::GhSubcommandNotAllowed,
+                            message: format!("`gh run {run_sub}` is not allowed"),
+                        });
+                    }
+                }
+                None => {
+                    return Err(Error::PolicyViolation {
+                        code: PolicyCode::GhSubcommandNotAllowed,
+                        message:
+                            "`gh run` requires an allowed verb (view, list, watch, rerun, download)"
+                                .to_owned(),
+                    });
+                }
             }
         }
 
@@ -2080,6 +2113,58 @@ mod tests {
     fn gh_issue_list_allowed() {
         let cmd = SafeGhCommand::new(&["issue".to_owned(), "list".to_owned()]).unwrap();
         assert_eq!(cmd.args(), &["issue", "list"]);
+    }
+
+    #[test]
+    fn gh_run_rerun_and_view_allowed() {
+        let rerun = SafeGhCommand::new(&["run".to_owned(), "rerun".to_owned(), "12345".to_owned()])
+            .unwrap();
+        assert_eq!(rerun.args(), &["run", "rerun", "12345"]);
+
+        let view = SafeGhCommand::new(&[
+            "run".to_owned(),
+            "view".to_owned(),
+            "12345".to_owned(),
+            "--log-failed".to_owned(),
+        ])
+        .unwrap();
+        assert_eq!(view.args(), &["run", "view", "12345", "--log-failed"]);
+
+        let repo_flag = SafeGhCommand::new(&[
+            "run".to_owned(),
+            "-R".to_owned(),
+            "acme/example-org".to_owned(),
+            "rerun".to_owned(),
+            "9".to_owned(),
+        ])
+        .unwrap();
+        assert_eq!(
+            repo_flag.args(),
+            &["run", "-R", "acme/example-org", "rerun", "9"]
+        );
+    }
+
+    #[test]
+    fn gh_run_delete_and_cancel_rejected() {
+        for verb in ["delete", "cancel"] {
+            let err = SafeGhCommand::new(&["run".to_owned(), verb.to_owned(), "1".to_owned()])
+                .unwrap_err();
+            assert!(matches!(
+                err,
+                Error::PolicyViolation {
+                    code: PolicyCode::GhSubcommandNotAllowed,
+                    ..
+                }
+            ));
+        }
+        let err = SafeGhCommand::new(&["run".to_owned()]).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::GhSubcommandNotAllowed,
+                ..
+            }
+        ));
     }
 
     // ---- error display tests ----

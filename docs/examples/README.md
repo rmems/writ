@@ -22,6 +22,7 @@ All of them, under `--json`:
 | no subcommand | `cli.bootstrap` |
 | `status` / `jobs` | `cli.status` / `cli.jobs` |
 | `git-safe` / `gh-safe` | `git.safe` / `gh.safe` |
+| `ci classify` | `ci.classify` |
 | `worktree create\|list\|remove\|prune` | `worktree.create` etc. |
 
 **The exception is the policy-violation path**, which prints plain text on stderr
@@ -50,6 +51,7 @@ cargo build
 writ --json                                   # cli.bootstrap
 writ --json status                            # cli.status
 writ --json git-safe --repo <repo> rev-parse --is-inside-work-tree   # git.safe
+writ --json ci classify --file docs/examples/ci-classify-input.json  # ci.classify
 writ --json worktree list                     # worktree.list
 # error envelope, no repository mutation:
 writ --json worktree create --schema-version 2 --repo <repo> <owner> <repo-name> <job> <branch>

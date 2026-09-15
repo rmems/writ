@@ -1,4 +1,4 @@
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -55,6 +55,22 @@ enum Command {
     Worktree {
         #[command(subcommand)]
         action: WorktreeAction,
+    },
+
+    /// Classify PR status checks (Class A/B/C) for companion-skill monitoring.
+    Ci {
+        #[command(subcommand)]
+        action: CiAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum CiAction {
+    /// Classify `gh pr checks` JSON or a GraphQL `statusCheckRollup` payload.
+    Classify {
+        /// JSON file to classify. Reads stdin when omitted.
+        #[arg(long)]
+        file: Option<PathBuf>,
     },
 }
 
@@ -369,6 +385,9 @@ async fn run(cli: Cli, stdout: &mut impl Write) -> writ_core::error::Result<Exit
             }
         },
         Some(Command::Worktree { action }) => run_worktree(action, cli.json, stdout),
+        Some(Command::Ci {
+            action: CiAction::Classify { file },
+        }) => run_ci_classify(file, cli.json, stdout),
         None => {
             if cli.json {
                 serde_json::to_writer(
@@ -629,6 +648,98 @@ fn exit_code_from_i32(code: i32) -> ExitCode {
     }
 }
 
+fn run_ci_classify(
+    file: Option<PathBuf>,
+    json: bool,
+    stdout: &mut impl Write,
+) -> writ_core::error::Result<ExitCode> {
+    let bytes = read_classify_input(file.as_deref())?;
+    match writ_core::ci_taxonomy::classify_from_slice(&bytes) {
+        Ok(report) => {
+            write_classify_result(&report, json, stdout)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(message) => {
+            if json {
+                let response = writ_core::contract::Response {
+                    ok: false,
+                    schema_version: writ_core::contract::SCHEMA_VERSION,
+                    command: "ci.classify",
+                    data: serde_json::json!({}),
+                    error: Some(writ_core::contract::ErrorData {
+                        code: "CLASSIFY_INPUT_INVALID".to_owned(),
+                        message: message.clone(),
+                    }),
+                };
+                serde_json::to_writer(&mut *stdout, &response).map_err(io::Error::other)?;
+                stdout.write_all(b"\n")?;
+            }
+            Err(io::Error::other(message).into())
+        }
+    }
+}
+
+fn read_classify_input(file: Option<&std::path::Path>) -> io::Result<Vec<u8>> {
+    match file {
+        Some(path) => std::fs::read(path),
+        None => {
+            let mut buf = Vec::new();
+            io::stdin().read_to_end(&mut buf)?;
+            Ok(buf)
+        }
+    }
+}
+
+fn write_classify_result(
+    report: &writ_core::ci_taxonomy::ClassificationReport,
+    json: bool,
+    stdout: &mut impl Write,
+) -> io::Result<()> {
+    if json {
+        let response = writ_core::contract::Response::success(
+            "ci.classify",
+            writ_core::ci_taxonomy::classify_response_data(report),
+        );
+        serde_json::to_writer(&mut *stdout, &response).map_err(io::Error::other)?;
+        stdout.write_all(b"\n")?;
+        return Ok(());
+    }
+
+    writeln!(
+        stdout,
+        "prefer real fixes or `gh run rerun` over empty CI-kick commits"
+    )?;
+    writeln!(
+        stdout,
+        "all_passed={} residual_codes={}",
+        report.all_passed(),
+        report.residual_codes().join(",")
+    )?;
+    for check in &report.checks {
+        let residual = check.residual_code.as_deref().unwrap_or("-");
+        writeln!(
+            stdout,
+            "{} {} {} action={:?} residual={residual}",
+            check.check_class.as_str(),
+            match check.entry.conclusion {
+                writ_core::ci_taxonomy::CheckConclusion::Success => "pass",
+                writ_core::ci_taxonomy::CheckConclusion::Failure => "fail",
+                writ_core::ci_taxonomy::CheckConclusion::Pending => "pending",
+                writ_core::ci_taxonomy::CheckConclusion::Skipped => "skipping",
+                writ_core::ci_taxonomy::CheckConclusion::Cancelled => "cancel",
+                writ_core::ci_taxonomy::CheckConclusion::TimedOut => "timed_out",
+                writ_core::ci_taxonomy::CheckConclusion::ActionRequired => "action_required",
+                writ_core::ci_taxonomy::CheckConclusion::Neutral => "neutral",
+                writ_core::ci_taxonomy::CheckConclusion::Stale => "stale",
+                writ_core::ci_taxonomy::CheckConclusion::StartupFailure => "startup_failure",
+            },
+            check.entry.name,
+            check.recommended_action,
+        )?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::process::ExitCode;
@@ -657,6 +768,85 @@ mod tests {
     #[test]
     fn command_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[tokio::test]
+    async fn ci_classify_emits_v1_envelope() {
+        let path = std::env::temp_dir().join(format!(
+            "writ-ci-classify-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(
+            &path,
+            r#"[{"name":"Build & Test","workflow":"CI","bucket":"fail","link":"https://github.com/acme/example-org/actions/runs/1"},{"name":"Kilo Code Review","bucket":"pending","link":"https://app.kilo.ai/r/1"}]"#,
+        )
+        .unwrap();
+        let cli = Cli {
+            json: true,
+            command: Some(super::Command::Ci {
+                action: super::CiAction::Classify {
+                    file: Some(path.clone()),
+                },
+            }),
+        };
+        let mut stdout = Vec::new();
+        let code = run(cli, &mut stdout).await.unwrap();
+        assert_eq!(code, ExitCode::SUCCESS);
+        let v: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+        assert_eq!(v.get("command").expect("command"), "ci.classify");
+        assert_eq!(v.get("ok").expect("ok"), true);
+        let checks = v
+            .get("data")
+            .expect("data")
+            .get("checks")
+            .expect("checks")
+            .as_array()
+            .expect("array");
+        assert_eq!(checks[0].get("check_class").expect("class"), "A");
+        assert_eq!(checks[1].get("check_class").expect("class"), "C");
+        assert_eq!(
+            v.pointer("/data/residual_codes")
+                .and_then(|c| c.as_array())
+                .expect("residual_codes")[0],
+            "class_c:kilo_pending"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn ci_classify_invalid_json_sets_ok_false() {
+        let path = std::env::temp_dir().join(format!(
+            "writ-ci-classify-bad-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, "not-json").unwrap();
+        let cli = Cli {
+            json: true,
+            command: Some(super::Command::Ci {
+                action: super::CiAction::Classify {
+                    file: Some(path.clone()),
+                },
+            }),
+        };
+        let mut stdout = Vec::new();
+        let err = run(cli, &mut stdout).await.unwrap_err();
+        assert_eq!(err.exit_code(), 1);
+        let v: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+        assert_eq!(v.get("ok").expect("ok"), false);
+        assert_eq!(v.get("command").expect("command"), "ci.classify");
+        assert_eq!(
+            v.pointer("/error/code").expect("code"),
+            "CLASSIFY_INPUT_INVALID"
+        );
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

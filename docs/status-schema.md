@@ -63,7 +63,7 @@ Each entry in the `jobs` array has these fields:
 | `branch` | `string` | no | Current branch checked out in the worktree. |
 | `process_state` | `ProcessState` | no | Lifecycle state of the job process. |
 | `last_error` | `string` | yes | Last error message if the job failed. Omitted when absent. |
-| `ci_class` | `CiClass` | no | CI classification for the job's head commit. |
+| `ci_class` | `CiClass` | no | Job-level CI rollup for the job's head commit (`pass` / `fail` / `pending` / `unknown`). This is **not** the Class A/B/C check taxonomy; see [`ci-taxonomy.md`](ci-taxonomy.md). |
 
 ## `ProcessState` enum
 
@@ -79,7 +79,9 @@ Serialized as a lowercase snake_case string.
 
 ## `CiClass` enum
 
-Serialized as a lowercase snake_case string.
+Serialized as a lowercase snake_case string. Job-level rollup only — per-check
+Class A (Actions/Azure), Class B (Codacy), and Class C (Kilo/CodeRabbit/Gitar)
+live in [`ci-taxonomy.md`](ci-taxonomy.md) and `writ ci classify`.
 
 | Variant | Meaning |
 | --- | --- |
