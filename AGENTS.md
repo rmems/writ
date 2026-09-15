@@ -134,6 +134,8 @@ For authorized implementation, complete the cohesive tranche: run focused gates 
 
 ## Architecture
 
+The v1 decision that `writ` is the only authoritative runtime, that `SKILL.md` files are thin clients, and that Codex `babysit-pr` is not replaced by a `writ` skill repo is recorded in [ADR 0001](docs/adr/0001-rust-only-v1-runtime-and-babysit-pr-boundary.md).
+
 `writ` is a **Rust workspace**. One binary owns both layers:
 
 - **Enforcement** — git worktrees, exact-base identity, path sandboxing, process supervision/timeouts, and **hard safety enforcement** (no runtime merge path, force-with-lease only, branch verification).
@@ -239,4 +241,5 @@ Use [`REVIEW.md`](REVIEW.md) for the shared checklist. Reviewers should verify b
 - Product epic: GitHub #1
 - Current phase (hook enforcement): GitHub #124
 - Threat model and boundary tests: GitHub #22, #81
+- Architecture decision: [ADR 0001](docs/adr/0001-rust-only-v1-runtime-and-babysit-pr-boundary.md) (Linear [RM-169](https://linear.app/rpd-34/issue/RM-169/v1-record-rust-only-architecture-and-codex-babysit-pr-boundary))
 - Linear project: <https://linear.app/rpd-34/project/worktrees-hives-e3052de4caa3>
