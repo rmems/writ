@@ -1122,6 +1122,16 @@ pub(crate) fn run_allowlisted_git_restricted(
     repo_dir: &Path,
     args: &[String],
 ) -> Result<GitOutput> {
+    run_allowlisted_git_restricted_with_file(repo_dir, args, false)
+}
+
+/// Same as [`run_allowlisted_git_restricted`], optionally allowing the `file`
+/// transport for an already-validated local `origin` path.
+pub(crate) fn run_allowlisted_git_restricted_with_file(
+    repo_dir: &Path,
+    args: &[String],
+    allow_file_protocol: bool,
+) -> Result<GitOutput> {
     let cmd = SafeGitCommand::new(args)?;
     let mut command = Command::new("git");
     command.arg("-C").arg(repo_dir);
@@ -1132,6 +1142,9 @@ pub(crate) fn run_allowlisted_git_restricted(
     command.arg("-c").arg("core.fsmonitor=");
     command.arg("-c").arg("fetch.fsckObjects=true");
     command.arg("-c").arg("transfer.fsckObjects=true");
+    if allow_file_protocol {
+        command.arg("-c").arg("protocol.file.allow=always");
+    }
     command.args(cmd.args());
     restrict_git_environment(&mut command);
     let output = command.output().map_err(|e| Error::Io {

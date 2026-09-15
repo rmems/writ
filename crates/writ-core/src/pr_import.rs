@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::error::{Error, PolicyCode, PrImportFailure, Result};
 use crate::git_safe::{
     github_repo_slugs_match, is_ext_transport_url, normalize_github_repo_identity,
-    run_allowlisted_git_restricted,
+    run_allowlisted_git_restricted, run_allowlisted_git_restricted_with_file,
 };
 use crate::identity::{
     CommitId, HexOidPrefix, StartPoint, hex_oid_matches_commit, peel_to_commit,
@@ -48,10 +48,11 @@ pub(crate) fn import_and_verify_pr_head(request: PrHeadImportRequest<'_>) -> Res
     let source_ref = format!("refs/pull/{}/head", request.pr_number);
     let import_ref = allocate_import_ref(request.pr_number);
     reject_occupied_import_ref(request.repo_root, &import_ref, &request, &source_ref)?;
-    verify_origin_scope(&request)?;
+    let allow_file_protocol = verify_origin_scope(&request)?;
 
     let args = pr_head_fetch_args(request.source_remote, &source_ref, &import_ref);
-    let output = run_allowlisted_git_restricted(request.repo_root, &args)?;
+    let output =
+        run_allowlisted_git_restricted_with_file(request.repo_root, &args, allow_file_protocol)?;
     if output.exit_code != 0 {
         return Err(import_failure(
             &request,
@@ -196,7 +197,7 @@ fn reject_occupied_import_ref(
     Ok(())
 }
 
-fn verify_origin_scope(request: &PrHeadImportRequest<'_>) -> Result<()> {
+fn verify_origin_scope(request: &PrHeadImportRequest<'_>) -> Result<bool> {
     let args = vec![
         "remote".to_owned(),
         "get-url".to_owned(),
@@ -217,14 +218,14 @@ fn verify_origin_scope(request: &PrHeadImportRequest<'_>) -> Result<()> {
         ));
     }
     if looks_like_local_remote(url) {
-        return Ok(());
+        return Ok(true);
     }
     let Some((_, slug)) = normalize_github_repo_identity(url) else {
-        return Ok(());
+        return Ok(false);
     };
     let expected = format!("{}/{}", request.owner, request.repo);
     if github_repo_slugs_match(&slug, &expected) {
-        return Ok(());
+        return Ok(false);
     }
     Err(unauthorized(&format!(
         "base remote `{url}` is not {expected}"
