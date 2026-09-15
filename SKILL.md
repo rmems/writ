@@ -63,6 +63,18 @@ When handing off a pull request, report:
 
 A worker or companion-skill monitoring agent MUST NOT claim it merged the PR. A primary interactive agent may claim a merge only after it performed and verified the authorized one-shot operation. If another actor merged the PR, report that without taking credit.
 
+### CI taxonomy (Class A / B / C)
+
+When monitoring PR checks, classify each row from `gh pr checks --json name,state,bucket,workflow,link` (and `statusCheckRollup` when `ACTION_REQUIRED` is needed) using [`docs/ci-taxonomy.md`](docs/ci-taxonomy.md) or `writ --json ci classify`. Summary:
+
+| Class | Meaning | Do | Do not |
+| --- | --- | --- | --- |
+| **A** | GitHub Actions / Azure build-test | Fix source; **one** `gh run rerun` on flake | Empty “kick CI” commits |
+| **B** | Codacy (and similar quality gates) | Fix real file+line findings; residual human gate on `ACTION_REQUIRED` | Empty pushes to wake the dashboard |
+| **C** | Kilo, CodeRabbit, Gitar, unknown bots | Report residual (`class_c:kilo_pending`, …); continue Class A | Empty retrigger commits |
+
+`skipping` is non-blocking. `pending` means continue other work without rerun spam. **Prefer a real fix or `gh run rerun` over noise commits.** Residual codes belong in watchlist notes and the final report.
+
 ### Platform-neutral worker prompt template
 
 When spawning a worker subagent, include these safety instructions in the prompt:
