@@ -8,7 +8,9 @@ use crate::error::{
 use crate::identity::{
     BranchName, BranchRef, CommitId, JobId, Owner, Repo, StartPoint, resolve_start_commit,
 };
+use crate::lease::{LeaseGrant, LeaseStore, ResumeKey};
 use crate::paths::{canonicalize_for_tools, derive_worktree_path, worktree_base_path};
+use crate::porcelain;
 
 #[derive(Clone, Copy)]
 struct GitArgList<'a>(&'a [&'a str]);
@@ -17,10 +19,13 @@ struct GitArgList<'a>(&'a [&'a str]);
 struct IoContext(&'static str);
 
 #[derive(Clone, Copy)]
-struct PorcelainListing<'a>(&'a str);
-
-#[derive(Clone, Copy)]
 struct PostconditionCause<'a>(&'a str);
+
+enum CreateMode {
+    Fresh,
+    Reclaim,
+    AlreadyPresent,
+}
 
 /// Result of a worktree creation operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,23 +54,36 @@ pub struct WorktreeCreateRequest<'a> {
 }
 
 /// Manages isolated git worktrees for hive jobs.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct WorktreeManager {
     base_path: Option<PathBuf>,
+    leases: LeaseStore,
 }
 
 impl WorktreeManager {
-    /// Create a new manager using the default base path.
+    /// Create a new manager using the default base path and the durable lease store.
     pub fn new() -> Result<Self> {
         let base = worktree_base_path()?;
-        Self::with_base(base)
+        Self::with_base_and_leases(base, LeaseStore::open(crate::paths::lease_store_path())?)
     }
 
     /// Create a new manager with an explicit base path (for testing or overrides).
     ///
     /// The base is created if missing and stored in canonical form so OS path
     /// aliases (e.g. macOS `/var` → `/private/var`) do not trip sandbox checks.
+    /// A per-base SQLite lease file is opened next to the worktrees so tests
+    /// do not share a process-global store.
     pub fn with_base(base: PathBuf) -> Result<Self> {
+        fs::create_dir_all(&base).map_err(|e| Error::Io {
+            context: "create worktree base directory",
+            source: e,
+        })?;
+        let lease_path = base.join("leases.db");
+        Self::with_base_and_leases(base, LeaseStore::open(lease_path)?)
+    }
+
+    /// Create a manager with an explicit base path and lease store.
+    pub fn with_base_and_leases(base: PathBuf, leases: LeaseStore) -> Result<Self> {
         fs::create_dir_all(&base).map_err(|e| Error::Io {
             context: "create worktree base directory",
             source: e,
@@ -78,6 +96,7 @@ impl WorktreeManager {
         })?;
         Ok(Self {
             base_path: Some(base),
+            leases,
         })
     }
 
@@ -89,12 +108,19 @@ impl WorktreeManager {
         })
     }
 
+    /// Borrow the lease store used by this manager.
+    #[must_use]
+    pub fn lease_store(&self) -> &LeaseStore {
+        &self.leases
+    }
+
     /// Create a new worktree for the given job.
     ///
     /// The worktree path will be: `{base}/{owner}/{repo}/{job_id}`.
     /// `start_point` is required and is resolved to a commit before any branch
-    /// mutation. Existing branches are rejected because the exact-base contract
-    /// does not define a durable resume identity for an existing ref.
+    /// mutation. Existing branches are reclaimed only when a durable lease
+    /// identity plus branch and upstream checks prove the ref still belongs to
+    /// this job. Foreign, moved, or concurrently adopted branches stay fail-closed.
     ///
     /// This six-argument shape is a frozen compatibility wrapper. New callers
     /// should use [`Self::create_with_request`] so identity fields stay packed.
@@ -142,8 +168,32 @@ impl WorktreeManager {
             Repo(request.repo),
             JobId(request.job_id),
         )?;
-        reject_unproven_resume(&request, CommitId(&start_commit))?;
-        add_worktree(&request, &worktree_path, CommitId(&start_commit))?;
+        let mode = decide_create_mode(
+            &request,
+            CommitId(&start_commit),
+            &worktree_path,
+            &self.leases,
+        )?;
+        // Persist identity before Git mutates so a later add/verify error
+        // still has a reclaimable lease. Residual git state is not deleted.
+        self.leases.grant(LeaseGrant {
+            repo: request.repo_root,
+            owner: request.owner,
+            repo_name: request.repo,
+            job_id: request.job_id,
+            branch: request.branch,
+            worktree_path: &worktree_path,
+            start_commit: &start_commit,
+        })?;
+        match mode {
+            CreateMode::AlreadyPresent => {}
+            CreateMode::Reclaim => {
+                add_worktree(&request, &worktree_path, CommitId(&start_commit), true)?;
+            }
+            CreateMode::Fresh => {
+                add_worktree(&request, &worktree_path, CommitId(&start_commit), false)?;
+            }
+        }
 
         let head_commit = verify_creation_postconditions(CreationPostconditions {
             repo_root: request.repo_root,
@@ -164,65 +214,10 @@ impl WorktreeManager {
     /// List all hive worktrees under the base path.
     pub fn list(&self) -> Result<Vec<Worktree>> {
         let base = self.base_path()?;
-        let mut worktrees = Vec::new();
-
         if !base.exists() {
-            return Ok(worktrees);
+            return Ok(Vec::new());
         }
-
-        // Walk the base directory: {base}/{owner}/{repo}/{job_id}
-        for owner_entry in fs::read_dir(base).map_err(|e| Error::Io {
-            context: "read worktree base directory",
-            source: e,
-        })? {
-            let owner_entry = owner_entry.map_err(|e| Error::Io {
-                context: "read owner entry",
-                source: e,
-            })?;
-            if !owner_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                continue;
-            }
-
-            for repo_entry in fs::read_dir(owner_entry.path()).map_err(|e| Error::Io {
-                context: "read repo directory",
-                source: e,
-            })? {
-                let repo_entry = repo_entry.map_err(|e| Error::Io {
-                    context: "read repo entry",
-                    source: e,
-                })?;
-                if !repo_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                    continue;
-                }
-
-                for job_entry in fs::read_dir(repo_entry.path()).map_err(|e| Error::Io {
-                    context: "read job directory",
-                    source: e,
-                })? {
-                    let job_entry = job_entry.map_err(|e| Error::Io {
-                        context: "read job entry",
-                        source: e,
-                    })?;
-                    if !job_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                        continue;
-                    }
-
-                    // Try to get the branch name from the worktree
-                    let branch = get_worktree_branch(&job_entry.path())
-                        .unwrap_or_else(|_| "unknown".to_string());
-
-                    worktrees.push(Worktree {
-                        path: job_entry.path(),
-                        branch,
-                        repo_root: PathBuf::new(), // Not tracked in list
-                        start_commit: None,        // Not tracked in list
-                        head_commit: None,         // Not tracked in list
-                    });
-                }
-            }
-        }
-
-        Ok(worktrees)
+        collect_job_worktrees(base, &self.leases)
     }
 
     /// Remove a worktree by its path.
@@ -230,6 +225,11 @@ impl WorktreeManager {
     /// If `force` is true, the worktree is removed even if it has uncommitted changes.
     /// The associated branch is NOT deleted by default.
     pub fn remove(&self, worktree_path: &Path, force: bool) -> Result<()> {
+        if !worktree_path.exists() {
+            self.leases.release_by_path(worktree_path)?;
+            return Ok(());
+        }
+
         // Verify the path is within our sandbox
         let base = self.base_path()?;
         if !is_within_base(worktree_path, base)? {
@@ -270,6 +270,7 @@ impl WorktreeManager {
 
         // Also clean up empty parent directories
         cleanup_empty_parents(worktree_path, base);
+        self.leases.release_by_path(worktree_path)?;
 
         Ok(())
     }
@@ -366,48 +367,218 @@ fn validate_repo_root(repo_root: &Path) -> Result<()> {
     })
 }
 
-fn reject_unproven_resume(
+fn decide_create_mode(
     request: &WorktreeCreateRequest<'_>,
     start_commit: CommitId<'_>,
+    worktree_path: &Path,
+    leases: &LeaseStore,
+) -> Result<CreateMode> {
+    if let Some(mode) = existing_worktree_mode(request, start_commit, worktree_path)? {
+        return Ok(mode);
+    }
+    if !branch_exists_in_repo(request.repo_root, BranchName(request.branch))? {
+        return Ok(CreateMode::Fresh);
+    }
+    prove_resume(request, start_commit, worktree_path, leases)?;
+    Ok(CreateMode::Reclaim)
+}
+
+fn existing_worktree_mode(
+    request: &WorktreeCreateRequest<'_>,
+    start_commit: CommitId<'_>,
+    worktree_path: &Path,
+) -> Result<Option<CreateMode>> {
+    if !worktree_path.exists() {
+        return Ok(None);
+    }
+    let Some(listing) = optional_git_stdout_bytes(
+        request.repo_root,
+        GitArgList(&["worktree", "list", "--porcelain", "-z"]),
+    ) else {
+        return Ok(None);
+    };
+    let expected_branch = format!("refs/heads/{}", request.branch);
+    if porcelain::registration_matches(
+        &listing,
+        worktree_path,
+        BranchRef(&expected_branch),
+        start_commit,
+    ) {
+        return Ok(Some(CreateMode::AlreadyPresent));
+    }
+    if porcelain::path_is_registered(&listing, worktree_path) {
+        return Err(resume_unproven(
+            request,
+            start_commit,
+            worktree_path,
+            "existing worktree registration does not match branch identity and start commit",
+        ));
+    }
+    Ok(None)
+}
+
+fn prove_resume(
+    request: &WorktreeCreateRequest<'_>,
+    start_commit: CommitId<'_>,
+    worktree_path: &Path,
+    leases: &LeaseStore,
 ) -> Result<()> {
-    let branch = BranchName(request.branch);
-    if branch_exists_in_repo(request.repo_root, branch)? {
-        return Err(Error::PolicyViolation {
-            code: PolicyCode::WorktreeResumeUnproven,
-            message: format!(
-                "refusing to reuse existing branch {:?} at requested commit \
-                 {}: safe resume identity is not proven",
-                branch.as_str(),
+    let Some(lease) = leases.find_resume(ResumeKey {
+        owner: request.owner,
+        repo_name: request.repo,
+        job_id: request.job_id,
+        branch: request.branch,
+    })?
+    else {
+        return Err(resume_unproven(
+            request,
+            start_commit,
+            worktree_path,
+            "no durable lease identity for this owner/repo/job/branch",
+        ));
+    };
+    if lease.start_commit != start_commit.as_str() {
+        return Err(resume_unproven(
+            request,
+            start_commit,
+            worktree_path,
+            &format!(
+                "lease start_commit {} does not match requested commit {}",
+                lease.start_commit,
                 start_commit.as_str()
             ),
-        });
+        ));
     }
+    let branch_commit = git_stdout(
+        request.repo_root,
+        GitArgList(&[
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            &format!("refs/heads/{}^{{commit}}", request.branch),
+        ]),
+        IoContext("verify resume branch commit"),
+    )?;
+    if branch_commit != start_commit.as_str() {
+        return Err(resume_unproven(
+            request,
+            start_commit,
+            worktree_path,
+            &format!("branch moved: current commit {branch_commit}"),
+        ));
+    }
+    if branch_checked_out_elsewhere(request.repo_root, request.branch, worktree_path)? {
+        return Err(resume_unproven(
+            request,
+            start_commit,
+            worktree_path,
+            "branch is checked out in another worktree",
+        ));
+    }
+    verify_resume_upstream(request.repo_root, request.branch)?;
     Ok(())
+}
+
+fn verify_resume_upstream(repo_root: &Path, branch: &str) -> Result<()> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args([
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            &format!("{branch}@{{upstream}}"),
+        ])
+        .output()
+        .map_err(|e| Error::Io {
+            context: "verify resume upstream",
+            source: e,
+        })?;
+    if !output.status.success() {
+        return Ok(());
+    }
+    let upstream = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let expected_suffix = format!("/{branch}");
+    if upstream == branch || upstream.ends_with(&expected_suffix) {
+        return Ok(());
+    }
+    Err(Error::PolicyViolation {
+        code: PolicyCode::WorktreeResumeUnproven,
+        message: format!(
+            "refusing to reuse branch {branch:?}: upstream {upstream:?} is not the expected tracking ref"
+        ),
+    })
+}
+
+fn branch_checked_out_elsewhere(
+    repo_root: &Path,
+    branch: &str,
+    expected_path: &Path,
+) -> Result<bool> {
+    let listing = git_stdout_bytes(
+        repo_root,
+        GitArgList(&["worktree", "list", "--porcelain", "-z"]),
+        IoContext("list worktrees for resume check"),
+    )?;
+    let expected_ref = format!("refs/heads/{branch}");
+    Ok(porcelain::parse_porcelain_z(&listing).iter().any(|record| {
+        record.branch.as_deref() == Some(expected_ref.as_str())
+            && !porcelain::paths_equal(&record.path, expected_path)
+    }))
+}
+
+fn resume_unproven(
+    request: &WorktreeCreateRequest<'_>,
+    start_commit: CommitId<'_>,
+    worktree_path: &Path,
+    reason: &str,
+) -> Error {
+    let residual =
+        inspect_residual_state(request.repo_root, worktree_path, BranchName(request.branch));
+    Error::PolicyViolation {
+        code: PolicyCode::WorktreeResumeUnproven,
+        message: format!(
+            "refusing to reuse existing branch {:?} at requested commit {}: {reason}; \
+             residual_state path={} path_exists={} registered={} branch_commit={} \
+             head_commit={}",
+            request.branch,
+            start_commit.as_str(),
+            worktree_path.display(),
+            residual.path_exists,
+            residual.worktree_registered,
+            residual.branch_commit.as_deref().unwrap_or("<absent>"),
+            residual.head_commit.as_deref().unwrap_or("<absent>")
+        ),
+    }
 }
 
 fn add_worktree(
     request: &WorktreeCreateRequest<'_>,
     worktree_path: &Path,
     start_commit: CommitId<'_>,
+    reuse_existing_branch: bool,
 ) -> Result<()> {
     let branch = BranchName(request.branch);
-    // Create the branch and linked worktree in one operation. If a concurrent
-    // actor creates the ref first, Git fails rather than attaching to it.
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(request.repo_root)
         .arg("worktree")
-        .arg("add")
-        .arg("-b")
-        .arg(branch.as_str())
-        .arg("--")
-        .arg(worktree_path)
-        .arg(start_commit.as_str())
-        .output()
-        .map_err(|e| Error::Io {
-            context: "spawn git worktree add",
-            source: e,
-        })?;
+        .arg("add");
+    if reuse_existing_branch {
+        command.arg("--").arg(worktree_path).arg(branch.as_str());
+    } else {
+        command
+            .arg("-b")
+            .arg(branch.as_str())
+            .arg("--")
+            .arg(worktree_path)
+            .arg(start_commit.as_str());
+    }
+    let output = command.output().map_err(|e| Error::Io {
+        context: "spawn git worktree add",
+        source: e,
+    })?;
 
     if output.status.success() {
         return Ok(());
@@ -550,9 +721,9 @@ impl CreationPostconditions<'_> {
         actual_branch_ref: BranchRef<'_>,
         head_commit: CommitId<'_>,
     ) -> Result<()> {
-        let listing = git_stdout(
+        let listing = git_stdout_bytes(
             self.repo_root,
-            GitArgList(&["worktree", "list", "--porcelain"]),
+            GitArgList(&["worktree", "list", "--porcelain", "-z"]),
             IoContext("verify created worktree registration"),
         )
         .map_err(|error| {
@@ -561,8 +732,8 @@ impl CreationPostconditions<'_> {
                 PostconditionCause(&error.to_string()),
             )
         })?;
-        if !worktree_registration_matches(
-            PorcelainListing(&listing),
+        if !porcelain::registration_matches(
+            &listing,
             self.worktree_path,
             actual_branch_ref,
             head_commit,
@@ -612,59 +783,96 @@ fn verify_creation_postconditions(postconditions: CreationPostconditions<'_>) ->
     Ok(head_commit)
 }
 
-fn worktree_registration_matches(
-    listing: PorcelainListing<'_>,
-    expected_path: &Path,
-    expected_branch_ref: BranchRef<'_>,
-    expected_head: CommitId<'_>,
-) -> bool {
-    listing.0.split("\n\n").any(|entry| {
-        let mut path = None;
-        let mut branch = None;
-        let mut head = None;
-        for line in entry.lines() {
-            if let Some(value) = line.strip_prefix("worktree ") {
-                path = Some(Path::new(value));
-            } else if let Some(value) = line.strip_prefix("branch ") {
-                branch = Some(value);
-            } else if let Some(value) = line.strip_prefix("HEAD ") {
-                head = Some(value);
+fn collect_job_worktrees(base: &Path, leases: &LeaseStore) -> Result<Vec<Worktree>> {
+    let mut worktrees = Vec::new();
+    for owner in dir_dirs(base, "read worktree base directory", "read owner entry")? {
+        for repo in dir_dirs(&owner, "read repo directory", "read repo entry")? {
+            for job in dir_dirs(&repo, "read job directory", "read job entry")? {
+                worktrees.push(describe_job_worktree(job, leases));
             }
         }
-        path == Some(expected_path)
-            && branch == Some(expected_branch_ref.as_str())
-            && head == Some(expected_head.as_str())
+    }
+    Ok(worktrees)
+}
+
+fn dir_dirs(path: &Path, dir_ctx: &'static str, entry_ctx: &'static str) -> Result<Vec<PathBuf>> {
+    let mut dirs = Vec::new();
+    for entry in fs::read_dir(path).map_err(|e| Error::Io {
+        context: dir_ctx,
+        source: e,
+    })? {
+        let entry = entry.map_err(|e| Error::Io {
+            context: entry_ctx,
+            source: e,
+        })?;
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            dirs.push(entry.path());
+        }
+    }
+    Ok(dirs)
+}
+
+fn describe_job_worktree(path: PathBuf, leases: &LeaseStore) -> Worktree {
+    let branch = get_worktree_branch(&path).unwrap_or_else(|_| "unknown".to_string());
+    let repo_root = find_repo_root_for_worktree(&path).unwrap_or_else(|_| PathBuf::new());
+    let head_commit = optional_git_stdout(
+        &path,
+        GitArgList(&["rev-parse", "--verify", "HEAD^{commit}"]),
+    );
+    let start_commit = leases
+        .find_by_path(&path)
+        .ok()
+        .flatten()
+        .map(|lease| lease.start_commit)
+        .or_else(|| head_commit.clone());
+    Worktree {
+        path,
+        branch,
+        repo_root,
+        start_commit,
+        head_commit,
+    }
+}
+
+fn spawn_git(repo: &Path, args: GitArgList<'_>) -> std::io::Result<std::process::Output> {
+    crate::git_cmd::git_in(repo, args.0)
+}
+
+fn git_output_checked(repo: &Path, args: GitArgList<'_>, context: IoContext) -> Result<Vec<u8>> {
+    let output = spawn_git(repo, args).map_err(|e| Error::Io {
+        context: context.0,
+        source: e,
+    })?;
+    if output.status.success() {
+        return Ok(output.stdout);
+    }
+    Err(Error::GitCommand {
+        args: args.0.iter().map(|arg| (*arg).to_owned()).collect(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
     })
 }
 
+fn trim_stdout(stdout: &[u8]) -> String {
+    String::from_utf8_lossy(stdout).trim().to_owned()
+}
+
 fn git_stdout(repo: &Path, args: GitArgList<'_>, context: IoContext) -> Result<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args.0)
-        .output()
-        .map_err(|e| Error::Io {
-            context: context.0,
-            source: e,
-        })?;
-    if !output.status.success() {
-        return Err(Error::GitCommand {
-            args: args.0.iter().map(|arg| (*arg).to_owned()).collect(),
-            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-        });
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    Ok(trim_stdout(&git_output_checked(repo, args, context)?))
+}
+
+fn git_stdout_bytes(repo: &Path, args: GitArgList<'_>, context: IoContext) -> Result<Vec<u8>> {
+    git_output_checked(repo, args, context)
 }
 
 fn optional_git_stdout(repo: &Path, args: GitArgList<'_>) -> Option<String> {
-    Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args.0)
-        .output()
+    optional_git_stdout_bytes(repo, args).map(|stdout| trim_stdout(&stdout))
+}
+
+fn optional_git_stdout_bytes(repo: &Path, args: GitArgList<'_>) -> Option<Vec<u8>> {
+    spawn_git(repo, args)
         .ok()
         .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .map(|output| output.stdout)
 }
 
 struct ResidualState {
@@ -691,14 +899,11 @@ fn inspect_residual_state(
         worktree_path,
         GitArgList(&["rev-parse", "--verify", "HEAD^{commit}"]),
     );
-    let worktree_registered =
-        optional_git_stdout(repo_root, GitArgList(&["worktree", "list", "--porcelain"]))
-            .is_some_and(|listing| {
-                listing.lines().any(|line| {
-                    line.strip_prefix("worktree ")
-                        .is_some_and(|path| Path::new(path) == worktree_path)
-                })
-            });
+    let worktree_registered = optional_git_stdout_bytes(
+        repo_root,
+        GitArgList(&["worktree", "list", "--porcelain", "-z"]),
+    )
+    .is_some_and(|listing| porcelain::path_is_registered(&listing, worktree_path));
     ResidualState {
         path_exists: worktree_path.exists(),
         branch_commit,
@@ -1179,21 +1384,21 @@ mod tests {
     fn registration_identity_requires_matching_path_branch_and_head() {
         let path = Path::new("/tmp/hive/job");
         let expected_head = "a".repeat(40);
-        let correct = format!(
-            "worktree /tmp/hive/job\nHEAD {expected_head}\nbranch refs/heads/feature/job\n\n"
-        );
-        let wrong_branch = format!(
-            "worktree /tmp/hive/job\nHEAD {expected_head}\nbranch refs/heads/feature/other\n\n"
-        );
+        let mut correct = b"worktree /tmp/hive/job\0HEAD ".to_vec();
+        correct.extend_from_slice(expected_head.as_bytes());
+        correct.extend_from_slice(b"\0branch refs/heads/feature/job\0\0");
+        let mut wrong_branch = b"worktree /tmp/hive/job\0HEAD ".to_vec();
+        wrong_branch.extend_from_slice(expected_head.as_bytes());
+        wrong_branch.extend_from_slice(b"\0branch refs/heads/feature/other\0\0");
 
-        assert!(worktree_registration_matches(
-            PorcelainListing(&correct),
+        assert!(porcelain::registration_matches(
+            &correct,
             path,
             BranchRef("refs/heads/feature/job"),
             CommitId(&expected_head),
         ));
-        assert!(!worktree_registration_matches(
-            PorcelainListing(&wrong_branch),
+        assert!(!porcelain::registration_matches(
+            &wrong_branch,
             path,
             BranchRef("refs/heads/feature/job"),
             CommitId(&expected_head),
@@ -1463,5 +1668,159 @@ mod tests {
     fn prune_succeeds_on_a_real_repository() {
         let harness = Harness::sha1();
         harness.manager.prune(&harness.repo_root).unwrap();
+    }
+
+    #[test]
+    fn create_remove_reclaim_same_start_commit() {
+        let harness = Harness::sha1();
+        let start_commit = harness.head();
+        let first = harness
+            .create("job-reclaim", "feature/reclaim", &start_commit)
+            .unwrap();
+        harness.manager.remove(&first.path, false).unwrap();
+        assert!(!first.path.exists());
+        assert_eq!(
+            harness.git(&["rev-parse", "refs/heads/feature/reclaim"]),
+            start_commit
+        );
+
+        let second = harness
+            .create("job-reclaim", "feature/reclaim", &start_commit)
+            .unwrap();
+        assert_eq!(second.start_commit.as_deref(), Some(start_commit.as_str()));
+        assert_eq!(second.head_commit.as_deref(), Some(start_commit.as_str()));
+        assert_eq!(
+            git_output(&second.path, &["symbolic-ref", "--quiet", "HEAD"]),
+            "refs/heads/feature/reclaim"
+        );
+        let lease = harness
+            .manager
+            .lease_store()
+            .find_resume(ResumeKey {
+                owner: "acme",
+                repo_name: "test-repo",
+                job_id: "job-reclaim",
+                branch: "feature/reclaim",
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(lease.mode, crate::lease::LeaseMode::WriterLocked);
+        assert!(lease.released_at.is_none());
+    }
+
+    #[test]
+    fn reclaim_rejects_branch_checked_out_elsewhere() {
+        let harness = Harness::sha1();
+        let start_commit = harness.head();
+        let wt = harness
+            .create(
+                "job-elsewhere-resume",
+                "feature/elsewhere-resume",
+                &start_commit,
+            )
+            .unwrap();
+        harness.manager.remove(&wt.path, false).unwrap();
+        let other = harness.temp_path().join("other-worktree");
+        harness.git(&[
+            "worktree",
+            "add",
+            "--",
+            other.to_str().unwrap(),
+            "feature/elsewhere-resume",
+        ]);
+        let result = harness.create(
+            "job-elsewhere-resume",
+            "feature/elsewhere-resume",
+            &start_commit,
+        );
+        assert_unproven_resume(result);
+        assert_eq!(git_output(&other, &["rev-parse", "HEAD"]), start_commit);
+    }
+
+    #[test]
+    fn reclaim_rejects_moved_branch_after_remove() {
+        let harness = Harness::sha1();
+        let start_commit = harness.head();
+        let wt = harness
+            .create("job-moved", "feature/moved", &start_commit)
+            .unwrap();
+        harness.manager.remove(&wt.path, false).unwrap();
+        let moved = harness.commit_file("moved.txt", "moved\n", "move branch");
+        harness.git(&["update-ref", "refs/heads/feature/moved", &moved]);
+        let result = harness.create("job-moved", "feature/moved", &start_commit);
+        assert_unproven_resume(result);
+        assert_eq!(
+            harness.git(&["rev-parse", "refs/heads/feature/moved"]),
+            moved
+        );
+    }
+
+    #[test]
+    fn create_rejects_ambiguous_unqualified_start_point() {
+        let harness = Harness::sha1();
+        let branch_commit = harness.head();
+        harness.git(&["branch", "collision", &branch_commit]);
+        let tag_commit = harness.commit_file("tag.txt", "tag\n", "tag target");
+        harness.git(&["tag", "collision", &tag_commit]);
+
+        assert_create_rejects_start_point_without_mutation(
+            &harness,
+            "collision",
+            "job-ambiguous",
+            "feature/selected",
+        );
+
+        let from_heads = harness
+            .create("job-heads", "feature/from-heads", "refs/heads/collision")
+            .unwrap();
+        assert_eq!(
+            from_heads.start_commit.as_deref(),
+            Some(branch_commit.as_str())
+        );
+
+        let from_tag = harness
+            .create("job-tag", "feature/from-tag", "refs/tags/collision")
+            .unwrap();
+        assert_eq!(from_tag.start_commit.as_deref(), Some(tag_commit.as_str()));
+    }
+
+    // Windows rejects newline in directory names (ERROR_INVALID_NAME / 123).
+    // #140 is the POSIX NUL-porcelain contract; parser coverage in
+    // `porcelain::tests` runs on every OS without creating such a directory.
+    #[cfg(unix)]
+    #[test]
+    fn newline_worktree_path_registers_as_one_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        fs::create_dir(&repo).unwrap();
+        let repo_root = init_test_repo_with_object_format(&repo, None).unwrap();
+        let base = temp.path().join("work\ntrees");
+        let manager = WorktreeManager::with_base(base).unwrap();
+        let start = git_output(&repo_root, &["rev-parse", "HEAD"]);
+        let wt = manager
+            .create_with_request(WorktreeCreateRequest {
+                repo_root: &repo_root,
+                owner: "acme",
+                repo: "test-repo",
+                job_id: "job-nl",
+                branch: "feature/newline",
+                start_point: &start,
+            })
+            .unwrap();
+        let listing = Command::new("git")
+            .arg("-C")
+            .arg(&repo_root)
+            .args(["worktree", "list", "--porcelain", "-z"])
+            .output()
+            .unwrap();
+        assert!(listing.status.success());
+        assert!(porcelain::registration_matches(
+            &listing.stdout,
+            &wt.path,
+            BranchRef("refs/heads/feature/newline"),
+            CommitId(&start),
+        ));
+        assert_eq!(wt.start_commit.as_deref(), Some(start.as_str()));
+        assert_eq!(wt.head_commit.as_deref(), Some(start.as_str()));
     }
 }
