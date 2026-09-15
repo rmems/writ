@@ -30,6 +30,9 @@ borrowed_identity!(StartPoint);
 borrowed_identity!(CommitId);
 borrowed_identity!(BranchRef);
 borrowed_identity!(HexOidPrefix);
+borrowed_identity!(RemoteName);
+borrowed_identity!(RefName);
+borrowed_identity!(HeadRepo);
 
 /// Resolve a caller-supplied commit-ish to one exact commit object.
 pub(crate) fn resolve_start_commit(

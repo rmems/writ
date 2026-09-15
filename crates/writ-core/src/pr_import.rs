@@ -14,8 +14,8 @@ use crate::git_safe::{
     run_allowlisted_git_restricted, run_allowlisted_git_restricted_with_file,
 };
 use crate::identity::{
-    CommitId, HexOidPrefix, StartPoint, hex_oid_matches_commit, peel_to_commit,
-    require_bare_full_object_id,
+    CommitId, HeadRepo, HexOidPrefix, RefName, RemoteName, StartPoint, hex_oid_matches_commit,
+    peel_to_commit, require_bare_full_object_id,
 };
 
 /// Named remote bound to the base repository. Callers cannot substitute a fork URL.
@@ -40,38 +40,44 @@ pub(crate) fn import_and_verify_pr_head(request: PrHeadImportRequest<'_>) -> Res
     let expected = StartPoint(request.expected_oid);
     require_bare_full_object_id(expected)?;
     validate_pr_number(request.pr_number)?;
-    validate_source_remote(request.source_remote)?;
+    validate_source_remote(RemoteName(request.source_remote))?;
     if let Some(head_repo) = request.head_repo {
-        validate_head_repo(head_repo)?;
+        validate_head_repo(HeadRepo(head_repo))?;
     }
 
     let source_ref = format!("refs/pull/{}/head", request.pr_number);
     let import_ref = allocate_import_ref(request.pr_number);
-    reject_occupied_import_ref(request.repo_root, &import_ref, &request, &source_ref)?;
+    let refs = ImportRefs {
+        source: RefName(&source_ref),
+        import: RefName(&import_ref),
+    };
+    reject_occupied_import_ref(request.repo_root, refs, &request)?;
     let allow_file_protocol = verify_origin_scope(&request)?;
 
-    let args = pr_head_fetch_args(request.source_remote, &source_ref, &import_ref);
+    let args = pr_head_fetch_args(RemoteName(request.source_remote), refs.source, refs.import);
     let output =
         run_allowlisted_git_restricted_with_file(request.repo_root, &args, allow_file_protocol)?;
     if output.exit_code != 0 {
         return Err(import_failure(
             &request,
-            &source_ref,
-            &import_ref,
-            format!("fetch failed: {}", output.stderr.trim()),
-            output.stderr,
+            refs,
+            FailureDetail {
+                reason: format!("fetch failed: {}", output.stderr.trim()),
+                stderr: output.stderr,
+            },
         ));
     }
 
-    let imported = match peel_to_commit(request.repo_root, StartPoint(&import_ref)) {
+    let imported = match peel_to_commit(request.repo_root, StartPoint(refs.import.as_str())) {
         Ok(commit) => commit,
         Err(error) => {
             return Err(import_failure(
                 &request,
-                &source_ref,
-                &import_ref,
-                format!("imported object is not a commit: {error}"),
-                error.to_string(),
+                refs,
+                FailureDetail {
+                    reason: format!("imported object is not a commit: {error}"),
+                    stderr: error.to_string(),
+                },
             ));
         }
     };
@@ -79,27 +85,43 @@ pub(crate) fn import_and_verify_pr_head(request: PrHeadImportRequest<'_>) -> Res
     if !hex_oid_matches_commit(HexOidPrefix(request.expected_oid), CommitId(&imported)) {
         return Err(import_failure(
             &request,
-            &source_ref,
-            &import_ref,
-            format!(
-                "imported commit {imported} does not equal expected head {}",
-                request.expected_oid
-            ),
-            String::new(),
+            refs,
+            FailureDetail {
+                reason: format!(
+                    "imported commit {imported} does not equal expected head {}",
+                    request.expected_oid
+                ),
+                stderr: String::new(),
+            },
         ));
     }
     Ok(imported)
 }
 
-pub(crate) fn pr_head_fetch_args(remote: &str, source_ref: &str, dest_ref: &str) -> Vec<String> {
+#[derive(Clone, Copy)]
+struct ImportRefs<'a> {
+    source: RefName<'a>,
+    import: RefName<'a>,
+}
+
+struct FailureDetail {
+    reason: String,
+    stderr: String,
+}
+
+pub(crate) fn pr_head_fetch_args(
+    remote: RemoteName<'_>,
+    source_ref: RefName<'_>,
+    dest_ref: RefName<'_>,
+) -> Vec<String> {
     vec![
         "fetch".to_owned(),
         "--no-tags".to_owned(),
         "--no-recurse-submodules".to_owned(),
         "--no-write-fetch-head".to_owned(),
         "--".to_owned(),
-        remote.to_owned(),
-        format!("{source_ref}:{dest_ref}"),
+        remote.as_str().to_owned(),
+        format!("{}:{}", source_ref.as_str(), dest_ref.as_str()),
     ]
 }
 
@@ -112,8 +134,8 @@ fn validate_pr_number(pr_number: u64) -> Result<()> {
     Ok(())
 }
 
-fn validate_source_remote(remote: &str) -> Result<()> {
-    if remote != BASE_SOURCE_REMOTE {
+fn validate_source_remote(remote: RemoteName<'_>) -> Result<()> {
+    if remote.as_str() != BASE_SOURCE_REMOTE {
         return Err(unauthorized(
             "fork PR import may only fetch from the base repository remote `origin`",
         ));
@@ -126,30 +148,42 @@ fn validate_source_remote(remote: &str) -> Result<()> {
     Ok(())
 }
 
-fn is_configured_remote_name(name: &str) -> bool {
-    let mut chars = name.chars();
+fn is_configured_remote_name(name: RemoteName<'_>) -> bool {
+    let text = name.as_str();
+    let mut chars = text.chars();
     let Some(first) = chars.next() else {
         return false;
     };
-    first.is_ascii_alphanumeric()
-        && name.len() <= 64
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
-        && !name.contains("..")
-        && !name.ends_with('.')
+    if !first.is_ascii_alphanumeric() {
+        return false;
+    }
+    if text.len() > 64 {
+        return false;
+    }
+    if !text
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        return false;
+    }
+    if text.contains("..") {
+        return false;
+    }
+    !text.ends_with('.')
 }
 
-fn validate_head_repo(head_repo: &str) -> Result<()> {
-    if is_ext_transport_url(head_repo) || looks_like_url_or_path(head_repo) {
+fn validate_head_repo(head_repo: HeadRepo<'_>) -> Result<()> {
+    if is_ext_transport_url(head_repo.as_str()) {
         return Err(unauthorized(
             "head_repo is not a fetch source; pass an owner/repo slug only",
         ));
     }
-    let mut parts = head_repo.split('/');
-    let owner = parts.next().unwrap_or("");
-    let repo = parts.next().unwrap_or("");
-    if owner.is_empty() || repo.is_empty() || parts.next().is_some() {
+    if looks_like_url_or_path(head_repo) {
+        return Err(unauthorized(
+            "head_repo is not a fetch source; pass an owner/repo slug only",
+        ));
+    }
+    if !is_owner_repo_slug(head_repo) {
         return Err(unauthorized(
             "head_repo must be an owner/repo slug, not a remote URL",
         ));
@@ -157,14 +191,41 @@ fn validate_head_repo(head_repo: &str) -> Result<()> {
     Ok(())
 }
 
-fn looks_like_url_or_path(value: &str) -> bool {
-    let trimmed = value.trim();
-    trimmed.contains("://")
-        || trimmed.contains('@')
-        || trimmed.starts_with('/')
-        || trimmed.starts_with('\\')
-        || trimmed.starts_with('-')
-        || trimmed.contains('\\')
+fn is_owner_repo_slug(head_repo: HeadRepo<'_>) -> bool {
+    let mut parts = head_repo.as_str().split('/');
+    let Some(owner) = parts.next() else {
+        return false;
+    };
+    let Some(repo) = parts.next() else {
+        return false;
+    };
+    if parts.next().is_some() {
+        return false;
+    }
+    if owner.is_empty() {
+        return false;
+    }
+    !repo.is_empty()
+}
+
+fn looks_like_url_or_path(head_repo: HeadRepo<'_>) -> bool {
+    let trimmed = head_repo.as_str().trim();
+    if trimmed.contains("://") {
+        return true;
+    }
+    if trimmed.contains('@') {
+        return true;
+    }
+    if trimmed.starts_with('/') {
+        return true;
+    }
+    if trimmed.starts_with('\\') {
+        return true;
+    }
+    if trimmed.starts_with('-') {
+        return true;
+    }
+    trimmed.contains('\\')
 }
 
 fn allocate_import_ref(pr_number: u64) -> String {
@@ -181,17 +242,17 @@ fn allocate_import_ref(pr_number: u64) -> String {
 
 fn reject_occupied_import_ref(
     repo_root: &Path,
-    import_ref: &str,
+    refs: ImportRefs<'_>,
     request: &PrHeadImportRequest<'_>,
-    source_ref: &str,
 ) -> Result<()> {
-    if optional_rev_parse(repo_root, import_ref).is_some() {
+    if optional_rev_parse(repo_root, refs.import).is_some() {
         return Err(import_failure(
             request,
-            source_ref,
-            import_ref,
-            "import ref namespace is already occupied".to_owned(),
-            String::new(),
+            refs,
+            FailureDetail {
+                reason: "import ref namespace is already occupied".to_owned(),
+                stderr: String::new(),
+            },
         ));
     }
     Ok(())
@@ -211,7 +272,10 @@ fn verify_origin_scope(request: &PrHeadImportRequest<'_>) -> Result<bool> {
             output.stderr.trim()
         )));
     }
-    let url = output.stdout.trim();
+    origin_url_is_in_scope(request, output.stdout.trim())
+}
+
+fn origin_url_is_in_scope(request: &PrHeadImportRequest<'_>, url: &str) -> Result<bool> {
     if is_ext_transport_url(url) {
         return Err(unauthorized(
             "base remote uses the forbidden ext:: transport",
@@ -234,15 +298,26 @@ fn verify_origin_scope(request: &PrHeadImportRequest<'_>) -> Result<bool> {
 
 fn looks_like_local_remote(url: &str) -> bool {
     let trimmed = url.trim();
-    trimmed.starts_with('/')
-        || trimmed.starts_with('.')
-        || trimmed.starts_with("file://")
-        || trimmed.contains('\\')
-        || (!trimmed.contains("://") && !trimmed.contains('@'))
+    if trimmed.starts_with('/') {
+        return true;
+    }
+    if trimmed.starts_with('.') {
+        return true;
+    }
+    if trimmed.starts_with("file://") {
+        return true;
+    }
+    if trimmed.contains('\\') {
+        return true;
+    }
+    if trimmed.contains("://") {
+        return false;
+    }
+    !trimmed.contains('@')
 }
 
-fn optional_rev_parse(repo_root: &Path, rev: &str) -> Option<String> {
-    let spec = format!("{rev}^{{commit}}");
+fn optional_rev_parse(repo_root: &Path, rev: RefName<'_>) -> Option<String> {
+    let spec = format!("{}^{{commit}}", rev.as_str());
     let args = vec![
         "rev-parse".to_owned(),
         "--verify".to_owned(),
@@ -251,23 +326,27 @@ fn optional_rev_parse(repo_root: &Path, rev: &str) -> Option<String> {
     ];
     let output = run_allowlisted_git_restricted(repo_root, &args).ok()?;
     if output.exit_code != 0 {
-        let object_args = vec![
-            "rev-parse".to_owned(),
-            "--verify".to_owned(),
-            "--end-of-options".to_owned(),
-            rev.to_owned(),
-        ];
-        let object = run_allowlisted_git_restricted(repo_root, &object_args).ok()?;
-        if object.exit_code != 0 {
-            return None;
-        }
-        let oid = object.stdout.trim();
-        if oid.is_empty() {
-            return None;
-        }
-        return Some(oid.to_owned());
+        return optional_object_id(repo_root, rev);
     }
-    let oid = output.stdout.trim();
+    nonempty_oid(&output.stdout)
+}
+
+fn optional_object_id(repo_root: &Path, rev: RefName<'_>) -> Option<String> {
+    let object_args = vec![
+        "rev-parse".to_owned(),
+        "--verify".to_owned(),
+        "--end-of-options".to_owned(),
+        rev.as_str().to_owned(),
+    ];
+    let object = run_allowlisted_git_restricted(repo_root, &object_args).ok()?;
+    if object.exit_code != 0 {
+        return None;
+    }
+    nonempty_oid(&object.stdout)
+}
+
+fn nonempty_oid(stdout: &str) -> Option<String> {
+    let oid = stdout.trim();
     if oid.is_empty() {
         None
     } else {
@@ -277,22 +356,20 @@ fn optional_rev_parse(repo_root: &Path, rev: &str) -> Option<String> {
 
 fn import_failure(
     request: &PrHeadImportRequest<'_>,
-    source_ref: &str,
-    import_ref: &str,
-    reason: String,
-    stderr: String,
+    refs: ImportRefs<'_>,
+    detail: FailureDetail,
 ) -> Error {
-    let imported = optional_rev_parse(request.repo_root, import_ref);
+    let imported = optional_rev_parse(request.repo_root, refs.import);
     Error::PrImportFailed(Box::new(PrImportFailure {
         expected_commit: request.expected_oid.to_owned(),
         source_remote: request.source_remote.to_owned(),
-        source_ref: source_ref.to_owned(),
-        import_ref: import_ref.to_owned(),
+        source_ref: refs.source.as_str().to_owned(),
+        import_ref: refs.import.as_str().to_owned(),
         imported_commit: imported.clone(),
         import_ref_exists: imported.is_some(),
         cleanup_performed: false,
-        reason,
-        stderr,
+        reason: detail.reason,
+        stderr: detail.stderr,
     }))
 }
 
@@ -307,6 +384,7 @@ fn unauthorized(message: &str) -> Error {
 mod tests {
     use super::*;
     use crate::git_safe::SafeGitCommand;
+    use crate::identity::{RefName, RemoteName};
     use std::fs;
     use std::path::PathBuf;
     use std::process::Command;
@@ -456,9 +534,9 @@ mod tests {
     #[test]
     fn fetch_argv_is_allowlisted_and_rejects_helpers() {
         let args = pr_head_fetch_args(
-            "origin",
-            "refs/pull/42/head",
-            "refs/writ/import/1/pr-42/head",
+            RemoteName("origin"),
+            RefName("refs/pull/42/head"),
+            RefName("refs/writ/import/1/pr-42/head"),
         );
         SafeGitCommand::new(&args).unwrap();
 
