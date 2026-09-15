@@ -225,11 +225,18 @@ fn tokens_define_git_or_gh(tokens: Argv<'_>) -> bool {
 }
 
 fn opaque_git_gh_shell(tokens: Argv<'_>) -> bool {
-    if tokens_define_git_or_gh(tokens) {
+    if tokens_define_git_or_gh(tokens) || program_has_expansion(tokens) {
         return true;
     }
     let has_redir = tokens.0.iter().any(|token| is_redir_token(ArgToken(token)));
     has_redir && invocation_from_tokens(tokens.0).is_some()
+}
+
+fn program_has_expansion(tokens: Argv<'_>) -> bool {
+    let Some(program) = strip_env_assignments(tokens).first() else {
+        return false;
+    };
+    program.contains('$') || program.contains('`')
 }
 
 #[derive(Clone, Copy)]
@@ -528,6 +535,8 @@ mod tests {
     fn git_gh_invocations_fail_closed_on_redir_and_function_def() {
         assert!(git_gh_invocations(ShellText("git status > /tmp/out")).is_err());
         assert!(git_gh_invocations(ShellText("git() { :; }; git status")).is_err());
+        assert!(git_gh_invocations(ShellText("g${x-}it push --force")).is_err());
         assert!(git_gh_invocations(ShellText("git status")).is_ok());
+        assert!(git_gh_invocations(ShellText("git commit -m '$msg'")).is_ok());
     }
 }

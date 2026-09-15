@@ -1,7 +1,8 @@
 //! Idempotent writer for the Claude Code hook block in `.claude/settings.json`.
 
-use std::fs;
-use std::path::Path;
+use std::ffi::OsString;
+use std::fs::{self, File, OpenOptions};
+use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
@@ -60,14 +61,15 @@ pub fn install_settings(
     settings_path: &Path,
     writ_command: WritCommand<'_>,
 ) -> Result<InstallResult> {
-    let existing = read_settings_object(settings_path)?;
-    let (merged, changed) = merge_hook_block(existing, writ_command);
     if let Some(parent) = settings_path.parent() {
         fs::create_dir_all(parent).map_err(|e| Error::Io {
             context: "create Claude Code settings directory",
             source: e,
         })?;
     }
+    let _lock = SettingsLock::acquire(settings_path)?;
+    let existing = read_settings_object(settings_path)?;
+    let (merged, changed) = merge_hook_block(existing, writ_command);
     if changed {
         write_settings(settings_path, &merged)?;
     }
@@ -76,6 +78,80 @@ pub fn install_settings(
         path: settings_path.to_path_buf(),
         changed,
     })
+}
+
+/// Exclusive lock for the settings read/merge/write so concurrent installers
+/// cannot clobber each other's hook blocks.
+struct SettingsLock {
+    _file: File,
+}
+
+impl SettingsLock {
+    fn acquire(settings_path: &Path) -> Result<Self> {
+        let lock_path = settings_lock_path(settings_path);
+        let file = open_lock_file(&lock_path).map_err(|e| Error::Io {
+            context: "open Claude Code settings lock",
+            source: e,
+        })?;
+        lock_file_exclusive(&file).map_err(|e| Error::Io {
+            context: "lock Claude Code settings",
+            source: e,
+        })?;
+        Ok(Self { _file: file })
+    }
+}
+
+fn settings_lock_path(settings_path: &Path) -> PathBuf {
+    let mut lock_name = settings_path
+        .file_name()
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| OsString::from("settings.json"));
+    lock_name.push(".lock");
+    match settings_path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(lock_name),
+        _ => PathBuf::from(lock_name),
+    }
+}
+
+#[cfg(windows)]
+fn open_lock_file(path: &Path) -> std::io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .share_mode(0)
+        .open(path)
+}
+
+#[cfg(not(windows))]
+fn open_lock_file(path: &Path) -> std::io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn lock_file_exclusive(file: &File) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: `file` is an open descriptor; LOCK_EX is the documented
+    // advisory exclusive flock and is released when the File is dropped.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(unix))]
+fn lock_file_exclusive(_file: &File) -> std::io::Result<()> {
+    Ok(())
 }
 
 fn read_settings_object(settings_path: &Path) -> Result<Value> {
@@ -318,6 +394,14 @@ mod tests {
         assert_eq!(
             parsed["hooks"]["WorktreeCreate"][0]["hooks"][0]["args"],
             json!(["hook"])
+        );
+    }
+
+    #[test]
+    fn settings_lock_sits_beside_settings() {
+        assert_eq!(
+            settings_lock_path(Path::new(".claude/settings.json")),
+            PathBuf::from(".claude/settings.json.lock")
         );
     }
 }

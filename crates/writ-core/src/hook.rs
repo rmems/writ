@@ -369,6 +369,14 @@ mod tests {
                 ..
             }
         ));
+        let expanded = validate_bash_command("g${x-}it push --force").unwrap_err();
+        assert!(matches!(
+            expanded,
+            Error::PolicyViolation {
+                code: PolicyCode::SubcommandNotAllowed,
+                ..
+            }
+        ));
     }
 
     #[test]

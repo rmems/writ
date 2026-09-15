@@ -174,6 +174,17 @@ impl WorktreeManager {
             &worktree_path,
             &self.leases,
         )?;
+        // Persist identity before Git mutates so a later add/verify error
+        // still has a reclaimable lease. Residual git state is not deleted.
+        self.leases.grant(LeaseGrant {
+            repo: request.repo_root,
+            owner: request.owner,
+            repo_name: request.repo,
+            job_id: request.job_id,
+            branch: request.branch,
+            worktree_path: &worktree_path,
+            start_commit: &start_commit,
+        })?;
         match mode {
             CreateMode::AlreadyPresent => {}
             CreateMode::Reclaim => {
@@ -189,16 +200,6 @@ impl WorktreeManager {
             worktree_path: &worktree_path,
             expected_branch: branch,
             expected_commit: CommitId(&start_commit),
-        })?;
-
-        self.leases.grant(LeaseGrant {
-            repo: request.repo_root,
-            owner: request.owner,
-            repo_name: request.repo,
-            job_id: request.job_id,
-            branch: request.branch,
-            worktree_path: &worktree_path,
-            start_commit: &start_commit,
         })?;
 
         Ok(Worktree {
