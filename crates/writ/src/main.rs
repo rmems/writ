@@ -76,6 +76,15 @@ enum WorktreeAction {
         /// Commit or ref required by v2 for exact-base branch creation.
         #[arg(long)]
         start_point: Option<String>,
+        /// GitHub pull request number whose `refs/pull/<n>/head` is imported from origin.
+        #[arg(long)]
+        pr_number: Option<u64>,
+        /// Named remote bound to the base repository (must be `origin` when set).
+        #[arg(long)]
+        source_remote: Option<String>,
+        /// Fork `owner/repo` identity. Never used as fetch or checkout authority.
+        #[arg(long)]
+        head_repo: Option<String>,
         /// Boundary schema: v1 returns an upgrade error; select v2 to create.
         #[arg(
             long,
@@ -211,6 +220,27 @@ fn worktree_error_data(error: &writ_core::error::Error) -> serde_json::Value {
             "cleanup_performed": false,
             })
         }
+        writ_core::error::Error::PrImportFailed(failure) => {
+            let writ_core::error::PrImportFailure {
+                expected_commit,
+                source_remote,
+                source_ref,
+                import_ref,
+                imported_commit,
+                import_ref_exists,
+                cleanup_performed,
+                ..
+            } = failure.as_ref();
+            serde_json::json!({
+                "expected_commit": expected_commit,
+                "source_remote": source_remote,
+                "source_ref": source_ref,
+                "import_ref": import_ref,
+                "imported_commit": imported_commit,
+                "import_ref_exists": import_ref_exists,
+                "cleanup_performed": cleanup_performed,
+            })
+        }
         _ => serde_json::json!({}),
     }
 }
@@ -250,6 +280,9 @@ fn worktree_response(
             job_id,
             branch,
             start_point,
+            pr_number,
+            source_remote,
+            head_repo,
             schema_version,
         } => {
             if schema_version == writ_core::contract::SCHEMA_VERSION {
@@ -266,6 +299,9 @@ fn worktree_response(
                 job_id: &job_id,
                 branch: &branch,
                 start_point: &start_point,
+                pr_number,
+                source_remote: source_remote.as_deref(),
+                head_repo: head_repo.as_deref(),
             })?;
             Ok(Response::success_with_schema(
                 "worktree.create",
@@ -706,6 +742,42 @@ mod tests {
         };
         assert_eq!(start_point.as_deref(), Some("origin/trunk"));
         assert_eq!(schema_version, 2);
+
+        let with_pr = Cli::try_parse_from([
+            "writ",
+            "worktree",
+            "create",
+            "--schema-version",
+            "2",
+            "--repo",
+            ".",
+            "--start-point",
+            "0123456789abcdef0123456789abcdef01234567",
+            "--pr-number",
+            "42",
+            "--head-repo",
+            "acme/fork",
+            "acme",
+            "repo",
+            "job",
+            "branch",
+        ])
+        .unwrap();
+        let Some(super::Command::Worktree {
+            action:
+                super::WorktreeAction::Create {
+                    pr_number,
+                    head_repo,
+                    source_remote,
+                    ..
+                },
+        }) = with_pr.command
+        else {
+            panic!("expected worktree create command with PR identity")
+        };
+        assert_eq!(pr_number, Some(42));
+        assert_eq!(head_repo.as_deref(), Some("acme/fork"));
+        assert_eq!(source_remote.as_deref(), None);
     }
 
     #[tokio::test]

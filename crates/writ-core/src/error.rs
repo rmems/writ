@@ -51,6 +51,38 @@ pub struct WorktreePostconditionFailure {
     pub reason: String,
 }
 
+/// Residual state after a failed exact-object PR-head import.
+#[derive(Debug)]
+pub struct PrImportFailure {
+    pub expected_commit: String,
+    pub source_remote: String,
+    pub source_ref: String,
+    pub import_ref: String,
+    pub imported_commit: Option<String>,
+    pub import_ref_exists: bool,
+    pub cleanup_performed: bool,
+    pub reason: String,
+    pub stderr: String,
+}
+
+impl Display for PrImportFailure {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "PR head import failed for `{}` from `{}/{}`: {}; residual_state \
+             import_ref_exists={} imported_commit={} cleanup_performed={}; automatic cleanup \
+             skipped because concurrent adoption cannot be disproven",
+            self.expected_commit,
+            self.source_remote,
+            self.source_ref,
+            self.reason.trim(),
+            self.import_ref_exists,
+            self.imported_commit.as_deref().unwrap_or("<absent>"),
+            self.cleanup_performed
+        )
+    }
+}
+
 impl Display for WorktreePostconditionFailure {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -98,6 +130,10 @@ pub enum Error {
     ContractUpgradeRequired { required_schema_version: u8 },
     /// The exact-base request boundary requires an explicit start point.
     StartPointRequired,
+    /// head_repo or a source remote was supplied without an explicit PR number.
+    PrImportIdentityRequired,
+    /// Exact-object import of a fork PR head failed and left residual refs.
+    PrImportFailed(Box<PrImportFailure>),
     /// A git or gh command was blocked by safety policy.
     PolicyViolation {
         /// Machine-readable policy error code.
@@ -128,6 +164,8 @@ pub enum PolicyCode {
     PathNotAllowed,
     /// An existing worktree branch lacks a durable identity proving safe resume ownership.
     WorktreeResumeUnproven,
+    /// The import source is not the configured base-repository remote.
+    UnauthorizedSource,
 }
 
 impl PolicyCode {
@@ -144,6 +182,7 @@ impl PolicyCode {
             Self::GhFlagNotAllowed => "GH_FLAG_NOT_ALLOWED",
             Self::PathNotAllowed => "PATH_NOT_ALLOWED",
             Self::WorktreeResumeUnproven => "WORKTREE_RESUME_UNPROVEN",
+            Self::UnauthorizedSource => "UNAUTHORIZED_SOURCE",
         }
     }
 }
@@ -192,6 +231,12 @@ impl Display for Error {
                 f,
                 "worktree.create schema v2 requires an explicit --start-point"
             ),
+            Self::PrImportIdentityRequired => write!(
+                f,
+                "fork PR import requires --pr-number and a full head object id; \
+                 head_repo is not fetch or checkout authority"
+            ),
+            Self::PrImportFailed(failure) => Display::fmt(failure.as_ref(), f),
             Self::PolicyViolation { code, message } => {
                 write!(f, "policy violation [{code}]: {message}")
             }
@@ -221,6 +266,8 @@ impl Error {
             Self::WorktreePostconditionFailed(_) => "WORKTREE_POSTCONDITION_FAILED",
             Self::ContractUpgradeRequired { .. } => "CONTRACT_UPGRADE_REQUIRED",
             Self::StartPointRequired => "START_POINT_REQUIRED",
+            Self::PrImportIdentityRequired => "PR_IMPORT_IDENTITY_REQUIRED",
+            Self::PrImportFailed(_) => "PR_IMPORT_FAILED",
             Self::PolicyViolation { code, .. } => code.as_str(),
         }
     }

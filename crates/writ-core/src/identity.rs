@@ -44,6 +44,25 @@ pub(crate) fn resolve_start_commit(
     Ok(commit)
 }
 
+/// Require a bare full-width object id with no commit-ish decorations.
+///
+/// Fork PR import cannot treat a symbolic ref or abbreviated selector as the
+/// expected head: those are mutable names, not an exact object identity.
+pub(crate) fn require_bare_full_object_id(start_point: StartPoint<'_>) -> Result<()> {
+    reject_empty_start_point(start_point)?;
+    let Some(hex_prefix) = leading_hex_oid_prefix(start_point) else {
+        return Err(rev_parse_error(GitErrorText(
+            "PR import start point must be a full 40- or 64-character object id".to_owned(),
+        )));
+    };
+    if hex_prefix.as_str().len() != start_point.as_str().len() {
+        return Err(rev_parse_error(GitErrorText(
+            "PR import start point must be a bare full object id without decorations".to_owned(),
+        )));
+    }
+    reject_non_full_hex_oid(hex_prefix)
+}
+
 fn reject_empty_start_point(start_point: StartPoint<'_>) -> Result<()> {
     if start_point.as_str().is_empty() {
         return Err(rev_parse_error(GitErrorText(
@@ -143,7 +162,7 @@ fn reject_hex_oid_mismatch(
     ))))
 }
 
-fn hex_oid_matches_commit(hex_prefix: HexOidPrefix<'_>, commit: CommitId<'_>) -> bool {
+pub(crate) fn hex_oid_matches_commit(hex_prefix: HexOidPrefix<'_>, commit: CommitId<'_>) -> bool {
     let prefix = hex_prefix.as_str();
     let commit = commit.as_str();
     if prefix.len() != commit.len() {
@@ -152,7 +171,7 @@ fn hex_oid_matches_commit(hex_prefix: HexOidPrefix<'_>, commit: CommitId<'_>) ->
     commit.eq_ignore_ascii_case(prefix)
 }
 
-fn peel_to_commit(repo_root: &Path, start_point: StartPoint<'_>) -> Result<String> {
+pub(crate) fn peel_to_commit(repo_root: &Path, start_point: StartPoint<'_>) -> Result<String> {
     let commitish = format!("{}^{{commit}}", start_point.as_str());
     let output = std::process::Command::new("git")
         .arg("-C")
@@ -340,5 +359,15 @@ mod tests {
         assert!(enforce_leading_hex_oid(StartPoint(SHA1), Some(CommitId(SHA1))).is_ok());
         let other = "f".repeat(40);
         assert!(enforce_leading_hex_oid(StartPoint(&other), Some(CommitId(SHA1))).is_err());
+    }
+
+    #[test]
+    fn pr_import_requires_a_bare_full_object_id() {
+        assert!(require_bare_full_object_id(StartPoint(SHA1)).is_ok());
+        assert!(require_bare_full_object_id(StartPoint(SHA256)).is_ok());
+        assert!(require_bare_full_object_id(StartPoint("refs/heads/main")).is_err());
+        assert!(require_bare_full_object_id(StartPoint("deadbeef")).is_err());
+        let decorated = format!("{SHA1}~0");
+        assert!(require_bare_full_object_id(StartPoint(&decorated)).is_err());
     }
 }
