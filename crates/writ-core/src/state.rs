@@ -75,6 +75,10 @@ mod tests {
             process_state: ProcessState::Running,
             last_error: None,
             ci_class: CiClass::Pending,
+            timeout_class: None,
+            residual_blockers: Vec::new(),
+            redispatch_count: None,
+            fix_count: None,
         }
     }
 

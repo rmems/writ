@@ -5,6 +5,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::contract::Response;
+use crate::timeout_policy::TimeoutClass;
 
 /// Lifecycle state of a watched job process.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -20,6 +21,8 @@ pub enum ProcessState {
     Failed,
     /// Job was cancelled by the operator.
     Cancelled,
+    /// Job hit a supervisor timeout / hang residual (see `timeout_class`).
+    TimedOut,
 }
 
 /// CI check-run classification for a job's head commit.
@@ -44,6 +47,7 @@ impl fmt::Display for ProcessState {
             Self::Completed => "completed",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
+            Self::TimedOut => "timed_out",
         })
     }
 }
@@ -85,6 +89,18 @@ pub struct JobStatus {
     pub last_error: Option<String>,
     /// CI classification for the job's head commit.
     pub ci_class: CiClass,
+    /// Stuck class when `process_state` is `timed_out` (additive v1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_class: Option<TimeoutClass>,
+    /// Structured leftovers (`timeout:hard`, CI codes, …). Empty omitted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub residual_blockers: Vec<String>,
+    /// Completed terminal runs of this item (harness-owned). Supervisor does not increment this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redispatch_count: Option<u32>,
+    /// Successful fix attempts. Timeout residuals must not increment this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fix_count: Option<u32>,
 }
 
 /// Payload for `writ status` and `writ jobs` v1 envelope responses.
@@ -127,6 +143,7 @@ pub fn status_error(command: &'static str, message: String) -> StatusReport {
 mod tests {
     use super::*;
     use crate::contract::SCHEMA_VERSION;
+    use crate::timeout_policy::TimeoutClass;
 
     fn sample_job() -> JobStatus {
         JobStatus {
@@ -140,6 +157,10 @@ mod tests {
             process_state: ProcessState::Running,
             last_error: None,
             ci_class: CiClass::Pending,
+            timeout_class: None,
+            residual_blockers: Vec::new(),
+            redispatch_count: None,
+            fix_count: None,
         }
     }
 
@@ -260,6 +281,31 @@ mod tests {
     }
 
     #[test]
+    fn timeout_residual_fields_serialize_when_present() {
+        let job = JobStatus {
+            process_state: ProcessState::TimedOut,
+            timeout_class: Some(TimeoutClass::Idle),
+            residual_blockers: vec![TimeoutClass::Idle.residual_blocker().to_owned()],
+            redispatch_count: Some(1),
+            fix_count: Some(0),
+            ..sample_job()
+        };
+        let json = serde_json::to_string(&job).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v.get("process_state").unwrap(), "timed_out");
+        assert_eq!(v.get("timeout_class").unwrap(), "idle");
+        assert_eq!(
+            v.get("residual_blockers").unwrap(),
+            &serde_json::json!(["timeout:idle"])
+        );
+        assert_eq!(v.get("fix_count").unwrap(), 0);
+        assert!(
+            !TimeoutClass::Idle.counts_toward_fix_cap(),
+            "timeout residual must not be treated as a fix"
+        );
+    }
+
+    #[test]
     fn process_state_variants_serialize_correctly() {
         let cases = [
             (ProcessState::Pending, "\"pending\""),
@@ -267,6 +313,7 @@ mod tests {
             (ProcessState::Completed, "\"completed\""),
             (ProcessState::Failed, "\"failed\""),
             (ProcessState::Cancelled, "\"cancelled\""),
+            (ProcessState::TimedOut, "\"timed_out\""),
         ];
         for (state, expected) in cases {
             assert_eq!(serde_json::to_string(&state).unwrap(), expected);
