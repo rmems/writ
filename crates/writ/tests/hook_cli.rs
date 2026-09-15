@@ -55,6 +55,38 @@ fn hook_blocks_git_force_push_with_exit_2() {
 }
 
 #[test]
+fn hook_blocks_quoted_force_push_and_config_injection() {
+    let root = TestDir::new();
+    let quoted = writ_hook(
+        &root.0,
+        r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"git push \"--force\""}}"#,
+    );
+    assert_eq!(quoted.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&quoted.stderr);
+    assert!(stderr.contains("BARE_FORCE_PUSH"), "stderr={stderr}");
+
+    let config = writ_hook(
+        &root.0,
+        r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"git -c alias.status='!git push --force' status"}}"#,
+    );
+    assert_eq!(config.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&config.stderr);
+    assert!(stderr.contains("SUBCOMMAND_NOT_ALLOWED"), "stderr={stderr}");
+}
+
+#[test]
+fn hook_worktree_create_requires_source_ref() {
+    let root = TestDir::new();
+    let output = writ_hook(
+        &root.0,
+        r#"{"hook_event_name":"WorktreeCreate","cwd":"/tmp","name":"wt"}"#,
+    );
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("START_POINT_REQUIRED"), "stderr={stderr}");
+}
+
+#[test]
 fn hook_allows_git_status() {
     let root = TestDir::new();
     let output = writ_hook(

@@ -2,7 +2,9 @@
 //!
 //! Reads hook JSON on stdin. Exit 0 allows; exit 2 blocks and writes a reason
 //! on stderr that Claude Code shows to the model. `WorktreeCreate` also prints
-//! the admitted worktree path as the last stdout line.
+//! the admitted worktree path as the last stdout line. Exact-base create
+//! requires a hook-supplied start ref (`source_ref` and aliases); there is no
+//! ambient `HEAD` fallback.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -33,7 +35,7 @@ pub fn dispatch(
     match dispatch_inner(HookJson(input), runtime, stdout) {
         Ok(()) => 0,
         Err(err) => {
-            let _ = writeln!(stderr, "writ hook: {err}");
+            let _ = writeln!(stderr, "writ hook: [{}] {err}", err.code());
             2
         }
     }
@@ -69,7 +71,7 @@ struct HookEvent {
     tool_name: Option<String>,
     #[serde(default)]
     tool_input: Option<ToolInput>,
-    #[serde(default)]
+    #[serde(default, alias = "worktree_name")]
     name: Option<String>,
     #[serde(default)]
     worktree_path: Option<String>,
@@ -79,7 +81,13 @@ struct HookEvent {
     agent_type: Option<String>,
     #[serde(default)]
     session_id: Option<String>,
-    #[serde(default)]
+    #[serde(
+        default,
+        alias = "sourceRef",
+        alias = "start_point",
+        alias = "base_ref",
+        alias = "baseRef"
+    )]
     source_ref: Option<String>,
 }
 
@@ -458,8 +466,22 @@ mod tests {
         );
         assert_eq!(code, 2);
         let stderr = String::from_utf8_lossy(&stderr);
-        assert!(stderr.contains("explicit --start-point"), "stderr={stderr}");
+        assert!(stderr.contains("START_POINT_REQUIRED"), "stderr={stderr}");
         assert!(stdout.is_empty());
+
+        let mut stderr = Vec::new();
+        let code = dispatch(
+            r#"{"hook_event_name":"WorktreeCreate","cwd":"/tmp","name":"job-1","source_ref":"  "}"#,
+            &runtime,
+            &mut stdout,
+            &mut stderr,
+        );
+        assert_eq!(code, 2);
+        assert!(
+            String::from_utf8_lossy(&stderr).contains("START_POINT_REQUIRED"),
+            "stderr={}",
+            String::from_utf8_lossy(&stderr)
+        );
     }
 
     #[test]
@@ -498,10 +520,13 @@ mod tests {
             worktree_base: Some(temp.path().join("worktrees")),
             lease_path: Some(temp.path().join("leases.db")),
         };
-        let payload = format!(
-            r#"{{"hook_event_name":"WorktreeCreate","cwd":"{}","name":"job-src","source_ref":"{first}"}}"#,
-            repo.display()
-        );
+        let payload = serde_json::json!({
+            "hook_event_name": "WorktreeCreate",
+            "cwd": repo,
+            "worktree_name": "job-src",
+            "sourceRef": first,
+        })
+        .to_string();
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let code = dispatch(&payload, &runtime, &mut stdout, &mut stderr);
