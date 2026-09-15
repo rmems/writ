@@ -79,6 +79,8 @@ struct HookEvent {
     agent_type: Option<String>,
     #[serde(default)]
     session_id: Option<String>,
+    #[serde(default)]
+    source_ref: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -144,9 +146,15 @@ fn create_inputs(event: &HookEvent) -> Result<CreateInputs> {
         PolicyCode::GitDirUnavailable,
         "WorktreeCreate hook JSON is missing `cwd`",
     )?;
+    let source_ref = event
+        .source_ref
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or(Error::StartPointRequired)?;
     let repo_root = git_toplevel(Path::new(cwd))?;
     let (owner, repo_name) = origin_owner_repo(&repo_root)?;
-    let start_commit = resolve_start_commit(&repo_root, StartPoint("HEAD"))?;
+    let start_commit = resolve_start_commit(&repo_root, StartPoint(source_ref))?;
     Ok(CreateInputs {
         repo_root,
         owner,
@@ -289,6 +297,9 @@ pub fn validate_bash_command(command: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::process::Command;
+    use tempfile::tempdir;
 
     #[test]
     fn pre_tool_use_blocks_force_push_and_merge() {
@@ -352,6 +363,49 @@ mod tests {
     }
 
     #[test]
+    fn pre_tool_use_blocks_quoted_force_flags() {
+        for command in [
+            r#"git push --for"ce""#,
+            r#"git push "--force""#,
+            r#"git push -"f""#,
+        ] {
+            let err = validate_bash_command(command).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    Error::PolicyViolation {
+                        code: PolicyCode::BareForcePush,
+                        ..
+                    }
+                ),
+                "{command}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pre_tool_use_blocks_git_config_overrides() {
+        for command in [
+            "git -c alias.status='!git push --force' status",
+            "git --config-env alias.status=FOO status",
+            "git --config-env=alias.status=FOO status",
+            "git -C /tmp/repo -c core.hooksPath=/tmp/hooks status",
+        ] {
+            let err = validate_bash_command(command).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    Error::PolicyViolation {
+                        code: PolicyCode::SubcommandNotAllowed,
+                        ..
+                    }
+                ),
+                "{command}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
     fn pre_tool_use_blocks_redirection_and_git_function_def() {
         let redir = validate_bash_command("git status > /tmp/out").unwrap_err();
         assert!(matches!(
@@ -389,6 +443,82 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn worktree_create_requires_explicit_source_ref() {
+        let runtime = HookRuntime::default();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = dispatch(
+            r#"{"hook_event_name":"WorktreeCreate","cwd":"/tmp","name":"job-1"}"#,
+            &runtime,
+            &mut stdout,
+            &mut stderr,
+        );
+        assert_eq!(code, 2);
+        let stderr = String::from_utf8_lossy(&stderr);
+        assert!(stderr.contains("explicit --start-point"), "stderr={stderr}");
+        assert!(stdout.is_empty());
+    }
+
+    #[test]
+    fn worktree_create_uses_source_ref_not_ambient_head() {
+        let temp = tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        fs::create_dir(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        };
+        git(&["init", "-b", "main"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        fs::write(repo.join("README"), "one\n").unwrap();
+        git(&["add", "README"]);
+        git(&["commit", "-m", "first"]);
+        let first = git(&["rev-parse", "HEAD"]);
+        fs::write(repo.join("README"), "two\n").unwrap();
+        git(&["add", "README"]);
+        git(&["commit", "-m", "second"]);
+        let second = git(&["rev-parse", "HEAD"]);
+        assert_ne!(first, second);
+
+        let runtime = HookRuntime {
+            worktree_base: Some(temp.path().join("worktrees")),
+            lease_path: Some(temp.path().join("leases.db")),
+        };
+        let payload = format!(
+            r#"{{"hook_event_name":"WorktreeCreate","cwd":"{}","name":"job-src","source_ref":"{first}"}}"#,
+            repo.display()
+        );
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = dispatch(&payload, &runtime, &mut stdout, &mut stderr);
+        assert_eq!(code, 0, "stderr={}", String::from_utf8_lossy(&stderr));
+        let created = String::from_utf8_lossy(&stdout).trim().to_owned();
+        assert!(!created.is_empty());
+        let wt_head = Command::new("git")
+            .arg("-C")
+            .arg(&created)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(wt_head.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&wt_head.stdout).trim(),
+            first.as_str()
+        );
     }
 
     #[test]

@@ -1,9 +1,8 @@
 //! Best-effort Bash statement and argv extraction for PreToolUse admission.
 //!
 //! This is not a shell. It only splits compounds and tokens far enough to
-//! feed `SafeGitCommand` / `SafeGhCommand`. Quote-toggle rules are kept
-//! identical to the original scanner, including tokenize's double-quote
-//! check, so admission behavior does not change.
+//! feed `SafeGitCommand` / `SafeGhCommand`. Quote toggles match Bash
+//! quote-removal so `"--force"` and `--for"ce"` become `--force`.
 
 use std::iter::Peekable;
 use std::str::Chars;
@@ -38,17 +37,13 @@ impl QuoteState {
         self.in_single || self.in_double
     }
 
-    fn toggle(&mut self, ch: char, kind: ScanKind) -> bool {
-        match (ch, kind) {
-            ('\'', _) if !self.in_double => {
+    fn toggle(&mut self, ch: char) -> bool {
+        match ch {
+            '\'' if !self.in_double => {
                 self.in_single = !self.in_single;
                 true
             }
-            ('"', ScanKind::Statements) if !self.in_single => {
-                self.in_double = !self.in_double;
-                true
-            }
-            ('"', ScanKind::Tokens) if !self.in_double => {
+            '"' if !self.in_single => {
                 self.in_double = !self.in_double;
                 true
             }
@@ -69,7 +64,7 @@ impl ScanBuf {
         if self.try_escape(ch, chars, kind) {
             return;
         }
-        if self.quotes.toggle(ch, kind) {
+        if self.quotes.toggle(ch) {
             self.keep_quote_char(ch, kind);
             return;
         }
@@ -443,14 +438,11 @@ impl GitPrefix {
 }
 
 fn takes_value(arg: ArgToken<'_>) -> bool {
+    // Location globals only. `-c` / `--config-env` stay in argv so
+    // `SafeGitCommand` sees them and fails closed (CLI path has no skip).
     matches!(
         arg.0,
-        "-C" | "-c"
-            | "--git-dir"
-            | "--work-tree"
-            | "--namespace"
-            | "--config-env"
-            | "--super-prefix"
+        "-C" | "--git-dir" | "--work-tree" | "--namespace" | "--super-prefix"
     )
 }
 
@@ -459,7 +451,6 @@ fn equals_form(arg: ArgToken<'_>) -> bool {
         "--git-dir=",
         "--work-tree=",
         "--namespace=",
-        "--config-env=",
         "--super-prefix=",
     ]
     .iter()
@@ -493,6 +484,18 @@ mod tests {
     #[test]
     fn tokenize_strips_quotes_and_keeps_quoted_whitespace() {
         assert_eq!(tokenize_shell(ShellText("'hello world'")), ["hello world"]);
+        assert_eq!(
+            tokenize_shell(ShellText(r#"git push --for"ce""#)),
+            ["git", "push", "--force"]
+        );
+        assert_eq!(
+            tokenize_shell(ShellText(r#"git push "--force""#)),
+            ["git", "push", "--force"]
+        );
+        assert_eq!(
+            tokenize_shell(ShellText(r#"git push -"f""#)),
+            ["git", "push", "-f"]
+        );
     }
 
     #[test]
@@ -512,6 +515,29 @@ mod tests {
         assert_eq!(
             skip_git_globals(Argv(&["--".to_owned(), "status".to_owned()])),
             ["status"]
+        );
+        assert_eq!(
+            skip_git_globals(Argv(&[
+                "-C".to_owned(),
+                "/tmp/repo".to_owned(),
+                "status".to_owned()
+            ])),
+            ["status"]
+        );
+        assert_eq!(
+            skip_git_globals(Argv(&[
+                "-c".to_owned(),
+                "alias.status=!git push --force".to_owned(),
+                "status".to_owned()
+            ])),
+            ["-c", "alias.status=!git push --force", "status"]
+        );
+        assert_eq!(
+            skip_git_globals(Argv(&[
+                "--config-env=alias.status=FOO".to_owned(),
+                "status".to_owned()
+            ])),
+            ["--config-env=alias.status=FOO", "status"]
         );
     }
 
