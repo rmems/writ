@@ -36,6 +36,7 @@ engines:
   duplication:
     exclude_paths:
       - "crates/*/tests/**"
+      - "crates/*/src/pr_import.rs"
       - "**/target/**"
   # `supervisor.rs` is deliberately absent from these three engine blocks even
   # though the sibling `.qlty/qlty.toml` records complexity findings there.
@@ -43,6 +44,12 @@ engines:
   # until reproduced, so this exclusion list tracks what actually fired rather
   # than pre-empting what might. Add `crates/*/src/supervisor.rs` if Codacy ever
   # reports it.
+  #
+  # `pr_import.rs` is the exact-object fork-head boundary: explicit PR identity,
+  # allowlisted fetch argv, and fail-closed residual reporting. Unit tests live in
+  # the same module (they need `pub(crate)` helpers), so complexity engines count
+  # fixtures as production code. Exclude complexity here the same way as
+  # `worktree.rs`; security engines stay enabled.
   #
   # `paths.rs` is included because Codacy's complexity engine does not parse
   # `#[cfg]` and reported `strip_verbatim_prefix` as 231 LOC (the rest of the
@@ -58,6 +65,7 @@ engines:
       - "crates/*/src/git_safe.rs"
       - "crates/*/src/main.rs"
       - "crates/*/src/paths.rs"
+      - "crates/*/src/pr_import.rs"
   metric:
     exclude_paths:
       - "crates/*/tests/**"
@@ -66,6 +74,7 @@ engines:
       - "crates/*/src/git_safe.rs"
       - "crates/*/src/main.rs"
       - "crates/*/src/paths.rs"
+      - "crates/*/src/pr_import.rs"
   lizard:
     exclude_paths:
       - "crates/*/tests/**"
@@ -74,3 +83,4 @@ engines:
       - "crates/*/src/git_safe.rs"
       - "crates/*/src/main.rs"
       - "crates/*/src/paths.rs"
+      - "crates/*/src/pr_import.rs"
