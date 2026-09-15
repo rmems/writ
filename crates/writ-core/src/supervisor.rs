@@ -57,7 +57,8 @@ const MAX_CAPTURE_BYTES: usize = 1_048_576;
 pub enum SupervisorErrorCode {
     /// Process could not be started.
     SpawnFailed,
-    /// Waiting on the child failed after spawn.
+    /// Waiting on the child failed after spawn. Prefer [`Self::LostChild`] for
+    /// hang residuals; retained so v1 JSON stays additive.
     WaitFailed,
     /// Wall-clock timeout fired (process group / child kill attempted).
     TimedOut,
@@ -629,12 +630,28 @@ async fn await_supervised_child(
                             }
                         }
                     }
-                    Err(e) => SupervisedOutput {
-                        stderr: format!("process error: {e}"),
-                        error_code: Some(SupervisorErrorCode::LostChild),
-                        timeout_class: Some(TimeoutClass::LostChild),
-                        ..SupervisedOutput::default()
-                    },
+                    Err(e) => {
+                        emit_progress(
+                            supervisor,
+                            wait.on_progress,
+                            wait.run_started,
+                            idle_for_since(wait.spawn_at, &wait.last_activity_ms),
+                            SupervisorStep::Recovering,
+                        );
+                        let mut recovered = recover_child(
+                            child,
+                            stdout_handle,
+                            stderr_handle,
+                            wait.policy,
+                            TimeoutClass::LostChild,
+                            wait.pid,
+                        )
+                        .await;
+                        if recovered.stderr.is_empty() {
+                            recovered.stderr = format!("process error: {e}");
+                        }
+                        recovered
+                    }
                 };
             }
         }
@@ -1729,5 +1746,90 @@ mod tests {
             "supervisor must not retry internally"
         );
         assert!(!crate::timeout_policy::TimeoutClass::Hard.counts_toward_fix_cap());
+    }
+
+    #[tokio::test]
+    async fn wall_clock_includes_permit_wait() {
+        let supervisor = Arc::new(Supervisor::new(1));
+        let holder = {
+            let s = Arc::clone(&supervisor);
+            tokio::spawn(async move {
+                s.run_unchecked(
+                    shell_program(),
+                    &[shell_flag(), {
+                        #[cfg(windows)]
+                        {
+                            "ping -n 8 127.0.0.1 >NUL"
+                        }
+                        #[cfg(not(windows))]
+                        {
+                            "sleep 4"
+                        }
+                    }],
+                    None,
+                )
+                .await
+            })
+        };
+        let armed = Instant::now();
+        while supervisor.active() == 0 && armed.elapsed() < Duration::from_secs(2) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(supervisor.active(), 1, "holder should own the only permit");
+
+        #[cfg(windows)]
+        let (program, args): (&str, &[&str]) = ("where.exe", &["where.exe"]);
+        #[cfg(not(windows))]
+        let (program, args): (&str, &[&str]) = ("true", &[]);
+        let queued = Instant::now();
+        let output = supervisor
+            .run(
+                program,
+                args,
+                Some(Duration::from_millis(250)),
+                &RunOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert!(output.timed_out, "stderr={}", output.stderr);
+        assert!(!output.killed, "permit-wait timeout must not kill a child");
+        assert_eq!(output.timeout_class, Some(TimeoutClass::Hard));
+        assert!(
+            output.stderr.contains("max-parallel permit"),
+            "stderr={}",
+            output.stderr
+        );
+        assert!(
+            queued.elapsed() < Duration::from_secs(2),
+            "queued run should time out without waiting for the holder"
+        );
+        let _ = holder.await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn grace_period_sends_term_before_kill() {
+        let supervisor = Supervisor::new(1);
+        let policy = TimeoutPolicy {
+            worker: Some(Duration::from_millis(150)),
+            grace: Duration::from_millis(800),
+            progress_every: None,
+            ..TimeoutPolicy::from_worker_timeout(None)
+        };
+        let started = Instant::now();
+        let output = supervisor
+            .run_unchecked_with_policy(
+                shell_program(),
+                &[shell_flag(), "trap 'exit 0' TERM; sleep 60"],
+                &policy,
+                &RunOptions::default(),
+            )
+            .await;
+        assert!(output.timed_out, "stderr={}", output.stderr);
+        assert_eq!(output.timeout_class, Some(TimeoutClass::Hard));
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "SIGTERM during grace should reap without waiting the full sleep"
+        );
     }
 }

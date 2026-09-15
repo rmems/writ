@@ -729,6 +729,56 @@ mod tests {
     }
 
     #[test]
+    fn supervisor_run_parses_named_timeout_policy_flags() {
+        let cli = Cli::try_parse_from([
+            "writ",
+            "supervisor",
+            "run",
+            "--timeout",
+            "10",
+            "--idle",
+            "3",
+            "--step",
+            "2",
+            "--orchestrator",
+            "15",
+            "--grace",
+            "5",
+            "--progress-secs",
+            "1",
+            "--max-redispatch",
+            "1",
+            "true",
+        ])
+        .unwrap();
+        let Some(super::Command::Supervisor {
+            action:
+                super::SupervisorAction::Run {
+                    timeout,
+                    idle,
+                    step,
+                    orchestrator,
+                    grace,
+                    progress_secs,
+                    max_redispatch,
+                    cmd,
+                    ..
+                },
+        }) = cli.command
+        else {
+            panic!("expected supervisor run");
+        };
+        assert_eq!(timeout, 10);
+        assert_eq!(idle, 3);
+        assert_eq!(step, 2);
+        assert_eq!(orchestrator, 15);
+        assert_eq!(grace, 5);
+        assert_eq!(progress_secs, 1);
+        assert_eq!(max_redispatch, 1);
+        assert_eq!(cmd, vec!["true"]);
+    }
+
+    #[test]
     fn worktree_create_parser_distinguishes_v1_migration_from_v2_exact_base() {
         let missing = Cli::try_parse_from([
             "writ", "worktree", "create", "--repo", ".", "acme", "repo", "job", "branch",
