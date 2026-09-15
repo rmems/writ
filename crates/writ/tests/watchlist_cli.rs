@@ -212,6 +212,69 @@ fn import_pr_babysit_is_read_only_on_source() {
 }
 
 #[test]
+fn check_missing_entry_with_repo_is_not_found() {
+    let dir = TestDir::new();
+    let state = dir.0.join("watchlist.json");
+    fs::write(&state, sample_watchlist()).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_writ"))
+        .args([
+            "--json",
+            "watchlist",
+            "check",
+            "--repo",
+            "acme/widgets",
+            "999",
+            "--state",
+        ])
+        .arg(&state)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(payload["ok"], false);
+    assert_eq!(payload["error"]["code"], "NOT_FOUND");
+}
+
+#[test]
+fn check_malformed_repo_is_invalid_input() {
+    let dir = TestDir::new();
+    let state = dir.0.join("watchlist.json");
+    fs::write(&state, sample_watchlist()).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_writ"))
+        .args([
+            "--json",
+            "watchlist",
+            "check",
+            "--repo",
+            "not-a-slug",
+            "7",
+            "--state",
+        ])
+        .arg(&state)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(payload["ok"], false);
+    assert_eq!(payload["error"]["code"], "INVALID_INPUT");
+}
+
+#[test]
+fn list_repo_filter_ignores_slug_case() {
+    let dir = TestDir::new();
+    let state = dir.0.join("watchlist.json");
+    fs::write(&state, sample_watchlist()).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_writ"))
+        .args(["watchlist", "list", "--repo", "ACME/widgets", "--state"])
+        .arg(&state)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("acme/widgets"));
+    assert!(!stdout.contains("example-org/core"));
+}
+
+#[test]
 fn check_all_without_allowlist_is_policy_exit() {
     let dir = TestDir::new();
     let state = dir.0.join("watchlist.json");

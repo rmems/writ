@@ -191,7 +191,10 @@ fn parse_repo_and_numbers(
     let mut numbers = Vec::new();
     for target in targets {
         if target.contains('/') {
-            if repo.is_some() && repo.as_deref() != Some(target.as_str()) {
+            if repo
+                .as_deref()
+                .is_some_and(|have| !have.eq_ignore_ascii_case(target))
+            {
                 return Err(WatchlistError::InvalidInput(
                     "conflicting repository arguments".to_owned(),
                 ));

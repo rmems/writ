@@ -7,7 +7,9 @@ use std::path::Path;
 use serde::Deserialize;
 
 use super::WatchlistError;
-use super::schema::{StackGroup, WatchEntry, WatchKind, WatchStatus, Watchlist, owner_of_repo};
+use super::schema::{
+    StackGroup, WatchEntry, WatchKind, WatchStatus, Watchlist, owner_of_repo, repos_match,
+};
 use super::store::{
     load_allowed_owners, load_watchlist, mutate_watchlist, owner_is_allowed, save_watchlist,
     utc_now_rfc3339,
@@ -307,6 +309,9 @@ fn select_check_targets(
     numbers: Option<&[u64]>,
     allowed_owners: &[String],
 ) -> Result<Vec<(String, u64)>, WatchlistError> {
+    if let Some(repo) = repo {
+        validate_repo(repo)?;
+    }
     if repo.is_none() && owner.is_none() && numbers.is_none() {
         if allowed_owners.is_empty() {
             return Err(WatchlistError::AllowlistRequired);
@@ -329,10 +334,10 @@ fn select_check_targets(
         }
     }
 
-    Ok(ordered_identities(list)
+    let targets: Vec<(String, u64)> = ordered_identities(list)
         .into_iter()
         .filter(|(target_repo, number)| {
-            repo.is_none_or(|want| target_repo == want)
+            repo.is_none_or(|want| repos_match(target_repo, want))
                 && owner.is_none_or(|want| {
                     owner_of_repo(target_repo).is_some_and(|have| have.eq_ignore_ascii_case(want))
                 })
@@ -346,7 +351,18 @@ fn select_check_targets(
                 true
             }
         })
-        .collect())
+        .collect();
+    if let Some(want) = numbers {
+        for &number in want {
+            if !targets.iter().any(|(_, have)| *have == number) {
+                return Err(WatchlistError::NotFound {
+                    repo: repo.unwrap_or("<unknown>").to_owned(),
+                    number,
+                });
+            }
+        }
+    }
+    Ok(targets)
 }
 
 fn refresh_targets(
@@ -625,7 +641,7 @@ pub(crate) fn classify_snapshot(snapshot: &PrSnapshot) -> (WatchStatus, Vec<Stri
         let state = check.state.to_ascii_uppercase();
         if matches!(
             state.as_str(),
-            "FAILURE" | "FAIL" | "ERROR" | "TIMED_OUT" | "CANCELLED"
+            "FAILURE" | "FAIL" | "ERROR" | "TIMED_OUT" | "CANCELLED" | "STARTUP_FAILURE" | "STALE"
         ) {
             failed = true;
             blockers.push(format!("class_a:{}", sanitize_token(&check.name)));
@@ -724,7 +740,7 @@ fn detect_stacks(list: &mut Watchlist) {
             continue;
         };
         parent[i] = list.prs.iter().enumerate().find_map(|(j, other)| {
-            (j != i && other.repo == entry.repo && other.branch == base).then_some(j)
+            (j != i && repos_match(&other.repo, &entry.repo) && other.branch == base).then_some(j)
         });
     }
     let mut has_child = vec![false; n];
@@ -783,7 +799,7 @@ fn rebuild_groups(list: &mut Watchlist) {
         group.numbers.sort_by_key(|number| {
             list.prs
                 .iter()
-                .find(|entry| entry.number == *number && entry.repo == group.repo)
+                .find(|entry| entry.number == *number && repos_match(&entry.repo, &group.repo))
                 .and_then(|entry| entry.stack_position)
                 .unwrap_or(0)
         });
@@ -803,8 +819,10 @@ mod tests {
     impl PrProbe for MapProbe {
         fn view(&self, repo: &str, number: u64) -> Result<PrSnapshot, WatchlistError> {
             self.snaps
-                .get(&(repo.to_owned(), number))
-                .cloned()
+                .iter()
+                .find_map(|((have_repo, have_number), snap)| {
+                    (*have_number == number && repos_match(have_repo, repo)).then(|| snap.clone())
+                })
                 .ok_or_else(|| WatchlistError::NotFound {
                     repo: repo.to_owned(),
                     number,
@@ -1040,6 +1058,22 @@ mod tests {
         let (status, blockers) = classify_snapshot(&snap);
         assert_eq!(status, WatchStatus::Residual);
         assert_eq!(blockers, vec!["class_b:codacy".to_owned()]);
+
+        snap.checks = vec![CheckSnapshot {
+            name: "setup".to_owned(),
+            state: "STARTUP_FAILURE".to_owned(),
+        }];
+        let (status, blockers) = classify_snapshot(&snap);
+        assert_eq!(status, WatchStatus::Failed);
+        assert_eq!(blockers, vec!["class_a:setup".to_owned()]);
+
+        snap.checks = vec![CheckSnapshot {
+            name: "ci".to_owned(),
+            state: "STALE".to_owned(),
+        }];
+        let (status, blockers) = classify_snapshot(&snap);
+        assert_eq!(status, WatchStatus::Failed);
+        assert_eq!(blockers, vec!["class_a:ci".to_owned()]);
     }
 
     #[test]
@@ -1131,6 +1165,84 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, WatchlistError::OwnerNotAllowed { .. }));
+    }
+
+    #[test]
+    fn check_missing_identity_is_not_found() {
+        let probe = MapProbe {
+            snaps: BTreeMap::new(),
+        };
+        let mut list = Watchlist::default();
+        let err = check_prs(
+            &mut list,
+            &probe,
+            None,
+            Some("acme/widgets"),
+            Some(&[41]),
+            &[],
+        )
+        .unwrap_err();
+        assert!(matches!(err, WatchlistError::NotFound { number: 41, .. }));
+
+        let err = check_prs(
+            &mut list,
+            &probe,
+            None,
+            Some("not-a-slug"),
+            Some(&[41]),
+            &[],
+        )
+        .unwrap_err();
+        assert!(matches!(err, WatchlistError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn add_and_check_treat_repo_slug_case_as_identity() {
+        let mut probe = MapProbe {
+            snaps: BTreeMap::new(),
+        };
+        probe.snaps.insert(
+            ("acme/widgets".to_owned(), 41),
+            open_snap("acme/widgets", 41, "feat/a", "main"),
+        );
+        let mut list = Watchlist::default();
+        add_prs(
+            &mut list,
+            &probe,
+            "acme/widgets",
+            &[41],
+            WatchKind::PrBabysit,
+            false,
+            &[],
+        )
+        .unwrap();
+        let second = add_prs(
+            &mut list,
+            &probe,
+            "ACME/widgets",
+            &[41],
+            WatchKind::PrBabysit,
+            false,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(second.refreshed, vec![("ACME/widgets".to_owned(), 41)]);
+        assert!(second.added.is_empty());
+        assert_eq!(list.prs.len(), 1);
+
+        let report = check_prs(
+            &mut list,
+            &probe,
+            None,
+            Some("ACME/Widgets"),
+            Some(&[41]),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(report.checked.len(), 1);
+        assert_eq!(report.checked[0].repo, "acme/widgets");
+        remove_pr(&mut list, "Acme/widgets", 41).unwrap();
+        assert!(list.prs.is_empty());
     }
 
     #[test]

@@ -128,7 +128,7 @@ impl WatchEntry {
     /// True when this entry is the same pull request as `(repo, number)`.
     #[must_use]
     pub fn is_identity(&self, repo: &str, number: u64) -> bool {
-        self.number == number && self.repo == repo
+        self.number == number && repos_match(&self.repo, repo)
     }
 }
 
@@ -186,7 +186,7 @@ impl Watchlist {
         self.prs
             .iter()
             .filter(|entry| owner.is_none_or(|want| owner_matches(entry.owner(), want)))
-            .filter(|entry| repo.is_none_or(|want| entry.repo == want))
+            .filter(|entry| repo.is_none_or(|want| repos_match(&entry.repo, want)))
             .collect()
     }
 }
@@ -199,6 +199,12 @@ pub fn owner_of_repo(repo: &str) -> Option<&str> {
         return None;
     }
     Some(owner)
+}
+
+/// GitHub `owner/name` slugs are case-insensitive.
+#[must_use]
+pub fn repos_match(left: &str, right: &str) -> bool {
+    left.eq_ignore_ascii_case(right)
 }
 
 fn owner_matches(actual: Option<&str>, want: &str) -> bool {
@@ -257,5 +263,34 @@ mod tests {
         assert_eq!(owner_of_repo("acme/widgets/extra"), None);
         assert_eq!(owner_of_repo("acme"), None);
         assert_eq!(owner_of_repo("/widgets"), None);
+    }
+
+    #[test]
+    fn identity_and_repo_filter_ignore_slug_case() {
+        let mut list = Watchlist::default();
+        list.prs.push(WatchEntry {
+            repo: "acme/widgets".to_owned(),
+            number: 41,
+            branch: "fix".to_owned(),
+            status: WatchStatus::Pending,
+            last_checked: "2026-01-01T00:00:00Z".to_owned(),
+            fix_count: 0,
+            residual_blockers: Vec::new(),
+            stack_id: None,
+            stack_type: None,
+            stack_position: None,
+            base: None,
+            title: None,
+            added_at: None,
+            check_count: None,
+            url: None,
+            kind: None,
+            extra: Map::new(),
+        });
+        assert!(list.get("ACME/widgets", 41).is_some());
+        assert!(list.get("acme/Widgets", 41).is_some());
+        assert!(list.get("acme/widgets", 42).is_none());
+        assert_eq!(list.filtered(None, Some("Acme/Widgets")).len(), 1);
+        assert!(list.filtered(None, Some("acme/other")).is_empty());
     }
 }
