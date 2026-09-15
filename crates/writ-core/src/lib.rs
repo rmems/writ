@@ -6,6 +6,7 @@
 mod bash_argv;
 pub mod contract;
 pub mod error;
+mod git_cmd;
 pub mod git_safe;
 pub mod hook;
 pub mod identity;

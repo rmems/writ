@@ -92,6 +92,27 @@ pub struct ResumeKey<'a> {
     pub branch: &'a str,
 }
 
+/// Owner/repo/job identity without the branch (unique lease row key).
+#[derive(Debug, Clone, Copy)]
+pub struct JobKey<'a> {
+    pub owner: &'a str,
+    pub repo_name: &'a str,
+    pub job_id: &'a str,
+}
+
+/// Agent-registry upsert payload.
+#[derive(Debug, Clone, Copy)]
+pub struct AgentIdentity<'a> {
+    pub agent_id: &'a str,
+    pub agent_type: &'a str,
+    pub session_id: Option<&'a str>,
+}
+
+struct LeaseSql {
+    where_sql: &'static str,
+    context: &'static str,
+}
+
 const LEASE_SELECT: &str = "SELECT repo, owner, repo_name, job_id, branch, branch_ref, worktree_path, start_commit, mode, ttl, heartbeat, max_files, max_churn, max_fix_cycles, fix_cycles, released_at FROM leases";
 
 /// SQLite-backed lease and agent registry.
@@ -199,11 +220,15 @@ impl LeaseStore {
         )
         .map_err(|e| lease_err("grant lease", e))?;
         drop(conn);
-        self.find_job(grant.owner, grant.repo_name, grant.job_id)?
-            .ok_or_else(|| Error::LeaseStore {
-                context: "grant lease",
-                message: "lease row missing after grant".to_owned(),
-            })
+        self.find_job(JobKey {
+            owner: grant.owner,
+            repo_name: grant.repo_name,
+            job_id: grant.job_id,
+        })?
+        .ok_or_else(|| Error::LeaseStore {
+            context: "grant lease",
+            message: "lease row missing after grant".to_owned(),
+        })
     }
 
     /// Release a writer lock by worktree path, keeping the identity row.
@@ -227,50 +252,46 @@ impl LeaseStore {
     /// Durable resume identity for an owner/repo/job/branch, including released rows.
     pub fn find_resume(&self, key: ResumeKey<'_>) -> Result<Option<Lease>> {
         self.query_lease(
-            "WHERE owner = ?1 AND repo_name = ?2 AND job_id = ?3 AND branch = ?4",
+            LeaseSql {
+                where_sql: "WHERE owner = ?1 AND repo_name = ?2 AND job_id = ?3 AND branch = ?4",
+                context: "lookup resume identity",
+            },
             params![key.owner, key.repo_name, key.job_id, key.branch],
-            "lookup resume identity",
         )
     }
 
     /// Look up a lease by owner/repo/job.
-    pub fn find_job(&self, owner: &str, repo_name: &str, job_id: &str) -> Result<Option<Lease>> {
+    pub fn find_job(&self, key: JobKey<'_>) -> Result<Option<Lease>> {
         self.query_lease(
-            "WHERE owner = ?1 AND repo_name = ?2 AND job_id = ?3",
-            params![owner, repo_name, job_id],
-            "lookup lease",
+            LeaseSql {
+                where_sql: "WHERE owner = ?1 AND repo_name = ?2 AND job_id = ?3",
+                context: "lookup lease",
+            },
+            params![key.owner, key.repo_name, key.job_id],
         )
     }
 
     /// Look up a lease by worktree path.
     pub fn find_by_path(&self, worktree_path: &Path) -> Result<Option<Lease>> {
         self.query_lease(
-            "WHERE worktree_path = ?1",
+            LeaseSql {
+                where_sql: "WHERE worktree_path = ?1",
+                context: "lookup lease by path",
+            },
             params![path_text(worktree_path)],
-            "lookup lease by path",
         )
     }
 
-    fn query_lease(
-        &self,
-        where_sql: &str,
-        params: impl rusqlite::Params,
-        context: &'static str,
-    ) -> Result<Option<Lease>> {
-        let sql = format!("{LEASE_SELECT} {where_sql}");
+    fn query_lease(&self, sql: LeaseSql, params: impl rusqlite::Params) -> Result<Option<Lease>> {
+        let query = format!("{LEASE_SELECT} {}", sql.where_sql);
         let conn = self.lock()?;
-        conn.query_row(&sql, params, lease_from_row)
+        conn.query_row(&query, params, lease_from_row)
             .optional()
-            .map_err(|e| lease_err(context, e))
+            .map_err(|e| lease_err(sql.context, e))
     }
 
     /// Upsert a live agent-registry row.
-    pub fn upsert_agent(
-        &self,
-        agent_id: &str,
-        agent_type: &str,
-        session_id: Option<&str>,
-    ) -> Result<()> {
+    pub fn upsert_agent(&self, identity: AgentIdentity<'_>) -> Result<()> {
         let now = now_secs();
         let conn = self.lock()?;
         conn.execute(
@@ -283,7 +304,12 @@ impl LeaseStore {
                 started_at = excluded.started_at,
                 stopped_at = NULL
             ",
-            params![agent_id, agent_type, session_id, now],
+            params![
+                identity.agent_id,
+                identity.agent_type,
+                identity.session_id,
+                now
+            ],
         )
         .map_err(|e| lease_err("upsert agent", e))?;
         Ok(())
@@ -414,7 +440,11 @@ mod tests {
         let tmp = tempdir().unwrap();
         let store = LeaseStore::open(tmp.path().join("leases.db")).unwrap();
         store
-            .upsert_agent("agent-1", "Explore", Some("session-1"))
+            .upsert_agent(AgentIdentity {
+                agent_id: "agent-1",
+                agent_type: "Explore",
+                session_id: Some("session-1"),
+            })
             .unwrap();
         store.retire_agent("agent-1").unwrap();
         let conn = store.conn.lock().unwrap();

@@ -112,20 +112,8 @@ fn write_settings(settings_path: &Path, merged: &Value) -> Result<()> {
 }
 
 fn merge_hook_block(mut root: Value, writ_command: WritCommand<'_>) -> (Value, bool) {
-    if !root.is_object() {
-        root = json!({});
-    }
-    let hooks = root
-        .as_object_mut()
-        .expect("root object")
-        .entry("hooks")
-        .or_insert_with(|| json!({}));
-    if !hooks.is_object() {
-        *hooks = json!({});
-    }
-
-    let mut changed = false;
-    changed |= ensure_pre_tool_use(hooks, writ_command);
+    let hooks = hooks_object(&mut root);
+    let mut changed = ensure_pre_tool_use(hooks, writ_command);
     for event in [
         HookEventName::WORKTREE_CREATE,
         HookEventName::WORKTREE_REMOVE,
@@ -135,6 +123,23 @@ fn merge_hook_block(mut root: Value, writ_command: WritCommand<'_>) -> (Value, b
         changed |= ensure_unmatched_event(hooks, event, writ_command);
     }
     (root, changed)
+}
+
+fn hooks_object(root: &mut Value) -> &mut Value {
+    coerce_object(root);
+    let hooks = root
+        .as_object_mut()
+        .expect("root object")
+        .entry("hooks")
+        .or_insert_with(|| json!({}));
+    coerce_object(hooks);
+    hooks
+}
+
+fn coerce_object(value: &mut Value) {
+    if !value.is_object() {
+        *value = json!({});
+    }
 }
 
 fn ensure_pre_tool_use(hooks: &mut Value, writ_command: WritCommand<'_>) -> bool {
@@ -185,21 +190,22 @@ fn ensure_unmatched_event(
 }
 
 fn event_groups(hooks: &mut Value, event: HookEventName) -> &mut Vec<Value> {
-    ensure_array(hooks, event.as_str())
+    ensure_array(hooks, JsonField(event.as_str()))
 }
 
 fn hook_list(group: &mut Value) -> &mut Vec<Value> {
-    ensure_array(group, "hooks")
+    ensure_array(group, JsonField("hooks"))
 }
 
-fn ensure_array<'a>(parent: &'a mut Value, key: &str) -> &'a mut Vec<Value> {
-    if !parent.is_object() {
-        *parent = json!({});
-    }
+#[derive(Clone, Copy)]
+struct JsonField(&'static str);
+
+fn ensure_array(parent: &mut Value, key: JsonField) -> &mut Vec<Value> {
+    coerce_object(parent);
     let entry = parent
         .as_object_mut()
         .expect("json object")
-        .entry(key)
+        .entry(key.0)
         .or_insert_with(|| json!([]));
     if !entry.is_array() {
         *entry = json!([]);

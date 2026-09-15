@@ -834,11 +834,7 @@ fn describe_job_worktree(path: PathBuf, leases: &LeaseStore) -> Worktree {
 }
 
 fn spawn_git(repo: &Path, args: GitArgList<'_>) -> std::io::Result<std::process::Output> {
-    Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args.0)
-        .output()
+    crate::git_cmd::git_in(repo, args.0)
 }
 
 fn git_output_checked(repo: &Path, args: GitArgList<'_>, context: IoContext) -> Result<Vec<u8>> {

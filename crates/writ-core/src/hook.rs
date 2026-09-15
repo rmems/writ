@@ -9,14 +9,11 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use crate::bash_argv::{
-    extract_substitutions, mentions_git_or_gh, split_shell_statements, tokenize_shell,
-};
+use crate::bash_argv::{GitGhTool, ShellText, git_gh_invocations};
 use crate::error::{Error, PolicyCode, Result};
 use crate::git_safe::{SafeGhCommand, SafeGitCommand};
 use crate::identity::{StartPoint, resolve_start_commit};
-use crate::lease::LeaseStore;
-use crate::supervisor::normalize_program_name;
+use crate::lease::{AgentIdentity, LeaseStore};
 use crate::worktree::{WorktreeCreateRequest, WorktreeManager};
 
 /// Process-local paths for hook dispatch (tests inject temp dirs).
@@ -33,7 +30,7 @@ pub fn dispatch(
     stdout: &mut impl Write,
     stderr: &mut impl Write,
 ) -> u8 {
-    match dispatch_inner(input, runtime, stdout) {
+    match dispatch_inner(HookJson(input), runtime, stdout) {
         Ok(()) => 0,
         Err(err) => {
             let _ = writeln!(stderr, "writ hook: {err}");
@@ -42,8 +39,14 @@ pub fn dispatch(
     }
 }
 
-fn dispatch_inner(input: &str, runtime: &HookRuntime, stdout: &mut impl Write) -> Result<()> {
-    let event: HookEvent = serde_json::from_str(input).map_err(|e| Error::Io {
+struct HookJson<'a>(&'a str);
+
+fn dispatch_inner(
+    input: HookJson<'_>,
+    runtime: &HookRuntime,
+    stdout: &mut impl Write,
+) -> Result<()> {
+    let event: HookEvent = serde_json::from_str(input.0).map_err(|e| Error::Io {
         context: "parse hook JSON",
         source: std::io::Error::new(std::io::ErrorKind::InvalidData, e),
     })?;
@@ -96,7 +99,7 @@ fn handle_pre_tool_use(event: &HookEvent) -> Result<()> {
     else {
         return Ok(());
     };
-    admit_bash_command(command)
+    admit_bash_command(ShellText(command))
 }
 
 fn handle_worktree_create(
@@ -150,7 +153,11 @@ fn handle_worktree_remove(event: &HookEvent, runtime: &HookRuntime) -> Result<()
 fn handle_subagent_start(event: &HookEvent, runtime: &HookRuntime) -> Result<()> {
     let agent_id = event.agent_id.as_deref().unwrap_or("unknown");
     let agent_type = event.agent_type.as_deref().unwrap_or("unknown");
-    open_store(runtime)?.upsert_agent(agent_id, agent_type, event.session_id.as_deref())
+    open_store(runtime)?.upsert_agent(AgentIdentity {
+        agent_id,
+        agent_type,
+        session_id: event.session_id.as_deref(),
+    })
 }
 
 fn handle_subagent_stop(event: &HookEvent, runtime: &HookRuntime) -> Result<()> {
@@ -180,12 +187,8 @@ fn open_store(runtime: &HookRuntime) -> Result<LeaseStore> {
 }
 
 fn git_toplevel(cwd: &Path) -> Result<PathBuf> {
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(["rev-parse", "--show-toplevel"])
-        .output()
-        .map_err(|e| Error::Io {
+    let output =
+        crate::git_cmd::git_in(cwd, &["rev-parse", "--show-toplevel"]).map_err(|e| Error::Io {
             context: "resolve hook repository root",
             source: e,
         })?;
@@ -225,143 +228,12 @@ fn origin_owner_repo(repo_root: &Path) -> Result<(String, String)> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GitGhTool {
-    Git,
-    Gh,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Invocation {
-    tool: GitGhTool,
-    args: Vec<String>,
-}
-
-fn extract_git_gh_invocations(command: &str) -> Result<Vec<Invocation>> {
-    let mut found = Vec::new();
-    for statement in split_shell_statements(command) {
-        collect_from_statement(&statement, &mut found)?;
-    }
-    if found.is_empty() && mentions_git_or_gh(command) {
-        return Err(Error::PolicyViolation {
-            code: PolicyCode::SubcommandNotAllowed,
-            message: format!("unparseable git/gh command: {command}"),
-        });
-    }
-    Ok(found)
-}
-
-fn collect_from_statement(statement: &str, found: &mut Vec<Invocation>) -> Result<()> {
-    for inner in extract_substitutions(statement) {
-        collect_from_statement(&inner, found)?;
-    }
-    let tokens = tokenize_shell(statement);
-    let Some(invocation) = invocation_from_tokens(&tokens) else {
-        return Ok(());
-    };
-    found.push(invocation);
-    Ok(())
-}
-
-fn invocation_from_tokens(tokens: &[String]) -> Option<Invocation> {
-    let stripped = strip_env_assignments(tokens);
-    let (program, rest) = stripped.split_first()?;
-    let name = normalize_program_name(program);
-    let tool = match name.as_str() {
-        "git" => GitGhTool::Git,
-        "gh" => GitGhTool::Gh,
-        _ => return None,
-    };
-    let args = match tool {
-        GitGhTool::Git => skip_git_global_options(rest),
-        GitGhTool::Gh => rest.to_vec(),
-    };
-    Some(Invocation { tool, args })
-}
-
-fn strip_env_assignments(tokens: &[String]) -> &[String] {
-    let mut i = 0;
-    while i < tokens.len() && is_env_assignment(&tokens[i]) {
-        i += 1;
-    }
-    &tokens[i..]
-}
-
-fn is_env_assignment(token: &str) -> bool {
-    let Some((key, _)) = token.split_once('=') else {
-        return false;
-    };
-    !key.is_empty()
-        && key
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-        && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
-
-fn skip_git_global_options(args: &[String]) -> Vec<String> {
-    let mut i = 0;
-    while i < args.len() {
-        match classify_git_prefix(&args[i]) {
-            GitPrefix::EndOfOptions => return tail_args(args, i.saturating_add(1)),
-            GitPrefix::TakesValue => i = i.saturating_add(2),
-            GitPrefix::EqualsForm => i = i.saturating_add(1),
-            GitPrefix::Operand => break,
-        }
-    }
-    tail_args(args, i)
-}
-
-fn tail_args(args: &[String], i: usize) -> Vec<String> {
-    args.get(i..).unwrap_or(&[]).to_vec()
-}
-
-enum GitPrefix {
-    EndOfOptions,
-    TakesValue,
-    EqualsForm,
-    Operand,
-}
-
-fn classify_git_prefix(arg: &str) -> GitPrefix {
-    if arg == "--" {
-        return GitPrefix::EndOfOptions;
-    }
-    if git_prefix_takes_value(arg) {
-        return GitPrefix::TakesValue;
-    }
-    if git_prefix_equals_form(arg) {
-        return GitPrefix::EqualsForm;
-    }
-    GitPrefix::Operand
-}
-
-fn git_prefix_takes_value(arg: &str) -> bool {
-    matches!(
-        arg,
-        "-C" | "-c"
-            | "--git-dir"
-            | "--work-tree"
-            | "--namespace"
-            | "--config-env"
-            | "--super-prefix"
-    )
-}
-
-fn git_prefix_equals_form(arg: &str) -> bool {
-    [
-        "--git-dir=",
-        "--work-tree=",
-        "--namespace=",
-        "--config-env=",
-        "--super-prefix=",
-    ]
-    .iter()
-    .any(|prefix| arg.starts_with(prefix))
-}
-
-fn admit_bash_command(command: &str) -> Result<()> {
-    for invocation in extract_git_gh_invocations(command)? {
+fn admit_bash_command(command: ShellText<'_>) -> Result<()> {
+    let invocations = git_gh_invocations(command).map_err(|unparsed| Error::PolicyViolation {
+        code: PolicyCode::SubcommandNotAllowed,
+        message: format!("unparseable git/gh command: {}", unparsed.0.0),
+    })?;
+    for invocation in invocations {
         match invocation.tool {
             GitGhTool::Git => {
                 SafeGitCommand::new(&invocation.args)?;
@@ -376,7 +248,7 @@ fn admit_bash_command(command: &str) -> Result<()> {
 
 /// Public validation entry used by tests: policy-check a Bash command string.
 pub fn validate_bash_command(command: &str) -> Result<()> {
-    admit_bash_command(command)
+    admit_bash_command(ShellText(command))
 }
 
 #[cfg(test)]

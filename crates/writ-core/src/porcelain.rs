@@ -20,45 +20,50 @@ pub struct WorktreeRecord {
 /// Parse NUL-delimited porcelain bytes into worktree records.
 #[must_use]
 pub fn parse_porcelain_z(bytes: &[u8]) -> Vec<WorktreeRecord> {
-    let mut records = Vec::new();
-    let mut current = PartialRecord::default();
-    let mut saw_attr = false;
+    let mut parser = PorcelainParser::default();
     for attr in bytes.split(|b| *b == 0) {
-        consume_attr(attr, &mut records, &mut current, &mut saw_attr);
+        parser.push(attr);
     }
-    flush_record(&mut records, current);
-    records
+    parser.finish()
 }
 
-fn consume_attr(
-    attr: &[u8],
-    records: &mut Vec<WorktreeRecord>,
-    current: &mut PartialRecord,
-    saw_attr: &mut bool,
-) {
-    if attr.is_empty() {
-        close_record(records, current, saw_attr);
-        return;
-    }
-    *saw_attr = true;
-    current.apply(attr);
+#[derive(Default)]
+struct PorcelainParser {
+    records: Vec<WorktreeRecord>,
+    current: PartialRecord,
+    open: bool,
 }
 
-fn close_record(
-    records: &mut Vec<WorktreeRecord>,
-    current: &mut PartialRecord,
-    saw_attr: &mut bool,
-) {
-    if !*saw_attr {
-        return;
+impl PorcelainParser {
+    fn push(&mut self, attr: &[u8]) {
+        match attr {
+            [] => self.close(),
+            field => self.field(field),
+        }
     }
-    flush_record(records, std::mem::take(current));
-    *saw_attr = false;
-}
 
-fn flush_record(records: &mut Vec<WorktreeRecord>, current: PartialRecord) {
-    if let Some(record) = current.finish() {
-        records.push(record);
+    fn field(&mut self, attr: &[u8]) {
+        self.open = true;
+        self.current.apply(attr);
+    }
+
+    fn close(&mut self) {
+        if !self.open {
+            return;
+        }
+        self.take_record();
+        self.open = false;
+    }
+
+    fn take_record(&mut self) {
+        if let Some(record) = std::mem::take(&mut self.current).finish() {
+            self.records.push(record);
+        }
+    }
+
+    fn finish(mut self) -> Vec<WorktreeRecord> {
+        self.take_record();
+        self.records
     }
 }
 
