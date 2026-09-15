@@ -561,9 +561,11 @@ impl CreationPostconditions<'_> {
         })?;
         if !porcelain::registration_matches(
             &listing,
-            self.worktree_path,
-            actual_branch_ref,
-            head_commit,
+            porcelain::RegistrationIdentity {
+                path: self.worktree_path,
+                branch_ref: actual_branch_ref,
+                head: head_commit,
+            },
         ) {
             return Err(self.failure(
                 Some(actual_branch_ref),
@@ -1479,9 +1481,11 @@ mod tests {
         assert!(
             porcelain::registration_matches(
                 &listing.stdout,
-                &wt.path,
-                BranchRef("refs/heads/feature/newline"),
-                CommitId(&start),
+                porcelain::RegistrationIdentity {
+                    path: &wt.path,
+                    branch_ref: BranchRef("refs/heads/feature/newline"),
+                    head: CommitId(&start),
+                },
             ),
             "newline-containing worktree path must stay in one porcelain record"
         );
