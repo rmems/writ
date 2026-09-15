@@ -208,24 +208,40 @@ fn is_owner_repo_slug(head_repo: HeadRepo<'_>) -> bool {
     !repo.is_empty()
 }
 
+/// Shared location tokens for head-repo rejection vs origin file-protocol.
+/// Callers interpret the flags differently; do not collapse those policies.
+#[derive(Clone, Copy)]
+struct LocationText<'a>(&'a str);
+
+impl<'a> LocationText<'a> {
+    fn new(text: &'a str) -> Self {
+        Self(text.trim())
+    }
+
+    fn as_str(self) -> &'a str {
+        self.0
+    }
+
+    fn is_filesystem_path(self) -> bool {
+        let text = self.0;
+        text.starts_with('/') || text.starts_with('\\') || text.contains('\\')
+    }
+
+    fn has_url_scheme(self) -> bool {
+        self.0.contains("://")
+    }
+
+    fn has_ssh_user(self) -> bool {
+        self.0.contains('@')
+    }
+}
+
 fn looks_like_url_or_path(head_repo: HeadRepo<'_>) -> bool {
-    let trimmed = head_repo.as_str().trim();
-    if trimmed.contains("://") {
-        return true;
-    }
-    if trimmed.contains('@') {
-        return true;
-    }
-    if trimmed.starts_with('/') {
-        return true;
-    }
-    if trimmed.starts_with('\\') {
-        return true;
-    }
-    if trimmed.starts_with('-') {
-        return true;
-    }
-    trimmed.contains('\\')
+    let loc = LocationText::new(head_repo.as_str());
+    loc.has_url_scheme()
+        || loc.has_ssh_user()
+        || loc.as_str().starts_with('-')
+        || loc.is_filesystem_path()
 }
 
 fn allocate_import_ref(pr_number: u64) -> String {
@@ -297,27 +313,23 @@ fn origin_url_is_in_scope(request: &PrHeadImportRequest<'_>, url: &str) -> Resul
 }
 
 fn looks_like_local_remote(url: &str) -> bool {
-    let trimmed = url.trim();
-    if trimmed.starts_with('/') {
+    let loc = LocationText::new(url);
+    if loc.is_filesystem_path() {
         return true;
     }
-    if trimmed.starts_with('.') {
+    let text = loc.as_str();
+    if text.starts_with('.') || text.starts_with("file://") {
         return true;
     }
-    if trimmed.starts_with("file://") {
-        return true;
-    }
-    if trimmed.contains('\\') {
-        return true;
-    }
-    if trimmed.contains("://") {
-        return false;
-    }
-    !trimmed.contains('@')
+    !loc.has_url_scheme() && !loc.has_ssh_user()
 }
 
 fn optional_rev_parse(repo_root: &Path, rev: RefName<'_>) -> Option<String> {
-    let spec = format!("{}^{{commit}}", rev.as_str());
+    optional_rev_parse_spec(repo_root, format!("{}^{{commit}}", rev.as_str()))
+        .or_else(|| optional_rev_parse_spec(repo_root, rev.as_str().to_owned()))
+}
+
+fn optional_rev_parse_spec(repo_root: &Path, spec: String) -> Option<String> {
     let args = vec![
         "rev-parse".to_owned(),
         "--verify".to_owned(),
@@ -326,23 +338,9 @@ fn optional_rev_parse(repo_root: &Path, rev: RefName<'_>) -> Option<String> {
     ];
     let output = run_allowlisted_git_restricted(repo_root, &args).ok()?;
     if output.exit_code != 0 {
-        return optional_object_id(repo_root, rev);
-    }
-    nonempty_oid(&output.stdout)
-}
-
-fn optional_object_id(repo_root: &Path, rev: RefName<'_>) -> Option<String> {
-    let object_args = vec![
-        "rev-parse".to_owned(),
-        "--verify".to_owned(),
-        "--end-of-options".to_owned(),
-        rev.as_str().to_owned(),
-    ];
-    let object = run_allowlisted_git_restricted(repo_root, &object_args).ok()?;
-    if object.exit_code != 0 {
         return None;
     }
-    nonempty_oid(&object.stdout)
+    nonempty_oid(&output.stdout)
 }
 
 fn nonempty_oid(stdout: &str) -> Option<String> {
@@ -821,5 +819,32 @@ mod tests {
             )
             .is_empty()
         );
+    }
+
+    #[test]
+    fn location_tokens_keep_head_repo_and_origin_policies_distinct() {
+        let cases = [
+            ("/abs/repo.git", true, true),
+            (r"C:\src\repo.git", true, true),
+            ("file:///tmp/origin.git", true, true),
+            ("./rel.git", false, true),
+            ("https://github.com/acme/widgets.git", true, false),
+            ("git@github.com:acme/widgets.git", true, false),
+            ("ext::sh -c evil", false, true),
+            ("-upload-pack", true, true),
+            ("acme/fork", false, true),
+        ];
+        for (input, url_or_path, local_remote) in cases {
+            assert_eq!(
+                looks_like_url_or_path(HeadRepo(input)),
+                url_or_path,
+                "url_or_path {input}"
+            );
+            assert_eq!(
+                looks_like_local_remote(input),
+                local_remote,
+                "local {input}"
+            );
+        }
     }
 }

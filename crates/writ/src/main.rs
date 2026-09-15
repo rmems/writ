@@ -1,5 +1,5 @@
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -169,6 +169,54 @@ async fn main() -> ExitCode {
     }
 }
 
+struct WorktreeResidual<'a> {
+    path: &'a Path,
+    branch: &'a str,
+    path_exists: bool,
+    branch_commit: &'a Option<String>,
+    head_commit: &'a Option<String>,
+    worktree_registered: bool,
+}
+
+macro_rules! worktree_residual {
+    ($failure:expr) => {
+        WorktreeResidual {
+            path: &$failure.path,
+            branch: &$failure.branch,
+            path_exists: $failure.path_exists,
+            branch_commit: &$failure.branch_commit,
+            head_commit: &$failure.head_commit,
+            worktree_registered: $failure.worktree_registered,
+        }
+    };
+}
+
+fn worktree_residual_json(
+    residual: WorktreeResidual<'_>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut map = serde_json::Map::new();
+    map.insert("path".to_owned(), serde_json::json!(residual.path));
+    map.insert("branch".to_owned(), serde_json::json!(residual.branch));
+    map.insert(
+        "path_exists".to_owned(),
+        serde_json::json!(residual.path_exists),
+    );
+    map.insert(
+        "branch_commit".to_owned(),
+        serde_json::json!(residual.branch_commit),
+    );
+    map.insert(
+        "head_commit".to_owned(),
+        serde_json::json!(residual.head_commit),
+    );
+    map.insert(
+        "worktree_registered".to_owned(),
+        serde_json::json!(residual.worktree_registered),
+    );
+    map.insert("cleanup_performed".to_owned(), serde_json::json!(false));
+    map
+}
+
 fn worktree_error_data(error: &writ_core::error::Error) -> serde_json::Value {
     match error {
         writ_core::error::Error::ContractUpgradeRequired {
@@ -176,7 +224,9 @@ fn worktree_error_data(error: &writ_core::error::Error) -> serde_json::Value {
         } => serde_json::json!({
             "required_schema_version": required_schema_version,
         }),
-        writ_core::error::Error::WorktreeCreationFailed(failure) => creation_failure_data(failure),
+        writ_core::error::Error::WorktreeCreationFailed(failure) => {
+            serde_json::Value::Object(worktree_residual_json(worktree_residual!(failure)))
+        }
         writ_core::error::Error::WorktreePostconditionFailed(failure) => {
             postcondition_failure_data(failure)
         }
@@ -185,52 +235,19 @@ fn worktree_error_data(error: &writ_core::error::Error) -> serde_json::Value {
     }
 }
 
-fn creation_failure_data(failure: &writ_core::error::WorktreeCreationFailure) -> serde_json::Value {
-    let writ_core::error::WorktreeCreationFailure {
-        path,
-        branch,
-        path_exists,
-        branch_commit,
-        head_commit,
-        worktree_registered,
-        ..
-    } = failure;
-    serde_json::json!({
-        "path": path,
-        "branch": branch,
-        "path_exists": path_exists,
-        "branch_commit": branch_commit,
-        "head_commit": head_commit,
-        "worktree_registered": worktree_registered,
-        "cleanup_performed": false,
-    })
-}
-
 fn postcondition_failure_data(
     failure: &writ_core::error::WorktreePostconditionFailure,
 ) -> serde_json::Value {
-    let writ_core::error::WorktreePostconditionFailure {
-        path,
-        branch,
-        expected_commit,
-        actual_branch,
-        path_exists,
-        branch_commit,
-        head_commit,
-        worktree_registered,
-        ..
-    } = failure;
-    serde_json::json!({
-        "path": path,
-        "branch": branch,
-        "expected_commit": expected_commit,
-        "actual_branch": actual_branch,
-        "path_exists": path_exists,
-        "branch_commit": branch_commit,
-        "head_commit": head_commit,
-        "worktree_registered": worktree_registered,
-        "cleanup_performed": false,
-    })
+    let mut map = worktree_residual_json(worktree_residual!(failure));
+    map.insert(
+        "expected_commit".to_owned(),
+        serde_json::json!(&failure.expected_commit),
+    );
+    map.insert(
+        "actual_branch".to_owned(),
+        serde_json::json!(&failure.actual_branch),
+    );
+    serde_json::Value::Object(map)
 }
 
 fn import_failure_data(failure: &writ_core::error::PrImportFailure) -> serde_json::Value {
