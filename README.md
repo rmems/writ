@@ -59,16 +59,13 @@ These apply to every agent, platform, and command path:
 
 Soft prompt text is not runtime enforcement. Hard stops live in Rust, at the binary boundary, where a malformed prompt cannot bypass them.
 
-## Owner allowlist — not currently enforced
+## Owner allowlist
 
-> [!WARNING]
-> **`WRIT_ALLOWED_OWNERS` has no reader anywhere under `crates/`.** It was enforced in the Python layer this repository just removed, so owner scoping is presently a stated requirement with no code behind it. Do not rely on it as an access control. Tracked in [#146](https://github.com/rmems/writ/issues/146).
+Repository access is controlled by a configured owner allowlist, not a built-in org list.
 
-The intended contract, for when enforcement lands:
-
-- Repository access is controlled by a configured owner allowlist, not a built-in org list.
-- Set `WRIT_ALLOWED_OWNERS=acme,example-org` (comma-separated), or pass explicit owners at the API boundary.
-- An empty allowlist denies multi-owner operations rather than permitting them.
+- Set `WRIT_ALLOWED_OWNERS=acme,example-org` (comma-separated), or pass `--allowed-owners` / explicit owners at the API boundary.
+- An empty allowlist denies owner-taking operations (`writ worktree create` and `gh` commands that select a repository via `-R` / `--repo` in any pflag spelling, or via `GH_REPO`) rather than permitting them.
+- Comparison uses the same host/case normalization as `github_repo_slugs_match`, so `Acme/Repo` and `github.com/acme/repo` cannot diverge.
 
 Examples use generic owners such as `acme` and `example-org`.
 

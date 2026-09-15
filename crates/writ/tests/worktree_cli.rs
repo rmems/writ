@@ -61,8 +61,19 @@ struct CreateRequest<'a> {
 }
 
 fn writ_cmd(root: &Path, create_args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_writ"))
+    writ_cmd_with_owners(root, create_args, Some("acme"))
+}
+
+fn writ_cmd_with_owners(root: &Path, create_args: &[&str], allowed_owners: Option<&str>) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_writ"));
+    command
         .env("WRIT_WORKTREE_BASE", root.join("worktrees"))
+        .env_remove("WRIT_ALLOWED_OWNERS")
+        .env_remove("WH_ALLOWED_OWNERS");
+    if let Some(owners) = allowed_owners {
+        command.env("WRIT_ALLOWED_OWNERS", owners);
+    }
+    command
         .args(["--json", "worktree", "create"])
         .args(create_args)
         .output()
@@ -335,4 +346,69 @@ fn partial_create_failure_reports_residual_state_without_deleting_branch() {
         fs::read_to_string(target.join("occupied")).unwrap(),
         "keep\n"
     );
+}
+
+#[test]
+fn empty_allowlist_rejects_create_without_mutation() {
+    let (root, repo) = primed();
+    let start = git(&repo, &["rev-parse", "HEAD"]);
+    let args = identity_args(
+        &repo,
+        &CreateRequest {
+            job: "denied-empty",
+            branch: "feature/denied-empty",
+            start: &start,
+        },
+    );
+    let output = writ_cmd_with_owners(&root.0, &args, None);
+    assert_error_envelope(&output, 2, 2, "OWNER_NOT_ALLOWED");
+    assert_uncreated(&root.0, &repo, "denied-empty", "feature/denied-empty");
+}
+
+#[test]
+fn owner_outside_allowlist_rejects_create_without_mutation() {
+    let (root, repo) = primed();
+    let start = git(&repo, &["rev-parse", "HEAD"]);
+    let args = identity_args(
+        &repo,
+        &CreateRequest {
+            job: "denied-other",
+            branch: "feature/denied-other",
+            start: &start,
+        },
+    );
+    let output = writ_cmd_with_owners(&root.0, &args, Some("other"));
+    assert_error_envelope(&output, 2, 2, "OWNER_NOT_ALLOWED");
+    assert_uncreated(&root.0, &repo, "denied-other", "feature/denied-other");
+}
+
+#[test]
+fn explicit_allowed_owners_flag_overrides_env_and_creates() {
+    let (root, repo) = primed();
+    let start = git(&repo, &["rev-parse", "HEAD"]);
+    let args = identity_args(
+        &repo,
+        &CreateRequest {
+            job: "explicit",
+            branch: "feature/explicit",
+            start: &start,
+        },
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_writ"))
+        .env("WRIT_WORKTREE_BASE", root.0.join("worktrees"))
+        .env("WRIT_ALLOWED_OWNERS", "other")
+        .args([
+            "--json",
+            "--allowed-owners",
+            "github.com/Acme/Repo",
+            "worktree",
+            "create",
+        ])
+        .args(&args)
+        .output()
+        .unwrap();
+    let envelope = json(&output);
+    assert!(output.status.success());
+    assert_eq!(envelope["ok"], true);
+    assert_eq!(envelope["data"]["branch"], "feature/explicit");
 }

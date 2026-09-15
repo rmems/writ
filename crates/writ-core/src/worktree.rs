@@ -8,6 +8,7 @@ use crate::error::{
 use crate::identity::{
     BranchName, BranchRef, CommitId, JobId, Owner, Repo, StartPoint, resolve_start_commit,
 };
+use crate::owners::OwnerAllowlist;
 use crate::paths::{canonicalize_for_tools, derive_worktree_path, worktree_base_path};
 
 #[derive(Clone, Copy)]
@@ -52,6 +53,7 @@ pub struct WorktreeCreateRequest<'a> {
 #[derive(Debug, Default)]
 pub struct WorktreeManager {
     base_path: Option<PathBuf>,
+    allowlist: OwnerAllowlist,
 }
 
 impl WorktreeManager {
@@ -78,7 +80,18 @@ impl WorktreeManager {
         })?;
         Ok(Self {
             base_path: Some(base),
+            allowlist: OwnerAllowlist::from_env(),
         })
+    }
+
+    /// Replace the owner allowlist used by create operations.
+    ///
+    /// Explicit per-call owners are the documented alternative to
+    /// `WRIT_ALLOWED_OWNERS`. An empty list still denies.
+    #[must_use]
+    pub fn with_allowlist(mut self, allowlist: OwnerAllowlist) -> Self {
+        self.allowlist = allowlist;
+        self
     }
 
     /// Get the base path this manager uses.
@@ -127,6 +140,7 @@ impl WorktreeManager {
 
     /// Create a worktree from a typed request used by CLI and orchestration adapters.
     pub fn create_with_request(&self, request: WorktreeCreateRequest<'_>) -> Result<Worktree> {
+        self.allowlist.enforce_owner(request.owner)?;
         let branch = BranchName(request.branch);
         let start_point = StartPoint(request.start_point);
         validate_worktree_branch(branch)?;
@@ -949,7 +963,9 @@ mod tests {
             let repo = temp.path().join("repo");
             fs::create_dir(&repo).unwrap();
             let repo_root = init_test_repo_with_object_format(&repo, object_format).unwrap();
-            let manager = WorktreeManager::with_base(temp.path().join("worktrees")).unwrap();
+            let manager = WorktreeManager::with_base(temp.path().join("worktrees"))
+                .unwrap()
+                .with_allowlist(OwnerAllowlist::from_owners(["acme"]));
             Self {
                 temp,
                 repo_root,
@@ -1065,6 +1081,99 @@ mod tests {
             .unwrap();
 
         assert_eq!(wt.head_commit.as_deref(), Some(start_commit.as_str()));
+    }
+
+    #[test]
+    fn create_rejects_owner_outside_allowlist_without_mutation() {
+        let harness = Harness::sha1();
+        let start_commit = harness.head();
+        let result = harness.manager.create(
+            &harness.repo_root,
+            "other",
+            "test-repo",
+            "job-denied",
+            "feature/denied",
+            &start_commit,
+        );
+        assert!(matches!(
+            result,
+            Err(Error::PolicyViolation {
+                code: PolicyCode::OwnerNotAllowed,
+                ..
+            })
+        ));
+        assert!(
+            git_output(&harness.repo_root, &["branch", "--list", "feature/denied"])
+                .trim()
+                .is_empty()
+        );
+        assert!(
+            !harness
+                .manager
+                .base_path()
+                .unwrap()
+                .join("other/test-repo/job-denied")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn create_rejects_empty_allowlist_without_mutation() {
+        let harness = Harness::sha1();
+        let start_commit = harness.head();
+        let manager = WorktreeManager::with_base(harness.temp_path().join("empty-allowlist"))
+            .unwrap()
+            .with_allowlist(OwnerAllowlist::default());
+        let result = manager.create(
+            &harness.repo_root,
+            "acme",
+            "test-repo",
+            "job-empty",
+            "feature/empty-allowlist",
+            &start_commit,
+        );
+        assert!(matches!(
+            result,
+            Err(Error::PolicyViolation {
+                code: PolicyCode::OwnerNotAllowed,
+                ..
+            })
+        ));
+        assert!(
+            git_output(
+                &harness.repo_root,
+                &["branch", "--list", "feature/empty-allowlist"]
+            )
+            .trim()
+            .is_empty()
+        );
+        assert!(
+            !harness
+                .temp_path()
+                .join("empty-allowlist/acme/test-repo/job-empty")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn create_honors_explicit_allowlist_case_and_host_form() {
+        let harness = Harness::sha1();
+        let start_commit = harness.head();
+        let manager = WorktreeManager::with_base(harness.temp_path().join("explicit-allowlist"))
+            .unwrap()
+            .with_allowlist(OwnerAllowlist::from_owners(["github.com/Acme/Repo"]));
+        let wt = manager
+            .create(
+                &harness.repo_root,
+                "ACME",
+                "test-repo",
+                "job-explicit",
+                "feature/explicit",
+                &start_commit,
+            )
+            .unwrap();
+        assert_eq!(wt.head_commit.as_deref(), Some(start_commit.as_str()));
+        assert!(wt.path.exists());
     }
 
     fn assert_unproven_resume(result: Result<Worktree>) {
