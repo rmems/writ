@@ -82,6 +82,7 @@ const STATE_PATH_ENV: &str = "WRIT_STATE_PATH";
 const LEGACY_STATE_PATH_ENV: &str = "WH_STATE_PATH";
 const WORKTREE_BASE_ENV: &str = "WRIT_WORKTREE_BASE";
 const LEGACY_WORKTREE_BASE_ENV: &str = "WH_WORKTREE_BASE";
+const LEASE_PATH_ENV: &str = "WRIT_LEASE_PATH";
 
 /// Named root for writ durable state under the user data directory.
 ///
@@ -125,6 +126,12 @@ impl StateRoot {
     #[must_use]
     pub fn watched_json(&self) -> PathBuf {
         self.path.join("watched.json")
+    }
+
+    /// Path to the SQLite lease store under this root.
+    #[must_use]
+    pub fn leases_db(&self) -> PathBuf {
+        self.path.join("leases.db")
     }
 }
 
@@ -185,6 +192,25 @@ pub fn state_path() -> PathBuf {
         std::env::var_os(STATE_PATH_ENV).as_deref(),
         std::env::var_os(LEGACY_STATE_PATH_ENV).as_deref(),
     )
+}
+
+/// Resolve the SQLite lease-store path.
+///
+/// Honours `WRIT_LEASE_PATH` when set and non-empty; otherwise
+/// `{resolved_state_root}/leases.db`.
+#[must_use]
+pub fn lease_store_path() -> PathBuf {
+    resolve_lease_path_in(
+        &user_data_dir(),
+        std::env::var_os(LEASE_PATH_ENV).as_deref(),
+    )
+}
+
+fn resolve_lease_path_in(user_data: &Path, writ_lease_path: Option<&OsStr>) -> PathBuf {
+    if let Some(custom) = writ_lease_path.filter(|v| !v.is_empty()) {
+        return PathBuf::from(custom);
+    }
+    StateRoot::from_user_data(user_data).leases_db()
 }
 
 /// Resolve the configured worktree base path.
@@ -312,8 +338,8 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{
-        StateRoot, derive_worktree_path, resolve_state_path, resolve_state_path_in,
-        resolve_worktree_base_in, user_data_dir, worktree_base_path,
+        StateRoot, derive_worktree_path, resolve_lease_path_in, resolve_state_path,
+        resolve_state_path_in, resolve_worktree_base_in, user_data_dir, worktree_base_path,
     };
 
     fn assert_ends_with(path: &Path, unix: &str, windows: &str) {
@@ -359,6 +385,26 @@ mod tests {
         assert_eq!(
             root.watched_json(),
             PathBuf::from("/tmp/writ-state/watched.json")
+        );
+        assert_eq!(root.leases_db(), PathBuf::from("/tmp/writ-state/leases.db"));
+    }
+
+    #[test]
+    fn lease_store_path_honours_override_and_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            resolve_lease_path_in(tmp.path(), os("/tmp/custom/leases.db")),
+            PathBuf::from("/tmp/custom/leases.db")
+        );
+        let default = resolve_lease_path_in(tmp.path(), None);
+        assert!(
+            default.ends_with("writ/leases.db") || default.ends_with("writ\\leases.db"),
+            "unexpected default lease path {}",
+            default.display()
+        );
+        assert_eq!(
+            resolve_lease_path_in(tmp.path(), os("")),
+            resolve_lease_path_in(tmp.path(), None)
         );
     }
 

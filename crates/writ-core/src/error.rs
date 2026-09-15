@@ -37,6 +37,39 @@ impl Display for WorktreeCreationFailure {
     }
 }
 
+/// Fail-closed interrupted allocation that must not be cleaned up automatically.
+#[derive(Debug)]
+pub struct LeaseAttentionFailure {
+    pub operation_id: String,
+    pub allocation_state: String,
+    pub classification: String,
+    pub conflicts: Vec<String>,
+    pub path: PathBuf,
+    pub path_exists: bool,
+    pub branch_commit: Option<String>,
+    pub head_commit: Option<String>,
+    pub worktree_registered: bool,
+}
+
+impl Display for LeaseAttentionFailure {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "lease allocation `{}` needs attention (state={} class={}): {}; \
+             residual_state path_exists={} registered={} branch_commit={} head_commit={}; \
+             automatic cleanup skipped because concurrent adoption cannot be disproven",
+            self.operation_id,
+            self.allocation_state,
+            self.classification,
+            self.conflicts.join("; "),
+            self.path_exists,
+            self.worktree_registered,
+            self.branch_commit.as_deref().unwrap_or("<absent>"),
+            self.head_commit.as_deref().unwrap_or("<absent>")
+        )
+    }
+}
+
 /// Exact-identity postcondition failure and the residual state left in place.
 #[derive(Debug)]
 pub struct WorktreePostconditionFailure {
@@ -105,6 +138,13 @@ pub enum Error {
         /// Human-readable explanation.
         message: String,
     },
+    /// The SQLite lease store could not complete an operation.
+    LeaseStore {
+        context: &'static str,
+        message: String,
+    },
+    /// Interrupted allocation evidence is partial or conflicting.
+    LeaseAttention(Box<LeaseAttentionFailure>),
 }
 
 /// Machine-readable error codes for policy violations.
@@ -128,6 +168,12 @@ pub enum PolicyCode {
     PathNotAllowed,
     /// An existing worktree branch lacks a durable identity proving safe resume ownership.
     WorktreeResumeUnproven,
+    /// Reconciliation found partial or conflicting git/lease evidence.
+    LeaseNeedsAttention,
+    /// A released lease cannot be resurrected by reconcile or prepare.
+    LeaseReleased,
+    /// A tombstoned lease cannot be resurrected by reconcile or prepare.
+    LeaseTombstoned,
 }
 
 impl PolicyCode {
@@ -144,6 +190,9 @@ impl PolicyCode {
             Self::GhFlagNotAllowed => "GH_FLAG_NOT_ALLOWED",
             Self::PathNotAllowed => "PATH_NOT_ALLOWED",
             Self::WorktreeResumeUnproven => "WORKTREE_RESUME_UNPROVEN",
+            Self::LeaseNeedsAttention => "LEASE_NEEDS_ATTENTION",
+            Self::LeaseReleased => "LEASE_RELEASED",
+            Self::LeaseTombstoned => "LEASE_TOMBSTONED",
         }
     }
 }
@@ -195,6 +244,8 @@ impl Display for Error {
             Self::PolicyViolation { code, message } => {
                 write!(f, "policy violation [{code}]: {message}")
             }
+            Self::LeaseStore { context, message } => write!(f, "{context}: {message}"),
+            Self::LeaseAttention(failure) => Display::fmt(failure.as_ref(), f),
         }
     }
 }
@@ -222,6 +273,8 @@ impl Error {
             Self::ContractUpgradeRequired { .. } => "CONTRACT_UPGRADE_REQUIRED",
             Self::StartPointRequired => "START_POINT_REQUIRED",
             Self::PolicyViolation { code, .. } => code.as_str(),
+            Self::LeaseStore { .. } => "LEASE_STORE_FAILED",
+            Self::LeaseAttention(_) => PolicyCode::LeaseNeedsAttention.as_str(),
         }
     }
 
@@ -229,7 +282,7 @@ impl Error {
     #[must_use]
     pub const fn exit_code(&self) -> u8 {
         match self {
-            Self::PolicyViolation { .. } => 2,
+            Self::PolicyViolation { .. } | Self::LeaseAttention(_) => 2,
             _ => 1,
         }
     }
@@ -270,5 +323,19 @@ mod tests {
 
         assert_eq!(policy.exit_code(), 2);
         assert_eq!(postcondition.exit_code(), 1);
+
+        let attention = Error::LeaseAttention(Box::new(crate::error::LeaseAttentionFailure {
+            operation_id: "op-1".to_owned(),
+            allocation_state: "MUTATING".to_owned(),
+            classification: "needs_attention".to_owned(),
+            conflicts: vec!["branch commit is absent".to_owned()],
+            path: PathBuf::from("worktree"),
+            path_exists: true,
+            branch_commit: None,
+            head_commit: None,
+            worktree_registered: false,
+        }));
+        assert_eq!(attention.exit_code(), 2);
+        assert_eq!(attention.code(), "LEASE_NEEDS_ATTENTION");
     }
 }

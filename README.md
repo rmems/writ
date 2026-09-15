@@ -22,7 +22,7 @@ Claude Code agent teams have real coordination and [documented zero isolation](h
 > [!NOTE]
 > **Status: the enforcement core is real; the hook layer is not built yet.**
 > Shipping today are the `git`/`gh` allowlists, exact-base worktree verification, path sandboxing, process supervision, and the absence of any merge path — reachable through the `writ` CLI, including `writ worktree create`, which remains supported.
-> Not yet built: the `PreToolUse`/`WorktreeCreate` hook dispatcher, `writ install`, and the SQLite lease store. Those are milestone **M1** ([#124](https://github.com/rmems/writ/issues/124)). Until they land, enforcement applies only to commands routed through `writ` deliberately — it is **opt-in, not unbypassable**.
+> Not yet built: the `PreToolUse`/`WorktreeCreate` hook dispatcher and `writ install`. Those remain milestone **M1** ([#124](https://github.com/rmems/writ/issues/124)). `writ worktree create` now persists a crash-consistent SQLite lease row before git mutation ([#136](https://github.com/rmems/writ/issues/136)); `writ lease inspect` / `writ lease reconcile` report and recover interrupted allocations without adopting unproven state. Until hooks land, enforcement still applies only to commands routed through `writ` deliberately — it is **opt-in, not unbypassable**.
 
 ## Architecture
 
@@ -34,7 +34,7 @@ Two layers, one binary.
 | **Coordination state** (cross-repo) *(planned, M1)* | Agents, leases with path scopes, ownership, blockers, freeze modes. SQLite, single file, derived from `git`/`gh`/disk. Not implemented yet | Task decomposition or scheduling |
 | `git`, `gh`, OS | Version-control, GitHub, and process primitives, invoked through allowlists | Policy |
 
-Leases are intended to be the join: coordination state that the enforcement layer will check at write time. No lease store exists yet (M1).
+Leases are the join: coordination state that the enforcement layer checks at write time. `writ worktree create` now records a crash-consistent lease before git mutation; the hook dispatcher that will make that check unbypassable is still M1.
 
 ### Why hooks (planned — M1)
 

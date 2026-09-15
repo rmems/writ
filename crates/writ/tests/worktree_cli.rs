@@ -63,6 +63,7 @@ struct CreateRequest<'a> {
 fn writ_cmd(root: &Path, create_args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_writ"))
         .env("WRIT_WORKTREE_BASE", root.join("worktrees"))
+        .env("WRIT_LEASE_PATH", root.join("leases.db"))
         .args(["--json", "worktree", "create"])
         .args(create_args)
         .output()
