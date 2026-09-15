@@ -56,6 +56,12 @@ enum Command {
         #[command(subcommand)]
         action: WorktreeAction,
     },
+
+    /// Format an attributed PR thread reply or summary comment.
+    Attribution {
+        #[command(subcommand)]
+        action: AttributionAction,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -98,6 +104,28 @@ enum WorktreeAction {
     Prune {
         #[arg(long)]
         repo: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AttributionAction {
+    /// Render a reply body with attribution and optional commit SHA.
+    Format {
+        /// Main reply content.
+        #[arg(long)]
+        body: String,
+        /// Identity line. Overrides `WRIT_AGENT_ID` / `WRIT_ATTRIBUTION`.
+        #[arg(long)]
+        agent_id: Option<String>,
+        /// Pushed commit SHA after a successful fix. Omit when no code changed.
+        #[arg(long)]
+        commit_sha: Option<String>,
+        /// `footer` (default) or `header`.
+        #[arg(long)]
+        placement: Option<String>,
+        /// Format as a PR-level comment instead of a review thread reply.
+        #[arg(long)]
+        pr_comment: bool,
     },
 }
 
@@ -326,7 +354,58 @@ fn run_worktree(
     Ok(ExitCode::SUCCESS)
 }
 
-/// Entry point for CLI commands (status/jobs, git/gh-safe, supervisor, worktree).
+fn run_attribution(
+    action: AttributionAction,
+    json: bool,
+    stdout: &mut impl Write,
+) -> writ_core::error::Result<ExitCode> {
+    match action {
+        AttributionAction::Format {
+            body,
+            agent_id,
+            commit_sha,
+            placement,
+            pr_comment,
+        } => {
+            let mut config = writ_core::attribution::AttributionConfig::from_env();
+            if let Some(id) = agent_id {
+                let id = id.trim();
+                if !id.is_empty() {
+                    config.agent_id = id.to_owned();
+                }
+            }
+            if let Some(placement) = placement {
+                config.placement = writ_core::attribution::AttributionPlacement::coerce(&placement);
+            }
+            let text = writ_core::attribution::format_reply(
+                body,
+                Some(&config),
+                commit_sha.as_deref(),
+                !pr_comment,
+            );
+            if json {
+                let response = writ_core::contract::Response::success(
+                    "attribution.format",
+                    serde_json::json!({
+                        "text": text,
+                        "agent_id": config.agent_id,
+                        "include_sha_on_fix": config.include_sha_on_fix,
+                        "placement": config.placement,
+                        "commit_sha": commit_sha.as_deref().map(str::trim).filter(|s| !s.is_empty()),
+                        "is_thread_reply": !pr_comment,
+                    }),
+                );
+                serde_json::to_writer(&mut *stdout, &response).map_err(io::Error::other)?;
+                stdout.write_all(b"\n")?;
+            } else {
+                writeln!(stdout, "{text}")?;
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+    }
+}
+
+/// Entry point for CLI commands (status/jobs, git/gh-safe, supervisor, worktree, attribution).
 async fn run(cli: Cli, stdout: &mut impl Write) -> writ_core::error::Result<ExitCode> {
     match cli.command {
         Some(Command::Status) => {
@@ -369,6 +448,7 @@ async fn run(cli: Cli, stdout: &mut impl Write) -> writ_core::error::Result<Exit
             }
         },
         Some(Command::Worktree { action }) => run_worktree(action, cli.json, stdout),
+        Some(Command::Attribution { action }) => run_attribution(action, cli.json, stdout),
         None => {
             if cli.json {
                 serde_json::to_writer(
@@ -657,6 +737,141 @@ mod tests {
     #[test]
     fn command_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn attribution_format_parser_accepts_thread_and_pr_shapes() {
+        let parsed = Cli::try_parse_from([
+            "writ",
+            "attribution",
+            "format",
+            "--body",
+            "Looks good!",
+            "--agent-id",
+            "Claude Code: worktrees-hives agent",
+            "--commit-sha",
+            "abc1234",
+        ])
+        .unwrap();
+        let Some(super::Command::Attribution {
+            action:
+                super::AttributionAction::Format {
+                    body,
+                    agent_id,
+                    commit_sha,
+                    pr_comment: false,
+                    ..
+                },
+        }) = parsed.command
+        else {
+            panic!("expected attribution format command")
+        };
+        assert_eq!(body, "Looks good!");
+        assert_eq!(
+            agent_id.as_deref(),
+            Some("Claude Code: worktrees-hives agent")
+        );
+        assert_eq!(commit_sha.as_deref(), Some("abc1234"));
+
+        let pr = Cli::try_parse_from([
+            "writ",
+            "attribution",
+            "format",
+            "--body",
+            "All checks passed.",
+            "--pr-comment",
+        ])
+        .unwrap();
+        let Some(super::Command::Attribution {
+            action:
+                super::AttributionAction::Format {
+                    pr_comment: true, ..
+                },
+        }) = pr.command
+        else {
+            panic!("expected PR comment attribution format")
+        };
+    }
+
+    #[tokio::test]
+    async fn attribution_format_human_writes_thread_template() {
+        let cli = Cli {
+            json: false,
+            command: Some(super::Command::Attribution {
+                action: super::AttributionAction::Format {
+                    body: "Looks good!".to_owned(),
+                    agent_id: Some("worktrees-hives agent".to_owned()),
+                    commit_sha: None,
+                    placement: None,
+                    pr_comment: false,
+                },
+            }),
+        };
+        let mut stdout = Vec::new();
+        let code = run(cli, &mut stdout).await.unwrap();
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert_eq!(
+            str::from_utf8(&stdout).unwrap(),
+            "Looks good!\n\n---\nworktrees-hives agent\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn attribution_format_json_includes_sha_after_fix() {
+        let cli = Cli {
+            json: true,
+            command: Some(super::Command::Attribution {
+                action: super::AttributionAction::Format {
+                    body: "Fixed the issue.".to_owned(),
+                    agent_id: Some("worktrees-hives agent".to_owned()),
+                    commit_sha: Some("abc1234".to_owned()),
+                    placement: Some("footer".to_owned()),
+                    pr_comment: false,
+                },
+            }),
+        };
+        let mut stdout = Vec::new();
+        let code = run(cli, &mut stdout).await.unwrap();
+        assert_eq!(code, ExitCode::SUCCESS);
+        let v: serde_json::Value =
+            serde_json::from_str(str::from_utf8(&stdout).unwrap().trim()).unwrap();
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["schema_version"], 1);
+        assert_eq!(v["command"], "attribution.format");
+        assert!(v["error"].is_null());
+        assert_eq!(
+            v["data"]["text"],
+            "Fixed the issue.\n\n---\nworktrees-hives agent: fixed in abc1234"
+        );
+        assert_eq!(v["data"]["commit_sha"], "abc1234");
+        assert_eq!(v["data"]["is_thread_reply"], true);
+    }
+
+    #[tokio::test]
+    async fn attribution_format_json_omits_empty_sha() {
+        let cli = Cli {
+            json: true,
+            command: Some(super::Command::Attribution {
+                action: super::AttributionAction::Format {
+                    body: "No code change.".to_owned(),
+                    agent_id: Some("Codex: worktrees-hives agent".to_owned()),
+                    commit_sha: Some("  ".to_owned()),
+                    placement: None,
+                    pr_comment: true,
+                },
+            }),
+        };
+        let mut stdout = Vec::new();
+        let code = run(cli, &mut stdout).await.unwrap();
+        assert_eq!(code, ExitCode::SUCCESS);
+        let v: serde_json::Value =
+            serde_json::from_str(str::from_utf8(&stdout).unwrap().trim()).unwrap();
+        assert_eq!(
+            v["data"]["text"],
+            "No code change.\n\nCodex: worktrees-hives agent"
+        );
+        assert!(v["data"]["commit_sha"].is_null());
+        assert_eq!(v["data"]["is_thread_reply"], false);
     }
 
     #[test]
