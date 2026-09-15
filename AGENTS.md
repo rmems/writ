@@ -137,7 +137,7 @@ For authorized implementation, complete the cohesive tranche: run focused gates 
 `writ` is a **Rust workspace**. One binary owns both layers:
 
 - **Enforcement** — git worktrees, exact-base identity, path sandboxing, process supervision/timeouts, and **hard safety enforcement** (no runtime merge path, force-with-lease only, branch verification).
-- **Coordination state** *(planned, M1)* — agents, leases with path scopes, ownership, and freeze modes, in a single SQLite file derived from `git`/`gh`/disk rather than transcribed. Not implemented: today `state.rs` only *reads* `watched.json`, no writer exists, and worktree creation records no lease.
+- **Coordination state** *(planned, M1)* — agents, leases with path scopes, ownership, and freeze modes, in a single SQLite file derived from `git`/`gh`/disk rather than transcribed. A writer now records durable worktree ownership for verified reclaim; `state.rs` still only *reads* `watched.json`, and path-scoped contention plus hook-time admission remain M1.
 - **Agent skill (`SKILL.md`)** — portable prompts describing when and how agents call the CLI on any platform.
 
 ```text

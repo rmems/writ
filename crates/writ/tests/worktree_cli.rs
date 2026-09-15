@@ -88,6 +88,14 @@ fn writ_create(root: &Path, repo: &Path, request: CreateRequest<'_>) -> Output {
     writ_cmd(root, &identity_args(repo, &request))
 }
 
+fn writ_remove(root: &Path, path: &Path) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_writ"))
+        .env("WRIT_WORKTREE_BASE", root.join("worktrees"))
+        .args(["--json", "worktree", "remove", path.to_str().unwrap()])
+        .output()
+        .unwrap()
+}
+
 fn json(output: &Output) -> serde_json::Value {
     serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
         panic!(
@@ -334,5 +342,94 @@ fn partial_create_failure_reports_residual_state_without_deleting_branch() {
     assert_eq!(
         fs::read_to_string(target.join("occupied")).unwrap(),
         "keep\n"
+    );
+}
+
+#[test]
+fn create_remove_reclaim_succeeds_for_owned_branch() {
+    let (root, repo) = primed();
+    let start = git(&repo, &["rev-parse", "HEAD"]);
+    let first = writ_create(
+        &root.0,
+        &repo,
+        CreateRequest {
+            job: "gh-42",
+            branch: "hive/gh-42",
+            start: &start,
+        },
+    );
+    assert!(
+        first.status.success(),
+        "stderr={:?}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first_json = json(&first);
+    let path = PathBuf::from(first_json["data"]["path"].as_str().unwrap());
+
+    let removed = writ_remove(&root.0, &path);
+    assert!(
+        removed.status.success(),
+        "stderr={:?}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    assert!(!path.exists());
+    assert_eq!(git(&repo, &["rev-parse", "refs/heads/hive/gh-42"]), start);
+
+    let second = writ_create(
+        &root.0,
+        &repo,
+        CreateRequest {
+            job: "gh-42",
+            branch: "hive/gh-42",
+            start: &start,
+        },
+    );
+    let envelope = json(&second);
+    assert!(
+        second.status.success(),
+        "stderr={:?} stdout={envelope}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert_eq!(envelope["data"]["start_commit"], start);
+    assert_eq!(envelope["data"]["head_commit"], start);
+    assert_eq!(envelope["data"]["branch_ref"], "refs/heads/hive/gh-42");
+    assert_eq!(envelope["data"]["worktree_registered"], true);
+}
+
+#[test]
+fn reclaim_of_foreign_branch_reports_residual_state_without_deleting() {
+    let (root, repo) = primed();
+    let start = git(&repo, &["rev-parse", "HEAD"]);
+    git(&repo, &["branch", "hive/gh-99", &start]);
+
+    let output = writ_create(
+        &root.0,
+        &repo,
+        CreateRequest {
+            job: "gh-99",
+            branch: "hive/gh-99",
+            start: &start,
+        },
+    );
+    let envelope = assert_error_envelope(&output, 2, 2, "WORKTREE_RESUME_UNPROVEN");
+    let message = envelope["error"]["message"].as_str().unwrap();
+    assert!(message.contains("residual_state"), "{message}");
+    assert!(
+        message.contains("branch_ref=refs/heads/hive/gh-99"),
+        "{message}"
+    );
+    assert!(
+        message.contains("ownership_evidence=lease=<absent>"),
+        "{message}"
+    );
+    assert_eq!(git(&repo, &["rev-parse", "refs/heads/hive/gh-99"]), start);
+    assert!(
+        !root
+            .0
+            .join("worktrees")
+            .join("acme")
+            .join("sample")
+            .join("gh-99")
+            .exists()
     );
 }
