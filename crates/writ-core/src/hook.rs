@@ -309,54 +309,28 @@ mod tests {
     use std::process::Command;
     use tempfile::tempdir;
 
-    #[test]
-    fn pre_tool_use_blocks_force_push_and_merge() {
+    fn assert_bash_hook_blocks(command: &str, needle: &str) {
         let runtime = HookRuntime::default();
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        let code = dispatch(
-            r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"git push --force"}}"#,
-            &runtime,
-            &mut stdout,
-            &mut stderr,
-        );
-        assert_eq!(code, 2);
-        assert!(String::from_utf8_lossy(&stderr).contains("BARE_FORCE_PUSH"));
-
-        let mut stderr = Vec::new();
-        let code = dispatch(
-            r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"FOO=bar git merge feature"}}"#,
-            &runtime,
-            &mut stdout,
-            &mut stderr,
-        );
-        assert_eq!(code, 2);
-        assert!(String::from_utf8_lossy(&stderr).contains("MERGE_BLOCKED"));
+        let payload = serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": { "command": command },
+        })
+        .to_string();
+        let code = dispatch(&payload, &runtime, &mut stdout, &mut stderr);
+        let stderr = String::from_utf8_lossy(&stderr);
+        assert_eq!(code, 2, "{command}: {stderr}");
+        assert!(stderr.contains(needle), "{command}: {stderr}");
     }
 
     #[test]
-    fn pre_tool_use_blocks_gh_merge_and_api() {
-        let runtime = HookRuntime::default();
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
-        let code = dispatch(
-            r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"gh pr merge 1"}}"#,
-            &runtime,
-            &mut stdout,
-            &mut stderr,
-        );
-        assert_eq!(code, 2);
-        assert!(String::from_utf8_lossy(&stderr).contains("MERGE_BLOCKED"));
-
-        let mut stderr = Vec::new();
-        let code = dispatch(
-            r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"gh api repos/acme/example"}}"#,
-            &runtime,
-            &mut stdout,
-            &mut stderr,
-        );
-        assert_eq!(code, 2);
-        assert!(String::from_utf8_lossy(&stderr).contains("GH_SUBCOMMAND_NOT_ALLOWED"));
+    fn pre_tool_use_blocks_git_and_gh_policy_violations() {
+        assert_bash_hook_blocks("git push --force", "BARE_FORCE_PUSH");
+        assert_bash_hook_blocks("FOO=bar git merge feature", "MERGE_BLOCKED");
+        assert_bash_hook_blocks("gh pr merge 1", "MERGE_BLOCKED");
+        assert_bash_hook_blocks("gh api repos/acme/example", "GH_SUBCOMMAND_NOT_ALLOWED");
     }
 
     #[test]
