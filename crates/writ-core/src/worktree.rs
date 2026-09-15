@@ -8,7 +8,10 @@ use crate::error::{
 use crate::identity::{
     BranchName, BranchRef, CommitId, JobId, Owner, Repo, StartPoint, resolve_start_commit,
 };
-use crate::paths::{canonicalize_for_tools, derive_worktree_path, worktree_base_path};
+use crate::lease::{AllocateRequest, JobKey, LeaseStore, ReconcileOutcome, attention_error};
+use crate::paths::{
+    canonicalize_for_tools, derive_worktree_path, lease_store_path, worktree_base_path,
+};
 
 #[derive(Clone, Copy)]
 struct GitArgList<'a>(&'a [&'a str]);
@@ -49,23 +52,32 @@ pub struct WorktreeCreateRequest<'a> {
 }
 
 /// Manages isolated git worktrees for hive jobs.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct WorktreeManager {
     base_path: Option<PathBuf>,
+    leases: LeaseStore,
 }
 
 impl WorktreeManager {
-    /// Create a new manager using the default base path.
+    /// Create a new manager using the default base path and durable lease store.
     pub fn new() -> Result<Self> {
         let base = worktree_base_path()?;
-        Self::with_base(base)
+        Self::with_base_and_leases(base, LeaseStore::open(lease_store_path())?)
     }
 
     /// Create a new manager with an explicit base path (for testing or overrides).
     ///
     /// The base is created if missing and stored in canonical form so OS path
     /// aliases (e.g. macOS `/var` → `/private/var`) do not trip sandbox checks.
+    /// A per-base SQLite lease file is opened next to the worktrees so tests
+    /// do not share process-global lease state.
     pub fn with_base(base: PathBuf) -> Result<Self> {
+        let lease_path = base.join("leases.db");
+        Self::with_base_and_leases(base, LeaseStore::open(lease_path)?)
+    }
+
+    /// Create a manager with an explicit base path and lease store.
+    pub fn with_base_and_leases(base: PathBuf, leases: LeaseStore) -> Result<Self> {
         fs::create_dir_all(&base).map_err(|e| Error::Io {
             context: "create worktree base directory",
             source: e,
@@ -78,7 +90,14 @@ impl WorktreeManager {
         })?;
         Ok(Self {
             base_path: Some(base),
+            leases,
         })
+    }
+
+    /// Borrow the lease store used by this manager.
+    #[must_use]
+    pub fn lease_store(&self) -> &LeaseStore {
+        &self.leases
     }
 
     /// Get the base path this manager uses.
@@ -142,7 +161,24 @@ impl WorktreeManager {
             Repo(request.repo),
             JobId(request.job_id),
         )?;
+        if let Some(recovered) =
+            self.recover_interrupted_allocation(&request, &worktree_path, &start_commit)?
+        {
+            return Ok(recovered);
+        }
         reject_unproven_resume(&request, CommitId(&start_commit))?;
+        let prepared = self.leases.prepare_allocate(AllocateRequest {
+            repo: request.repo_root,
+            owner: request.owner,
+            repo_name: request.repo,
+            job_id: request.job_id,
+            branch: request.branch,
+            worktree_path: &worktree_path,
+            requested_start_point: request.start_point,
+            start_commit: &start_commit,
+            ttl: None,
+        })?;
+        self.leases.mark_mutating(&prepared.operation_id)?;
         add_worktree(&request, &worktree_path, CommitId(&start_commit))?;
 
         let head_commit = verify_creation_postconditions(CreationPostconditions {
@@ -151,6 +187,7 @@ impl WorktreeManager {
             expected_branch: branch,
             expected_commit: CommitId(&start_commit),
         })?;
+        self.leases.commit_allocate(&prepared.operation_id)?;
 
         Ok(Worktree {
             path: worktree_path,
@@ -159,6 +196,56 @@ impl WorktreeManager {
             start_commit: Some(start_commit),
             head_commit: Some(head_commit),
         })
+    }
+
+    fn recover_interrupted_allocation(
+        &self,
+        request: &WorktreeCreateRequest<'_>,
+        worktree_path: &Path,
+        start_commit: &str,
+    ) -> Result<Option<Worktree>> {
+        let key = JobKey {
+            owner: request.owner,
+            repo_name: request.repo,
+            job_id: request.job_id,
+        };
+        let Some(outcome) = self.leases.reconcile(key, request.repo_root)? else {
+            return Ok(None);
+        };
+        match outcome {
+            ReconcileOutcome::Retry { .. } => Ok(None),
+            ReconcileOutcome::Promoted { lease, inspection }
+            | ReconcileOutcome::AlreadyActive { lease, inspection } => {
+                if lease.start_commit == start_commit && lease.branch == request.branch {
+                    Ok(Some(Worktree {
+                        path: worktree_path.to_path_buf(),
+                        branch: request.branch.to_owned(),
+                        repo_root: request.repo_root.to_path_buf(),
+                        start_commit: Some(lease.start_commit),
+                        head_commit: inspection.head_commit,
+                    }))
+                } else {
+                    Err(attention_error(&lease, &inspection))
+                }
+            }
+            ReconcileOutcome::NeedsAttention { lease, inspection } => {
+                Err(attention_error(&lease, &inspection))
+            }
+            ReconcileOutcome::Released { .. } => Err(Error::PolicyViolation {
+                code: PolicyCode::LeaseReleased,
+                message: format!(
+                    "refusing to resurrect released lease for {}/{}/{}",
+                    request.owner, request.repo, request.job_id
+                ),
+            }),
+            ReconcileOutcome::Tombstoned { .. } => Err(Error::PolicyViolation {
+                code: PolicyCode::LeaseTombstoned,
+                message: format!(
+                    "refusing to resurrect tombstoned lease for {}/{}/{}",
+                    request.owner, request.repo, request.job_id
+                ),
+            }),
+        }
     }
 
     /// List all hive worktrees under the base path.
@@ -270,6 +357,7 @@ impl WorktreeManager {
 
         // Also clean up empty parent directories
         cleanup_empty_parents(worktree_path, base);
+        self.leases.release_by_path(worktree_path)?;
 
         Ok(())
     }
@@ -1046,6 +1134,82 @@ mod tests {
         let listed = harness.manager.list().unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].path, wt.path);
+
+        let lease = harness
+            .manager
+            .lease_store()
+            .find_job(crate::lease::JobKey {
+                owner: "acme",
+                repo_name: "test-repo",
+                job_id: "job-1",
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            lease.allocation_state,
+            crate::lease::AllocationState::Active
+        );
+        assert_eq!(lease.start_commit, start_commit);
+        assert_eq!(lease.requested_start_point, start_commit);
+        assert!(!lease.operation_id.is_empty());
+    }
+
+    #[test]
+    fn create_promotes_matching_interrupted_allocation() {
+        let harness = Harness::sha1();
+        let start_commit = harness.head();
+        let request = harness.request("job-interrupt", "feature/interrupt", &start_commit);
+        let path = harness.job_path("job-interrupt");
+        let prepared = harness
+            .manager
+            .lease_store()
+            .prepare_allocate(crate::lease::AllocateRequest {
+                repo: request.repo_root,
+                owner: request.owner,
+                repo_name: request.repo,
+                job_id: request.job_id,
+                branch: request.branch,
+                worktree_path: &path,
+                requested_start_point: request.start_point,
+                start_commit: &start_commit,
+                ttl: None,
+            })
+            .unwrap();
+        harness
+            .manager
+            .lease_store()
+            .mark_mutating(&prepared.operation_id)
+            .unwrap();
+        harness.git(&[
+            "worktree",
+            "add",
+            "-b",
+            "feature/interrupt",
+            "--",
+            path.to_str().unwrap(),
+            &start_commit,
+        ]);
+
+        let wt = harness
+            .create("job-interrupt", "feature/interrupt", &start_commit)
+            .unwrap();
+        assert_eq!(wt.start_commit.as_deref(), Some(start_commit.as_str()));
+        assert_eq!(wt.head_commit.as_deref(), Some(start_commit.as_str()));
+        let lease = harness
+            .manager
+            .lease_store()
+            .find_job(crate::lease::JobKey {
+                owner: "acme",
+                repo_name: "test-repo",
+                job_id: "job-interrupt",
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            lease.allocation_state,
+            crate::lease::AllocationState::Active
+        );
+        assert_eq!(lease.start_commit, start_commit);
     }
 
     #[test]

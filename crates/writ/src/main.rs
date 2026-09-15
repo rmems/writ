@@ -56,6 +56,12 @@ enum Command {
         #[command(subcommand)]
         action: WorktreeAction,
     },
+
+    /// Crash-consistent lease inspection and reconciliation.
+    Lease {
+        #[command(subcommand)]
+        action: LeaseAction,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -102,6 +108,37 @@ enum WorktreeAction {
 }
 
 #[derive(Debug, Subcommand)]
+enum LeaseAction {
+    /// Report git and lease identity without mutating or adopting anything.
+    Inspect {
+        /// Repository root used to inspect branch, HEAD, and registration.
+        #[arg(long)]
+        repo: PathBuf,
+        /// GitHub-style owner segment.
+        owner: String,
+        /// Repository name segment.
+        repo_name: String,
+        /// Job id segment (e.g. gh-42).
+        job_id: String,
+        /// Branch name used when no lease row exists.
+        #[arg(long)]
+        branch: Option<String>,
+    },
+    /// Reconcile an interrupted allocation without destructive cleanup.
+    Reconcile {
+        /// Repository root used to inspect branch, HEAD, and registration.
+        #[arg(long)]
+        repo: PathBuf,
+        /// GitHub-style owner segment.
+        owner: String,
+        /// Repository name segment.
+        repo_name: String,
+        /// Job id segment (e.g. gh-42).
+        job_id: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum SupervisorAction {
     /// Run a command under supervision.
     Run {
@@ -132,13 +169,13 @@ enum SupervisorAction {
 async fn main() -> ExitCode {
     let cli = Cli::parse();
     let json = cli.json;
-    let worktree_command = worktree_command_name(&cli);
     let worktree_schema_version = worktree_schema_version(&cli);
+    let json_command = json_error_command(&cli);
 
     match run(cli, &mut io::stdout()).await {
         Ok(code) => code,
         Err(error) => {
-            if json && let Some(command) = worktree_command {
+            if json && let Some(command) = json_command {
                 let response = writ_core::contract::Response {
                     ok: false,
                     schema_version: worktree_schema_version,
@@ -211,6 +248,31 @@ fn worktree_error_data(error: &writ_core::error::Error) -> serde_json::Value {
             "cleanup_performed": false,
             })
         }
+        writ_core::error::Error::LeaseAttention(failure) => {
+            let writ_core::error::LeaseAttentionFailure {
+                operation_id,
+                allocation_state,
+                classification,
+                conflicts,
+                path,
+                path_exists,
+                branch_commit,
+                head_commit,
+                worktree_registered,
+            } = failure.as_ref();
+            serde_json::json!({
+            "operation_id": operation_id,
+            "allocation_state": allocation_state,
+            "classification": classification,
+            "conflicts": conflicts,
+            "path": path,
+            "path_exists": path_exists,
+            "branch_commit": branch_commit,
+            "head_commit": head_commit,
+            "worktree_registered": worktree_registered,
+            "cleanup_performed": false,
+            })
+        }
         _ => serde_json::json!({}),
     }
 }
@@ -221,6 +283,20 @@ fn worktree_schema_version(cli: &Cli) -> u8 {
             action: WorktreeAction::Create { schema_version, .. },
         }) => *schema_version,
         _ => writ_core::contract::SCHEMA_VERSION,
+    }
+}
+
+fn json_error_command(cli: &Cli) -> Option<&'static str> {
+    worktree_command_name(cli).or(lease_command_name(cli))
+}
+
+fn lease_command_name(cli: &Cli) -> Option<&'static str> {
+    match &cli.command {
+        Some(Command::Lease { action }) => Some(match action {
+            LeaseAction::Inspect { .. } => "lease.inspect",
+            LeaseAction::Reconcile { .. } => "lease.reconcile",
+        }),
+        _ => None,
     }
 }
 
@@ -326,6 +402,109 @@ fn run_worktree(
     Ok(ExitCode::SUCCESS)
 }
 
+fn lease_response(
+    action: LeaseAction,
+) -> writ_core::error::Result<writ_core::contract::Response<serde_json::Value>> {
+    use writ_core::contract::Response;
+    use writ_core::lease::{InspectRequest, JobKey, LeaseStore};
+    use writ_core::paths::lease_store_path;
+
+    let store = LeaseStore::open(lease_store_path())?;
+    match action {
+        LeaseAction::Inspect {
+            repo,
+            owner,
+            repo_name,
+            job_id,
+            branch,
+        } => {
+            let worktree_path = inspect_worktree_path(&store, &owner, &repo_name, &job_id)?;
+            let inspection = store.inspect(InspectRequest {
+                repo_root: &repo,
+                owner: &owner,
+                repo_name: &repo_name,
+                job_id: &job_id,
+                worktree_path: &worktree_path,
+                branch: branch.as_deref(),
+            })?;
+            Ok(Response::success(
+                "lease.inspect",
+                serde_json::to_value(&inspection).map_err(std::io::Error::other)?,
+            ))
+        }
+        LeaseAction::Reconcile {
+            repo,
+            owner,
+            repo_name,
+            job_id,
+        } => {
+            let key = JobKey {
+                owner: &owner,
+                repo_name: &repo_name,
+                job_id: &job_id,
+            };
+            match store.reconcile(key, &repo)? {
+                None => Ok(Response::success(
+                    "lease.reconcile",
+                    serde_json::json!({
+                        "outcome": "absent",
+                    }),
+                )),
+                Some(outcome) => {
+                    if let writ_core::lease::ReconcileOutcome::NeedsAttention {
+                        lease,
+                        inspection,
+                    } = &outcome
+                    {
+                        return Err(writ_core::lease::attention_error(lease, inspection));
+                    }
+                    Ok(Response::success(
+                        "lease.reconcile",
+                        serde_json::json!({
+                            "outcome": outcome.as_str(),
+                        }),
+                    ))
+                }
+            }
+        }
+    }
+}
+
+fn inspect_worktree_path(
+    store: &writ_core::lease::LeaseStore,
+    owner: &str,
+    repo_name: &str,
+    job_id: &str,
+) -> writ_core::error::Result<std::path::PathBuf> {
+    use writ_core::lease::JobKey;
+    use writ_core::paths::{derive_worktree_path, worktree_base_path};
+
+    if let Some(lease) = store.find_job(JobKey {
+        owner,
+        repo_name,
+        job_id,
+    })? {
+        return Ok(std::path::PathBuf::from(lease.worktree_path));
+    }
+    derive_worktree_path(&worktree_base_path()?, owner, repo_name, job_id)
+}
+
+fn run_lease(
+    action: LeaseAction,
+    json: bool,
+    stdout: &mut impl Write,
+) -> writ_core::error::Result<ExitCode> {
+    let response = lease_response(action)?;
+
+    if json {
+        serde_json::to_writer(&mut *stdout, &response).map_err(io::Error::other)?;
+        stdout.write_all(b"\n")?;
+    } else {
+        writeln!(stdout, "ok={} command={}", response.ok, response.command)?;
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 /// Entry point for CLI commands (status/jobs, git/gh-safe, supervisor, worktree).
 async fn run(cli: Cli, stdout: &mut impl Write) -> writ_core::error::Result<ExitCode> {
     match cli.command {
@@ -369,6 +548,7 @@ async fn run(cli: Cli, stdout: &mut impl Write) -> writ_core::error::Result<Exit
             }
         },
         Some(Command::Worktree { action }) => run_worktree(action, cli.json, stdout),
+        Some(Command::Lease { action }) => run_lease(action, cli.json, stdout),
         None => {
             if cli.json {
                 serde_json::to_writer(
@@ -706,6 +886,40 @@ mod tests {
         };
         assert_eq!(start_point.as_deref(), Some("origin/trunk"));
         assert_eq!(schema_version, 2);
+    }
+
+    #[test]
+    fn lease_inspect_and_reconcile_parser_accepts_identity_args() {
+        let inspect = Cli::try_parse_from([
+            "writ", "lease", "inspect", "--repo", ".", "--branch", "hive/job", "acme", "sample",
+            "job",
+        ])
+        .unwrap();
+        let Some(super::Command::Lease {
+            action: super::LeaseAction::Inspect { job_id, .. },
+        }) = inspect.command
+        else {
+            panic!("expected lease inspect")
+        };
+        assert_eq!(job_id, "job");
+
+        let reconcile = Cli::try_parse_from([
+            "writ",
+            "lease",
+            "reconcile",
+            "--repo",
+            ".",
+            "acme",
+            "sample",
+            "job",
+        ])
+        .unwrap();
+        assert!(matches!(
+            reconcile.command,
+            Some(super::Command::Lease {
+                action: super::LeaseAction::Reconcile { .. },
+            })
+        ));
     }
 
     #[tokio::test]
