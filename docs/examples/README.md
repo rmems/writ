@@ -23,6 +23,7 @@ All of them, under `--json`:
 | `status` / `jobs` | `cli.status` / `cli.jobs` |
 | `git-safe` / `gh-safe` | `git.safe` / `gh.safe` |
 | `worktree create\|list\|remove\|prune` | `worktree.create` etc. |
+| `hook` | no envelope — stdout is empty or a worktree path; policy is exit 2 + stderr |
 
 **The exception is the policy-violation path**, which prints plain text on stderr
 with exit code 2 instead of an envelope:

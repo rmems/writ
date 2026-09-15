@@ -37,6 +37,7 @@ pub(crate) fn resolve_start_commit(
     start_point: StartPoint<'_>,
 ) -> Result<String> {
     reject_empty_start_point(start_point)?;
+    reject_ambiguous_unqualified_ref(repo_root, start_point)?;
     enforce_leading_hex_oid(start_point, None)?;
     let commit = peel_to_commit(repo_root, start_point)?;
     reject_empty_resolved_commit(start_point, CommitId(&commit))?;
@@ -150,6 +151,74 @@ fn hex_oid_matches_commit(hex_prefix: HexOidPrefix<'_>, commit: CommitId<'_>) ->
         return false;
     }
     commit.eq_ignore_ascii_case(prefix)
+}
+
+/// Reject an unqualified name that names both a branch and a tag.
+///
+/// `git rev-parse --verify foo^{commit}` can exit 0 with an ambiguity warning
+/// on stderr when `refs/heads/foo` and `refs/tags/foo` exist at different
+/// commits. Fully qualified `refs/heads/…` / `refs/tags/…` / object ids pass.
+fn reject_ambiguous_unqualified_ref(repo_root: &Path, start_point: StartPoint<'_>) -> Result<()> {
+    let Some(name) = unqualified_refname(start_point) else {
+        return Ok(());
+    };
+    if name == "HEAD" || name == "@" {
+        return Ok(());
+    }
+    let head_ref = format!("refs/heads/{name}");
+    let tag_ref = format!("refs/tags/{name}");
+    let head_exists = ref_exists(repo_root, &head_ref)?;
+    let tag_exists = ref_exists(repo_root, &tag_ref)?;
+    if head_exists && tag_exists {
+        return Err(rev_parse_error(GitErrorText(format!(
+            "start point {name:?} is ambiguous: both {head_ref} and {tag_ref} exist; \
+             use a fully qualified ref"
+        ))));
+    }
+    Ok(())
+}
+
+fn unqualified_refname(start_point: StartPoint<'_>) -> Option<&str> {
+    let text = start_point.as_str();
+    if text.starts_with("refs/") {
+        return None;
+    }
+    if leading_hex_oid_prefix(start_point).is_some() {
+        return None;
+    }
+    let deco = text.find(['~', '^', ':']).unwrap_or(text.len());
+    let brace = text.find("@{").unwrap_or(text.len());
+    let name = &text[..deco.min(brace)];
+    if name.is_empty() { None } else { Some(name) }
+}
+
+fn ref_exists(repo_root: &Path, git_ref: &str) -> Result<bool> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .arg("show-ref")
+        .arg("--verify")
+        .arg("--quiet")
+        .arg("--")
+        .arg(git_ref)
+        .output()
+        .map_err(|e| Error::Io {
+            context: "check start-point ref existence",
+            source: e,
+        })?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(Error::GitCommand {
+            args: vec![
+                "show-ref".into(),
+                "--verify".into(),
+                "--quiet".into(),
+                git_ref.to_owned(),
+            ],
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        }),
+    }
 }
 
 fn peel_to_commit(repo_root: &Path, start_point: StartPoint<'_>) -> Result<String> {
@@ -340,5 +409,15 @@ mod tests {
         assert!(enforce_leading_hex_oid(StartPoint(SHA1), Some(CommitId(SHA1))).is_ok());
         let other = "f".repeat(40);
         assert!(enforce_leading_hex_oid(StartPoint(&other), Some(CommitId(SHA1))).is_err());
+    }
+
+    #[test]
+    fn unqualified_refname_strips_decorations_and_skips_qualified_refs() {
+        assert_eq!(
+            unqualified_refname(StartPoint("collision~1")),
+            Some("collision")
+        );
+        assert_eq!(unqualified_refname(StartPoint("refs/heads/main")), None);
+        assert_eq!(unqualified_refname(StartPoint(SHA1)), None);
     }
 }

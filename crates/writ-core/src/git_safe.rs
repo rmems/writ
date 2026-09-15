@@ -91,7 +91,14 @@ const BLOCKED_GH_PR_SUBSUBCOMMANDS: &[&str] = &[
 ];
 
 /// `gh pr` flags that are blocked (direct merge-related flags).
-const BLOCKED_GH_FLAGS: &[&str] = &["--merge", "--squash", "--rebase", "--auto", "--admin"];
+const BLOCKED_GH_FLAGS: &[&str] = &[
+    "--merge",
+    "--squash",
+    "--rebase",
+    "--auto",
+    "--admin",
+    "--merge-queue",
+];
 
 /// Pre-validated git command ready for execution.
 #[derive(Debug, Clone)]
@@ -2033,9 +2040,14 @@ mod tests {
     }
 
     #[test]
-    fn gh_merge_flag_rejected() {
-        let err = SafeGhCommand::new(&["pr".to_owned(), "create".to_owned(), "--merge".to_owned()])
-            .unwrap_err();
+    fn gh_merge_queue_flag_rejected() {
+        let err = SafeGhCommand::new(&[
+            "pr".to_owned(),
+            "view".to_owned(),
+            "1".to_owned(),
+            "--merge-queue".to_owned(),
+        ])
+        .unwrap_err();
         assert!(matches!(
             err,
             Error::PolicyViolation {

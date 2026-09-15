@@ -1,4 +1,4 @@
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -56,6 +56,9 @@ enum Command {
         #[command(subcommand)]
         action: WorktreeAction,
     },
+
+    /// Dispatch a Claude Code hook event from JSON on stdin (exit 0 or 2).
+    Hook,
 }
 
 #[derive(Debug, Subcommand)]
@@ -326,6 +329,20 @@ fn run_worktree(
     Ok(ExitCode::SUCCESS)
 }
 
+fn run_hook(stdout: &mut impl Write) -> writ_core::error::Result<ExitCode> {
+    let mut stdin = Vec::new();
+    io::stdin().read_to_end(&mut stdin)?;
+    let context = writ_core::hook::HookContext::from_env()?;
+    let outcome = writ_core::hook::dispatch_hook(&stdin, &context);
+    if !outcome.stdout.is_empty() {
+        stdout.write_all(outcome.stdout.as_bytes())?;
+    }
+    if !outcome.stderr.is_empty() {
+        let _ = write!(io::stderr(), "{}", outcome.stderr);
+    }
+    Ok(ExitCode::from(outcome.exit_code))
+}
+
 /// Entry point for CLI commands (status/jobs, git/gh-safe, supervisor, worktree).
 async fn run(cli: Cli, stdout: &mut impl Write) -> writ_core::error::Result<ExitCode> {
     match cli.command {
@@ -369,6 +386,7 @@ async fn run(cli: Cli, stdout: &mut impl Write) -> writ_core::error::Result<Exit
             }
         },
         Some(Command::Worktree { action }) => run_worktree(action, cli.json, stdout),
+        Some(Command::Hook) => run_hook(stdout),
         None => {
             if cli.json {
                 serde_json::to_writer(

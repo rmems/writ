@@ -1133,6 +1133,40 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn timeout_leaves_no_live_untracked_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("child.pid");
+        let script = format!("echo $$ > '{}'; exec sleep 60", pidfile.display());
+        let supervisor = Supervisor::new(1);
+        let output = supervisor
+            .run_unchecked(
+                shell_program(),
+                &[shell_flag(), &script],
+                Some(Duration::from_millis(300)),
+            )
+            .await;
+        assert!(output.timed_out, "stderr={}", output.stderr);
+        assert!(output.killed);
+        let mut pid_text = String::new();
+        for _ in 0..20 {
+            if let Ok(text) = std::fs::read_to_string(&pidfile) {
+                pid_text = text;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let pid = pid_text.trim();
+        assert!(!pid.is_empty(), "child did not record its pid");
+        let proc = std::path::PathBuf::from(format!("/proc/{pid}"));
+        assert!(
+            !proc.exists(),
+            "timed-out child {pid} is still live at {}",
+            proc.display()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn timeout_remains_active_while_draining_inherited_pipes() {
         let supervisor = Supervisor::new(1);
         let started = Instant::now();
