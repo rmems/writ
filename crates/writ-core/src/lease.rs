@@ -352,23 +352,113 @@ impl LeaseStore {
 }
 
 fn lease_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Lease> {
+    let identity = lease_identity(row)?;
+    let limits = lease_limits(row)?;
     Ok(Lease {
-        repo: row.get(0)?,
-        owner: row.get(1)?,
-        repo_name: row.get(2)?,
-        job_id: row.get(3)?,
-        branch: row.get(4)?,
-        branch_ref: row.get(5)?,
-        worktree_path: row.get(6)?,
-        start_commit: row.get(7)?,
-        mode: LeaseMode::parse(&row.get::<_, String>(8)?),
+        repo: identity.repo,
+        owner: identity.owner,
+        repo_name: identity.repo_name,
+        job_id: identity.job_id,
+        branch: identity.branch,
+        branch_ref: identity.branch_ref,
+        worktree_path: identity.worktree_path,
+        start_commit: identity.start_commit,
+        mode: identity.mode,
+        ttl: limits.ttl,
+        heartbeat: limits.heartbeat,
+        max_files: limits.max_files,
+        max_churn: limits.max_churn,
+        max_fix_cycles: limits.max_fix_cycles,
+        fix_cycles: limits.fix_cycles,
+        released_at: limits.released_at,
+    })
+}
+
+struct LeaseIdentity {
+    repo: String,
+    owner: String,
+    repo_name: String,
+    job_id: String,
+    branch: String,
+    branch_ref: String,
+    worktree_path: String,
+    start_commit: String,
+    mode: LeaseMode,
+}
+
+struct LeaseLimits {
+    ttl: Option<i64>,
+    heartbeat: Option<i64>,
+    max_files: Option<i64>,
+    max_churn: Option<i64>,
+    max_fix_cycles: Option<i64>,
+    fix_cycles: Option<i64>,
+    released_at: Option<i64>,
+}
+
+fn lease_identity(row: &rusqlite::Row<'_>) -> rusqlite::Result<LeaseIdentity> {
+    let names = lease_names(row)?;
+    let refs = lease_refs(row)?;
+    Ok(LeaseIdentity {
+        repo: names.0,
+        owner: names.1,
+        repo_name: names.2,
+        job_id: names.3,
+        branch: names.4,
+        branch_ref: refs.0,
+        worktree_path: refs.1,
+        start_commit: refs.2,
+        mode: refs.3,
+    })
+}
+
+fn lease_names(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<(String, String, String, String, String)> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+    ))
+}
+
+fn lease_refs(row: &rusqlite::Row<'_>) -> rusqlite::Result<(String, String, String, LeaseMode)> {
+    Ok((
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        LeaseMode::parse(&row.get::<_, String>(8)?),
+    ))
+}
+
+fn lease_limits(row: &rusqlite::Row<'_>) -> rusqlite::Result<LeaseLimits> {
+    let reserved = lease_budget_cells(row)?;
+    Ok(LeaseLimits {
         ttl: row.get(9)?,
         heartbeat: row.get(10)?,
+        max_files: reserved.max_files,
+        max_churn: reserved.max_churn,
+        max_fix_cycles: reserved.max_fix_cycles,
+        fix_cycles: reserved.fix_cycles,
+        released_at: row.get(15)?,
+    })
+}
+
+struct BudgetCells {
+    max_files: Option<i64>,
+    max_churn: Option<i64>,
+    max_fix_cycles: Option<i64>,
+    fix_cycles: Option<i64>,
+}
+
+fn lease_budget_cells(row: &rusqlite::Row<'_>) -> rusqlite::Result<BudgetCells> {
+    Ok(BudgetCells {
         max_files: row.get(11)?,
         max_churn: row.get(12)?,
         max_fix_cycles: row.get(13)?,
         fix_cycles: row.get(14)?,
-        released_at: row.get(15)?,
     })
 }
 

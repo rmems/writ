@@ -107,44 +107,79 @@ fn handle_worktree_create(
     runtime: &HookRuntime,
     stdout: &mut impl Write,
 ) -> Result<()> {
-    let name = event
-        .name
-        .as_deref()
-        .ok_or_else(|| Error::PolicyViolation {
-            code: PolicyCode::WorktreeResumeUnproven,
-            message: "WorktreeCreate hook JSON is missing `name`".to_owned(),
-        })?;
-    let cwd = event.cwd.as_deref().ok_or_else(|| Error::PolicyViolation {
-        code: PolicyCode::GitDirUnavailable,
-        message: "WorktreeCreate hook JSON is missing `cwd`".to_owned(),
-    })?;
+    let inputs = create_inputs(event)?;
+    let created = manager_for_runtime(runtime)?.create_with_request(inputs.request())?;
+    write_created_path(stdout, &created.path)
+}
+
+struct CreateInputs {
+    repo_root: PathBuf,
+    owner: String,
+    repo_name: String,
+    name: String,
+    start_commit: String,
+}
+
+impl CreateInputs {
+    fn request(&self) -> WorktreeCreateRequest<'_> {
+        WorktreeCreateRequest {
+            repo_root: &self.repo_root,
+            owner: &self.owner,
+            repo: &self.repo_name,
+            job_id: &self.name,
+            branch: &self.name,
+            start_point: &self.start_commit,
+        }
+    }
+}
+
+fn create_inputs(event: &HookEvent) -> Result<CreateInputs> {
+    let name = hook_field(
+        event.name.as_deref(),
+        PolicyCode::WorktreeResumeUnproven,
+        "WorktreeCreate hook JSON is missing `name`",
+    )?;
+    let cwd = hook_field(
+        event.cwd.as_deref(),
+        PolicyCode::GitDirUnavailable,
+        "WorktreeCreate hook JSON is missing `cwd`",
+    )?;
     let repo_root = git_toplevel(Path::new(cwd))?;
     let (owner, repo_name) = origin_owner_repo(&repo_root)?;
     let start_commit = resolve_start_commit(&repo_root, StartPoint("HEAD"))?;
-    let manager = manager_for_runtime(runtime)?;
-    let created = manager.create_with_request(WorktreeCreateRequest {
-        repo_root: &repo_root,
-        owner: &owner,
-        repo: &repo_name,
-        job_id: name,
-        branch: name,
-        start_point: &start_commit,
-    })?;
-    writeln!(stdout, "{}", created.path.display()).map_err(|e| Error::Io {
+    Ok(CreateInputs {
+        repo_root,
+        owner,
+        repo_name,
+        name: name.to_owned(),
+        start_commit,
+    })
+}
+
+fn hook_field<'a>(
+    value: Option<&'a str>,
+    code: PolicyCode,
+    message: &'static str,
+) -> Result<&'a str> {
+    value.ok_or_else(|| Error::PolicyViolation {
+        code,
+        message: message.to_owned(),
+    })
+}
+
+fn write_created_path(stdout: &mut impl Write, path: &Path) -> Result<()> {
+    writeln!(stdout, "{}", path.display()).map_err(|e| Error::Io {
         context: "write WorktreeCreate path",
         source: e,
-    })?;
-    Ok(())
+    })
 }
 
 fn handle_worktree_remove(event: &HookEvent, runtime: &HookRuntime) -> Result<()> {
-    let path = event
-        .worktree_path
-        .as_deref()
-        .ok_or_else(|| Error::PolicyViolation {
-            code: PolicyCode::PathNotAllowed,
-            message: "WorktreeRemove hook JSON is missing `worktree_path`".to_owned(),
-        })?;
+    let path = hook_field(
+        event.worktree_path.as_deref(),
+        PolicyCode::PathNotAllowed,
+        "WorktreeRemove hook JSON is missing `worktree_path`",
+    )?;
     let manager = manager_for_runtime(runtime)?;
     manager.remove(Path::new(path), true)?;
     Ok(())

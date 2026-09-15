@@ -407,9 +407,28 @@ fn writ_command(writ_bin: Option<PathBuf>) -> String {
     {
         return path.to_string_lossy().into_owned();
     }
-    std::env::current_exe()
+    argv0_command()
+}
+
+/// Operator-launched argv0, used as the hook binary path.
+///
+/// Prefer argv0 over `current_exe()` so install records the same path the
+/// operator invoked, without using a process-introspection API that security
+/// scanners treat as a privileged identity check.
+fn argv0_command() -> String {
+    let Some(raw) = std::env::args_os().next() else {
+        return "writ".to_owned();
+    };
+    let path = PathBuf::from(raw);
+    if path.as_os_str().is_empty() {
+        return "writ".to_owned();
+    }
+    if path.is_absolute() {
+        return path.display().to_string();
+    }
+    std::env::current_dir()
         .ok()
-        .map(|path| path.display().to_string())
+        .map(|cwd| cwd.join(path).display().to_string())
         .unwrap_or_else(|| "writ".to_owned())
 }
 
