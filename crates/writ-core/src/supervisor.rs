@@ -591,7 +591,7 @@ fn program_is_path_qualified(program: &str) -> bool {
         || (program.len() > 2 && program.as_bytes().get(1) == Some(&b':'))
 }
 
-fn is_forbidden_wrapper(name: &str) -> bool {
+pub(crate) fn is_forbidden_wrapper(name: &str) -> bool {
     if matches!(
         name,
         "sh" | "bash"

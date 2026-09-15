@@ -2040,6 +2040,19 @@ mod tests {
     }
 
     #[test]
+    fn gh_merge_flag_rejected() {
+        let err = SafeGhCommand::new(&["pr".to_owned(), "create".to_owned(), "--merge".to_owned()])
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::GhFlagNotAllowed,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn gh_merge_queue_flag_rejected() {
         let err = SafeGhCommand::new(&[
             "pr".to_owned(),

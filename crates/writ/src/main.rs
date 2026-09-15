@@ -330,10 +330,16 @@ fn run_worktree(
 }
 
 fn run_hook(stdout: &mut impl Write) -> writ_core::error::Result<ExitCode> {
-    let mut stdin = Vec::new();
-    io::stdin().read_to_end(&mut stdin)?;
-    let context = writ_core::hook::HookContext::from_env()?;
-    let outcome = writ_core::hook::dispatch_hook(&stdin, &context);
+    // PreToolUse only blocks on exit 2. Operational failures in the wrapper
+    // (stdin, env) must not leak as a non-blocking exit 1.
+    let outcome = match read_hook_outcome() {
+        Ok(outcome) => outcome,
+        Err(error) => writ_core::hook::HookOutcome {
+            exit_code: 2,
+            stdout: String::new(),
+            stderr: format!("writ: {error}\n"),
+        },
+    };
     if !outcome.stdout.is_empty() {
         stdout.write_all(outcome.stdout.as_bytes())?;
     }
@@ -341,6 +347,13 @@ fn run_hook(stdout: &mut impl Write) -> writ_core::error::Result<ExitCode> {
         let _ = write!(io::stderr(), "{}", outcome.stderr);
     }
     Ok(ExitCode::from(outcome.exit_code))
+}
+
+fn read_hook_outcome() -> writ_core::error::Result<writ_core::hook::HookOutcome> {
+    let mut stdin = Vec::new();
+    io::stdin().read_to_end(&mut stdin)?;
+    let context = writ_core::hook::HookContext::from_env()?;
+    Ok(writ_core::hook::dispatch_hook(&stdin, &context))
 }
 
 /// Entry point for CLI commands (status/jobs, git/gh-safe, supervisor, worktree).

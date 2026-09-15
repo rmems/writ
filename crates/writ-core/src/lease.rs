@@ -243,8 +243,11 @@ fn lease_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Lease> {
     })
 }
 
-fn path_key(path: &Path) -> String {
-    path.to_string_lossy().into_owned()
+pub(crate) fn path_key(path: &Path) -> String {
+    crate::paths::canonicalize_for_tools(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn unix_now() -> i64 {

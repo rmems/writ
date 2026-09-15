@@ -10,9 +10,9 @@ use serde::Deserialize;
 
 use crate::error::{Error, PolicyCode, Result};
 use crate::git_safe::{SafeGhCommand, SafeGitCommand};
-use crate::lease::{Lease, LeaseMode, LeaseStore};
-use crate::paths::worktree_base_path;
-use crate::supervisor::normalize_program_name;
+use crate::lease::{Lease, LeaseMode, LeaseStore, path_key};
+use crate::paths::{derive_worktree_path, worktree_base_path};
+use crate::supervisor::{is_forbidden_wrapper, normalize_program_name};
 use crate::worktree::{WorktreeCreateRequest, WorktreeManager};
 
 /// Paths an accidental agent must not rewrite: hook config and the enforcer.
@@ -219,15 +219,6 @@ fn pre_tool_use_error(error: &Error) -> HookOutcome {
 }
 
 fn enforce_bash_command(command: &str, ctx: &HookContext, cwd: Option<&str>) -> Result<()> {
-    if let Some(path) = protected_write_target(command, ctx) {
-        return Err(Error::PolicyViolation {
-            code: PolicyCode::ProtectedPath,
-            message: format!(
-                "refusing to write protected path `{}`",
-                path.to_string_lossy()
-            ),
-        });
-    }
     let words = split_shell_words(command)?;
     let words = strip_env_assignments(&words);
     if words.is_empty() {
@@ -238,8 +229,30 @@ fn enforce_bash_command(command: &str, ctx: &HookContext, cwd: Option<&str>) -> 
             reason: "compound shell command is not a single git/gh invocation".to_owned(),
         });
     }
+    if extra_git_or_gh_tokens(words) {
+        return Err(Error::HookFailClosed {
+            reason: "multiple git/gh invocations in one Bash payload".to_owned(),
+        });
+    }
+    if let Some(path) = protected_write_target(words, ctx) {
+        return Err(Error::PolicyViolation {
+            code: PolicyCode::ProtectedPath,
+            message: format!(
+                "refusing to write protected path `{}`",
+                path.to_string_lossy()
+            ),
+        });
+    }
     let program = normalize_program_name(&words[0]);
     let args = &words[1..];
+    if is_forbidden_wrapper(&program) {
+        return Err(Error::PolicyViolation {
+            code: PolicyCode::SubcommandNotAllowed,
+            message: format!(
+                "program `{program}` can launch unreviewed commands and is not allowed at PreToolUse"
+            ),
+        });
+    }
     match program.as_str() {
         "git" => {
             let cmd = SafeGitCommand::new(args)?;
@@ -299,6 +312,8 @@ fn create_and_lease(payload: &HookPayload, ctx: &HookContext) -> Result<PathBuf>
             reason: "WorktreeCreate missing cwd".to_owned(),
         })?;
     let repo_root = Path::new(repo_root);
+    let derived = derive_worktree_path(&ctx.worktree_base, owner, repo, job_id)?;
+    reject_protected_lease_scope(&derived, ctx)?;
     let manager = WorktreeManager::with_base(ctx.worktree_base.clone())?;
     let request = WorktreeCreateRequest {
         repo_root,
@@ -309,10 +324,10 @@ fn create_and_lease(payload: &HookPayload, ctx: &HookContext) -> Result<PathBuf>
         start_point,
     };
     let worktree = manager.create_with_request(request)?;
-    reject_protected_lease_scope(&worktree.path, ctx)?;
+    let stored = path_key(&worktree.path);
     let store = LeaseStore::open(&ctx.lease_path)?;
     store.grant(&Lease {
-        worktree_path: worktree.path.to_string_lossy().into_owned(),
+        worktree_path: stored.clone(),
         repo: repo.to_owned(),
         branch: branch.to_owned(),
         owner: owner.to_owned(),
@@ -320,7 +335,7 @@ fn create_and_lease(payload: &HookPayload, ctx: &HookContext) -> Result<PathBuf>
         ttl: None,
         heartbeat: None,
     })?;
-    Ok(worktree.path)
+    Ok(PathBuf::from(stored))
 }
 
 fn dispatch_worktree_remove(payload: &HookPayload, ctx: &HookContext) -> HookOutcome {
@@ -400,40 +415,59 @@ fn path_eq(left: &Path, right: &Path) -> bool {
     }
 }
 
-fn protected_write_target(command: &str, ctx: &HookContext) -> Option<PathBuf> {
-    if !contains_write_operator(command) {
-        return None;
+fn protected_write_target(words: &[String], ctx: &HookContext) -> Option<PathBuf> {
+    let program = normalize_program_name(&words[0]);
+    if matches!(
+        program.as_str(),
+        "tee" | "cp" | "mv" | "install" | "touch" | "dd"
+    ) {
+        for word in &words[1..] {
+            if word.starts_with('-') {
+                continue;
+            }
+            if is_protected_path(Path::new(word), ctx) {
+                return Some(PathBuf::from(word));
+            }
+        }
     }
-    if let Some(path) = command_mentions_hook_config(command) {
-        return Some(path);
-    }
-    let enforcer = ctx.enforcer_path.to_string_lossy();
-    if !enforcer.is_empty() && command.contains(enforcer.as_ref()) {
-        return Some(ctx.enforcer_path.clone());
-    }
-    None
-}
-
-fn contains_write_operator(command: &str) -> bool {
-    command.contains(">>")
-        || command.contains('>')
-        || command.split_whitespace().any(|word| {
-            matches!(
-                normalize_program_name(word).as_str(),
-                "tee" | "dd" | "install"
-            )
-        })
-        || command.contains("sed -i")
-        || command.contains("sed -i ")
-}
-
-fn command_mentions_hook_config(command: &str) -> Option<PathBuf> {
-    for suffix in HOOK_CONFIG_SUFFIXES {
-        if command.contains(suffix) {
-            return Some(PathBuf::from(suffix));
+    for dest in redirect_destinations(words) {
+        if is_protected_path(Path::new(dest), ctx) {
+            return Some(PathBuf::from(dest));
         }
     }
     None
+}
+
+fn redirect_destinations(words: &[String]) -> Vec<&str> {
+    let mut dests = Vec::new();
+    let mut pending = false;
+    for word in words {
+        if pending {
+            dests.push(word.as_str());
+            pending = false;
+            continue;
+        }
+        if matches!(word.as_str(), ">" | ">>" | "2>" | "2>>") {
+            pending = true;
+            continue;
+        }
+        for prefix in [">>", ">", "2>>", "2>"] {
+            if let Some(rest) = word.strip_prefix(prefix)
+                && !rest.is_empty()
+            {
+                dests.push(rest);
+                break;
+            }
+        }
+    }
+    dests
+}
+
+fn extra_git_or_gh_tokens(words: &[String]) -> bool {
+    words
+        .iter()
+        .skip(1)
+        .any(|word| matches!(normalize_program_name(word).as_str(), "git" | "gh"))
 }
 
 fn looks_like_shell_control(words: &[String]) -> bool {
@@ -497,6 +531,16 @@ fn split_shell_words(command: &str) -> Result<Vec<String>> {
             continue;
         }
         match ch {
+            '\n' | '\r' => {
+                return Err(Error::HookFailClosed {
+                    reason: "unquoted newline is a command separator".to_owned(),
+                });
+            }
+            ';' => {
+                return Err(Error::HookFailClosed {
+                    reason: "unquoted semicolon is a command separator".to_owned(),
+                });
+            }
             '\'' => in_single = true,
             '"' => in_double = true,
             '`' => {
@@ -539,6 +583,7 @@ pub fn false_positive_corpus() -> &'static [&'static str] {
         "git push origin feature/assigned",
         "git push --force-with-lease origin feature/assigned",
         "git rebase origin/main",
+        "git status .claude/settings.json 2>/dev/null",
         "gh pr view 1",
         "gh pr list",
     ]
@@ -655,15 +700,57 @@ mod tests {
     }
 
     #[test]
-    fn git_status_of_hook_config_is_not_a_false_positive() {
+    fn newline_separated_merge_fails_closed() {
         let dir = tempdir().unwrap();
         let payload = serde_json::json!({
             "hook_event_name": "PreToolUse",
             "tool_name": "Bash",
-            "tool_input": {"command": "git status .claude/settings.json"}
+            "tool_input": {"command": "git status\ngit merge feature"}
+        });
+        let outcome = dispatch_hook(payload.to_string().as_bytes(), &ctx(dir.path()));
+        assert_eq!(outcome.exit_code, 2, "{}", outcome.stderr);
+        assert!(
+            outcome.stderr.contains("newline") || outcome.stderr.contains("failed closed"),
+            "{}",
+            outcome.stderr
+        );
+    }
+
+    #[test]
+    fn cp_to_hook_config_is_blocked() {
+        let dir = tempdir().unwrap();
+        let payload = serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "cp foo .claude/settings.json"}
+        });
+        let outcome = dispatch_hook(payload.to_string().as_bytes(), &ctx(dir.path()));
+        assert_eq!(outcome.exit_code, 2);
+        assert!(outcome.stderr.contains("PROTECTED_PATH"));
+    }
+
+    #[test]
+    fn git_status_redirecting_stderr_is_not_a_false_positive() {
+        let dir = tempdir().unwrap();
+        let payload = serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "git status .claude/settings.json 2>/dev/null"}
         });
         let outcome = dispatch_hook(payload.to_string().as_bytes(), &ctx(dir.path()));
         assert_eq!(outcome.exit_code, 0, "{}", outcome.stderr);
+    }
+
+    #[test]
+    fn wrapper_launching_git_is_blocked() {
+        let dir = tempdir().unwrap();
+        let payload = serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "sh -c \"git merge feature\""}
+        });
+        let outcome = dispatch_hook(payload.to_string().as_bytes(), &ctx(dir.path()));
+        assert_eq!(outcome.exit_code, 2, "{}", outcome.stderr);
     }
 
     #[test]

@@ -158,6 +158,40 @@ fn worktree_create_grants_a_lease_row_queryable_in_sqlite() {
 }
 
 #[test]
+fn worktree_create_refuses_a_lease_on_hook_config() {
+    let root = TestDir::new();
+    let repo = init_repo(&root.0);
+    let start = git(&repo, &["rev-parse", "HEAD"]);
+    let payload = serde_json::json!({
+        "hook_event_name": "WorktreeCreate",
+        "cwd": repo,
+        "name": "settings.json",
+        "owner": "acme",
+        "repo": ".claude",
+        "job_id": "settings.json",
+        "branch": "feature/protected",
+        "start_point": start,
+    });
+    let output = writ_hook(&root.0, &payload);
+    assert_ne!(output.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("PROTECTED_PATH"));
+    if root.0.join("leases.sqlite").exists() {
+        let conn = rusqlite::Connection::open(root.0.join("leases.sqlite")).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM leases", [], |row| row.get(0))
+            .unwrap_or(0);
+        assert_eq!(count, 0);
+    }
+}
+
+#[test]
+fn newline_separated_git_merge_is_blocked() {
+    let root = TestDir::new();
+    let output = writ_hook(&root.0, &bash("git status\ngit merge feature"));
+    assert_eq!(output.status.code(), Some(2));
+}
+
+#[test]
 fn worktree_create_rejects_path_escape() {
     let root = TestDir::new();
     let repo = init_repo(&root.0);
@@ -349,6 +383,13 @@ fn protected_path_rewrite_is_blocked() {
     let output = writ_hook(&root.0, &bash("tee .claude/settings.local.json"));
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stderr).contains("PROTECTED_PATH"));
+}
+
+#[test]
+fn wrapper_launching_git_merge_is_blocked() {
+    let root = TestDir::new();
+    let output = writ_hook(&root.0, &bash("sh -c \"git merge feature\""));
+    assert_eq!(output.status.code(), Some(2));
 }
 
 #[test]
