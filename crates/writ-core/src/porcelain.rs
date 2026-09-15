@@ -88,7 +88,7 @@ pub fn registration_matches(
     expected_branch_ref: BranchRef<'_>,
     expected_head: CommitId<'_>,
 ) -> bool {
-    parse_porcelain_z(bytes).iter().any(|record| {
+    any_record(bytes, |record| {
         record.path.as_path() == expected_path
             && record.branch.as_deref() == Some(expected_branch_ref.as_str())
             && record.head.as_deref() == Some(expected_head.as_str())
@@ -98,9 +98,11 @@ pub fn registration_matches(
 /// True when any record's worktree path equals `expected_path`.
 #[must_use]
 pub fn path_is_registered(bytes: &[u8], expected_path: &Path) -> bool {
-    parse_porcelain_z(bytes)
-        .iter()
-        .any(|record| record.path.as_path() == expected_path)
+    any_record(bytes, |record| record.path.as_path() == expected_path)
+}
+
+fn any_record(bytes: &[u8], pred: impl Fn(&WorktreeRecord) -> bool) -> bool {
+    parse_porcelain_z(bytes).iter().any(pred)
 }
 
 #[derive(Default)]
@@ -118,8 +120,8 @@ impl PartialRecord {
         };
         match label {
             "worktree" => self.path = Some(path_from_bytes(value)),
-            "HEAD" => self.head = Some(String::from_utf8_lossy(value).into_owned()),
-            "branch" => self.branch = Some(String::from_utf8_lossy(value).into_owned()),
+            "HEAD" => self.head = Some(text_value(value)),
+            "branch" => self.branch = Some(text_value(value)),
             _ => {}
         }
     }
@@ -131,6 +133,10 @@ impl PartialRecord {
             branch: self.branch,
         })
     }
+}
+
+fn text_value(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
 }
 
 fn split_label_value(attr: &[u8]) -> (&str, Option<&[u8]>) {
@@ -165,15 +171,16 @@ mod tests {
 
     fn record_bytes(path: &[u8], head: &str, branch: &str) -> Vec<u8> {
         let mut out = Vec::new();
-        out.extend_from_slice(b"worktree ");
-        out.extend_from_slice(path);
-        out.push(0);
-        out.extend_from_slice(b"HEAD ");
-        out.extend_from_slice(head.as_bytes());
-        out.push(0);
-        out.extend_from_slice(b"branch ");
-        out.extend_from_slice(branch.as_bytes());
-        out.push(0);
+        for (label, value) in [
+            (b"worktree".as_slice(), path),
+            (b"HEAD".as_slice(), head.as_bytes()),
+            (b"branch".as_slice(), branch.as_bytes()),
+        ] {
+            out.extend_from_slice(label);
+            out.push(b' ');
+            out.extend_from_slice(value);
+            out.push(0);
+        }
         out.push(0);
         out
     }
@@ -182,52 +189,59 @@ mod tests {
         record_bytes(path.as_bytes(), head, branch)
     }
 
-    #[test]
-    fn parses_ordinary_record() {
-        let head = "a".repeat(40);
-        let bytes = utf8_record("/tmp/hive/job", &head, "refs/heads/feature/job");
-        let records = parse_porcelain_z(&bytes);
+    fn assert_one_complete_record(bytes: &[u8], path: &str, head: &str, branch: &str) {
+        let records = parse_porcelain_z(bytes);
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].path, PathBuf::from("/tmp/hive/job"));
-        assert_eq!(records[0].head.as_deref(), Some(head.as_str()));
-        assert_eq!(records[0].branch.as_deref(), Some("refs/heads/feature/job"));
+        assert_eq!(records[0].path, PathBuf::from(path));
+        assert_eq!(records[0].head.as_deref(), Some(head));
+        assert_eq!(records[0].branch.as_deref(), Some(branch));
         assert!(registration_matches(
-            &bytes,
-            Path::new("/tmp/hive/job"),
-            BranchRef("refs/heads/feature/job"),
-            CommitId(&head),
+            bytes,
+            Path::new(path),
+            BranchRef(branch),
+            CommitId(head),
         ));
-        assert!(path_is_registered(&bytes, Path::new("/tmp/hive/job")));
+        assert!(path_is_registered(bytes, Path::new(path)));
+    }
+
+    fn assert_identity_rejected(bytes: &[u8], path: &str, branch: &str, head: &str) {
+        assert!(!registration_matches(
+            bytes,
+            Path::new(path),
+            BranchRef(branch),
+            CommitId(head),
+        ));
     }
 
     #[test]
-    fn newline_in_path_stays_in_one_record() {
-        let head = "b".repeat(40);
-        let path = "/tmp/base\nsegment/job";
-        let bytes = utf8_record(path, &head, "refs/heads/feature/job");
-        let records = parse_porcelain_z(&bytes);
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].path, PathBuf::from(path));
-        assert_eq!(records[0].head.as_deref(), Some(head.as_str()));
-        assert_eq!(records[0].branch.as_deref(), Some("refs/heads/feature/job"));
-        assert!(registration_matches(
-            &bytes,
-            Path::new(path),
-            BranchRef("refs/heads/feature/job"),
-            CommitId(&head),
-        ));
-        assert!(path_is_registered(&bytes, Path::new(path)));
-        assert!(!path_is_registered(&bytes, Path::new("/tmp/base")));
+    fn complete_records_keep_path_head_and_branch_together() {
+        let ordinary_head = "a".repeat(40);
+        let newline_head = "b".repeat(40);
+        let newline_path = "/tmp/base\nsegment/job";
+        assert_one_complete_record(
+            &utf8_record("/tmp/hive/job", &ordinary_head, "refs/heads/feature/job"),
+            "/tmp/hive/job",
+            &ordinary_head,
+            "refs/heads/feature/job",
+        );
+        let newline = utf8_record(newline_path, &newline_head, "refs/heads/feature/job");
+        assert_one_complete_record(
+            &newline,
+            newline_path,
+            &newline_head,
+            "refs/heads/feature/job",
+        );
+        assert!(!path_is_registered(&newline, Path::new("/tmp/base")));
     }
 
     #[test]
     fn path_bytes_are_not_trimmed() {
         let head = "d".repeat(40);
-        let path = b"/tmp/job ";
-        let bytes = record_bytes(path, &head, "refs/heads/feature/job");
-        let records = parse_porcelain_z(&bytes);
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].path, PathBuf::from("/tmp/job "));
+        let bytes = record_bytes(b"/tmp/job ", &head, "refs/heads/feature/job");
+        assert_eq!(
+            parse_porcelain_z(&bytes)[0].path,
+            PathBuf::from("/tmp/job ")
+        );
         assert!(!path_is_registered(&bytes, Path::new("/tmp/job")));
     }
 
@@ -235,47 +249,35 @@ mod tests {
     fn ignores_unrelated_records_and_rejects_partial_matches() {
         let head = "c".repeat(40);
         let other_head = "e".repeat(40);
-        let mut bytes = utf8_record("/tmp/other", &head, "refs/heads/feature/job");
-        bytes.extend_from_slice(&utf8_record(
+        let mut mixed = utf8_record("/tmp/other", &head, "refs/heads/feature/job");
+        mixed.extend_from_slice(&utf8_record(
             "/tmp/hive/job",
             &head,
             "refs/heads/feature/other",
         ));
-        bytes.extend_from_slice(&utf8_record(
+        mixed.extend_from_slice(&utf8_record(
             "/tmp/elsewhere",
             &other_head,
             "refs/heads/feature/elsewhere",
         ));
-
-        let expected_path = Path::new("/tmp/hive/job");
-        let expected_branch = BranchRef("refs/heads/feature/job");
-        let expected_head = CommitId(&head);
-
-        assert!(!registration_matches(
-            &bytes,
-            expected_path,
-            expected_branch,
-            expected_head,
-        ));
-        assert!(!path_is_registered(&bytes, Path::new("/tmp/hive")));
-        assert!(!registration_matches(
-            &utf8_record("/tmp/other", &head, "refs/heads/feature/job"),
-            expected_path,
-            expected_branch,
-            expected_head,
-        ));
-        assert!(!registration_matches(
-            &utf8_record("/tmp/hive/job", &other_head, "refs/heads/feature/job"),
-            expected_path,
-            expected_branch,
-            expected_head,
-        ));
-        assert!(!registration_matches(
-            &utf8_record("/tmp/hive/job", &head, "refs/heads/feature/other"),
-            expected_path,
-            expected_branch,
-            expected_head,
-        ));
+        assert_identity_rejected(&mixed, "/tmp/hive/job", "refs/heads/feature/job", &head);
+        assert!(!path_is_registered(&mixed, Path::new("/tmp/hive")));
+        for (path, rec_head, branch) in [
+            ("/tmp/other", head.as_str(), "refs/heads/feature/job"),
+            (
+                "/tmp/hive/job",
+                other_head.as_str(),
+                "refs/heads/feature/job",
+            ),
+            ("/tmp/hive/job", head.as_str(), "refs/heads/feature/other"),
+        ] {
+            assert_identity_rejected(
+                &utf8_record(path, rec_head, branch),
+                "/tmp/hive/job",
+                "refs/heads/feature/job",
+                &head,
+            );
+        }
     }
 
     #[test]
@@ -283,12 +285,7 @@ mod tests {
         let head = "f".repeat(40);
         let mut bytes = utf8_record("/tmp/hive/job", &head, "refs/heads/feature/other");
         bytes.extend_from_slice(&utf8_record("/tmp/other", &head, "refs/heads/feature/job"));
-        assert!(!registration_matches(
-            &bytes,
-            Path::new("/tmp/hive/job"),
-            BranchRef("refs/heads/feature/job"),
-            CommitId(&head),
-        ));
+        assert_identity_rejected(&bytes, "/tmp/hive/job", "refs/heads/feature/job", &head);
         assert_eq!(parse_porcelain_z(&bytes).len(), 2);
     }
 
