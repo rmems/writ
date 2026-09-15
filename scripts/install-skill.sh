@@ -152,13 +152,35 @@ expand_roots() {
   done
 }
 
+# True if $1 is $2 or a path under $2. Both arguments must be absolute
+# physical paths (no trailing slash). The trailing-slash test avoids
+# treating /tmp/writ-extra as inside /tmp/writ.
+path_is_inside() {
+  local inner=$1
+  local outer=$2
+  [[ "$inner" == "$outer" || "$inner" == "$outer"/* ]]
+}
+
 install_one() {
   local name=$1
   local parent target
   parent="$(root_parent "$name")" || die "unknown root: $name"
   target="$parent/$SKILL_NAME"
 
+  if path_is_inside "$parent" "$CLONE_ABS"; then
+    die "refusing to create skill root $parent inside this clone"
+  fi
+
   mkdir -p "$parent"
+
+  if [[ -d "$target" && ! -L "$target" ]]; then
+    local existing
+    existing="$(cd "$target" && pwd -P)"
+    if [[ "$existing" == "$CLONE_ABS" ]]; then
+      echo "ok: $target is this clone (no symlink needed)"
+      return 0
+    fi
+  fi
 
   if [[ -L "$target" || -e "$target" ]]; then
     if points_at_clone "$target"; then
@@ -168,17 +190,23 @@ install_one() {
     if [[ "$FORCE" -ne 1 ]]; then
       die "$target exists and is not a symlink to this clone; pass --force to replace"
     fi
+    if path_is_inside "$CLONE_ABS" "$target"; then
+      die "refusing to replace $target because it contains this clone"
+    fi
     if [[ -d "$target" && ! -L "$target" ]]; then
-      local existing
-      existing="$(cd "$target" && pwd -P)"
-      if [[ "$existing" == "$CLONE_ABS" ]]; then
-        die "refusing to replace the clone directory itself: $target"
+      local target_phys
+      target_phys="$(cd "$target" && pwd -P)"
+      if path_is_inside "$CLONE_ABS" "$target_phys"; then
+        die "refusing to replace $target because it contains this clone"
       fi
     fi
     rm -rf "$target"
   fi
 
   ln -sfn "$CLONE_ABS" "$target"
+  if [[ ! -f "$target/SKILL.md" ]]; then
+    die "install failed: $target/SKILL.md missing after link"
+  fi
   echo "linked: $target -> $CLONE_ABS"
 }
 
@@ -231,6 +259,8 @@ CLONE_ABS="$(abs_dir "$CLONE_DIR")"
 [[ -f "$CLONE_ABS/SKILL.md" ]] || die "SKILL.md not found in $CLONE_ABS (is --clone-dir the repo root?)"
 
 [[ -n "${HOME:-}" ]] || die "HOME is unset"
+[[ -d "$HOME" ]] || die "HOME is not a directory: $HOME"
+HOME="$(cd "$HOME" && pwd -P)"
 
 declare -a SELECTED_ROOTS=()
 expand_roots
@@ -244,7 +274,7 @@ echo
 echo "Verify:"
 for name in "${SELECTED_ROOTS[@]}"; do
   parent="$(root_parent "$name")"
-  echo "  test -f $parent/$SKILL_NAME/SKILL.md && echo OK ($name)"
+  echo "  test -f '$parent/$SKILL_NAME/SKILL.md' && echo OK ($name)"
 done
 echo
 echo "Next steps:"

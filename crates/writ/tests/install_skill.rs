@@ -70,11 +70,17 @@ fn skill_link(home: &Path, root: &str) -> PathBuf {
     home.join(root).join("skills/writ")
 }
 
-fn assert_linked(home: &Path, root: &str) {
+fn fake_clone(root: &Path) -> PathBuf {
+    let clone = root.join("clone");
+    fs::create_dir_all(&clone).unwrap();
+    fs::write(clone.join("SKILL.md"), "# writ\n").unwrap();
+    clone.canonicalize().unwrap()
+}
+
+fn assert_linked_to(home: &Path, root: &str, clone: &Path) {
     let link = skill_link(home, root);
     let dest = fs::read_link(&link).unwrap_or_else(|err| panic!("read_link {link:?}: {err}"));
     let dest_canon = dest.canonicalize().unwrap();
-    let clone = repo_root();
     assert_eq!(dest_canon, clone, "symlink {link:?} -> {dest:?}");
     assert!(
         link.join("SKILL.md").is_file(),
@@ -91,13 +97,13 @@ fn default_root_is_idempotent() {
 
     let first = run(home, &["--clone-dir", clone_str]);
     assert_success(&first);
-    assert_linked(home, ".agents");
+    assert_linked_to(home, ".agents", &clone);
     assert!(stdout(&first).contains("/skills writ"));
 
     let second = run(home, &["--clone-dir", clone_str]);
     assert_success(&second);
     assert!(stdout(&second).contains("already"));
-    assert_linked(home, ".agents");
+    assert_linked_to(home, ".agents", &clone);
 }
 
 #[test]
@@ -133,7 +139,7 @@ fn force_replaces_conflict() {
 
     let output = run(home, &["--force", "--clone-dir", clone.to_str().unwrap()]);
     assert_success(&output);
-    assert_linked(home, ".agents");
+    assert_linked_to(home, ".agents", &clone);
 }
 
 #[test]
@@ -147,7 +153,7 @@ fn all_roots_share_one_clone() {
     );
     assert_success(&output);
     for root in [".agents", ".grok", ".cline", ".claude", ".cursor"] {
-        assert_linked(home, root);
+        assert_linked_to(home, root, &clone);
         let dest = fs::read_link(skill_link(home, root))
             .unwrap()
             .canonicalize()
@@ -201,7 +207,7 @@ fn force_replaces_symlink_to_other_path() {
         &["--force", "--clone-dir", repo_root().to_str().unwrap()],
     );
     assert_success(&with_force);
-    assert_linked(home, ".agents");
+    assert_linked_to(home, ".agents", &repo_root());
 }
 
 #[test]
@@ -217,5 +223,74 @@ fn writ_clone_env_selects_checkout() {
         .output()
         .unwrap();
     assert_success(&output);
-    assert_linked(&home, ".agents");
+    assert_linked_to(&home, ".agents", &repo_root());
+}
+
+#[test]
+fn comma_separated_roots() {
+    let tmp = TestDir::new();
+    let home = &tmp.0;
+    let clone = repo_root();
+    let output = run(
+        home,
+        &[
+            "--root",
+            "grok,cline",
+            "--clone-dir",
+            clone.to_str().unwrap(),
+        ],
+    );
+    assert_success(&output);
+    assert_linked_to(home, ".grok", &clone);
+    assert_linked_to(home, ".cline", &clone);
+    assert!(!skill_link(home, ".agents").exists());
+}
+
+#[test]
+fn clone_already_at_skill_path_is_ok() {
+    let tmp = TestDir::new();
+    let clone = tmp.0.join(".agents/skills/writ");
+    fs::create_dir_all(&clone).unwrap();
+    fs::write(clone.join("SKILL.md"), "# writ\n").unwrap();
+    let clone = clone.canonicalize().unwrap();
+
+    let output = run(&tmp.0, &["--clone-dir", clone.to_str().unwrap()]);
+    assert_success(&output);
+    assert!(stdout(&output).contains("no symlink needed"));
+    assert!(clone.join("SKILL.md").is_file());
+    let meta = clone.symlink_metadata().unwrap();
+    assert!(meta.file_type().is_dir());
+    assert!(!meta.file_type().is_symlink());
+}
+
+#[test]
+fn force_refuses_to_delete_clone_nested_under_skill_path() {
+    let tmp = TestDir::new();
+    let home = &tmp.0;
+    let clone = home.join(".agents/skills/writ/nested");
+    fs::create_dir_all(&clone).unwrap();
+    fs::write(clone.join("SKILL.md"), "# writ\n").unwrap();
+
+    let output = run(home, &["--force", "--clone-dir", clone.to_str().unwrap()]);
+    assert!(!output.status.success(), "stderr={}", stderr(&output));
+    assert!(
+        stderr(&output).contains("contains this clone"),
+        "stderr={}",
+        stderr(&output)
+    );
+    assert!(clone.join("SKILL.md").is_file());
+}
+
+#[test]
+fn refuses_skill_root_inside_clone() {
+    let tmp = TestDir::new();
+    let clone = fake_clone(&tmp.0);
+    let output = run(&clone, &["--clone-dir", clone.to_str().unwrap()]);
+    assert!(!output.status.success(), "stderr={}", stderr(&output));
+    assert!(
+        stderr(&output).contains("inside this clone"),
+        "stderr={}",
+        stderr(&output)
+    );
+    assert!(!clone.join(".agents").exists());
 }

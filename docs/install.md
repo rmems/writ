@@ -44,6 +44,8 @@ test -f "$HOME/.agents/skills/writ/SKILL.md" && echo OK
 
 `ln -sfn` uses an **absolute** clone path so the link survives a later working-directory change. The link target is the **skill directory** (the clone), not a bare `SKILL.md` file. Agents that require the directory name to match frontmatter `name` look for `writ`.
 
+If `<root>/writ` already exists as a **real directory**, GNU/BSD `ln -sfn "$CLONE" <root>/writ` does not replace it — it creates `<root>/writ/writ`. Check with `ls -ld ~/.agents/skills/writ` first, or use `scripts/install-skill.sh`, which refuses that conflict without `--force`.
+
 ## Cross-agent skill roots
 
 | Root | Path | Script `--root` | Priority |
@@ -108,7 +110,7 @@ rm -f ~/.agents/skills/writ ~/.grok/skills/writ ~/.cline/skills/writ
 rm -f ~/.claude/skills/writ ~/.cursor/skills/writ ~/.codex/skills/writ
 ```
 
-Do not delete the clone unless you intend to. `--force` on a later install only replaces the skill-root path, never the clone.
+Do not delete the clone unless you intend to. `--force` replaces a conflicting skill-root *entry* (file or foreign directory). It refuses when that path *is* this clone or *contains* this clone, so a nested checkout under `~/.agents/skills/writ/` cannot be `rm -rf`'d by accident.
 
 ## Registry publish (optional, later)
 
