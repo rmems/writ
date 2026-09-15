@@ -23,25 +23,43 @@ pub fn parse_porcelain_z(bytes: &[u8]) -> Vec<WorktreeRecord> {
     let mut records = Vec::new();
     let mut current = PartialRecord::default();
     let mut saw_attr = false;
-
     for attr in bytes.split(|b| *b == 0) {
-        if attr.is_empty() {
-            if saw_attr {
-                if let Some(record) = current.finish() {
-                    records.push(record);
-                }
-                current = PartialRecord::default();
-                saw_attr = false;
-            }
-            continue;
-        }
-        saw_attr = true;
-        current.apply(attr);
+        consume_attr(attr, &mut records, &mut current, &mut saw_attr);
     }
+    flush_record(&mut records, current);
+    records
+}
+
+fn consume_attr(
+    attr: &[u8],
+    records: &mut Vec<WorktreeRecord>,
+    current: &mut PartialRecord,
+    saw_attr: &mut bool,
+) {
+    if attr.is_empty() {
+        close_record(records, current, saw_attr);
+        return;
+    }
+    *saw_attr = true;
+    current.apply(attr);
+}
+
+fn close_record(
+    records: &mut Vec<WorktreeRecord>,
+    current: &mut PartialRecord,
+    saw_attr: &mut bool,
+) {
+    if !*saw_attr {
+        return;
+    }
+    flush_record(records, std::mem::take(current));
+    *saw_attr = false;
+}
+
+fn flush_record(records: &mut Vec<WorktreeRecord>, current: PartialRecord) {
     if let Some(record) = current.finish() {
         records.push(record);
     }
-    records
 }
 
 /// True when one porcelain record matches the expected path, full branch ref, and HEAD.
@@ -90,22 +108,13 @@ struct PartialRecord {
 impl PartialRecord {
     fn apply(&mut self, attr: &[u8]) {
         let (label, value) = split_label_value(attr);
+        let Some(value) = value else {
+            return;
+        };
         match label {
-            "worktree" => {
-                if let Some(value) = value {
-                    self.path = Some(path_from_bytes(value));
-                }
-            }
-            "HEAD" => {
-                if let Some(value) = value {
-                    self.head = Some(String::from_utf8_lossy(value).into_owned());
-                }
-            }
-            "branch" => {
-                if let Some(value) = value {
-                    self.branch = Some(String::from_utf8_lossy(value).into_owned());
-                }
-            }
+            "worktree" => self.path = Some(path_from_bytes(value)),
+            "HEAD" => self.head = Some(lossy_utf8(value)),
+            "branch" => self.branch = Some(lossy_utf8(value)),
             _ => {}
         }
     }
@@ -127,6 +136,10 @@ fn split_label_value(attr: &[u8]) -> (&str, Option<&[u8]>) {
         }
         None => (std::str::from_utf8(attr).unwrap_or(""), None),
     }
+}
+
+fn lossy_utf8(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
 }
 
 fn path_from_bytes(bytes: &[u8]) -> PathBuf {

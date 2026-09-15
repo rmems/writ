@@ -9,6 +9,9 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::bash_argv::{
+    extract_substitutions, mentions_git_or_gh, split_shell_statements, tokenize_shell,
+};
 use crate::error::{Error, PolicyCode, Result};
 use crate::git_safe::{SafeGhCommand, SafeGitCommand};
 use crate::identity::{StartPoint, resolve_start_commit};
@@ -93,17 +96,7 @@ fn handle_pre_tool_use(event: &HookEvent) -> Result<()> {
     else {
         return Ok(());
     };
-    for invocation in extract_git_gh_invocations(command)? {
-        match invocation.tool {
-            GitGhTool::Git => {
-                SafeGitCommand::new(&invocation.args)?;
-            }
-            GitGhTool::Gh => {
-                SafeGhCommand::new(&invocation.args)?;
-            }
-        }
-    }
-    Ok(())
+    admit_bash_command(command)
 }
 
 fn handle_worktree_create(
@@ -249,11 +242,7 @@ fn extract_git_gh_invocations(command: &str) -> Result<Vec<Invocation>> {
     for statement in split_shell_statements(command) {
         collect_from_statement(&statement, &mut found)?;
     }
-    if found.is_empty()
-        && command
-            .split(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_')
-            .any(|token| matches!(token, "git" | "gh"))
-    {
+    if found.is_empty() && mentions_git_or_gh(command) {
         return Err(Error::PolicyViolation {
             code: PolicyCode::SubcommandNotAllowed,
             message: format!("unparseable git/gh command: {command}"),
@@ -313,171 +302,65 @@ fn is_env_assignment(token: &str) -> bool {
 fn skip_git_global_options(args: &[String]) -> Vec<String> {
     let mut i = 0;
     while i < args.len() {
-        let arg = args[i].as_str();
-        if arg == "--" {
-            return args[i + 1..].to_vec();
+        match classify_git_prefix(&args[i]) {
+            GitPrefix::EndOfOptions => return tail_args(args, i.saturating_add(1)),
+            GitPrefix::TakesValue => i = i.saturating_add(2),
+            GitPrefix::EqualsForm => i = i.saturating_add(1),
+            GitPrefix::Operand => break,
         }
-        if matches!(
-            arg,
-            "-C" | "-c"
-                | "--git-dir"
-                | "--work-tree"
-                | "--namespace"
-                | "--config-env"
-                | "--super-prefix"
-        ) {
-            i += 2;
-            continue;
-        }
-        if arg.starts_with("--git-dir=")
-            || arg.starts_with("--work-tree=")
-            || arg.starts_with("--namespace=")
-            || arg.starts_with("--config-env=")
-            || arg.starts_with("--super-prefix=")
-        {
-            i += 1;
-            continue;
-        }
-        break;
     }
+    tail_args(args, i)
+}
+
+fn tail_args(args: &[String], i: usize) -> Vec<String> {
     args.get(i..).unwrap_or(&[]).to_vec()
 }
 
-fn split_shell_statements(command: &str) -> Vec<String> {
-    let mut statements = Vec::new();
-    let mut current = String::new();
-    let mut chars = command.chars().peekable();
-    let mut in_single = false;
-    let mut in_double = false;
-    while let Some(ch) = chars.next() {
-        if ch == '\\' && !in_single {
-            if let Some(next) = chars.next() {
-                current.push(ch);
-                current.push(next);
-            }
-            continue;
-        }
-        if ch == '\'' && !in_double {
-            in_single = !in_single;
-            current.push(ch);
-            continue;
-        }
-        if ch == '"' && !in_single {
-            in_double = !in_double;
-            current.push(ch);
-            continue;
-        }
-        if !in_single && !in_double {
-            if ch == ';' || ch == '\n' {
-                push_statement(&mut statements, &mut current);
-                continue;
-            }
-            if ch == '&' && chars.peek() == Some(&'&') {
-                chars.next();
-                push_statement(&mut statements, &mut current);
-                continue;
-            }
-            if ch == '|' && chars.peek() == Some(&'|') {
-                chars.next();
-                push_statement(&mut statements, &mut current);
-                continue;
-            }
-            if ch == '|' || ch == '&' {
-                push_statement(&mut statements, &mut current);
-                continue;
-            }
-        }
-        current.push(ch);
-    }
-    push_statement(&mut statements, &mut current);
-    statements
+enum GitPrefix {
+    EndOfOptions,
+    TakesValue,
+    EqualsForm,
+    Operand,
 }
 
-fn push_statement(statements: &mut Vec<String>, current: &mut String) {
-    let trimmed = current.trim();
-    if !trimmed.is_empty() {
-        statements.push(trimmed.to_owned());
+fn classify_git_prefix(arg: &str) -> GitPrefix {
+    if arg == "--" {
+        return GitPrefix::EndOfOptions;
     }
-    current.clear();
+    if git_prefix_takes_value(arg) {
+        return GitPrefix::TakesValue;
+    }
+    if git_prefix_equals_form(arg) {
+        return GitPrefix::EqualsForm;
+    }
+    GitPrefix::Operand
 }
 
-fn extract_substitutions(statement: &str) -> Vec<String> {
-    let mut found = Vec::new();
-    let bytes = statement.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'$'
-            && bytes.get(i + 1) == Some(&b'(')
-            && let Some((inner, end)) = take_balanced(&statement[i + 2..], '(', ')')
-        {
-            found.push(inner.to_owned());
-            i += 2 + end;
-            continue;
-        }
-        if bytes[i] == b'`'
-            && let Some(end) = statement[i + 1..].find('`')
-        {
-            found.push(statement[i + 1..i + 1 + end].to_owned());
-            i += 2 + end;
-            continue;
-        }
-        i += 1;
-    }
-    found
+fn git_prefix_takes_value(arg: &str) -> bool {
+    matches!(
+        arg,
+        "-C" | "-c"
+            | "--git-dir"
+            | "--work-tree"
+            | "--namespace"
+            | "--config-env"
+            | "--super-prefix"
+    )
 }
 
-fn take_balanced(input: &str, open: char, close: char) -> Option<(&str, usize)> {
-    let mut depth = 1;
-    for (idx, ch) in input.char_indices() {
-        if ch == open {
-            depth += 1;
-        } else if ch == close {
-            depth -= 1;
-            if depth == 0 {
-                return Some((&input[..idx], idx + ch.len_utf8()));
-            }
-        }
-    }
-    None
+fn git_prefix_equals_form(arg: &str) -> bool {
+    [
+        "--git-dir=",
+        "--work-tree=",
+        "--namespace=",
+        "--config-env=",
+        "--super-prefix=",
+    ]
+    .iter()
+    .any(|prefix| arg.starts_with(prefix))
 }
 
-fn tokenize_shell(statement: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut chars = statement.chars().peekable();
-    let mut in_single = false;
-    let mut in_double = false;
-    while let Some(ch) = chars.next() {
-        if ch == '\\' && !in_single {
-            if let Some(next) = chars.next() {
-                current.push(next);
-            }
-            continue;
-        }
-        if ch == '\'' && !in_double {
-            in_single = !in_single;
-            continue;
-        }
-        if ch == '"' && !in_double {
-            in_double = !in_double;
-            continue;
-        }
-        if ch.is_whitespace() && !in_single && !in_double {
-            if !current.is_empty() {
-                tokens.push(std::mem::take(&mut current));
-            }
-            continue;
-        }
-        current.push(ch);
-    }
-    if !current.is_empty() {
-        tokens.push(current);
-    }
-    tokens
-}
-
-/// Public validation entry used by tests: policy-check a Bash command string.
-pub fn validate_bash_command(command: &str) -> Result<()> {
+fn admit_bash_command(command: &str) -> Result<()> {
     for invocation in extract_git_gh_invocations(command)? {
         match invocation.tool {
             GitGhTool::Git => {
@@ -489,6 +372,11 @@ pub fn validate_bash_command(command: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Public validation entry used by tests: policy-check a Bash command string.
+pub fn validate_bash_command(command: &str) -> Result<()> {
+    admit_bash_command(command)
 }
 
 #[cfg(test)]
@@ -552,6 +440,7 @@ mod tests {
         validate_bash_command("npm test").unwrap();
         validate_bash_command("/usr/bin/git status").unwrap();
         validate_bash_command("git -C /tmp/repo status").unwrap();
+        validate_bash_command("git -- status").unwrap();
     }
 
     #[test]

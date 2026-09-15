@@ -83,6 +83,17 @@ pub struct LeaseGrant<'a> {
     pub start_commit: &'a str,
 }
 
+/// Durable resume identity key: owner/repo/job plus the branch name.
+#[derive(Debug, Clone, Copy)]
+pub struct ResumeKey<'a> {
+    pub owner: &'a str,
+    pub repo_name: &'a str,
+    pub job_id: &'a str,
+    pub branch: &'a str,
+}
+
+const LEASE_SELECT: &str = "SELECT repo, owner, repo_name, job_id, branch, branch_ref, worktree_path, start_commit, mode, ttl, heartbeat, max_files, max_churn, max_fix_cycles, fix_cycles, released_at FROM leases";
+
 /// SQLite-backed lease and agent registry.
 #[derive(Debug)]
 pub struct LeaseStore {
@@ -214,69 +225,43 @@ impl LeaseStore {
     }
 
     /// Durable resume identity for an owner/repo/job/branch, including released rows.
-    pub fn find_resume(
-        &self,
-        owner: &str,
-        repo_name: &str,
-        job_id: &str,
-        branch: &str,
-    ) -> Result<Option<Lease>> {
-        let conn = self.lock()?;
-        let lease = conn
-            .query_row(
-                "
-                SELECT repo, owner, repo_name, job_id, branch, branch_ref, worktree_path,
-                       start_commit, mode, ttl, heartbeat, max_files, max_churn,
-                       max_fix_cycles, fix_cycles, released_at
-                FROM leases
-                WHERE owner = ?1 AND repo_name = ?2 AND job_id = ?3 AND branch = ?4
-                ",
-                params![owner, repo_name, job_id, branch],
-                lease_from_row,
-            )
-            .optional()
-            .map_err(|e| lease_err("lookup resume identity", e))?;
-        Ok(lease)
+    pub fn find_resume(&self, key: ResumeKey<'_>) -> Result<Option<Lease>> {
+        self.query_lease(
+            "WHERE owner = ?1 AND repo_name = ?2 AND job_id = ?3 AND branch = ?4",
+            params![key.owner, key.repo_name, key.job_id, key.branch],
+            "lookup resume identity",
+        )
     }
 
     /// Look up a lease by owner/repo/job.
     pub fn find_job(&self, owner: &str, repo_name: &str, job_id: &str) -> Result<Option<Lease>> {
-        let conn = self.lock()?;
-        let lease = conn
-            .query_row(
-                "
-                SELECT repo, owner, repo_name, job_id, branch, branch_ref, worktree_path,
-                       start_commit, mode, ttl, heartbeat, max_files, max_churn,
-                       max_fix_cycles, fix_cycles, released_at
-                FROM leases
-                WHERE owner = ?1 AND repo_name = ?2 AND job_id = ?3
-                ",
-                params![owner, repo_name, job_id],
-                lease_from_row,
-            )
-            .optional()
-            .map_err(|e| lease_err("lookup lease", e))?;
-        Ok(lease)
+        self.query_lease(
+            "WHERE owner = ?1 AND repo_name = ?2 AND job_id = ?3",
+            params![owner, repo_name, job_id],
+            "lookup lease",
+        )
     }
 
     /// Look up a lease by worktree path.
     pub fn find_by_path(&self, worktree_path: &Path) -> Result<Option<Lease>> {
+        self.query_lease(
+            "WHERE worktree_path = ?1",
+            params![path_text(worktree_path)],
+            "lookup lease by path",
+        )
+    }
+
+    fn query_lease(
+        &self,
+        where_sql: &str,
+        params: impl rusqlite::Params,
+        context: &'static str,
+    ) -> Result<Option<Lease>> {
+        let sql = format!("{LEASE_SELECT} {where_sql}");
         let conn = self.lock()?;
-        let lease = conn
-            .query_row(
-                "
-                SELECT repo, owner, repo_name, job_id, branch, branch_ref, worktree_path,
-                       start_commit, mode, ttl, heartbeat, max_files, max_churn,
-                       max_fix_cycles, fix_cycles, released_at
-                FROM leases
-                WHERE worktree_path = ?1
-                ",
-                params![path_text(worktree_path)],
-                lease_from_row,
-            )
+        conn.query_row(&sql, params, lease_from_row)
             .optional()
-            .map_err(|e| lease_err("lookup lease by path", e))?;
-        Ok(lease)
+            .map_err(|e| lease_err(context, e))
     }
 
     /// Upsert a live agent-registry row.
@@ -412,7 +397,12 @@ mod tests {
         assert!(released.released_at.is_some());
 
         let resume = store
-            .find_resume("acme", "sample", "gh-42", "hive/gh-42")
+            .find_resume(ResumeKey {
+                owner: "acme",
+                repo_name: "sample",
+                job_id: "gh-42",
+                branch: "hive/gh-42",
+            })
             .unwrap()
             .unwrap();
         assert_eq!(resume.start_commit, "abc123");

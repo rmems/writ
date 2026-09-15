@@ -10,6 +10,44 @@ use crate::error::{Error, Result};
 /// Stable argv for the hook dispatcher.
 pub const HOOK_ARGS: [&str; 1] = ["hook"];
 
+/// Path or name of the `writ` executable written into hook settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WritCommand<'a>(pub &'a str);
+
+impl<'a> WritCommand<'a> {
+    #[must_use]
+    pub const fn as_str(self) -> &'a str {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy)]
+struct HookEventName(&'static str);
+
+impl HookEventName {
+    const PRE_TOOL_USE: Self = Self("PreToolUse");
+    const WORKTREE_CREATE: Self = Self("WorktreeCreate");
+    const WORKTREE_REMOVE: Self = Self("WorktreeRemove");
+    const SUBAGENT_START: Self = Self("SubagentStart");
+    const SUBAGENT_STOP: Self = Self("SubagentStop");
+
+    const fn as_str(self) -> &'static str {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct HookIf(&'static str);
+
+impl HookIf {
+    const BASH_GIT: Self = Self("Bash(git *)");
+    const BASH_GH: Self = Self("Bash(gh *)");
+
+    const fn as_str(self) -> &'static str {
+        self.0
+    }
+}
+
 /// Result of an install pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallResult {
@@ -18,24 +56,11 @@ pub struct InstallResult {
 }
 
 /// Merge the `writ hook` block into `settings_path` without dropping other hooks.
-pub fn install_settings(settings_path: &Path, writ_command: &str) -> Result<InstallResult> {
-    let existing = if settings_path.exists() {
-        let text = fs::read_to_string(settings_path).map_err(|e| Error::Io {
-            context: "read Claude Code settings",
-            source: e,
-        })?;
-        if text.trim().is_empty() {
-            json!({})
-        } else {
-            serde_json::from_str(&text).map_err(|e| Error::Io {
-                context: "parse Claude Code settings",
-                source: std::io::Error::new(std::io::ErrorKind::InvalidData, e),
-            })?
-        }
-    } else {
-        json!({})
-    };
-
+pub fn install_settings(
+    settings_path: &Path,
+    writ_command: WritCommand<'_>,
+) -> Result<InstallResult> {
+    let existing = read_settings_object(settings_path)?;
     let (merged, changed) = merge_hook_block(existing, writ_command);
     if let Some(parent) = settings_path.parent() {
         fs::create_dir_all(parent).map_err(|e| Error::Io {
@@ -44,19 +69,7 @@ pub fn install_settings(settings_path: &Path, writ_command: &str) -> Result<Inst
         })?;
     }
     if changed {
-        let body = format!(
-            "{}\n",
-            serde_json::to_string_pretty(&merged).map_err(|e| {
-                Error::Io {
-                    context: "serialize Claude Code settings",
-                    source: std::io::Error::other(e),
-                }
-            })?
-        );
-        fs::write(settings_path, body).map_err(|e| Error::Io {
-            context: "write Claude Code settings",
-            source: e,
-        })?;
+        write_settings(settings_path, &merged)?;
     }
 
     Ok(InstallResult {
@@ -65,7 +78,40 @@ pub fn install_settings(settings_path: &Path, writ_command: &str) -> Result<Inst
     })
 }
 
-fn merge_hook_block(mut root: Value, writ_command: &str) -> (Value, bool) {
+fn read_settings_object(settings_path: &Path) -> Result<Value> {
+    if !settings_path.exists() {
+        return Ok(json!({}));
+    }
+    let text = fs::read_to_string(settings_path).map_err(|e| Error::Io {
+        context: "read Claude Code settings",
+        source: e,
+    })?;
+    if text.trim().is_empty() {
+        return Ok(json!({}));
+    }
+    serde_json::from_str(&text).map_err(|e| Error::Io {
+        context: "parse Claude Code settings",
+        source: std::io::Error::new(std::io::ErrorKind::InvalidData, e),
+    })
+}
+
+fn write_settings(settings_path: &Path, merged: &Value) -> Result<()> {
+    let body = format!(
+        "{}\n",
+        serde_json::to_string_pretty(merged).map_err(|e| {
+            Error::Io {
+                context: "serialize Claude Code settings",
+                source: std::io::Error::other(e),
+            }
+        })?
+    );
+    fs::write(settings_path, body).map_err(|e| Error::Io {
+        context: "write Claude Code settings",
+        source: e,
+    })
+}
+
+fn merge_hook_block(mut root: Value, writ_command: WritCommand<'_>) -> (Value, bool) {
     if !root.is_object() {
         root = json!({});
     }
@@ -81,34 +127,34 @@ fn merge_hook_block(mut root: Value, writ_command: &str) -> (Value, bool) {
     let mut changed = false;
     changed |= ensure_pre_tool_use(hooks, writ_command);
     for event in [
-        "WorktreeCreate",
-        "WorktreeRemove",
-        "SubagentStart",
-        "SubagentStop",
+        HookEventName::WORKTREE_CREATE,
+        HookEventName::WORKTREE_REMOVE,
+        HookEventName::SUBAGENT_START,
+        HookEventName::SUBAGENT_STOP,
     ] {
         changed |= ensure_unmatched_event(hooks, event, writ_command);
     }
     (root, changed)
 }
 
-fn ensure_pre_tool_use(hooks: &mut Value, writ_command: &str) -> bool {
-    let groups = event_groups(hooks, "PreToolUse");
+fn ensure_pre_tool_use(hooks: &mut Value, writ_command: WritCommand<'_>) -> bool {
+    let groups = event_groups(hooks, HookEventName::PRE_TOOL_USE);
     let Some(bash_group) = groups.iter_mut().find(|group| matcher_is_bash(group)) else {
         groups.push(json!({
             "matcher": "Bash",
             "hooks": [
-                hook_handler(writ_command, Some("Bash(git *)")),
-                hook_handler(writ_command, Some("Bash(gh *)")),
+                hook_handler(writ_command, Some(HookIf::BASH_GIT)),
+                hook_handler(writ_command, Some(HookIf::BASH_GH)),
             ]
         }));
         return true;
     };
     let handlers = hook_list(bash_group);
     let mut changed = false;
-    for condition in ["Bash(git *)", "Bash(gh *)"] {
+    for condition in [HookIf::BASH_GIT, HookIf::BASH_GH] {
         if let Some(existing) = handlers
             .iter_mut()
-            .find(|h| handler_if(h) == Some(condition))
+            .find(|h| handler_if(h) == Some(condition.as_str()))
         {
             changed |= update_handler_command(existing, writ_command);
         } else {
@@ -119,7 +165,11 @@ fn ensure_pre_tool_use(hooks: &mut Value, writ_command: &str) -> bool {
     changed
 }
 
-fn ensure_unmatched_event(hooks: &mut Value, event: &str, writ_command: &str) -> bool {
+fn ensure_unmatched_event(
+    hooks: &mut Value,
+    event: HookEventName,
+    writ_command: WritCommand<'_>,
+) -> bool {
     let groups = event_groups(hooks, event);
     if let Some(existing) = groups
         .iter_mut()
@@ -134,34 +184,27 @@ fn ensure_unmatched_event(hooks: &mut Value, event: &str, writ_command: &str) ->
     true
 }
 
-fn event_groups<'a>(hooks: &'a mut Value, event: &str) -> &'a mut Vec<Value> {
-    let entry = hooks
+fn event_groups<'a>(hooks: &'a mut Value, event: HookEventName) -> &'a mut Vec<Value> {
+    ensure_array(hooks, event.as_str())
+}
+
+fn hook_list(group: &mut Value) -> &mut Vec<Value> {
+    ensure_array(group, "hooks")
+}
+
+fn ensure_array<'a>(parent: &'a mut Value, key: &str) -> &'a mut Vec<Value> {
+    if !parent.is_object() {
+        *parent = json!({});
+    }
+    let entry = parent
         .as_object_mut()
-        .expect("hooks object")
-        .entry(event)
+        .expect("json object")
+        .entry(key)
         .or_insert_with(|| json!([]));
     if !entry.is_array() {
         *entry = json!([]);
     }
-    entry.as_array_mut().expect("hook event array")
-}
-
-fn hook_list(group: &mut Value) -> &mut Vec<Value> {
-    if !group.is_object() {
-        *group = json!({});
-    }
-    let hooks = group
-        .as_object_mut()
-        .expect("hook group object")
-        .entry("hooks")
-        .or_insert_with(|| json!([]));
-    if !hooks.is_array() {
-        *hooks = json!([]);
-    }
-    group
-        .get_mut("hooks")
-        .and_then(Value::as_array_mut)
-        .expect("hooks array")
+    entry.as_array_mut().expect("json array")
 }
 
 fn matcher_is_bash(group: &Value) -> bool {
@@ -193,14 +236,14 @@ fn command_looks_like_writ(command: &str) -> bool {
     name == "writ"
 }
 
-fn update_handler_command(handler: &mut Value, writ_command: &str) -> bool {
+fn update_handler_command(handler: &mut Value, writ_command: WritCommand<'_>) -> bool {
     let mut changed = false;
     if handler.get("type").and_then(Value::as_str) != Some("command") {
         handler["type"] = json!("command");
         changed = true;
     }
-    if handler.get("command").and_then(Value::as_str) != Some(writ_command) {
-        handler["command"] = json!(writ_command);
+    if handler.get("command").and_then(Value::as_str) != Some(writ_command.as_str()) {
+        handler["command"] = json!(writ_command.as_str());
         changed = true;
     }
     let expected_args = json!(HOOK_ARGS);
@@ -211,14 +254,14 @@ fn update_handler_command(handler: &mut Value, writ_command: &str) -> bool {
     changed
 }
 
-fn hook_handler(writ_command: &str, condition: Option<&str>) -> Value {
+fn hook_handler(writ_command: WritCommand<'_>, condition: Option<HookIf>) -> Value {
     let mut handler = json!({
         "type": "command",
-        "command": writ_command,
+        "command": writ_command.as_str(),
         "args": HOOK_ARGS,
     });
     if let Some(condition) = condition {
-        handler["if"] = json!(condition);
+        handler["if"] = json!(condition.as_str());
     }
     handler
 }
@@ -246,9 +289,9 @@ mod tests {
         )
         .unwrap();
 
-        let first = install_settings(&path, "/opt/writ").unwrap();
+        let first = install_settings(&path, WritCommand("/opt/writ")).unwrap();
         assert!(first.changed);
-        let second = install_settings(&path, "/opt/writ").unwrap();
+        let second = install_settings(&path, WritCommand("/opt/writ")).unwrap();
         assert!(!second.changed);
 
         let parsed: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();

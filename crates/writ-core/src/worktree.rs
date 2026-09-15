@@ -8,7 +8,7 @@ use crate::error::{
 use crate::identity::{
     BranchName, BranchRef, CommitId, JobId, Owner, Repo, StartPoint, resolve_start_commit,
 };
-use crate::lease::{LeaseGrant, LeaseStore};
+use crate::lease::{LeaseGrant, LeaseStore, ResumeKey};
 use crate::paths::{canonicalize_for_tools, derive_worktree_path, worktree_base_path};
 use crate::porcelain;
 
@@ -213,78 +213,10 @@ impl WorktreeManager {
     /// List all hive worktrees under the base path.
     pub fn list(&self) -> Result<Vec<Worktree>> {
         let base = self.base_path()?;
-        let mut worktrees = Vec::new();
-
         if !base.exists() {
-            return Ok(worktrees);
+            return Ok(Vec::new());
         }
-
-        // Walk the base directory: {base}/{owner}/{repo}/{job_id}
-        for owner_entry in fs::read_dir(base).map_err(|e| Error::Io {
-            context: "read worktree base directory",
-            source: e,
-        })? {
-            let owner_entry = owner_entry.map_err(|e| Error::Io {
-                context: "read owner entry",
-                source: e,
-            })?;
-            if !owner_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                continue;
-            }
-
-            for repo_entry in fs::read_dir(owner_entry.path()).map_err(|e| Error::Io {
-                context: "read repo directory",
-                source: e,
-            })? {
-                let repo_entry = repo_entry.map_err(|e| Error::Io {
-                    context: "read repo entry",
-                    source: e,
-                })?;
-                if !repo_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                    continue;
-                }
-
-                for job_entry in fs::read_dir(repo_entry.path()).map_err(|e| Error::Io {
-                    context: "read job directory",
-                    source: e,
-                })? {
-                    let job_entry = job_entry.map_err(|e| Error::Io {
-                        context: "read job entry",
-                        source: e,
-                    })?;
-                    if !job_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                        continue;
-                    }
-
-                    let path = job_entry.path();
-                    let branch =
-                        get_worktree_branch(&path).unwrap_or_else(|_| "unknown".to_string());
-                    let repo_root =
-                        find_repo_root_for_worktree(&path).unwrap_or_else(|_| PathBuf::new());
-                    let head_commit = optional_git_stdout(
-                        &path,
-                        GitArgList(&["rev-parse", "--verify", "HEAD^{commit}"]),
-                    );
-                    let start_commit = self
-                        .leases
-                        .find_by_path(&path)
-                        .ok()
-                        .flatten()
-                        .map(|lease| lease.start_commit)
-                        .or_else(|| head_commit.clone());
-
-                    worktrees.push(Worktree {
-                        path,
-                        branch,
-                        repo_root,
-                        start_commit,
-                        head_commit,
-                    });
-                }
-            }
-        }
-
-        Ok(worktrees)
+        collect_job_worktrees(base, &self.leases)
     }
 
     /// Remove a worktree by its path.
@@ -490,8 +422,12 @@ fn prove_resume(
     worktree_path: &Path,
     leases: &LeaseStore,
 ) -> Result<()> {
-    let Some(lease) =
-        leases.find_resume(request.owner, request.repo, request.job_id, request.branch)?
+    let Some(lease) = leases.find_resume(ResumeKey {
+        owner: request.owner,
+        repo_name: request.repo,
+        job_id: request.job_id,
+        branch: request.branch,
+    })?
     else {
         return Err(resume_unproven(
             request,
@@ -846,61 +782,97 @@ fn verify_creation_postconditions(postconditions: CreationPostconditions<'_>) ->
     Ok(head_commit)
 }
 
-fn git_stdout(repo: &Path, args: GitArgList<'_>, context: IoContext) -> Result<String> {
-    let output = Command::new("git")
+fn collect_job_worktrees(base: &Path, leases: &LeaseStore) -> Result<Vec<Worktree>> {
+    let mut worktrees = Vec::new();
+    for owner in dir_dirs(base, "read worktree base directory", "read owner entry")? {
+        for repo in dir_dirs(&owner, "read repo directory", "read repo entry")? {
+            for job in dir_dirs(&repo, "read job directory", "read job entry")? {
+                worktrees.push(describe_job_worktree(job, leases));
+            }
+        }
+    }
+    Ok(worktrees)
+}
+
+fn dir_dirs(path: &Path, dir_ctx: &'static str, entry_ctx: &'static str) -> Result<Vec<PathBuf>> {
+    let mut dirs = Vec::new();
+    for entry in fs::read_dir(path).map_err(|e| Error::Io {
+        context: dir_ctx,
+        source: e,
+    })? {
+        let entry = entry.map_err(|e| Error::Io {
+            context: entry_ctx,
+            source: e,
+        })?;
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            dirs.push(entry.path());
+        }
+    }
+    Ok(dirs)
+}
+
+fn describe_job_worktree(path: PathBuf, leases: &LeaseStore) -> Worktree {
+    let branch = get_worktree_branch(&path).unwrap_or_else(|_| "unknown".to_string());
+    let repo_root = find_repo_root_for_worktree(&path).unwrap_or_else(|_| PathBuf::new());
+    let head_commit = optional_git_stdout(
+        &path,
+        GitArgList(&["rev-parse", "--verify", "HEAD^{commit}"]),
+    );
+    let start_commit = leases
+        .find_by_path(&path)
+        .ok()
+        .flatten()
+        .map(|lease| lease.start_commit)
+        .or_else(|| head_commit.clone());
+    Worktree {
+        path,
+        branch,
+        repo_root,
+        start_commit,
+        head_commit,
+    }
+}
+
+fn spawn_git(repo: &Path, args: GitArgList<'_>) -> std::io::Result<std::process::Output> {
+    Command::new("git")
         .arg("-C")
         .arg(repo)
         .args(args.0)
         .output()
-        .map_err(|e| Error::Io {
-            context: context.0,
-            source: e,
-        })?;
-    if !output.status.success() {
-        return Err(Error::GitCommand {
-            args: args.0.iter().map(|arg| (*arg).to_owned()).collect(),
-            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-        });
+}
+
+fn git_output_checked(repo: &Path, args: GitArgList<'_>, context: IoContext) -> Result<Vec<u8>> {
+    let output = spawn_git(repo, args).map_err(|e| Error::Io {
+        context: context.0,
+        source: e,
+    })?;
+    if output.status.success() {
+        return Ok(output.stdout);
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    Err(Error::GitCommand {
+        args: args.0.iter().map(|arg| (*arg).to_owned()).collect(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+    })
+}
+
+fn trim_stdout(stdout: &[u8]) -> String {
+    String::from_utf8_lossy(stdout).trim().to_owned()
+}
+
+fn git_stdout(repo: &Path, args: GitArgList<'_>, context: IoContext) -> Result<String> {
+    Ok(trim_stdout(&git_output_checked(repo, args, context)?))
 }
 
 fn git_stdout_bytes(repo: &Path, args: GitArgList<'_>, context: IoContext) -> Result<Vec<u8>> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args.0)
-        .output()
-        .map_err(|e| Error::Io {
-            context: context.0,
-            source: e,
-        })?;
-    if !output.status.success() {
-        return Err(Error::GitCommand {
-            args: args.0.iter().map(|arg| (*arg).to_owned()).collect(),
-            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-        });
-    }
-    Ok(output.stdout)
+    git_output_checked(repo, args, context)
 }
 
 fn optional_git_stdout(repo: &Path, args: GitArgList<'_>) -> Option<String> {
-    Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args.0)
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    optional_git_stdout_bytes(repo, args).map(|stdout| trim_stdout(&stdout))
 }
 
 fn optional_git_stdout_bytes(repo: &Path, args: GitArgList<'_>) -> Option<Vec<u8>> {
-    Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args.0)
-        .output()
+    spawn_git(repo, args)
         .ok()
         .filter(|output| output.status.success())
         .map(|output| output.stdout)
@@ -1727,7 +1699,12 @@ mod tests {
         let lease = harness
             .manager
             .lease_store()
-            .find_resume("acme", "test-repo", "job-reclaim", "feature/reclaim")
+            .find_resume(ResumeKey {
+                owner: "acme",
+                repo_name: "test-repo",
+                job_id: "job-reclaim",
+                branch: "feature/reclaim",
+            })
             .unwrap()
             .unwrap();
         assert_eq!(lease.mode, crate::lease::LeaseMode::WriterLocked);
@@ -1810,6 +1787,10 @@ mod tests {
         assert_eq!(from_tag.start_commit.as_deref(), Some(tag_commit.as_str()));
     }
 
+    // Windows rejects newline in directory names (ERROR_INVALID_NAME / 123).
+    // #140 is the POSIX NUL-porcelain contract; parser coverage in
+    // `porcelain::tests` runs on every OS without creating such a directory.
+    #[cfg(unix)]
     #[test]
     fn newline_worktree_path_registers_as_one_record() {
         let temp = tempfile::tempdir().unwrap();

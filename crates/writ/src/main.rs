@@ -331,8 +331,7 @@ fn run_worktree(
     let response = worktree_response(action)?;
 
     if json {
-        serde_json::to_writer(&mut *stdout, &response).map_err(io::Error::other)?;
-        stdout.write_all(b"\n")?;
+        write_json_line(stdout, &response)?;
     } else {
         writeln!(stdout, "ok={} command={}", response.ok, response.command)?;
     }
@@ -359,7 +358,18 @@ fn run_install(
 ) -> writ_core::error::Result<ExitCode> {
     let settings = settings.unwrap_or_else(|| PathBuf::from(".claude/settings.json"));
     let command = writ_command(writ_bin);
-    let result = writ_core::install::install_settings(&settings, &command)?;
+    let result =
+        writ_core::install::install_settings(&settings, writ_core::install::WritCommand(&command))?;
+    emit_install_output(json, stdout, &result, &command)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+fn emit_install_output(
+    json: bool,
+    stdout: &mut impl Write,
+    result: &writ_core::install::InstallResult,
+    command: &str,
+) -> io::Result<()> {
     if json {
         let response = writ_core::contract::Response::success(
             "cli.install",
@@ -369,21 +379,23 @@ fn run_install(
                 "command": command,
             }),
         );
-        serde_json::to_writer(&mut *stdout, &response).map_err(io::Error::other)?;
-        stdout.write_all(b"\n")?;
-    } else {
-        writeln!(
-            stdout,
-            "install {} settings {}",
-            if result.changed {
-                "updated"
-            } else {
-                "unchanged"
-            },
-            result.path.display()
-        )?;
+        return write_json_line(stdout, &response);
     }
-    Ok(ExitCode::SUCCESS)
+    writeln!(
+        stdout,
+        "install {} settings {}",
+        if result.changed {
+            "updated"
+        } else {
+            "unchanged"
+        },
+        result.path.display()
+    )
+}
+
+fn write_json_line(stdout: &mut impl Write, value: &impl serde::Serialize) -> io::Result<()> {
+    serde_json::to_writer(&mut *stdout, value).map_err(io::Error::other)?;
+    stdout.write_all(b"\n")
 }
 
 fn writ_command(writ_bin: Option<PathBuf>) -> String {
