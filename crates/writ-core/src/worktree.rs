@@ -8,7 +8,7 @@ use crate::error::{
 use crate::identity::{
     BranchName, BranchRef, CommitId, JobId, Owner, Repo, StartPoint, resolve_start_commit,
 };
-use crate::lease::{LeaseGrant, LeaseStore, ResumeKey};
+use crate::lease::{LeaseGrant, LeaseMode, LeaseStore, ResumeKey};
 use crate::paths::{canonicalize_for_tools, derive_worktree_path, worktree_base_path};
 
 #[derive(Clone, Copy)]
@@ -520,6 +520,18 @@ fn prove_resume(
             ),
         ));
     }
+    if !matches!(lease.mode, LeaseMode::WriterLocked | LeaseMode::Unassigned) {
+        return Err(resume_unproven(
+            request,
+            start_commit,
+            worktree_path,
+            Some(&ownership),
+            &format!(
+                "lease mode {} is not a reclaimable writer or released identity",
+                lease.mode.as_str()
+            ),
+        ));
+    }
     if Path::new(&lease.worktree_path) != worktree_path {
         return Err(resume_unproven(
             request,
@@ -570,11 +582,19 @@ fn prove_resume(
             "branch is checked out in another worktree",
         ));
     }
-    verify_resume_upstream(request.repo_root, request.branch)?;
+    if let Some(reason) = resume_upstream_mismatch(request.repo_root, request.branch)? {
+        return Err(resume_unproven(
+            request,
+            start_commit,
+            worktree_path,
+            Some(&ownership),
+            &reason,
+        ));
+    }
     Ok(())
 }
 
-fn verify_resume_upstream(repo_root: &Path, branch: &str) -> Result<()> {
+fn resume_upstream_mismatch(repo_root: &Path, branch: &str) -> Result<Option<String>> {
     let output = Command::new("git")
         .arg("-C")
         .arg(repo_root)
@@ -590,19 +610,27 @@ fn verify_resume_upstream(repo_root: &Path, branch: &str) -> Result<()> {
             source: e,
         })?;
     if !output.status.success() {
-        return Ok(());
+        return Ok(None);
     }
     let upstream = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    let expected_suffix = format!("/{branch}");
-    if upstream == branch || upstream.ends_with(&expected_suffix) {
-        return Ok(());
+    if tracking_ref_matches_branch(&upstream, branch) {
+        return Ok(None);
     }
-    Err(Error::PolicyViolation {
-        code: PolicyCode::WorktreeResumeUnproven,
-        message: format!(
-            "refusing to reuse branch {branch:?}: upstream {upstream:?} is not the expected tracking ref"
-        ),
-    })
+    Ok(Some(format!(
+        "upstream {upstream:?} is not the expected tracking ref"
+    )))
+}
+
+/// A configured upstream is reclaimable only when it is the branch itself or
+/// `{remote}/{branch}` with a single remote-name segment. A suffix match would
+/// admit `origin/evil/{branch}`.
+fn tracking_ref_matches_branch(upstream: &str, branch: &str) -> bool {
+    if upstream == branch {
+        return true;
+    }
+    upstream
+        .split_once('/')
+        .is_some_and(|(remote, name)| !remote.is_empty() && name == branch)
 }
 
 fn branch_checked_out_elsewhere(
@@ -1919,10 +1947,38 @@ mod tests {
             .status()
             .unwrap();
         let result = harness.create("job-upstream", "feature/upstream", &start_commit);
-        assert_unproven_resume(result);
+        match result {
+            Err(Error::PolicyViolation {
+                code: PolicyCode::WorktreeResumeUnproven,
+                message,
+            }) => {
+                assert!(message.contains("upstream"), "{message}");
+                assert!(message.contains("residual_state"), "{message}");
+                assert!(
+                    message.contains("branch_ref=refs/heads/feature/upstream"),
+                    "{message}"
+                );
+                assert!(message.contains("ownership_evidence="), "{message}");
+            }
+            other => panic!("expected unproven resume, got {other:?}"),
+        }
         assert_eq!(
             harness.git(&["rev-parse", "refs/heads/feature/upstream"]),
             start_commit
         );
+    }
+
+    #[test]
+    fn tracking_ref_matches_exact_remote_branch_not_nested_suffix() {
+        assert!(tracking_ref_matches_branch(
+            "origin/hive/gh-42",
+            "hive/gh-42"
+        ));
+        assert!(tracking_ref_matches_branch("hive/gh-42", "hive/gh-42"));
+        assert!(!tracking_ref_matches_branch(
+            "origin/evil/hive/gh-42",
+            "hive/gh-42"
+        ));
+        assert!(!tracking_ref_matches_branch("origin/main", "hive/gh-42"));
     }
 }

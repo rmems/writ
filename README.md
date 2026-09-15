@@ -31,7 +31,7 @@ Two layers, one binary.
 | Layer | Owns | Does not own |
 | --- | --- | --- |
 | **Enforcement** (per-repo) | Exact base, branch/path identity, path sandbox, git/gh allowlists, no merge path, force-with-lease only, process containment | Which agent does what |
-| **Coordination state** (cross-repo) *(planned, M1)* | Agents, leases with path scopes, ownership, blockers, freeze modes. SQLite, single file, derived from `git`/`gh`/disk. Not implemented yet | Task decomposition or scheduling |
+| **Coordination state** (cross-repo) *(M1 in progress)* | Durable worktree ownership for verified reclaim. Planned: path-scoped leases, blockers, freeze modes, hook-time admission | Task decomposition or scheduling |
 | `git`, `gh`, OS | Version-control, GitHub, and process primitives, invoked through allowlists | Policy |
 
 Leases are intended to be the join: coordination state that the enforcement layer will check at write time. A SQLite lease file now stores durable worktree ownership for verified reclaim ([#141](https://github.com/rmems/writ/issues/141)). Hook-time admission, path-scoped contention, and budget enforcement remain M1.

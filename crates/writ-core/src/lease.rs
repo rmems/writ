@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -123,8 +123,11 @@ impl LeaseStore {
             })?;
         }
         let conn = Connection::open(&path).map_err(|e| lease_err("open lease store", e))?;
+        conn.busy_timeout(Duration::from_millis(5000))
+            .map_err(|e| lease_err("set lease busy timeout", e))?;
         conn.execute_batch(
             "
+            PRAGMA journal_mode = WAL;
             PRAGMA foreign_keys = ON;
             CREATE TABLE IF NOT EXISTS leases (
                 id INTEGER PRIMARY KEY,
@@ -380,6 +383,18 @@ mod tests {
         assert_eq!(resume.start_commit, "abc123");
         assert_eq!(resume.branch_ref, "refs/heads/hive/gh-42");
         assert_eq!(resume.worktree_path, path_text(&wt));
+        assert_eq!(resume.mode, LeaseMode::Unassigned);
+    }
+
+    #[test]
+    fn open_sets_busy_timeout() {
+        let tmp = tempdir().unwrap();
+        let store = LeaseStore::open(tmp.path().join("leases.db")).unwrap();
+        let conn = store.lock().unwrap();
+        let timeout: i64 = conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(timeout, 5000);
     }
 
     #[test]
