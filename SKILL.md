@@ -87,7 +87,9 @@ Worker prompts remain strictly non-merging. Do not forward the primary agent's m
 
 This skill is portable procedure, not a security boundary. Route orchestrated
 mutations through `writ`, with Rust enforcing the runtime boundary as
-defined in [`AGENTS.md`](AGENTS.md#enforcement-layers). The separate interactive
+defined in [`AGENTS.md`](AGENTS.md#enforcement-layers). Long-running
+supervised children use [`docs/supervisor-timeouts.md`](docs/supervisor-timeouts.md)
+for hang recovery; hosts own `max_redispatch_per_item`. The separate interactive
 host merge path is available only to the primary agent after it completes the
 linked one-shot authorization protocol; never forward that authority to a
 worker.

@@ -63,6 +63,7 @@ Each entry in the `jobs` array has these fields:
 | `branch` | `string` | no | Current branch checked out in the worktree. |
 | `process_state` | `ProcessState` | no | Lifecycle state of the job process. |
 | `last_error` | `string` | yes | Last error message if the job failed. Omitted when absent. |
+| `timeout_residual` | `TimeoutResidual` | yes | Hang / timeout residual when the job stopped because a worker was stuck. Omitted when absent. Specified for watchlist and aggregate reports; hosts persist it. `writ` has no state writer today. |
 | `ci_class` | `CiClass` | no | CI classification for the job's head commit. |
 
 ## `ProcessState` enum
@@ -76,6 +77,26 @@ Serialized as a lowercase snake_case string.
 | `completed` | Job finished successfully. |
 | `failed` | Job terminated with an error. |
 | `cancelled` | Job was cancelled by the operator. |
+
+When a worker hits the supervisor timeout or stall detector, persist
+`process_state: failed` (or `cancelled` if the operator aborted) plus
+`timeout_residual` from [`supervisor-timeouts.md`](supervisor-timeouts.md). Do
+not invent a commit SHA to stand in for the failed run.
+
+## `TimeoutResidual` object
+
+Additive v1 object. Present only on timeout / stall / permit-wait failures.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `reason` | `string` | `wall_clock`, `stall`, or `permit_wait`. |
+| `recovery_stage` | `string` | `none`, `graceful_cancel`, or `kill`. Never `merge` or `push`. |
+| `redispatch_count` | `u32` | Host redispatches already consumed. A single `writ supervisor run` always reports `0`. |
+| `max_redispatch_per_item` | `u32` | Configured host cap. Prevents infinite retry loops. |
+| `elapsed_ms` | `u64` | Wall time from supervisor start to residual. |
+| `last_output_ms` | `u64` | Optional. Milliseconds from start to the last captured child byte. |
+
+The object must not include `sha`, `commit`, or `head` fields.
 
 ## `CiClass` enum
 

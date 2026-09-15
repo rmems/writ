@@ -98,6 +98,7 @@ cargo test --workspace
 - [`REVIEW.md`](REVIEW.md) — pull-request lifecycle and review checklist
 - [`docs/workflows/safe-issue-verified-commit.md`](docs/workflows/safe-issue-verified-commit.md) — issue → verified push
 - [`docs/workflows/safe-verified-commit-to-pr.md`](docs/workflows/safe-verified-commit-to-pr.md) — verified push → PR handoff (never merges)
+- [`docs/supervisor-timeouts.md`](docs/supervisor-timeouts.md) — per-worker timeout policy, stall detection, hang recovery
 - Product epic: [#1](https://github.com/rmems/writ/issues/1) · Current phase: [#124](https://github.com/rmems/writ/issues/124)
 - Threat model: [#22](https://github.com/rmems/writ/issues/22) · Boundary contract tests: [#81](https://github.com/rmems/writ/issues/81)
 - [Linear `worktrees-hives` project](https://linear.app/rpd-34/project/worktrees-hives-e3052de4caa3)

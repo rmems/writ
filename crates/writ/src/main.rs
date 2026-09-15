@@ -106,8 +106,44 @@ enum SupervisorAction {
     /// Run a command under supervision.
     Run {
         /// Wall-clock timeout in seconds. 0 means no timeout.
-        #[arg(long, default_value = "0")]
+        #[arg(
+            long,
+            default_value_t = writ_core::timeout_policy::TIMEOUT_SECS_UNLIMITED,
+            env = "WRIT_SUPERVISOR_TIMEOUT_SECS"
+        )]
         timeout: u64,
+
+        /// Seconds to wait after SIGTERM before SIGKILL (Unix). 0 skips graceful cancel.
+        #[arg(
+            long,
+            default_value_t = writ_core::timeout_policy::GRACE_SECS_DEFAULT,
+            env = "WRIT_SUPERVISOR_GRACE_SECS"
+        )]
+        grace: u64,
+
+        /// Seconds without child stdout/stderr before stall recovery. 0 disables.
+        #[arg(
+            long,
+            default_value_t = writ_core::timeout_policy::STALL_SECS_DEFAULT,
+            env = "WRIT_SUPERVISOR_STALL_SECS"
+        )]
+        stall: u64,
+
+        /// Progress heartbeat interval in seconds while waiting. 0 disables.
+        #[arg(
+            long,
+            default_value_t = writ_core::timeout_policy::PROGRESS_SECS_DEFAULT,
+            env = "WRIT_SUPERVISOR_PROGRESS_SECS"
+        )]
+        progress: u64,
+
+        /// Host redispatch cap recorded on residuals. `writ` never retries internally.
+        #[arg(
+            long,
+            default_value_t = writ_core::timeout_policy::MAX_REDISPATCH_PER_ITEM_DEFAULT,
+            env = "WRIT_SUPERVISOR_MAX_REDISPATCH"
+        )]
+        max_redispatch: u32,
 
         /// Expected branch for mutating supervised `git` / `gh pr` commands.
         #[arg(long)]
@@ -351,18 +387,30 @@ async fn run(cli: Cli, stdout: &mut impl Write) -> writ_core::error::Result<Exit
         Some(Command::Supervisor { action }) => match action {
             SupervisorAction::Run {
                 timeout,
+                grace,
+                stall,
+                progress,
+                max_redispatch,
                 expected_branch,
                 repo,
                 max_parallel,
                 cmd,
             } => {
                 run_supervisor(
-                    cli.json,
-                    timeout,
-                    expected_branch,
-                    repo,
-                    max_parallel,
-                    cmd,
+                    SupervisorRunRequest {
+                        json: cli.json,
+                        timeout_secs: timeout,
+                        expected_branch,
+                        repo,
+                        max_parallel,
+                        cmd,
+                        timeout_policy: writ_core::timeout_policy::TimeoutPolicy::from_seconds(
+                            grace,
+                            stall,
+                            progress,
+                            max_redispatch,
+                        ),
+                    },
                     stdout,
                 )
                 .await
@@ -383,16 +431,30 @@ async fn run(cli: Cli, stdout: &mut impl Write) -> writ_core::error::Result<Exit
     }
 }
 
-/// Run `writ supervisor run` with policy-checked core supervisor and consistent JSON envelopes.
-async fn run_supervisor(
+struct SupervisorRunRequest {
     json: bool,
     timeout_secs: u64,
     expected_branch: Option<String>,
     repo: Option<PathBuf>,
     max_parallel: usize,
     cmd: Vec<String>,
+    timeout_policy: writ_core::timeout_policy::TimeoutPolicy,
+}
+
+/// Run `writ supervisor run` with policy-checked core supervisor and consistent JSON envelopes.
+async fn run_supervisor(
+    request: SupervisorRunRequest,
     stdout: &mut impl Write,
 ) -> writ_core::error::Result<ExitCode> {
+    let SupervisorRunRequest {
+        json,
+        timeout_secs,
+        expected_branch,
+        repo,
+        max_parallel,
+        cmd,
+        timeout_policy,
+    } = request;
     let program = match cmd.first() {
         Some(p) => p.as_str(),
         None => {
@@ -404,9 +466,19 @@ async fn run_supervisor(
         }
     };
     let args: Vec<&str> = cmd[1..].iter().map(|s| s.as_str()).collect();
+    let on_progress = timeout_policy.progress.map(|_| {
+        std::sync::Arc::new(|report: &writ_core::timeout_policy::ProgressReport| {
+            eprintln!(
+                "{}",
+                writ_core::timeout_policy::format_progress_line(report)
+            );
+        }) as writ_core::timeout_policy::ProgressCallback
+    });
     let options = writ_core::supervisor::RunOptions {
         expected_branch,
         repo,
+        timeout_policy,
+        on_progress,
     };
     let timeout = if timeout_secs == 0 {
         None
@@ -650,6 +722,7 @@ mod tests {
             branch: "feature/foo".to_owned(),
             process_state: ProcessState::Running,
             last_error: None,
+            timeout_residual: None,
             ci_class: CiClass::Pending,
         }
     }
@@ -706,6 +779,46 @@ mod tests {
         };
         assert_eq!(start_point.as_deref(), Some("origin/trunk"));
         assert_eq!(schema_version, 2);
+    }
+
+    #[test]
+    fn supervisor_run_parser_reads_named_timeout_keys() {
+        let parsed = Cli::try_parse_from([
+            "writ",
+            "supervisor",
+            "run",
+            "--timeout",
+            "30",
+            "--grace",
+            "2",
+            "--stall",
+            "15",
+            "--progress",
+            "5",
+            "--max-redispatch",
+            "2",
+            "true",
+        ])
+        .unwrap();
+        let Some(super::Command::Supervisor {
+            action:
+                super::SupervisorAction::Run {
+                    timeout,
+                    grace,
+                    stall,
+                    progress,
+                    max_redispatch,
+                    ..
+                },
+        }) = parsed.command
+        else {
+            panic!("expected supervisor run");
+        };
+        assert_eq!(timeout, 30);
+        assert_eq!(grace, 2);
+        assert_eq!(stall, 15);
+        assert_eq!(progress, 5);
+        assert_eq!(max_redispatch, 2);
     }
 
     #[tokio::test]
@@ -905,6 +1018,10 @@ mod tests {
             command: Some(super::Command::Supervisor {
                 action: super::SupervisorAction::Run {
                     timeout: 0,
+                    grace: 0,
+                    stall: 0,
+                    progress: 0,
+                    max_redispatch: 1,
                     expected_branch: None,
                     repo: None,
                     max_parallel: 1,
@@ -939,6 +1056,10 @@ mod tests {
             command: Some(super::Command::Supervisor {
                 action: super::SupervisorAction::Run {
                     timeout: 0,
+                    grace: 0,
+                    stall: 0,
+                    progress: 0,
+                    max_redispatch: 1,
                     expected_branch: None,
                     repo: None,
                     max_parallel: 1,
@@ -966,6 +1087,10 @@ mod tests {
             command: Some(super::Command::Supervisor {
                 action: super::SupervisorAction::Run {
                     timeout: 0,
+                    grace: 0,
+                    stall: 0,
+                    progress: 0,
+                    max_redispatch: 1,
                     expected_branch: None,
                     repo: None,
                     max_parallel: 1,
@@ -1008,6 +1133,10 @@ mod tests {
             command: Some(super::Command::Supervisor {
                 action: super::SupervisorAction::Run {
                     timeout: 0,
+                    grace: 0,
+                    stall: 0,
+                    progress: 0,
+                    max_redispatch: 1,
                     expected_branch: None,
                     repo: None,
                     max_parallel: 1,
@@ -1062,6 +1191,10 @@ mod tests {
             command: Some(super::Command::Supervisor {
                 action: super::SupervisorAction::Run {
                     timeout: 0,
+                    grace: 0,
+                    stall: 0,
+                    progress: 0,
+                    max_redispatch: 1,
                     expected_branch: None,
                     repo: None,
                     max_parallel: 1,
@@ -1089,6 +1222,10 @@ mod tests {
             command: Some(super::Command::Supervisor {
                 action: super::SupervisorAction::Run {
                     timeout: 0,
+                    grace: 0,
+                    stall: 0,
+                    progress: 0,
+                    max_redispatch: 1,
                     expected_branch: None,
                     repo: None,
                     max_parallel: 1,
@@ -1133,6 +1270,7 @@ mod tests {
             stdout_truncated: false,
             stderr_truncated: false,
             error_code: None,
+            residual: None,
         };
         assert_eq!(supervised_exit_code(&timed_out), ExitCode::from(124));
 
@@ -1145,6 +1283,7 @@ mod tests {
             stdout_truncated: false,
             stderr_truncated: false,
             error_code: None,
+            residual: None,
         };
         assert_eq!(supervised_exit_code(&child_fail), ExitCode::from(7));
     }

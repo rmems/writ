@@ -218,7 +218,7 @@ Version 1 responses use this envelope shape:
 - Standard output is machine-readable JSON when `--json` is selected.
 - Diagnostics belong on standard error.
 - Additive fields are compatible within v1; removals or semantic renames require a schema-version change.
-- Supervised execution is `writ supervisor run --timeout <secs>`; it is implemented, not reserved. Do not improvise a second timeout path in the CLI.
+- Supervised execution is `writ supervisor run --timeout <secs>`; it is implemented, not reserved. Do not improvise a second timeout path in the CLI. Hang recovery, stall detection, progress heartbeats, and `max_redispatch_per_item` are documented in [`docs/supervisor-timeouts.md`](docs/supervisor-timeouts.md).
 
 Response envelopes and error codes are illustrated by the fixtures in `docs/examples/`.
 
