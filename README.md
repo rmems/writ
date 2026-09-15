@@ -59,10 +59,10 @@ These apply to every agent, platform, and command path:
 
 Soft prompt text is not runtime enforcement. Hard stops live in Rust, at the binary boundary, where a malformed prompt cannot bypass them.
 
-## Owner allowlist — not currently enforced
+## Owner allowlist — partial enforcement
 
 > [!WARNING]
-> **`WRIT_ALLOWED_OWNERS` has no reader anywhere under `crates/`.** It was enforced in the Python layer this repository just removed, so owner scoping is presently a stated requirement with no code behind it. Do not rely on it as an access control. Tracked in [#146](https://github.com/rmems/writ/issues/146).
+> **`WRIT_ALLOWED_OWNERS` is read by `writ watchlist check-all` (and `WH_ALLOWED_OWNERS` as a legacy alias).** An empty allowlist denies that multi-owner walk. Other multi-owner discovery/scheduling still has no reader under `crates/` after the Python layer was removed, so do not treat the env var as a general access-control gate. Broader enforcement is tracked in [#146](https://github.com/rmems/writ/issues/146).
 
 The intended contract, for when enforcement lands:
 
@@ -96,6 +96,8 @@ cargo test --workspace
 - [`AGENTS.md`](AGENTS.md) — the authoritative contribution, autonomy, and safety contract
 - [`SKILL.md`](SKILL.md) — portable agent procedure (guidance, not a security boundary)
 - [`REVIEW.md`](REVIEW.md) — pull-request lifecycle and review checklist
+- [`docs/status-schema.md`](docs/status-schema.md) — `writ status` / `writ jobs` JSON
+- [`docs/watchlist-schema.md`](docs/watchlist-schema.md) — `writ watchlist` persistence
 - [`docs/workflows/safe-issue-verified-commit.md`](docs/workflows/safe-issue-verified-commit.md) — issue → verified push
 - [`docs/workflows/safe-verified-commit-to-pr.md`](docs/workflows/safe-verified-commit-to-pr.md) — verified push → PR handoff (never merges)
 - Product epic: [#1](https://github.com/rmems/writ/issues/1) · Current phase: [#124](https://github.com/rmems/writ/issues/124)

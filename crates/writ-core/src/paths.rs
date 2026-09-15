@@ -80,8 +80,12 @@ const LEGACY_STATE_ROOT_NAME: &str = "worktrees-hives";
 
 const STATE_PATH_ENV: &str = "WRIT_STATE_PATH";
 const LEGACY_STATE_PATH_ENV: &str = "WH_STATE_PATH";
+const WATCHLIST_PATH_ENV: &str = "WRIT_WATCHLIST_PATH";
+const LEGACY_WATCHLIST_PATH_ENV: &str = "WH_WATCHLIST_PATH";
 const WORKTREE_BASE_ENV: &str = "WRIT_WORKTREE_BASE";
 const LEGACY_WORKTREE_BASE_ENV: &str = "WH_WORKTREE_BASE";
+/// PR/job watchlist filename. Distinct from `watched.json` (job-status read path).
+const WATCHLIST_FILENAME: &str = "watchlist.json";
 
 /// Named root for writ durable state under the user data directory.
 ///
@@ -125,6 +129,16 @@ impl StateRoot {
     #[must_use]
     pub fn watched_json(&self) -> PathBuf {
         self.path.join("watched.json")
+    }
+
+    /// Path to the multi-owner PR watchlist (`watchlist.json`) under this root.
+    ///
+    /// This is a different file from [`Self::watched_json`]: the job-status reader
+    /// expects a JSON array, while the watchlist is a versioned object. Mixing
+    /// them would break `writ status`.
+    #[must_use]
+    pub fn watchlist_json(&self) -> PathBuf {
+        self.path.join(WATCHLIST_FILENAME)
     }
 }
 
@@ -184,6 +198,40 @@ pub fn state_path() -> PathBuf {
         &user_data_dir(),
         std::env::var_os(STATE_PATH_ENV).as_deref(),
         std::env::var_os(LEGACY_STATE_PATH_ENV).as_deref(),
+    )
+}
+
+/// Resolve the PR watchlist path from an optional `WRIT_WATCHLIST_PATH` override.
+///
+/// Empty overrides are treated as unset. This never reads `WRIT_STATE_PATH` /
+/// `WH_STATE_PATH` (those point at the job-status `watched.json` array).
+#[must_use]
+pub fn resolve_watchlist_path(writ_watchlist_path: Option<&OsStr>) -> PathBuf {
+    resolve_watchlist_path_in(&user_data_dir(), writ_watchlist_path, None)
+}
+
+fn resolve_watchlist_path_in(
+    user_data: &Path,
+    writ_watchlist_path: Option<&OsStr>,
+    legacy_watchlist_path: Option<&OsStr>,
+) -> PathBuf {
+    if let Some(custom) = first_nonempty(writ_watchlist_path, legacy_watchlist_path) {
+        return PathBuf::from(custom);
+    }
+    StateRoot::from_user_data(user_data).watchlist_json()
+}
+
+/// Resolve the path to the multi-owner PR watchlist file.
+///
+/// Honours `WRIT_WATCHLIST_PATH`, then `WH_WATCHLIST_PATH`. Otherwise defaults
+/// to [`StateRoot::default_root()`]'s `watchlist.json`. Never writes into
+/// `pr-babysit/` and never shares `watched.json` with [`state_path`].
+#[must_use]
+pub fn watchlist_path() -> PathBuf {
+    resolve_watchlist_path_in(
+        &user_data_dir(),
+        std::env::var_os(WATCHLIST_PATH_ENV).as_deref(),
+        std::env::var_os(LEGACY_WATCHLIST_PATH_ENV).as_deref(),
     )
 }
 
@@ -313,7 +361,8 @@ mod tests {
 
     use super::{
         StateRoot, derive_worktree_path, resolve_state_path, resolve_state_path_in,
-        resolve_worktree_base_in, user_data_dir, worktree_base_path,
+        resolve_watchlist_path, resolve_watchlist_path_in, resolve_worktree_base_in, user_data_dir,
+        worktree_base_path,
     };
 
     fn assert_ends_with(path: &Path, unix: &str, windows: &str) {
@@ -360,6 +409,31 @@ mod tests {
             root.watched_json(),
             PathBuf::from("/tmp/writ-state/watched.json")
         );
+    }
+
+    #[test]
+    fn state_root_watchlist_json_is_not_watched_json() {
+        let root = StateRoot::from_path("/tmp/writ-state");
+        assert_eq!(
+            root.watchlist_json(),
+            PathBuf::from("/tmp/writ-state/watchlist.json")
+        );
+        assert_ne!(root.watchlist_json(), root.watched_json());
+    }
+
+    #[test]
+    fn resolve_watchlist_path_honours_override_and_ignores_state_path() {
+        let path = resolve_watchlist_path(Some(OsStr::new("/tmp/acme/watchlist.json")));
+        assert_eq!(path, PathBuf::from("/tmp/acme/watchlist.json"));
+        let tmp = tempfile::tempdir().unwrap();
+        let path = resolve_watchlist_path_in(
+            tmp.path(),
+            None,
+            Some(OsStr::new("/tmp/legacy/watchlist.json")),
+        );
+        assert_eq!(path, PathBuf::from("/tmp/legacy/watchlist.json"));
+        let path = resolve_watchlist_path_in(tmp.path(), None, None);
+        assert_ends_with(&path, "writ/watchlist.json", "writ\\watchlist.json");
     }
 
     #[test]

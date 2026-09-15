@@ -11,6 +11,7 @@ pub mod paths;
 pub mod state;
 pub mod status;
 pub mod supervisor;
+pub mod watchlist;
 pub mod worktree;
 
 /// Version shared by the core library and CLI workspace packages.

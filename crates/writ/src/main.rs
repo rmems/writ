@@ -3,7 +3,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+
+mod watchlist;
 
 /// Manage isolated issue-to-PR jobs and their durable state.
 #[derive(Debug, Parser)]
@@ -55,6 +57,101 @@ enum Command {
     Worktree {
         #[command(subcommand)]
         action: WorktreeAction,
+    },
+
+    /// Multi-owner PR watchlist persisted in `watchlist.json`.
+    Watchlist {
+        #[command(subcommand)]
+        action: WatchlistAction,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum WatchlistKindArg {
+    /// Tracked for babysit / check-all cycles.
+    PrBabysit,
+    /// Added after issue-to-PR handoff.
+    IssueToPr,
+}
+
+#[derive(Debug, Subcommand)]
+enum WatchlistAction {
+    /// Resolve PR metadata via `gh pr view` and persist it.
+    Add {
+        /// Override `watchlist.json` path (`WRIT_WATCHLIST_PATH`).
+        #[arg(long)]
+        state: Option<PathBuf>,
+        /// Repository `owner/name`.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Reset `fix_count` / residuals when refreshing an existing entry.
+        #[arg(long)]
+        reset: bool,
+        /// Job kind stored on the entry.
+        #[arg(long, default_value = "pr-babysit", value_enum)]
+        kind: WatchlistKindArg,
+        /// `owner/name` and/or pull-request numbers.
+        targets: Vec<String>,
+    },
+    /// Remove one entry. Stack-mates stay on the watchlist.
+    Remove {
+        /// Override `watchlist.json` path (`WRIT_WATCHLIST_PATH`).
+        #[arg(long)]
+        state: Option<PathBuf>,
+        /// Repository `owner/name`.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Pull-request number (alternative to a positional target).
+        #[arg(long)]
+        number: Option<u64>,
+        /// `owner/name` and/or a single pull-request number.
+        targets: Vec<String>,
+    },
+    /// List watched pull requests (all owners by default).
+    List {
+        /// Override `watchlist.json` path (`WRIT_WATCHLIST_PATH`).
+        #[arg(long)]
+        state: Option<PathBuf>,
+        /// Filter by `owner/name`.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Filter by repository owner.
+        #[arg(long)]
+        owner: Option<String>,
+    },
+    /// Refresh one watchlist entry from GitHub.
+    Check {
+        /// Override `watchlist.json` path (`WRIT_WATCHLIST_PATH`).
+        #[arg(long)]
+        state: Option<PathBuf>,
+        /// Repository `owner/name` (required when the number is not unique).
+        #[arg(long)]
+        repo: Option<String>,
+        /// Pull-request number.
+        number: u64,
+    },
+    /// One cycle over the whole watchlist (allowlisted owners; stack order).
+    #[command(name = "check-all")]
+    CheckAll {
+        /// Override `watchlist.json` path (`WRIT_WATCHLIST_PATH`).
+        #[arg(long)]
+        state: Option<PathBuf>,
+        /// Limit the cycle to one `owner/name`.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Limit the cycle to one owner.
+        #[arg(long)]
+        owner: Option<String>,
+    },
+    /// Copy entries from pr-babysit JSON (read-only; never writes there).
+    #[command(name = "import-pr-babysit")]
+    ImportPrBabysit {
+        /// Override `watchlist.json` path (`WRIT_WATCHLIST_PATH`).
+        #[arg(long)]
+        state: Option<PathBuf>,
+        /// Source file (default: `$XDG_DATA_HOME/pr-babysit/watched-prs.json`).
+        #[arg(long)]
+        path: Option<PathBuf>,
     },
 }
 
@@ -369,6 +466,9 @@ async fn run(cli: Cli, stdout: &mut impl Write) -> writ_core::error::Result<Exit
             }
         },
         Some(Command::Worktree { action }) => run_worktree(action, cli.json, stdout),
+        Some(Command::Watchlist { action }) => {
+            watchlist::run(action, cli.json, stdout).map_err(Into::into)
+        }
         None => {
             if cli.json {
                 serde_json::to_writer(
@@ -657,6 +757,34 @@ mod tests {
     #[test]
     fn command_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn watchlist_parser_accepts_add_repo_and_numbers() {
+        let cli = Cli::try_parse_from([
+            "writ",
+            "watchlist",
+            "add",
+            "--repo",
+            "acme/widgets",
+            "41",
+            "36",
+        ])
+        .unwrap();
+        let Some(super::Command::Watchlist {
+            action:
+                super::WatchlistAction::Add {
+                    repo: Some(repo),
+                    targets,
+                    reset: false,
+                    ..
+                },
+        }) = cli.command
+        else {
+            panic!("expected watchlist add");
+        };
+        assert_eq!(repo, "acme/widgets");
+        assert_eq!(targets, ["41", "36"]);
     }
 
     #[test]
