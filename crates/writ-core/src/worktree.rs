@@ -6,7 +6,7 @@ use crate::error::{
     Error, PolicyCode, Result, WorktreeCreationFailure, WorktreePostconditionFailure,
 };
 use crate::identity::{
-    resolve_start_commit, BranchName, BranchRef, CommitId, JobId, Owner, Repo, StartPoint,
+    BranchName, BranchRef, CommitId, JobId, Owner, Repo, StartPoint, resolve_start_commit,
 };
 use crate::paths::{canonicalize_for_tools, derive_worktree_path, worktree_base_path};
 use crate::porcelain;
