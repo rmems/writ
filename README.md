@@ -91,9 +91,32 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
+## Issue labels and templates
+
+Canonical product labels (use these; do not invent new names unless the epic
+expands the taxonomy). Prefer **`docs`** over GitHub’s default `documentation`.
+Keep GitHub label descriptions identical to this table (commands in
+[`CONTRIBUTING.md`](CONTRIBUTING.md)):
+
+| Label | Description |
+| --- | --- |
+| `epic` | Multi-issue umbrella / milestone grouping |
+| `core` | Skill loop primitives (discover, claim, PR, babysit, state) |
+| `orchestrator` | Multi-subagent scheduling, caps, join/report |
+| `docs` | README, SKILL.md, templates, operator docs |
+| `platform` | Install paths, multi-agent-host packaging, validation on second host |
+| `safety` | Never-merge, force-with-lease, fix caps, owner allowlist, hang recovery |
+
+Optional GitHub issue forms live in [`.github/ISSUE_TEMPLATE/`](.github/ISSUE_TEMPLATE/):
+**Feature** (new capability), **Bug** (unexpected failure), **Chore** (hygiene,
+packaging, docs-only). Each asks for Summary, Problem / context, Acceptance
+criteria checkboxes, and the Linear footer documented in
+[`CONTRIBUTING.md`](CONTRIBUTING.md).
+
 ## Project documentation
 
 - [`AGENTS.md`](AGENTS.md) — the authoritative contribution, autonomy, and safety contract
+- [`CONTRIBUTING.md`](CONTRIBUTING.md) — issue templates and canonical labels
 - [`SKILL.md`](SKILL.md) — portable agent procedure (guidance, not a security boundary)
 - [`REVIEW.md`](REVIEW.md) — pull-request lifecycle and review checklist
 - [`docs/workflows/safe-issue-verified-commit.md`](docs/workflows/safe-issue-verified-commit.md) — issue → verified push
