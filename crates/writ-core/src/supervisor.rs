@@ -30,6 +30,7 @@ use tokio::time::Instant;
 
 use crate::error::{Error, PolicyCode, Result};
 use crate::git_safe::{SafeGhCommand, SafeGitCommand};
+use crate::owners::OwnerAllowlist;
 
 /// How long to wait for the child to exit after a timeout kill.
 const POST_KILL_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -103,6 +104,8 @@ pub struct RunOptions {
     pub expected_branch: Option<String>,
     /// Repository working tree for git branch verification and `git -C` (default: `.`).
     pub repo: Option<PathBuf>,
+    /// Explicit owner allowlist. `None` reads `WRIT_ALLOWED_OWNERS` / `WH_ALLOWED_OWNERS`.
+    pub allowlist: Option<OwnerAllowlist>,
 }
 
 /// Configuration for the process supervisor.
@@ -518,7 +521,11 @@ fn prepare_supervised_command(
             })
         }
         "gh" => {
-            let _safe = SafeGhCommand::new(&owned_args)?;
+            let allowlist = options
+                .allowlist
+                .clone()
+                .unwrap_or_else(OwnerAllowlist::from_env);
+            let _safe = SafeGhCommand::with_allowlist(&owned_args, &allowlist)?;
             // Always spawn PATH `gh`, never a user-supplied path-qualified binary.
             let (cwd, branch_check) = if crate::git_safe::gh_requires_branch_check(&owned_args) {
                 let expected =
@@ -943,6 +950,42 @@ mod tests {
     }
 
     #[test]
+    fn policy_blocks_gh_repo_selector_outside_allowlist() {
+        let err = check_command_policy(
+            "gh",
+            &["pr", "view", "-R", "other/repo", "1"],
+            &RunOptions {
+                allowlist: Some(OwnerAllowlist::from_owners(["acme"])),
+                ..RunOptions::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::OwnerNotAllowed,
+                ..
+            }
+        ));
+        let clustered = check_command_policy(
+            "gh",
+            &["pr", "view", "-R=other/repo", "1"],
+            &RunOptions {
+                allowlist: Some(OwnerAllowlist::from_owners(["acme"])),
+                ..RunOptions::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            clustered,
+            Error::PolicyViolation {
+                code: PolicyCode::OwnerNotAllowed,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn policy_rejects_path_qualified_script() {
         let err = check_command_policy("./tools/run", &[], &RunOptions::default()).unwrap_err();
         assert!(matches!(
@@ -1056,6 +1099,7 @@ mod tests {
             &RunOptions {
                 expected_branch: Some("feature".to_owned()),
                 repo: Some(repo),
+                allowlist: None,
             },
         )
         .unwrap_err();

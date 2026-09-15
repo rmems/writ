@@ -6,6 +6,7 @@
 //! - Merge is blocked only when it is the git subcommand (branch names like `merge` are allowed).
 //! - `gh pr merge` and merge-related flags are blocked; `gh api` is not allowlisted.
 //! - Mutating commands verify the current branch when `expected_branch` is provided to `run`.
+//! - `gh -R` / `--repo` selectors are checked against the configured owner allowlist.
 //! - All policy violations carry stable structured error codes.
 
 use std::collections::HashSet;
@@ -13,6 +14,7 @@ use std::path::Path;
 use std::process::Command;
 
 use crate::error::{Error, PolicyCode, Result};
+use crate::owners::OwnerAllowlist;
 
 /// Git subcommands allowed for hive jobs.
 const ALLOWED_GIT_SUBCOMMANDS: &[&str] = &[
@@ -342,8 +344,20 @@ pub struct SafeGhCommand {
 impl SafeGhCommand {
     /// Create a new safe gh command after validating the full argument list.
     ///
-    /// Returns an error if the command violates any safety policy.
+    /// Returns an error if the command violates any safety policy. Owner
+    /// allowlist checks for `-R` / `--repo` use [`OwnerAllowlist::from_env`].
     pub fn new(args: &[String]) -> Result<Self> {
+        Self::with_allowlist(args, &OwnerAllowlist::from_env())
+    }
+
+    /// Validate a gh command against an explicit owner allowlist.
+    ///
+    /// `-R` / `--repo` selectors are rejected unless their owner is allowlisted.
+    /// Commands without a repo selector are not multi-owner operations and skip
+    /// that check. The allowlist is enforced after argv policy so merge blocks
+    /// remain the more specific rejection when both would apply, and always
+    /// before [`Self::run`].
+    pub fn with_allowlist(args: &[String], allowlist: &OwnerAllowlist) -> Result<Self> {
         if args.is_empty() {
             return Err(Error::PolicyViolation {
                 code: PolicyCode::GhSubcommandNotAllowed,
@@ -397,6 +411,8 @@ impl SafeGhCommand {
                 });
             }
         }
+
+        enforce_gh_repo_targets(args, allowlist, gh_repo_env_selector().as_deref())?;
 
         Ok(Self {
             args: args.to_vec(),
@@ -472,12 +488,8 @@ fn first_positional_after(args: &[String]) -> Option<&str> {
                 i += 1;
                 continue;
             }
-            if a == "-R" || a == "--repo" {
-                i += 2;
-                continue;
-            }
-            if a.starts_with("--repo=") {
-                i += 1;
+            if let Some((_, consume_next)) = gh_repo_flag(a, args.get(i + 1).map(String::as_str)) {
+                i += if consume_next { 2 } else { 1 };
                 continue;
             }
             return None;
@@ -652,11 +664,11 @@ fn gh_repo_clone_destination(args: &[String]) -> Option<&str> {
             break;
         }
         if a.starts_with('-') {
-            if a == "-R" || a == "--repo" {
-                i += 2;
+            if let Some((_, consume_next)) = gh_repo_flag(a, args.get(i + 1).map(String::as_str)) {
+                i += if consume_next { 2 } else { 1 };
                 continue;
             }
-            if a.starts_with("--repo=") || a == "--help" || a == "-h" {
+            if a == "--help" || a == "-h" {
                 i += 1;
                 continue;
             }
@@ -978,24 +990,104 @@ fn reject_command_valued_config_assignment(kv: &str) -> Result<()> {
     Ok(())
 }
 
-/// Extract `-R` / `--repo` / `--repo=` selector from a `gh` argv (including `pr` etc.).
+/// Extract the last `-R` / `--repo` selector from a `gh` argv (including `pr` etc.).
+///
+/// Accepts the pflag spellings `gh` 2.x actually parses: `-R value`, `-R=value`,
+/// `-Rvalue`, `--repo value`, `--repo=value`, and clustered shorts whose last
+/// letter is `R` (`-wR value`, `-wR=value`, `-wRvalue`). Last flag wins, matching
+/// `gh`.
 #[must_use]
 pub fn gh_repo_selector(args: &[String]) -> Option<&str> {
+    gh_repo_selectors(args).last().copied()
+}
+
+fn gh_repo_selectors(args: &[String]) -> Vec<&str> {
+    let mut selectors = Vec::new();
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
         if a == "--" {
             break;
         }
-        if a == "-R" || a == "--repo" {
-            return args.get(i + 1).map(String::as_str);
+        match gh_repo_flag(a, args.get(i + 1).map(String::as_str)) {
+            Some((selector, consume_next)) => {
+                selectors.push(selector);
+                i += if consume_next { 2 } else { 1 };
+            }
+            None => i += 1,
         }
-        if let Some(v) = a.strip_prefix("--repo=") {
-            return Some(v);
-        }
-        i += 1;
     }
-    None
+    selectors
+}
+
+/// Parse one argv token as a `gh` repo selector flag.
+///
+/// Returns `(selector, consume_next)` when `arg` is `-R` / `--repo` in any
+/// accepted spelling. A missing required value is an empty selector so callers
+/// can fail closed.
+fn gh_repo_flag<'a>(arg: &'a str, next: Option<&'a str>) -> Option<(&'a str, bool)> {
+    if arg == "--repo" || arg == "-R" {
+        return Some((next.unwrap_or(""), true));
+    }
+    if let Some(value) = arg.strip_prefix("--repo=") {
+        return Some((value, false));
+    }
+    if let Some(value) = arg.strip_prefix("-R=") {
+        return Some((value, false));
+    }
+    if let Some(value) = arg.strip_prefix("-R")
+        && !value.is_empty()
+    {
+        return Some((value, false));
+    }
+    clustered_short_repo_flag(arg, next)
+}
+
+fn clustered_short_repo_flag<'a>(arg: &'a str, next: Option<&'a str>) -> Option<(&'a str, bool)> {
+    if !arg.starts_with('-') || arg.starts_with("--") {
+        return None;
+    }
+    let body = &arg[1..];
+    let (letters, eq_value) = match body.split_once('=') {
+        Some((letters, value)) => (letters, Some(value)),
+        None => (body, None),
+    };
+    let r_idx = letters.find('R')?;
+    if !letters[..r_idx].chars().all(|c| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    let after = &letters[r_idx + 1..];
+    if !after.is_empty() {
+        return Some((after, false));
+    }
+    if let Some(value) = eq_value {
+        return Some((value, false));
+    }
+    Some((next.unwrap_or(""), true))
+}
+
+fn gh_repo_env_selector() -> Option<String> {
+    std::env::var("GH_REPO")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn enforce_gh_repo_targets(
+    args: &[String],
+    allowlist: &OwnerAllowlist,
+    implicit_repo: Option<&str>,
+) -> Result<()> {
+    let selectors = gh_repo_selectors(args);
+    if selectors.is_empty() {
+        if let Some(selector) = implicit_repo.filter(|value| !value.trim().is_empty()) {
+            allowlist.enforce_repo_selector(selector)?;
+        }
+        return Ok(());
+    }
+    for selector in selectors {
+        allowlist.enforce_repo_selector(selector)?;
+    }
+    Ok(())
 }
 
 /// Normalize a GitHub repo selector or remote URL to `(host, owner/repo)` (lowercase).
@@ -1084,6 +1176,27 @@ pub fn github_repo_slugs_match(a: &str, b: &str) -> bool {
         (Some((ha, sa)), Some((hb, sb))) => ha == hb && sa == sb,
         _ => false,
     }
+}
+
+/// Extract a lowercase GitHub owner from a bare owner name or repo selector.
+///
+/// Uses the same identity parser as [`normalize_github_repo_identity`] so
+/// `Acme/Repo` and `github.com/acme/repo` yield the same owner (`acme`). Bare
+/// owner names that cannot be parsed as `owner/repo` slugs are lowercased as-is
+/// when they do not look like a host or URL.
+#[must_use]
+pub fn github_owner_name(spec: &str) -> Option<String> {
+    if let Some((_, slug)) = normalize_github_repo_identity(spec) {
+        return slug.split('/').next().map(str::to_owned);
+    }
+    let owner = spec.trim().trim_matches('/');
+    if owner.is_empty() {
+        return None;
+    }
+    if owner.contains(['/', '@', ':']) || owner.contains('.') {
+        return None;
+    }
+    Some(owner.to_ascii_lowercase())
 }
 
 /// Reject `git push` refspecs that update a remote branch other than `expected`.
@@ -1828,6 +1941,59 @@ mod tests {
     }
 
     #[test]
+    fn gh_repo_selector_extracts_pflag_spellings() {
+        assert_eq!(
+            gh_repo_selector(&[
+                "pr".to_owned(),
+                "-R=other/repo".to_owned(),
+                "view".to_owned()
+            ]),
+            Some("other/repo")
+        );
+        assert_eq!(
+            gh_repo_selector(&[
+                "pr".to_owned(),
+                "-Rother/repo".to_owned(),
+                "view".to_owned()
+            ]),
+            Some("other/repo")
+        );
+        assert_eq!(
+            gh_repo_selector(&[
+                "pr".to_owned(),
+                "-wR".to_owned(),
+                "other/repo".to_owned(),
+                "view".to_owned()
+            ]),
+            Some("other/repo")
+        );
+        assert_eq!(
+            gh_repo_selector(&[
+                "pr".to_owned(),
+                "-wR=other/repo".to_owned(),
+                "view".to_owned()
+            ]),
+            Some("other/repo")
+        );
+        assert_eq!(
+            gh_repo_selector(&[
+                "pr".to_owned(),
+                "-wRother/repo".to_owned(),
+                "view".to_owned()
+            ]),
+            Some("other/repo")
+        );
+        assert_eq!(
+            gh_repo_selector(&[
+                "pr".to_owned(),
+                "--repo=other/repo".to_owned(),
+                "view".to_owned()
+            ]),
+            Some("other/repo")
+        );
+    }
+
+    #[test]
     fn github_slug_normalize_and_match() {
         assert_eq!(
             normalize_github_repo_slug("https://github.com/Acme/Repo.git").as_deref(),
@@ -1848,6 +2014,148 @@ mod tests {
             "git@github.enterprise:acme/repo.git",
             "github.enterprise/acme/repo"
         ));
+        assert_eq!(github_owner_name("Acme/Repo").as_deref(), Some("acme"));
+        assert_eq!(
+            github_owner_name("github.com/acme/repo").as_deref(),
+            Some("acme")
+        );
+        assert_eq!(github_owner_name("ACME").as_deref(), Some("acme"));
+    }
+
+    #[test]
+    fn gh_repo_selector_outside_allowlist_is_rejected_before_run() {
+        let allowlist = crate::owners::OwnerAllowlist::from_owners(["acme"]);
+        let err = SafeGhCommand::with_allowlist(
+            &[
+                "pr".to_owned(),
+                "view".to_owned(),
+                "-R".to_owned(),
+                "other/repo".to_owned(),
+                "1".to_owned(),
+            ],
+            &allowlist,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::OwnerNotAllowed,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn gh_repo_selector_matching_allowlist_is_accepted() {
+        let allowlist = crate::owners::OwnerAllowlist::from_owners(["acme"]);
+        let cmd = SafeGhCommand::with_allowlist(
+            &[
+                "pr".to_owned(),
+                "view".to_owned(),
+                "-R".to_owned(),
+                "github.com/Acme/Repo".to_owned(),
+                "1".to_owned(),
+            ],
+            &allowlist,
+        )
+        .unwrap();
+        assert_eq!(
+            cmd.args(),
+            &["pr", "view", "-R", "github.com/Acme/Repo", "1"]
+        );
+    }
+
+    #[test]
+    fn empty_allowlist_denies_gh_repo_selector() {
+        let err = SafeGhCommand::with_allowlist(
+            &[
+                "pr".to_owned(),
+                "view".to_owned(),
+                "--repo=acme/repo".to_owned(),
+                "1".to_owned(),
+            ],
+            &crate::owners::OwnerAllowlist::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::OwnerNotAllowed,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn gh_without_repo_selector_skips_owner_allowlist() {
+        let cmd = SafeGhCommand::with_allowlist(
+            &["issue".to_owned(), "list".to_owned()],
+            &crate::owners::OwnerAllowlist::default(),
+        )
+        .unwrap();
+        assert_eq!(cmd.args(), &["issue", "list"]);
+    }
+
+    #[test]
+    fn gh_pflag_repo_spellings_outside_allowlist_are_rejected_before_run() {
+        let allowlist = crate::owners::OwnerAllowlist::from_owners(["acme"]);
+        for args in [
+            vec![
+                "pr".to_owned(),
+                "view".to_owned(),
+                "-R=other/repo".to_owned(),
+                "1".to_owned(),
+            ],
+            vec![
+                "pr".to_owned(),
+                "view".to_owned(),
+                "-Rother/repo".to_owned(),
+                "1".to_owned(),
+            ],
+            vec![
+                "pr".to_owned(),
+                "view".to_owned(),
+                "-wR".to_owned(),
+                "other/repo".to_owned(),
+                "1".to_owned(),
+            ],
+        ] {
+            let err = SafeGhCommand::with_allowlist(&args, &allowlist).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    Error::PolicyViolation {
+                        code: PolicyCode::OwnerNotAllowed,
+                        ..
+                    }
+                ),
+                "expected OwnerNotAllowed for {args:?}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn gh_repo_env_is_enforced_when_argv_has_no_selector() {
+        let allowlist = crate::owners::OwnerAllowlist::from_owners(["acme"]);
+        let err = enforce_gh_repo_targets(
+            &["pr".to_owned(), "view".to_owned(), "1".to_owned()],
+            &allowlist,
+            Some("other/repo"),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::OwnerNotAllowed,
+                ..
+            }
+        ));
+        enforce_gh_repo_targets(
+            &["pr".to_owned(), "view".to_owned(), "1".to_owned()],
+            &allowlist,
+            Some("github.com/Acme/Repo"),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -2009,6 +2317,24 @@ mod tests {
     }
 
     #[test]
+    fn gh_pr_merge_after_equals_repo_flag_rejected() {
+        let err = SafeGhCommand::new(&[
+            "pr".to_owned(),
+            "-R=acme/widgets".to_owned(),
+            "merge".to_owned(),
+            "1".to_owned(),
+        ])
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::MergeBlocked,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn gh_pr_merge_rejected() {
         let err = SafeGhCommand::new(&["pr".to_owned(), "merge".to_owned()]).unwrap_err();
         assert!(matches!(
@@ -2098,6 +2424,7 @@ mod tests {
             "GH_SUBCOMMAND_NOT_ALLOWED"
         );
         assert_eq!(PolicyCode::GhFlagNotAllowed.as_str(), "GH_FLAG_NOT_ALLOWED");
+        assert_eq!(PolicyCode::OwnerNotAllowed.as_str(), "OWNER_NOT_ALLOWED");
     }
 
     #[test]
