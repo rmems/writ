@@ -106,8 +106,32 @@ enum SupervisorAction {
     /// Run a command under supervision.
     Run {
         /// Wall-clock timeout in seconds. 0 means no timeout.
-        #[arg(long, default_value = "0")]
+        #[arg(long, default_value_t = writ_core::timeout_policy::DEFAULT_WORKER_SECS)]
         timeout: u64,
+
+        /// Idle hang detector: no captured output for this many seconds. 0 disables.
+        #[arg(long, default_value_t = writ_core::timeout_policy::DEFAULT_IDLE_SECS)]
+        idle: u64,
+
+        /// Optional per-step cap in seconds. 0 disables.
+        #[arg(long, default_value_t = writ_core::timeout_policy::DEFAULT_STEP_SECS)]
+        step: u64,
+
+        /// Overall wait budget in seconds. 0 falls back to `--timeout`.
+        #[arg(long, default_value_t = writ_core::timeout_policy::DEFAULT_ORCHESTRATOR_SECS)]
+        orchestrator: u64,
+
+        /// Seconds between SIGTERM and SIGKILL (Unix). 0 = kill immediately.
+        #[arg(long, default_value_t = writ_core::timeout_policy::DEFAULT_GRACE_SECS)]
+        grace: u64,
+
+        /// Progress tick interval on stderr while waiting. 0 disables.
+        #[arg(long, default_value_t = writ_core::timeout_policy::DEFAULT_PROGRESS_SECS)]
+        progress_secs: u64,
+
+        /// Harness redispatch budget recorded on the policy. Supervisor never retries.
+        #[arg(long, default_value_t = writ_core::timeout_policy::DEFAULT_MAX_REDISPATCH_PER_ITEM)]
+        max_redispatch: u32,
 
         /// Expected branch for mutating supervised `git` / `gh pr` commands.
         #[arg(long)]
@@ -351,6 +375,12 @@ async fn run(cli: Cli, stdout: &mut impl Write) -> writ_core::error::Result<Exit
         Some(Command::Supervisor { action }) => match action {
             SupervisorAction::Run {
                 timeout,
+                idle,
+                step,
+                orchestrator,
+                grace,
+                progress_secs,
+                max_redispatch,
                 expected_branch,
                 repo,
                 max_parallel,
@@ -359,6 +389,12 @@ async fn run(cli: Cli, stdout: &mut impl Write) -> writ_core::error::Result<Exit
                 run_supervisor(
                     cli.json,
                     timeout,
+                    idle,
+                    step,
+                    orchestrator,
+                    grace,
+                    progress_secs,
+                    max_redispatch,
                     expected_branch,
                     repo,
                     max_parallel,
@@ -383,10 +419,21 @@ async fn run(cli: Cli, stdout: &mut impl Write) -> writ_core::error::Result<Exit
     }
 }
 
+fn secs_opt(secs: u64) -> Option<Duration> {
+    (secs > 0).then(|| Duration::from_secs(secs))
+}
+
 /// Run `writ supervisor run` with policy-checked core supervisor and consistent JSON envelopes.
+#[allow(clippy::too_many_arguments)]
 async fn run_supervisor(
     json: bool,
     timeout_secs: u64,
+    idle_secs: u64,
+    step_secs: u64,
+    orchestrator_secs: u64,
+    grace_secs: u64,
+    progress_secs: u64,
+    max_redispatch: u32,
     expected_branch: Option<String>,
     repo: Option<PathBuf>,
     max_parallel: usize,
@@ -404,20 +451,38 @@ async fn run_supervisor(
         }
     };
     let args: Vec<&str> = cmd[1..].iter().map(|s| s.as_str()).collect();
+    let progress_every = if progress_secs == 0 {
+        None
+    } else {
+        Some(Duration::from_secs(progress_secs))
+    };
+    let on_progress = progress_every.map(|_| {
+        std::sync::Arc::new(|snap: &writ_core::timeout_policy::ProgressSnapshot| {
+            eprintln!("{}", snap.format_line());
+        }) as writ_core::timeout_policy::ProgressCallback
+    });
     let options = writ_core::supervisor::RunOptions {
         expected_branch,
         repo,
+        on_progress,
     };
-    let timeout = if timeout_secs == 0 {
-        None
-    } else {
-        Some(Duration::from_secs(timeout_secs))
+    let policy = writ_core::timeout_policy::TimeoutPolicy {
+        worker: secs_opt(timeout_secs),
+        step: secs_opt(step_secs),
+        idle: secs_opt(idle_secs),
+        orchestrator: secs_opt(orchestrator_secs),
+        grace: Duration::from_secs(grace_secs),
+        max_redispatch_per_item: max_redispatch,
+        progress_every,
     };
 
     // One-shot CLI: a single awaited child cannot contend with itself.
     // Library callers may still use Supervisor::new(n) for in-process fan-out.
     let supervisor = writ_core::supervisor::Supervisor::new(max_parallel.max(1));
-    match supervisor.run(program, &args, timeout, &options).await {
+    match supervisor
+        .run_with_policy(program, &args, &policy, &options)
+        .await
+    {
         Ok(output) => {
             write_supervisor_result(json, Ok(&output), stdout)?;
             if json {
@@ -651,6 +716,10 @@ mod tests {
             process_state: ProcessState::Running,
             last_error: None,
             ci_class: CiClass::Pending,
+            timeout_class: None,
+            residual_blockers: Vec::new(),
+            redispatch_count: None,
+            fix_count: None,
         }
     }
 
@@ -905,6 +974,12 @@ mod tests {
             command: Some(super::Command::Supervisor {
                 action: super::SupervisorAction::Run {
                     timeout: 0,
+                    idle: 0,
+                    step: 0,
+                    orchestrator: 0,
+                    grace: 0,
+                    progress_secs: 0,
+                    max_redispatch: 1,
                     expected_branch: None,
                     repo: None,
                     max_parallel: 1,
@@ -939,6 +1014,12 @@ mod tests {
             command: Some(super::Command::Supervisor {
                 action: super::SupervisorAction::Run {
                     timeout: 0,
+                    idle: 0,
+                    step: 0,
+                    orchestrator: 0,
+                    grace: 0,
+                    progress_secs: 0,
+                    max_redispatch: 1,
                     expected_branch: None,
                     repo: None,
                     max_parallel: 1,
@@ -966,6 +1047,12 @@ mod tests {
             command: Some(super::Command::Supervisor {
                 action: super::SupervisorAction::Run {
                     timeout: 0,
+                    idle: 0,
+                    step: 0,
+                    orchestrator: 0,
+                    grace: 0,
+                    progress_secs: 0,
+                    max_redispatch: 1,
                     expected_branch: None,
                     repo: None,
                     max_parallel: 1,
@@ -1008,6 +1095,12 @@ mod tests {
             command: Some(super::Command::Supervisor {
                 action: super::SupervisorAction::Run {
                     timeout: 0,
+                    idle: 0,
+                    step: 0,
+                    orchestrator: 0,
+                    grace: 0,
+                    progress_secs: 0,
+                    max_redispatch: 1,
                     expected_branch: None,
                     repo: None,
                     max_parallel: 1,
@@ -1062,6 +1155,12 @@ mod tests {
             command: Some(super::Command::Supervisor {
                 action: super::SupervisorAction::Run {
                     timeout: 0,
+                    idle: 0,
+                    step: 0,
+                    orchestrator: 0,
+                    grace: 0,
+                    progress_secs: 0,
+                    max_redispatch: 1,
                     expected_branch: None,
                     repo: None,
                     max_parallel: 1,
@@ -1089,6 +1188,12 @@ mod tests {
             command: Some(super::Command::Supervisor {
                 action: super::SupervisorAction::Run {
                     timeout: 0,
+                    idle: 0,
+                    step: 0,
+                    orchestrator: 0,
+                    grace: 0,
+                    progress_secs: 0,
+                    max_redispatch: 1,
                     expected_branch: None,
                     repo: None,
                     max_parallel: 1,
@@ -1125,26 +1230,15 @@ mod tests {
     #[test]
     fn supervised_exit_code_maps_timeout_and_kill() {
         let timed_out = writ_core::supervisor::SupervisedOutput {
-            exit_code: None,
             timed_out: true,
             killed: true,
-            stdout: String::new(),
-            stderr: String::new(),
-            stdout_truncated: false,
-            stderr_truncated: false,
-            error_code: None,
+            ..writ_core::supervisor::SupervisedOutput::default()
         };
         assert_eq!(supervised_exit_code(&timed_out), ExitCode::from(124));
 
         let child_fail = writ_core::supervisor::SupervisedOutput {
             exit_code: Some(7),
-            timed_out: false,
-            killed: false,
-            stdout: String::new(),
-            stderr: String::new(),
-            stdout_truncated: false,
-            stderr_truncated: false,
-            error_code: None,
+            ..writ_core::supervisor::SupervisedOutput::default()
         };
         assert_eq!(supervised_exit_code(&child_fail), ExitCode::from(7));
     }
