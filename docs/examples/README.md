@@ -23,6 +23,7 @@ All of them, under `--json`:
 | `status` / `jobs` | `cli.status` / `cli.jobs` |
 | `git-safe` / `gh-safe` | `git.safe` / `gh.safe` |
 | `worktree create\|list\|remove\|prune` | `worktree.create` etc. |
+| `claim issue\|pr` | `claim.issue` / `claim.pr` |
 
 **The exception is the policy-violation path**, which prints plain text on stderr
 with exit code 2 instead of an envelope:
@@ -53,4 +54,5 @@ writ --json git-safe --repo <repo> rev-parse --is-inside-work-tree   # git.safe
 writ --json worktree list                     # worktree.list
 # error envelope, no repository mutation:
 writ --json worktree create --schema-version 2 --repo <repo> <owner> <repo-name> <job> <branch>
+writ --json claim issue --repo <repo> --start-point <ref> --url https://github.com/acme/example/issues/1
 ```

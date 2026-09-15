@@ -98,6 +98,11 @@ pub enum Error {
     ContractUpgradeRequired { required_schema_version: u8 },
     /// The exact-base request boundary requires an explicit start point.
     StartPointRequired,
+    /// Claim inputs were malformed (URL, number, slug, or identity fields).
+    InvalidClaim {
+        /// Human-readable explanation.
+        message: String,
+    },
     /// A git or gh command was blocked by safety policy.
     PolicyViolation {
         /// Machine-readable policy error code.
@@ -128,6 +133,16 @@ pub enum PolicyCode {
     PathNotAllowed,
     /// An existing worktree branch lacks a durable identity proving safe resume ownership.
     WorktreeResumeUnproven,
+    /// A second claim targeted a job id whose worktree path already exists.
+    WorktreeAlreadyClaimed,
+    /// The requested owner is outside `WRIT_ALLOWED_OWNERS`.
+    OwnerNotAllowed,
+    /// An attach requested a branch that is already checked out in another worktree.
+    WorktreeBranchInUse,
+    /// An attach requested a start point that does not match the existing branch tip.
+    WorktreeAttachMismatch,
+    /// An attach requested a branch that does not exist locally.
+    WorktreeAttachMissingBranch,
 }
 
 impl PolicyCode {
@@ -144,6 +159,11 @@ impl PolicyCode {
             Self::GhFlagNotAllowed => "GH_FLAG_NOT_ALLOWED",
             Self::PathNotAllowed => "PATH_NOT_ALLOWED",
             Self::WorktreeResumeUnproven => "WORKTREE_RESUME_UNPROVEN",
+            Self::WorktreeAlreadyClaimed => "WORKTREE_ALREADY_CLAIMED",
+            Self::OwnerNotAllowed => "OWNER_NOT_ALLOWED",
+            Self::WorktreeBranchInUse => "WORKTREE_BRANCH_IN_USE",
+            Self::WorktreeAttachMismatch => "WORKTREE_ATTACH_MISMATCH",
+            Self::WorktreeAttachMissingBranch => "WORKTREE_ATTACH_MISSING_BRANCH",
         }
     }
 }
@@ -192,6 +212,7 @@ impl Display for Error {
                 f,
                 "worktree.create schema v2 requires an explicit --start-point"
             ),
+            Self::InvalidClaim { message } => write!(f, "{message}"),
             Self::PolicyViolation { code, message } => {
                 write!(f, "policy violation [{code}]: {message}")
             }
@@ -221,6 +242,7 @@ impl Error {
             Self::WorktreePostconditionFailed(_) => "WORKTREE_POSTCONDITION_FAILED",
             Self::ContractUpgradeRequired { .. } => "CONTRACT_UPGRADE_REQUIRED",
             Self::StartPointRequired => "START_POINT_REQUIRED",
+            Self::InvalidClaim { .. } => "INVALID_CLAIM",
             Self::PolicyViolation { code, .. } => code.as_str(),
         }
     }

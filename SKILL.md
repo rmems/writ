@@ -10,6 +10,7 @@ Use this skill when:
 - Discovering work from GitHub or Linear issues
 - Spawning worker subagents for code changes
 - Running [Safe Issue → Verified Commit](docs/workflows/safe-issue-verified-commit.md) then [Safe Verified Commit → PR](docs/workflows/safe-verified-commit-to-pr.md)
+- Claiming an issue or PR into an isolated worktree ([claim → branch → worktree](docs/workflows/claim-worktree-isolation.md))
 - Handing a pull request to the installed companion `babysit-pr` skill when interactive monitoring is needed
 - Executing a human-requested one-shot merge after the automated workflows end
 - Reporting results back to the operator
@@ -31,7 +32,7 @@ This skill never grants an exception to those rules. Worker, orchestrator, sched
 Before making any code change, the agent MUST verify:
 
 1. **Worktree isolation:** `pwd` is inside the assigned worktree path (`{worktree_root}/{owner}/{repo}/{job_id}`).
-2. **Branch correctness:** `git branch --show-current` matches the assigned feature branch.
+2. **Branch correctness:** `git rev-parse --abbrev-ref HEAD` (or `git branch --show-current`) matches the assigned feature branch.
 3. **Clean state:** `git status` shows no uncommitted changes from other work. A dirty or stale primary checkout is preserved and is not a reason to abort isolated work.
 4. **Remote alignment:** For a newly created, unpublished assigned branch, fetch the intended remote base and prove that the branch equals that exact remote-base commit before edits; it may lack an upstream only for this creation proof. For a published assigned branch, fetch and verify its expected upstream and the expected local/remote relationship instead of comparing the branch with the base. Stop on an unexpected upstream, unexpected remote commit, behind state, or divergence.
 5. **No cross-boundary edits:** No file outside the worktree is modified (no `../` paths, no absolute paths outside the worktree root).
@@ -75,7 +76,7 @@ SAFETY RULES (non-negotiable):
 - `git push --force-with-lease` is allowed only for rebasing your own branch
 - NEVER edit files outside your assigned worktree
 - One writable worker per assigned worktree and branch
-- Before editing, verify: worktree path, branch name, clean assigned state, and remote alignment; exact remote-base equality applies only to a newly created unpublished branch, while a published branch must match its expected upstream relationship
+- Before editing, verify: worktree path, branch name (`git rev-parse --abbrev-ref HEAD`), clean assigned state, and remote alignment; exact remote-base equality applies only to a newly created unpublished branch, while a published branch must match its expected upstream relationship
 - Repair a clean bootstrap source or unpublished verified-base alignment; abort on unsafe identity or path mismatch
 - After the first tested implementation and before publication, obtain one independent risk-matched review; add review only for a named high-risk boundary or an actual finding
 - After pushing, reply with SHA and agent attribution
@@ -87,7 +88,9 @@ Worker prompts remain strictly non-merging. Do not forward the primary agent's m
 
 This skill is portable procedure, not a security boundary. Route orchestrated
 mutations through `writ`, with Rust enforcing the runtime boundary as
-defined in [`AGENTS.md`](AGENTS.md#enforcement-layers). The separate interactive
-host merge path is available only to the primary agent after it completes the
-linked one-shot authorization protocol; never forward that authority to a
-worker.
+defined in [`AGENTS.md`](AGENTS.md#enforcement-layers). Isolate new issue or
+PR work with `writ claim` as specified in
+[claim → branch → worktree](docs/workflows/claim-worktree-isolation.md). The
+separate interactive host merge path is available only to the primary agent
+after it completes the linked one-shot authorization protocol; never forward
+that authority to a worker.

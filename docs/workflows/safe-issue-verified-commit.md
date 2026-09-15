@@ -21,7 +21,7 @@ Do not hard-code an owner. Multi-repo discovery and scheduling still use `WRIT_A
 Abort and report if any of these fail:
 
 - Issue is closed, is a pull request, or has no actionable acceptance criteria
-- Owner is outside the configured allowlist (unless the operator named this repo/job explicitly). **No code enforces this today** -- `WRIT_ALLOWED_OWNERS` has no reader under `crates/` since the Python layer was removed, so this stop depends on the operator, not the boundary (#146).
+- Owner is outside the configured allowlist (unless the operator named this repo/job explicitly). `writ claim` enforces `WRIT_ALLOWED_OWNERS` when that list is set. Multi-owner discovery still has no reader (#146).
 - Unsafe identity or path mismatch, a genuine ownership collision, or a non-recoverable cleanliness/remote check. Exact remote-base equality applies only to a newly created, unpublished assigned branch. A published branch must have the expected upstream and local/remote relationship instead. Repair a clean bootstrap source or unpublished verified-base alignment before editing; do not abort isolated work because a primary checkout is dirty or stale.
 - `writ` is missing and no enforcing wrapper is available (mutating runs). An "enforcing wrapper" means a wrapper that routes the mutation through `writ-core`'s allowlist and branch verification; a wrapper that merely calls `git` directly is not one, and does not satisfy this check.
 - Any required quality gate fails or times out
@@ -42,14 +42,15 @@ Abort and report if any of these fail:
 1. If this repo uses Beads, run `bd prime`, inspect `bd ready`, and claim the relevant bead.
 2. Start from an up-to-date base. Never edit `main` or `master`.
 3. Create or reuse a dedicated branch and isolated worktree:
-   - Required: `writ --json worktree create --schema-version 2 --repo <repo> --start-point <exact-commit-or-ref> <owner> <repo-name> <job-id> <branch>` (`WRIT_BIN` or `PATH`). Never omit the caller-selected boundary version/start point or derive it from the source checkout's ambient `HEAD`.
+   - Required: `writ --json claim issue --repo <repo> --start-point <exact-commit-or-ref> [--slug <short-slug>] --url <issue-url>` (or owner + repo + number). `WRIT_BIN` or `PATH`. This derives `job_id=gh-<n>` and branch `hive/issue-<n>` (optionally slugged), then calls the exact-base worktree boundary. Never omit the caller-selected start point or derive it from the source checkout's ambient `HEAD`.
+   - Equivalent lower-level form: `writ --json worktree create --schema-version 2 --repo <repo> --start-point <exact-commit-or-ref> <owner> <repo-name> <job-id> <branch>`. Prefer `writ claim` so naming and one-worktree-per-job policy stay in Rust. For an existing PR, `writ --json claim pr --repo <repo> --start-point <pr-head-sha> --head-branch <pr-head> <owner> <repo-name> <pr>` attaches that head without renaming it. See [claim → branch → worktree](claim-worktree-isolation.md).
    - If `writ` is missing, stop, unless a wrapper routes the mutation through `writ-core` -- the same definition as the hard stop above. A wrapper that re-implements the checks itself and then calls `git` directly does **not** qualify: re-implemented policy is prompt-level text, not the code-enforced boundary.
-   - What routing through `writ-core` actually gets you, so the promise is not larger than the code: the git/gh argv allowlist, no merge path, force-with-lease only, sandboxed path derivation with symlink rejection, exact-base resolution, branch and `HEAD` postcondition verification, supervised child processes, and origin-slug matching for `gh -R`. **Owner-allowlist enforcement is not among them.** `WRIT_ALLOWED_OWNERS` has no reader anywhere under `crates/`; it was enforced in the Python layer removed by [#144](https://github.com/rmems/writ/issues/144), so it is currently policy text with no code behind it.
+   - What routing through `writ-core` actually gets you, so the promise is not larger than the code: the git/gh argv allowlist, no merge path, force-with-lease only, sandboxed path derivation with symlink rejection, exact-base resolution, branch and `HEAD` postcondition verification, supervised child processes, origin-slug matching for `gh -R`, and **`writ claim` owner-allowlist checks when `WRIT_ALLOWED_OWNERS` is set**. Multi-owner discovery/scheduling still has no allowlist reader ([#146](https://github.com/rmems/writ/issues/146)).
    - Raw `git worktree add` is forbidden on mutating runs.
-4. Suggested issue branch: `hive/issue-<n>-<short-slug>` (document any local override).
+4. Canonical issue branch: `hive/issue-<n>` or `hive/issue-<n>-<short-slug>` (produced by `writ claim issue`; document any local override).
 5. For a newly created, unpublished assigned branch, fetch the intended remote base and prove that the branch equals that exact remote-base commit before edits. It may have no upstream only for this creation proof; never use an ambient or stale `HEAD` as the base.
 6. For a published assigned branch, fetch and verify the configured expected upstream and the expected local/remote relationship; do not compare the branch for equality with the base. Stop on an unexpected upstream, unexpected remote commit, behind state, or divergence.
-7. Run the remaining pre-edit checklist in `AGENTS.md` / `SKILL.md`: worktree path, `git branch --show-current`, clean assigned tree, expected remote, no path escape.
+7. Run the remaining pre-edit checklist in `AGENTS.md` / `SKILL.md`: worktree path, `git rev-parse --abbrev-ref HEAD`, clean assigned tree, expected remote, no path escape.
 8. One writable worktree per job. Do not share it with another agent.
 
 ### 3. Implement

@@ -56,6 +56,12 @@ enum Command {
         #[command(subcommand)]
         action: WorktreeAction,
     },
+
+    /// Claim a GitHub issue or pull request into an isolated worktree.
+    Claim {
+        #[command(subcommand)]
+        action: ClaimAction,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -102,6 +108,55 @@ enum WorktreeAction {
 }
 
 #[derive(Debug, Subcommand)]
+enum ClaimAction {
+    /// Claim a GitHub issue: create `hive/issue-<n>` from an exact start point.
+    Issue {
+        /// Repository root (git dir / working tree).
+        #[arg(long)]
+        repo: PathBuf,
+        /// Commit or ref to create the issue branch from (never ambient HEAD).
+        #[arg(long)]
+        start_point: String,
+        /// Optional short suffix: `hive/issue-<n>-<slug>`.
+        #[arg(long)]
+        slug: Option<String>,
+        /// GitHub issue URL (`https://github.com/owner/repo/issues/N`).
+        #[arg(long)]
+        url: Option<String>,
+        /// GitHub owner when `--url` is omitted.
+        owner: Option<String>,
+        /// Repository name when `--url` is omitted.
+        repo_name: Option<String>,
+        /// Issue number when `--url` is omitted.
+        issue: Option<u64>,
+    },
+    /// Claim a pull request: check out the existing head branch without renaming it.
+    Pr {
+        /// Repository root (git dir / working tree).
+        #[arg(long)]
+        repo: PathBuf,
+        /// Exact PR head commit (full object id) or a ref that peels to it.
+        #[arg(long)]
+        start_point: String,
+        /// Existing PR head branch name (no silent rename).
+        #[arg(long)]
+        head_branch: String,
+        /// Optional fork slug `owner/repo` recorded on the claim result.
+        #[arg(long)]
+        head_repo: Option<String>,
+        /// GitHub pull-request URL (`https://github.com/owner/repo/pull/N`).
+        #[arg(long)]
+        url: Option<String>,
+        /// GitHub owner when `--url` is omitted.
+        owner: Option<String>,
+        /// Repository name when `--url` is omitted.
+        repo_name: Option<String>,
+        /// Pull-request number when `--url` is omitted.
+        pr: Option<u64>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum SupervisorAction {
     /// Run a command under supervision.
     Run {
@@ -132,16 +187,16 @@ enum SupervisorAction {
 async fn main() -> ExitCode {
     let cli = Cli::parse();
     let json = cli.json;
-    let worktree_command = worktree_command_name(&cli);
-    let worktree_schema_version = worktree_schema_version(&cli);
+    let envelope_command = envelope_command_name(&cli);
+    let envelope_schema_version = envelope_schema_version(&cli);
 
     match run(cli, &mut io::stdout()).await {
         Ok(code) => code,
         Err(error) => {
-            if json && let Some(command) = worktree_command {
+            if json && let Some(command) = envelope_command {
                 let response = writ_core::contract::Response {
                     ok: false,
-                    schema_version: worktree_schema_version,
+                    schema_version: envelope_schema_version,
                     command,
                     data: worktree_error_data(&error),
                     error: Some(writ_core::contract::ErrorData {
@@ -215,7 +270,7 @@ fn worktree_error_data(error: &writ_core::error::Error) -> serde_json::Value {
     }
 }
 
-fn worktree_schema_version(cli: &Cli) -> u8 {
+fn envelope_schema_version(cli: &Cli) -> u8 {
     match &cli.command {
         Some(Command::Worktree {
             action: WorktreeAction::Create { schema_version, .. },
@@ -224,13 +279,17 @@ fn worktree_schema_version(cli: &Cli) -> u8 {
     }
 }
 
-fn worktree_command_name(cli: &Cli) -> Option<&'static str> {
+fn envelope_command_name(cli: &Cli) -> Option<&'static str> {
     match &cli.command {
         Some(Command::Worktree { action }) => Some(match action {
             WorktreeAction::Create { .. } => "worktree.create",
             WorktreeAction::List => "worktree.list",
             WorktreeAction::Remove { .. } => "worktree.remove",
             WorktreeAction::Prune { .. } => "worktree.prune",
+        }),
+        Some(Command::Claim { action }) => Some(match action {
+            ClaimAction::Issue { .. } => "claim.issue",
+            ClaimAction::Pr { .. } => "claim.pr",
         }),
         _ => None,
     }
@@ -326,6 +385,171 @@ fn run_worktree(
     Ok(ExitCode::SUCCESS)
 }
 
+fn run_claim(
+    action: ClaimAction,
+    json: bool,
+    stdout: &mut impl Write,
+) -> writ_core::error::Result<ExitCode> {
+    let response = claim_response(action)?;
+    if json {
+        serde_json::to_writer(&mut *stdout, &response).map_err(io::Error::other)?;
+        stdout.write_all(b"\n")?;
+    } else {
+        let data = &response.data;
+        writeln!(stdout, "ok={} command={}", response.ok, response.command)?;
+        if let Some(path) = data.get("path").and_then(|value| value.as_str()) {
+            writeln!(stdout, "path={path}")?;
+        }
+        if let Some(branch) = data.get("branch").and_then(|value| value.as_str()) {
+            writeln!(stdout, "branch={branch}")?;
+        }
+        if let Some(job_id) = data.get("job_id").and_then(|value| value.as_str()) {
+            writeln!(stdout, "job_id={job_id}")?;
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn claim_response(
+    action: ClaimAction,
+) -> writ_core::error::Result<writ_core::contract::Response<serde_json::Value>> {
+    use writ_core::claim::{ClaimKind, ClaimRequest, claim};
+    use writ_core::worktree::WorktreeManager;
+
+    let allowed = writ_core::claim::allowed_owners_from_env().unwrap_or_default();
+    let manager = WorktreeManager::new()?;
+    match action {
+        ClaimAction::Issue {
+            repo,
+            start_point,
+            slug,
+            url,
+            owner,
+            repo_name,
+            issue,
+        } => {
+            let target = resolve_claim_target(
+                url.as_deref(),
+                owner,
+                repo_name,
+                issue,
+                writ_core::claim::ClaimResource::Issue,
+            )?;
+            let result = claim(
+                &manager,
+                ClaimRequest {
+                    repo_root: &repo,
+                    owner: &target.owner,
+                    repo: &target.repo,
+                    start_point: &start_point,
+                    kind: ClaimKind::Issue {
+                        number: target.number,
+                        slug: slug.as_deref(),
+                    },
+                    allowed_owners: &allowed,
+                },
+            )?;
+            Ok(claim_success("claim.issue", result, &repo))
+        }
+        ClaimAction::Pr {
+            repo,
+            start_point,
+            head_branch,
+            head_repo,
+            url,
+            owner,
+            repo_name,
+            pr,
+        } => {
+            let target = resolve_claim_target(
+                url.as_deref(),
+                owner,
+                repo_name,
+                pr,
+                writ_core::claim::ClaimResource::PullRequest,
+            )?;
+            let result = claim(
+                &manager,
+                ClaimRequest {
+                    repo_root: &repo,
+                    owner: &target.owner,
+                    repo: &target.repo,
+                    start_point: &start_point,
+                    kind: ClaimKind::PullRequest {
+                        number: target.number,
+                        head_branch: &head_branch,
+                        head_repo: head_repo.as_deref(),
+                    },
+                    allowed_owners: &allowed,
+                },
+            )?;
+            Ok(claim_success("claim.pr", result, &repo))
+        }
+    }
+}
+
+fn claim_success(
+    command: &'static str,
+    result: writ_core::claim::ClaimResult,
+    repo_root: &std::path::Path,
+) -> writ_core::contract::Response<serde_json::Value> {
+    writ_core::contract::Response::success(
+        command,
+        serde_json::json!({
+            "path": result.worktree_path,
+            "branch": result.branch,
+            "branch_ref": format!("refs/heads/{}", result.branch),
+            "job_id": result.job_id,
+            "owner": result.owner,
+            "repo": result.repo,
+            "issue_number": result.issue_number,
+            "pr_number": result.pr_number,
+            "owns_branch": result.owns_branch,
+            "head_repo": result.head_repo,
+            "repo_root": repo_root,
+            "start_commit": result.start_commit,
+            "head_commit": result.head_commit,
+            "worktree_registered": true,
+        }),
+    )
+}
+
+fn resolve_claim_target(
+    url: Option<&str>,
+    owner: Option<String>,
+    repo_name: Option<String>,
+    number: Option<u64>,
+    expected: writ_core::claim::ClaimResource,
+) -> writ_core::error::Result<writ_core::claim::GitHubClaimTarget> {
+    match (url, owner, repo_name, number) {
+        (Some(url), None, None, None) => {
+            let target = writ_core::claim::parse_github_claim_url(url)?;
+            if target.kind != expected {
+                let wanted = match expected {
+                    writ_core::claim::ClaimResource::Issue => "issue",
+                    writ_core::claim::ClaimResource::PullRequest => "pull request",
+                };
+                return Err(writ_core::error::Error::InvalidClaim {
+                    message: format!("URL is not a GitHub {wanted}: {url}"),
+                });
+            }
+            Ok(target)
+        }
+        (None, Some(owner), Some(repo), Some(number)) => Ok(writ_core::claim::GitHubClaimTarget {
+            owner,
+            repo,
+            kind: expected,
+            number,
+        }),
+        (Some(_), _, _, _) => Err(writ_core::error::Error::InvalidClaim {
+            message: "use --url or owner repo number, not both".to_owned(),
+        }),
+        _ => Err(writ_core::error::Error::InvalidClaim {
+            message: "provide --url or owner, repository, and number".to_owned(),
+        }),
+    }
+}
+
 /// Entry point for CLI commands (status/jobs, git/gh-safe, supervisor, worktree).
 async fn run(cli: Cli, stdout: &mut impl Write) -> writ_core::error::Result<ExitCode> {
     match cli.command {
@@ -369,6 +593,7 @@ async fn run(cli: Cli, stdout: &mut impl Write) -> writ_core::error::Result<Exit
             }
         },
         Some(Command::Worktree { action }) => run_worktree(action, cli.json, stdout),
+        Some(Command::Claim { action }) => run_claim(action, cli.json, stdout),
         None => {
             if cli.json {
                 serde_json::to_writer(
@@ -706,6 +931,67 @@ mod tests {
         };
         assert_eq!(start_point.as_deref(), Some("origin/trunk"));
         assert_eq!(schema_version, 2);
+    }
+
+    #[test]
+    fn claim_parser_accepts_url_or_identity_fields() {
+        let url = Cli::try_parse_from([
+            "writ",
+            "claim",
+            "issue",
+            "--repo",
+            ".",
+            "--start-point",
+            "origin/main",
+            "--url",
+            "https://github.com/acme/sample/issues/42",
+        ])
+        .unwrap();
+        let Some(super::Command::Claim {
+            action:
+                super::ClaimAction::Issue {
+                    url: Some(parsed_url),
+                    issue: None,
+                    ..
+                },
+        }) = url.command
+        else {
+            panic!("expected claim issue --url")
+        };
+        assert!(parsed_url.contains("/issues/42"));
+
+        let positional = Cli::try_parse_from([
+            "writ",
+            "claim",
+            "pr",
+            "--repo",
+            ".",
+            "--start-point",
+            "origin/feature",
+            "--head-branch",
+            "feature/pr-head",
+            "acme",
+            "sample",
+            "9",
+        ])
+        .unwrap();
+        let Some(super::Command::Claim {
+            action:
+                super::ClaimAction::Pr {
+                    head_branch,
+                    pr: Some(9),
+                    owner: Some(owner),
+                    repo_name: Some(repo_name),
+                    url: None,
+                    ..
+                },
+        }) = positional.command
+        else {
+            panic!("expected claim pr identity fields")
+        };
+        assert_eq!(head_branch, "feature/pr-head");
+        assert_eq!(owner, "acme");
+        assert_eq!(repo_name, "sample");
     }
 
     #[tokio::test]

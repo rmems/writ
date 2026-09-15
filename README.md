@@ -21,7 +21,7 @@ Claude Code agent teams have real coordination and [documented zero isolation](h
 
 > [!NOTE]
 > **Status: the enforcement core is real; the hook layer is not built yet.**
-> Shipping today are the `git`/`gh` allowlists, exact-base worktree verification, path sandboxing, process supervision, and the absence of any merge path — reachable through the `writ` CLI, including `writ worktree create`, which remains supported.
+> Shipping today are the `git`/`gh` allowlists, exact-base worktree verification, path sandboxing, process supervision, `writ claim` for issue/PR isolation, and the absence of any merge path — reachable through the `writ` CLI, including `writ worktree create`, which remains supported.
 > Not yet built: the `PreToolUse`/`WorktreeCreate` hook dispatcher, `writ install`, and the SQLite lease store. Those are milestone **M1** ([#124](https://github.com/rmems/writ/issues/124)). Until they land, enforcement applies only to commands routed through `writ` deliberately — it is **opt-in, not unbypassable**.
 
 ## Architecture
@@ -59,16 +59,16 @@ These apply to every agent, platform, and command path:
 
 Soft prompt text is not runtime enforcement. Hard stops live in Rust, at the binary boundary, where a malformed prompt cannot bypass them.
 
-## Owner allowlist — not currently enforced
+## Owner allowlist — claim enforces it; discovery does not
 
 > [!WARNING]
-> **`WRIT_ALLOWED_OWNERS` has no reader anywhere under `crates/`.** It was enforced in the Python layer this repository just removed, so owner scoping is presently a stated requirement with no code behind it. Do not rely on it as an access control. Tracked in [#146](https://github.com/rmems/writ/issues/146).
+> **`writ claim` reads `WRIT_ALLOWED_OWNERS` (then `WH_ALLOWED_OWNERS`) and rejects other owners when that list is set.** Multi-owner discovery and scheduling still have no allowlist reader after the Python layer was removed, so do not treat the variable as a fleet-wide access control. Tracked in [#146](https://github.com/rmems/writ/issues/146).
 
-The intended contract, for when enforcement lands:
+The intended contract:
 
 - Repository access is controlled by a configured owner allowlist, not a built-in org list.
 - Set `WRIT_ALLOWED_OWNERS=acme,example-org` (comma-separated), or pass explicit owners at the API boundary.
-- An empty allowlist denies multi-owner operations rather than permitting them.
+- An empty or unset allowlist does not restrict an explicit single-repository `writ claim`. Multi-owner discovery should still deny by default once [#146](https://github.com/rmems/writ/issues/146) lands.
 
 Examples use generic owners such as `acme` and `example-org`.
 
@@ -97,6 +97,7 @@ cargo test --workspace
 - [`SKILL.md`](SKILL.md) — portable agent procedure (guidance, not a security boundary)
 - [`REVIEW.md`](REVIEW.md) — pull-request lifecycle and review checklist
 - [`docs/workflows/safe-issue-verified-commit.md`](docs/workflows/safe-issue-verified-commit.md) — issue → verified push
+- [`docs/workflows/claim-worktree-isolation.md`](docs/workflows/claim-worktree-isolation.md) — claim → branch → isolated worktree
 - [`docs/workflows/safe-verified-commit-to-pr.md`](docs/workflows/safe-verified-commit-to-pr.md) — verified push → PR handoff (never merges)
 - Product epic: [#1](https://github.com/rmems/writ/issues/1) · Current phase: [#124](https://github.com/rmems/writ/issues/124)
 - Threat model: [#22](https://github.com/rmems/writ/issues/22) · Boundary contract tests: [#81](https://github.com/rmems/writ/issues/81)
