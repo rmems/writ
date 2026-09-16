@@ -63,6 +63,7 @@ struct CreateRequest<'a> {
 fn writ_cmd(root: &Path, create_args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_writ"))
         .env("WRIT_WORKTREE_BASE", root.join("worktrees"))
+        .env("WRIT_LEASE_PATH", root.join("leases.db"))
         .args(["--json", "worktree", "create"])
         .args(create_args)
         .output()
@@ -292,6 +293,59 @@ fn v2_success_reports_verified_path_ref_commit_and_registration_identity() {
             "worktree_registered": envelope["data"]["worktree_registered"],
         })
     );
+}
+
+#[test]
+fn create_remove_reclaim_succeeds_for_same_job_and_start_commit() {
+    let (root, repo) = primed();
+    let start = git(&repo, &["rev-parse", "HEAD"]);
+    let first = writ_create(
+        &root.0,
+        &repo,
+        CreateRequest {
+            job: "reclaim",
+            branch: "hive/gh-42",
+            start: &start,
+        },
+    );
+    assert!(
+        first.status.success(),
+        "stderr={:?}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let path = json(&first)["data"]["path"].as_str().unwrap().to_owned();
+
+    let remove = Command::new(env!("CARGO_BIN_EXE_writ"))
+        .env("WRIT_WORKTREE_BASE", root.0.join("worktrees"))
+        .env("WRIT_LEASE_PATH", root.0.join("leases.db"))
+        .args(["--json", "worktree", "remove", &path])
+        .output()
+        .unwrap();
+    assert!(
+        remove.status.success(),
+        "stderr={:?}",
+        String::from_utf8_lossy(&remove.stderr)
+    );
+    assert_eq!(git(&repo, &["rev-parse", "refs/heads/hive/gh-42"]), start);
+
+    let second = writ_create(
+        &root.0,
+        &repo,
+        CreateRequest {
+            job: "reclaim",
+            branch: "hive/gh-42",
+            start: &start,
+        },
+    );
+    assert!(
+        second.status.success(),
+        "reclaim failed: stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let envelope = json(&second);
+    assert_eq!(envelope["data"]["start_commit"], start);
+    assert_eq!(envelope["data"]["head_commit"], start);
 }
 
 #[test]

@@ -32,10 +32,7 @@ borrowed_identity!(BranchRef);
 borrowed_identity!(HexOidPrefix);
 
 /// Resolve a caller-supplied commit-ish to one exact commit object.
-pub(crate) fn resolve_start_commit(
-    repo_root: &Path,
-    start_point: StartPoint<'_>,
-) -> Result<String> {
+pub fn resolve_start_commit(repo_root: &Path, start_point: StartPoint<'_>) -> Result<String> {
     reject_empty_start_point(start_point)?;
     enforce_leading_hex_oid(start_point, None)?;
     let commit = peel_to_commit(repo_root, start_point)?;
