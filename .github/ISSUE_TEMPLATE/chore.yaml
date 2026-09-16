@@ -1,21 +1,22 @@
-name: Feature
-description: New skill, CLI, or enforcement capability
-title: "[Feature]: "
+name: Chore
+description: Hygiene, packaging, or docs-only work
+title: "[Chore]: "
 body:
   - type: markdown
     attributes:
       value: |
-        Use this template for a new `writ` capability. Keep the write-up short
-        enough that a worker can act without a second round trip. Use only the
-        canonical labels in CONTRIBUTING.md. Runtime merge, auto-merge, merge
-        queues, and bare `--force` are forbidden.
+        Use this template for repo hygiene, packaging, templates, and
+        docs-only work. Prefer the `docs` label for operator docs and
+        templates; use `platform` for install/packaging. Use only the
+        canonical labels in CONTRIBUTING.md. Runtime merge, auto-merge,
+        merge queues, and bare `--force` are forbidden.
 
   - type: textarea
     id: summary
     attributes:
       label: Summary
       description: One or two sentences. This is what workers treat as the title-level intent.
-      placeholder: Reject ambiguous unqualified start-point refs during worktree create.
+      placeholder: Document canonical issue labels and add feature/bug/chore templates.
     validations:
       required: true
 
@@ -23,8 +24,8 @@ body:
     id: problem-context
     attributes:
       label: Problem / context
-      description: What is blocked today, who hits it, and why a new capability is the right fix.
-      placeholder: Exact-base resolution accepts an ambiguous refname, so a worker can start from a same-named tag.
+      description: Why this hygiene matters now, and what stays out of scope.
+      placeholder: Label meanings are undocumented, so follow-up issues are thin and hard to filter.
     validations:
       required: true
 
@@ -46,11 +47,11 @@ body:
       label: Canonical label
       description: Apply this same GitHub label on the issue. Do not invent a new name.
       options:
-        - core
-        - orchestrator
+        - docs
         - platform
         - safety
-        - docs
+        - core
+        - orchestrator
         - epic
     validations:
       required: true
