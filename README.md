@@ -280,6 +280,22 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
+## Install the agent skill
+
+`SKILL.md` is the portable procedure (not a security boundary). Clone once, then symlink that directory into a skill root so `<root>/writ/SKILL.md` resolves. Shared hub:
+
+```bash
+git clone https://github.com/rmems/writ.git "$HOME/src/writ"
+"$HOME/src/writ/scripts/install-skill.sh"
+test -f "$HOME/.agents/skills/writ/SKILL.md" && echo OK
+```
+
+`./scripts/install-skill.sh --root all` also links Grok, Cline, Claude Code, and Cursor roots. The installer is idempotent, creates parent directories, and refuses to clobber a non-symlink without `--force`. Restart the agent (or start a new session) and list skills, or run `/skills writ`.
+
+Full root table, uninstall, verification, and WSL notes: [`docs/install.md`](docs/install.md).
+
+This is not `writ install`. Hook registration into `.claude/settings.json` is milestone M1 and is not built yet ([#124](https://github.com/rmems/writ/issues/124)).
+
 ## Runtime paths
 
 | Purpose | Default | Override |
@@ -336,12 +352,14 @@ criteria checkboxes, and the Linear footer documented in
 - Planning mirror: [Linear `worktrees-hives` project](https://linear.app/rpd-34/project/worktrees-hives-e3052de4caa3) (this issue: [RM-118](https://linear.app/rpd-34/issue/RM-118/expand-readme-install-commands-architecture))
 
 Milestone groups from the epic: **M1** hook enforcement + minimal lease store; **M2** rename (landed); **M3** cross-repo lease/state + MCP; **M4** path-scoped admission.
+>>>>>>> main
 
 ## Project documentation
 
 - [`AGENTS.md`](AGENTS.md) — the authoritative contribution, autonomy, and safety contract
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — issue templates and canonical labels
 - [`SKILL.md`](SKILL.md) — portable agent procedure (guidance, not a security boundary)
+- [`docs/install.md`](docs/install.md) — clone + symlink skill install, cross-agent roots, uninstall
 - [`REVIEW.md`](REVIEW.md) — pull-request lifecycle and review checklist
 - [`docs/adr/0001-rust-only-v1-runtime-and-babysit-pr-boundary.md`](docs/adr/0001-rust-only-v1-runtime-and-babysit-pr-boundary.md) — v1 Rust-only runtime and Codex `babysit-pr` boundary
 - [`docs/workflows/safe-issue-verified-commit.md`](docs/workflows/safe-issue-verified-commit.md) — issue → verified push
