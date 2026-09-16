@@ -32,10 +32,7 @@ borrowed_identity!(BranchRef);
 borrowed_identity!(HexOidPrefix);
 
 /// Resolve a caller-supplied commit-ish to one exact commit object.
-pub(crate) fn resolve_start_commit(
-    repo_root: &Path,
-    start_point: StartPoint<'_>,
-) -> Result<String> {
+pub fn resolve_start_commit(repo_root: &Path, start_point: StartPoint<'_>) -> Result<String> {
     reject_empty_start_point(start_point)?;
     enforce_leading_hex_oid(start_point, None)?;
     let commit = peel_to_commit(repo_root, start_point)?;
@@ -168,6 +165,22 @@ fn peel_to_commit(repo_root: &Path, start_point: StartPoint<'_>) -> Result<Strin
         })?;
 
     if output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.to_ascii_lowercase().contains("is ambiguous") {
+            return Err(Error::GitCommand {
+                args: vec![
+                    "rev-parse".into(),
+                    "--verify".into(),
+                    "--end-of-options".into(),
+                    commitish,
+                ],
+                stderr: format!(
+                    "ambiguous start point {:?}: {}",
+                    start_point.as_str(),
+                    stderr.trim()
+                ),
+            });
+        }
         return Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned());
     }
     Err(Error::GitCommand {

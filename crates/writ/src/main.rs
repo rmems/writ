@@ -1,4 +1,4 @@
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -55,6 +55,19 @@ enum Command {
     Worktree {
         #[command(subcommand)]
         action: WorktreeAction,
+    },
+
+    /// Dispatch a Claude Code hook event from JSON on stdin.
+    Hook,
+
+    /// Idempotently write the writ hook block into Claude Code settings.
+    Install {
+        /// Settings file to update (default: `.claude/settings.json` in the current directory).
+        #[arg(long)]
+        settings: Option<PathBuf>,
+        /// Executable the hook should invoke (default: `WRIT_BIN`, then `writ` on `PATH`).
+        #[arg(long)]
+        writ_bin: Option<PathBuf>,
     },
 }
 
@@ -318,12 +331,83 @@ fn run_worktree(
     let response = worktree_response(action)?;
 
     if json {
-        serde_json::to_writer(&mut *stdout, &response).map_err(io::Error::other)?;
-        stdout.write_all(b"\n")?;
+        write_json_line(stdout, &response)?;
     } else {
         writeln!(stdout, "ok={} command={}", response.ok, response.command)?;
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn run_hook(stdout: &mut impl Write) -> writ_core::error::Result<ExitCode> {
+    let mut input = String::new();
+    io::stdin().read_to_string(&mut input)?;
+    let code = writ_core::hook::dispatch(
+        &input,
+        &writ_core::hook::HookRuntime::default(),
+        stdout,
+        &mut io::stderr(),
+    );
+    Ok(ExitCode::from(code))
+}
+
+fn run_install(
+    settings: Option<PathBuf>,
+    writ_bin: Option<PathBuf>,
+    json: bool,
+    stdout: &mut impl Write,
+) -> writ_core::error::Result<ExitCode> {
+    let settings = settings.unwrap_or_else(|| PathBuf::from(".claude/settings.json"));
+    let command = writ_command(writ_bin);
+    let result =
+        writ_core::install::install_settings(&settings, writ_core::install::WritCommand(&command))?;
+    emit_install_output(json, stdout, &result, &command)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+fn emit_install_output(
+    json: bool,
+    stdout: &mut impl Write,
+    result: &writ_core::install::InstallResult,
+    command: &str,
+) -> io::Result<()> {
+    if json {
+        let response = writ_core::contract::Response::success(
+            "cli.install",
+            serde_json::json!({
+                "path": result.path,
+                "changed": result.changed,
+                "command": command,
+            }),
+        );
+        return write_json_line(stdout, &response);
+    }
+    writeln!(
+        stdout,
+        "install {} settings {}",
+        if result.changed {
+            "updated"
+        } else {
+            "unchanged"
+        },
+        result.path.display()
+    )
+}
+
+fn write_json_line(stdout: &mut impl Write, value: &impl serde::Serialize) -> io::Result<()> {
+    serde_json::to_writer(&mut *stdout, value).map_err(io::Error::other)?;
+    stdout.write_all(b"\n")
+}
+
+fn writ_command(writ_bin: Option<PathBuf>) -> String {
+    if let Some(path) = writ_bin {
+        return path.to_string_lossy().into_owned();
+    }
+    if let Some(path) = std::env::var_os("WRIT_BIN")
+        && !path.is_empty()
+    {
+        return path.to_string_lossy().into_owned();
+    }
+    "writ".to_owned()
 }
 
 /// Entry point for CLI commands (status/jobs, git/gh-safe, supervisor, worktree).
@@ -369,6 +453,10 @@ async fn run(cli: Cli, stdout: &mut impl Write) -> writ_core::error::Result<Exit
             }
         },
         Some(Command::Worktree { action }) => run_worktree(action, cli.json, stdout),
+        Some(Command::Hook) => run_hook(stdout),
+        Some(Command::Install { settings, writ_bin }) => {
+            run_install(settings, writ_bin, cli.json, stdout)
+        }
         None => {
             if cli.json {
                 serde_json::to_writer(

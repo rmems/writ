@@ -20,9 +20,7 @@ Claude Code agent teams have real coordination and [documented zero isolation](h
 `writ` fills that gap. It does not assign work. It **admits writes**.
 
 > [!NOTE]
-> **Status: the enforcement core is real; the hook layer is not built yet.**
-> Shipping today are the `git`/`gh` allowlists, exact-base worktree verification, path sandboxing, process supervision, and the absence of any merge path — reachable through the `writ` CLI, including `writ worktree create`, which remains supported.
-> Not yet built: the `PreToolUse`/`WorktreeCreate` hook dispatcher, `writ install`, and the SQLite lease store. Those are milestone **M1** ([#124](https://github.com/rmems/writ/issues/124)). Until they land, enforcement applies only to commands routed through `writ` deliberately — it is **opt-in, not unbypassable**.
+> **Status: Phase 1 hook dispatcher is in this tree.** `writ hook` admits `PreToolUse` (Bash `git`/`gh` only), `WorktreeCreate`, and `WorktreeRemove`, and `writ install` writes the hook block. The SQLite lease store is a skeleton: grant/release plus reserved budget columns, not MCP or budget enforcement. Live Claude Code end-to-end burn-in is still outstanding on [#124](https://github.com/rmems/writ/issues/124).
 
 ## Architecture
 
@@ -34,7 +32,7 @@ Two layers, one binary.
 | **Coordination state** (cross-repo) *(planned, M1)* | Agents, leases with path scopes, ownership, blockers, freeze modes. SQLite, single file, derived from `git`/`gh`/disk. Not implemented yet | Task decomposition or scheduling |
 | `git`, `gh`, OS | Version-control, GitHub, and process primitives, invoked through allowlists | Policy |
 
-Leases are intended to be the join: coordination state that the enforcement layer will check at write time. No lease store exists yet (M1).
+Leases are the join: coordination state that the enforcement layer checks at write time. Phase 1 ships a SQLite skeleton (`leases.db`) so create/remove is not a Markdown-only control plane. Budget columns are reserved and unused; enforcement is [#167](https://github.com/rmems/writ/issues/167).
 
 ### Why hooks (planned — M1)
 
@@ -44,7 +42,7 @@ Enforcement is designed to run as [Claude Code hooks](https://code.claude.com/do
 - **`WorktreeCreate`** — "Any non-zero exit code aborts worktree creation." This is the lease-admission seam.
 - **`WorktreeRemove`**, **`SubagentStart`/`SubagentStop`** — lease release and agent registry.
 
-This inverts the usual failure mode. Safety is normally opt-in: a tool must be *called* to help — which is exactly the position `writ` is in today. Once registered as a hook, it will apply regardless of whether the agent cooperates. That gap is the point of M1, and it is the honest reason the "unbypassable" property is described here as a design goal rather than a current guarantee.
+Register with `writ install`. Matcher scope starts at `Bash(git *)` and `Bash(gh *)` only.
 
 ## Safety invariants
 

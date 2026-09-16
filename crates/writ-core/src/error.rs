@@ -105,6 +105,11 @@ pub enum Error {
         /// Human-readable explanation.
         message: String,
     },
+    /// The SQLite lease store could not complete an operation.
+    LeaseStore {
+        context: &'static str,
+        message: String,
+    },
 }
 
 /// Machine-readable error codes for policy violations.
@@ -195,6 +200,9 @@ impl Display for Error {
             Self::PolicyViolation { code, message } => {
                 write!(f, "policy violation [{code}]: {message}")
             }
+            Self::LeaseStore { context, message } => {
+                write!(f, "{context}: {message}")
+            }
         }
     }
 }
@@ -222,6 +230,7 @@ impl Error {
             Self::ContractUpgradeRequired { .. } => "CONTRACT_UPGRADE_REQUIRED",
             Self::StartPointRequired => "START_POINT_REQUIRED",
             Self::PolicyViolation { code, .. } => code.as_str(),
+            Self::LeaseStore { .. } => "LEASE_STORE_FAILED",
         }
     }
 
