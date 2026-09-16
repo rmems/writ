@@ -1,0 +1,11 @@
+crates/writ/tests/worktree_cli.rs
+  376a2a22b751ca10 615
+crates/writ-core/src/identity.rs
+  376a2a22b751ca10 659
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "2c1fa82c8c5af96465997ecda9fff0804f30df76",
+  "prompts": {}
+}
