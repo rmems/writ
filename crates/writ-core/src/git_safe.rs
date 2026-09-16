@@ -1025,6 +1025,30 @@ pub fn normalize_github_repo_identity(spec: &str) -> Option<(String, String)> {
             s = after.to_owned();
         }
     }
+    // scp-like without user: host:owner/repo (e.g. github.com:owner/repo.git).
+    // The pre-colon token is only treated as a host when it looks like one
+    // (contains a dot), so local paths containing colons keep their existing
+    // interpretation. RM-824: without this, `github.com:evil/repo.git`
+    // normalizes to the wrong slug instead of the attacker's identity.
+    if !s.contains('@')
+        && !s.contains("://")
+        && let Some(colon) = s.find(':')
+    {
+        let (maybe_host, rest) = s.split_at(colon);
+        let path = &rest[1..];
+        let is_drive = maybe_host.len() == 1 && maybe_host.as_bytes()[0].is_ascii_alphabetic();
+        if !maybe_host.is_empty()
+            && maybe_host.contains('.')
+            && !maybe_host.contains('/')
+            && !maybe_host.contains('\\')
+            && !path.is_empty()
+            && !path.starts_with('/')
+            && !is_drive
+        {
+            host = maybe_host.to_ascii_lowercase();
+            s = path.to_owned();
+        }
+    }
     for prefix in ["https://", "http://", "ssh://", "git://"] {
         if let Some(rest) = s.strip_prefix(prefix) {
             s = rest.to_owned();
@@ -1908,6 +1932,16 @@ mod tests {
         assert_eq!(
             normalize_github_repo_slug("git@github.com:Acme/Repo.git").as_deref(),
             Some("acme/repo")
+        );
+        // scp-like without user (RM-824): `host:path` must resolve the real
+        // identity instead of collapsing to a `github.com/<host>` slug.
+        assert_eq!(
+            normalize_github_repo_identity("github.com:Acme/Repo.git"),
+            Some(("github.com".to_owned(), "acme/repo".to_owned()))
+        );
+        assert_eq!(
+            normalize_github_repo_identity("github.com:evil/repo.git"),
+            Some(("github.com".to_owned(), "evil/repo".to_owned()))
         );
         assert!(github_repo_slugs_match("Acme/Repo", "github.com/acme/repo"));
         assert!(!github_repo_slugs_match("Acme/Repo", "other/repo"));

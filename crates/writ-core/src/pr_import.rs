@@ -321,7 +321,37 @@ fn looks_like_local_remote(url: &str) -> bool {
     if text.starts_with('.') || text.starts_with("file://") {
         return true;
     }
+    // scp-like `[user@]host:path` is a remote even without `user@`
+    // (`github.com:evil/repo.git`). Git resolves it over SSH, so it must flow
+    // through identity normalization and unauthorized-source rejection instead
+    // of being trusted as a local path (RM-824).
+    if is_scp_like_remote(text) {
+        return false;
+    }
     !loc.has_url_scheme() && !loc.has_ssh_user()
+}
+
+/// Whether `text` uses git's scp-like `[user@]host:path` syntax, which git
+/// resolves as an SSH remote rather than a local path. Mirrors git's own rule:
+/// no URL scheme, and a `:` before the first `/`. Windows drive prefixes
+/// (`C:/...`) are local paths, and the `ext::` transport is rejected
+/// separately before this classifier runs.
+fn is_scp_like_remote(text: &str) -> bool {
+    if text.contains("://") || text.starts_with("ext::") {
+        return false;
+    }
+    let Some(colon) = text.find(':') else {
+        return false;
+    };
+    let (host, path) = text.split_at(colon);
+    let path = &path[1..];
+    if host.is_empty() || path.is_empty() {
+        return false;
+    }
+    if host.len() == 1 && host.as_bytes()[0].is_ascii_alphabetic() {
+        return false;
+    }
+    !host.contains('/') && !host.contains('\\')
 }
 
 fn optional_rev_parse(repo_root: &Path, rev: RefName<'_>) -> Option<String> {
@@ -746,6 +776,55 @@ mod tests {
     }
 
     #[test]
+    fn scp_like_remote_without_user_is_rejected_as_unauthorized() {
+        // RM-824: `github.com:evil/widgets.git` (no `user@`) was misclassified
+        // as a local path, bypassing unauthorized-source enforcement, while
+        // the same identity with `git@` was correctly rejected. Both must now
+        // fail closed through the same rejection path.
+        let harness = OriginHarness::new();
+        for origin_url in [
+            "github.com:evil/widgets.git",
+            "git@github.com:evil/widgets.git",
+        ] {
+            git(&harness.clone, &["remote", "set-url", "origin", origin_url]);
+            let err =
+                import_and_verify_pr_head(harness.request(1, &harness.missing_head)).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    Error::PolicyViolation {
+                        code: PolicyCode::UnauthorizedSource,
+                        ..
+                    }
+                ),
+                "origin `{origin_url}` was not rejected: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn scp_like_expected_repo_and_local_remotes_keep_working() {
+        // The expected repo in scp-like form (with or without `user@`) stays
+        // allowed, and legitimate local remotes still enable file protocol.
+        let dir = tempdir().unwrap();
+        let oid = "0".repeat(40);
+        let request = PrHeadImportRequest {
+            repo_root: dir.path(),
+            owner: "acme",
+            repo: "widgets",
+            pr_number: 1,
+            expected_oid: &oid,
+            source_remote: "origin",
+            head_repo: None,
+        };
+        assert!(!origin_url_is_in_scope(&request, "github.com:acme/widgets.git").unwrap());
+        assert!(!origin_url_is_in_scope(&request, "git@github.com:acme/widgets.git").unwrap());
+        assert!(origin_url_is_in_scope(&request, "/srv/repos/widgets.git").unwrap());
+        assert!(origin_url_is_in_scope(&request, "./widgets.git").unwrap());
+        assert!(origin_url_is_in_scope(&request, "file:///srv/repos/widgets.git").unwrap());
+    }
+
+    #[test]
     fn concurrent_imports_use_isolated_namespaces() {
         let harness = OriginHarness::new();
         let first = harness.publish_pr_commit(11, "one");
@@ -830,6 +909,11 @@ mod tests {
             ("./rel.git", false, true),
             ("https://github.com/acme/widgets.git", true, false),
             ("git@github.com:acme/widgets.git", true, false),
+            // RM-824: scp-like without `user@` is a remote, not a local path.
+            ("github.com:evil/repo.git", false, false),
+            ("github.com:acme/widgets.git", false, false),
+            // Windows drive prefix with forward slashes stays a local path.
+            ("C:/src/repo.git", false, true),
             ("ext::sh -c evil", false, true),
             ("-upload-pack", true, true),
             ("acme/fork", false, true),
