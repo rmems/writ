@@ -72,6 +72,15 @@ impl Display for WorktreePostconditionFailure {
     }
 }
 
+/// One fully qualified ref that collided with an unqualified start point.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AmbiguousRef {
+    /// Fully qualified refname, such as `refs/heads/collision`.
+    pub refname: String,
+    /// Canonical commit that ref peels to.
+    pub commit: String,
+}
+
 /// Errors returned by core primitives.
 #[derive(Debug)]
 pub enum Error {
@@ -90,6 +99,12 @@ pub enum Error {
     },
     /// A git subprocess command failed.
     GitCommand { args: Vec<String>, stderr: String },
+    /// An unqualified start point named more than one commit-ish.
+    AmbiguousStartPoint {
+        start_point: String,
+        refs: Vec<AmbiguousRef>,
+        git_warning: Option<String>,
+    },
     /// A worktree create transaction failed and may have left residual state.
     WorktreeCreationFailed(Box<WorktreeCreationFailure>),
     /// Creation completed but its exact branch/ref/HEAD identity was not preserved.
@@ -103,6 +118,11 @@ pub enum Error {
         /// Machine-readable policy error code.
         code: PolicyCode,
         /// Human-readable explanation.
+        message: String,
+    },
+    /// The SQLite lease store could not complete an operation.
+    LeaseStore {
+        context: &'static str,
         message: String,
     },
 }
@@ -179,6 +199,20 @@ impl Display for Error {
                     stderr.trim()
                 )
             }
+            Self::AmbiguousStartPoint {
+                start_point,
+                refs,
+                git_warning,
+            } => {
+                write!(f, "ambiguous start point `{start_point}`")?;
+                for colliding in refs {
+                    write!(f, " {}={}", colliding.refname, colliding.commit)?;
+                }
+                if let Some(warning) = git_warning {
+                    write!(f, "; {warning}")?;
+                }
+                write!(f, "; qualify as refs/heads/<name> or refs/tags/<name>")
+            }
             Self::WorktreeCreationFailed(failure) => Display::fmt(failure.as_ref(), f),
             Self::WorktreePostconditionFailed(failure) => Display::fmt(failure.as_ref(), f),
             Self::ContractUpgradeRequired {
@@ -194,6 +228,9 @@ impl Display for Error {
             ),
             Self::PolicyViolation { code, message } => {
                 write!(f, "policy violation [{code}]: {message}")
+            }
+            Self::LeaseStore { context, message } => {
+                write!(f, "{context}: {message}")
             }
         }
     }
@@ -217,11 +254,13 @@ impl Error {
             Self::SandboxViolation { .. } => "SANDBOX_VIOLATION",
             Self::Io { .. } => "IO_ERROR",
             Self::GitCommand { .. } => "GIT_COMMAND_FAILED",
+            Self::AmbiguousStartPoint { .. } => "AMBIGUOUS_START_POINT",
             Self::WorktreeCreationFailed(_) => "WORKTREE_CREATE_FAILED",
             Self::WorktreePostconditionFailed(_) => "WORKTREE_POSTCONDITION_FAILED",
             Self::ContractUpgradeRequired { .. } => "CONTRACT_UPGRADE_REQUIRED",
             Self::StartPointRequired => "START_POINT_REQUIRED",
             Self::PolicyViolation { code, .. } => code.as_str(),
+            Self::LeaseStore { .. } => "LEASE_STORE_FAILED",
         }
     }
 
@@ -270,5 +309,19 @@ mod tests {
 
         assert_eq!(policy.exit_code(), 2);
         assert_eq!(postcondition.exit_code(), 1);
+
+        let ambiguous = Error::AmbiguousStartPoint {
+            start_point: "collision".to_owned(),
+            refs: vec![super::AmbiguousRef {
+                refname: "refs/heads/collision".to_owned(),
+                commit: "0".repeat(40),
+            }],
+            git_warning: None,
+        };
+        assert_eq!(ambiguous.exit_code(), 1);
+        assert_eq!(ambiguous.code(), "AMBIGUOUS_START_POINT");
+        let displayed = ambiguous.to_string();
+        assert!(displayed.contains("collision"), "{displayed}");
+        assert!(displayed.contains("refs/heads/collision"), "{displayed}");
     }
 }

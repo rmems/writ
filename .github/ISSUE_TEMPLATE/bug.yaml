@@ -1,36 +1,69 @@
-name: Bug report / unexpected behavior (subagent spawn or worktree sandbox)
-description: Report a bug in subagent spawning, worktree isolation, safety gates, etc.
-
+name: Bug
+description: Unexpected skill, CLI, CI, or process failure
+title: "[Bug]: "
 body:
-- type: markdown
-  attributes:
-    value: |
-      ## 🛡️ Safety-first debug mode — no auto-merge allowed!
+  - type: markdown
+    attributes:
+      value: |
+        Report a failure in worktree isolation, safety gates, CI, or agent
+        process. Include commands and exit codes when a CLI path is involved.
+        Use only the canonical labels in CONTRIBUTING.md. Runtime merge,
+        auto-merge, merge queues, and bare `--force` are forbidden.
 
-      This repo runs agents that spawn isolated git worktrees for issue → PR workflows (never auto merge). Bug reports should focus on agent behavior, not just "it broke" to help subagents understand root cause.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: One or two sentences. This is what workers treat as the title-level intent.
+      placeholder: "`writ worktree create` accepts an ambiguous start-point ref and checks out the tag."
+    validations:
+      required: true
 
-- type: input
-  id: bug-title
-  attributes:
-    label: Bug title or one-line summary? 
-    description: Short name of what went wrong  
-    placeholder: e.g., "Agent spawns PR into wrong branch for #42, worktree isolation fails"  
+  - type: textarea
+    id: problem-context
+    attributes:
+      label: Problem / context
+      description: "Repro steps, expected vs actual, and commands with exit codes. Attach `--json` envelopes when relevant."
+      placeholder: |
+        1. Command run
+        2. Observed result (stdout/stderr, exit code)
+        3. Expected result
+    validations:
+      required: true
 
-- type: textarea
-  id: steps-to-repro
-  attributes:
-    label: Steps to reproduce (required) — include agent commands, CLI args, GitHub/Linear issue numbers? 
-    description: |
-      List exactly what the subagent did wrong. If it involves CLI tooling (`writ status`, `writ git-safe push`), specify command output + exit codes too!
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Checkboxes workers parse as the Done bar. Add or delete rows as needed.
+      value: |
+        - [ ]
+        - [ ]
+        - [ ]
+    validations:
+      required: true
 
-- type: textarea
-  attributes:
-    label: Expected behavior / agent policy violation (if applicable)? 
-    description: |  
-      Did the Rust safety gate reject a bad commit, or let one through? If the command emits a JSON envelope, say whether `--json` was passed and whether `schema_version` matched what the caller expected.
+  - type: dropdown
+    id: canonical-label
+    attributes:
+      label: Canonical label
+      description: Apply this same GitHub label on the issue. Do not invent a new name.
+      options:
+        - core
+        - orchestrator
+        - platform
+        - safety
+        - docs
+        - epic
+    validations:
+      required: true
 
-- type: textarea
-  id: environment-details
-  attributes:
-    label: Environment + traces (optional but helpful) — Rust toolchain version, OS and architecture, GitHub Actions workflow names, or local sub-agent spawn logs
-    description: |
+  - type: textarea
+    id: linear
+    attributes:
+      label: Linear
+      description: Planning twin. Keep this footer even when no twin exists yet; replace the placeholders when it does.
+      value: |
+        Linear: <url> (`RM-N`)
+    validations:
+      required: true

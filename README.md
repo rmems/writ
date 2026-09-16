@@ -39,6 +39,9 @@ Claude Code agent teams have real coordination and [documented zero isolation](h
 
 `writ` fills that gap. It does not assign work. It **admits writes**.
 
+> [!NOTE]
+> **Status: Phase 1 hook dispatcher is in this tree.** `writ hook` admits `PreToolUse` (Bash `git`/`gh` only), `WorktreeCreate`, and `WorktreeRemove`, and `writ install` writes the hook block. The SQLite lease store is a skeleton: grant/release plus reserved budget columns, not MCP or budget enforcement. Live Claude Code end-to-end burn-in is still outstanding on [#124](https://github.com/rmems/writ/issues/124).
+
 ## Install
 
 Two pieces: the **binary** (enforcement) and the **skill** (portable agent procedure). Install both. Neither is a substitute for the other.
@@ -133,7 +136,7 @@ Two layers, one binary.
 | **Coordination state** (cross-repo) *(planned, M1)* | Agents, leases with path scopes, ownership, blockers, freeze modes. SQLite, single file, derived from `git`/`gh`/disk. Not implemented yet | Task decomposition or scheduling |
 | `git`, `gh`, OS | Version-control, GitHub, and process primitives, invoked through allowlists | Policy |
 
-Leases are intended to be the join: coordination state that the enforcement layer will check at write time. No lease store exists yet (M1).
+Leases are the join: coordination state that the enforcement layer checks at write time. Phase 1 ships a SQLite skeleton (`leases.db`) so create/remove is not a Markdown-only control plane. Budget columns are reserved and unused; enforcement is [#167](https://github.com/rmems/writ/issues/167).
 
 ```text
                     ┌─────────────────────────┐
@@ -173,7 +176,7 @@ Enforcement is designed to run as [Claude Code hooks](https://code.claude.com/do
 - **`WorktreeCreate`** — "Any non-zero exit code aborts worktree creation." This is the lease-admission seam.
 - **`WorktreeRemove`**, **`SubagentStart`/`SubagentStop`** — lease release and agent registry.
 
-This inverts the usual failure mode. Safety is normally opt-in: a tool must be *called* to help — which is exactly the position `writ` is in today. Once registered as a hook, it will apply regardless of whether the agent cooperates. That gap is the point of M1, and it is the honest reason the "unbypassable" property is described here as a design goal rather than a current guarantee.
+Register with `writ install`. Matcher scope starts at `Bash(git *)` and `Bash(gh *)` only.
 
 ### Glossary
 
@@ -299,6 +302,28 @@ If the new `writ` data root is absent and a pre-rename `worktrees-hives` root st
 | Owner allowlist did not block another org | Not enforced in code yet ([#146](https://github.com/rmems/writ/issues/146)). Treat it as an operator policy. |
 | `writ install` is missing | Planned M1. Do not invent a second installer. Track [#18](https://github.com/rmems/writ/issues/18) and [#124](https://github.com/rmems/writ/issues/124). |
 
+## Issue labels and templates
+
+Canonical product labels (use these; do not invent new names unless the epic
+expands the taxonomy). Prefer **`docs`** over GitHub’s default `documentation`.
+Keep GitHub label descriptions identical to this table (commands in
+[`CONTRIBUTING.md`](CONTRIBUTING.md)):
+
+| Label | Description |
+| --- | --- |
+| `epic` | Multi-issue umbrella / milestone grouping |
+| `core` | Skill loop primitives (discover, claim, PR, babysit, state) |
+| `orchestrator` | Multi-subagent scheduling, caps, join/report |
+| `docs` | README, SKILL.md, templates, operator docs |
+| `platform` | Install paths, multi-agent-host packaging, validation on second host |
+| `safety` | Never-merge, force-with-lease, fix caps, owner allowlist, hang recovery |
+
+Optional GitHub issue forms live in [`.github/ISSUE_TEMPLATE/`](.github/ISSUE_TEMPLATE/):
+**Feature** (new capability), **Bug** (unexpected failure), **Chore** (hygiene,
+packaging, docs-only). Each asks for Summary, Problem / context, Acceptance
+criteria checkboxes, and the Linear footer documented in
+[`CONTRIBUTING.md`](CONTRIBUTING.md).
+
 ## Roadmap and issues
 
 - Product epic: [#1](https://github.com/rmems/writ/issues/1)
@@ -315,8 +340,10 @@ Milestone groups from the epic: **M1** hook enforcement + minimal lease store; *
 ## Project documentation
 
 - [`AGENTS.md`](AGENTS.md) — the authoritative contribution, autonomy, and safety contract
+- [`CONTRIBUTING.md`](CONTRIBUTING.md) — issue templates and canonical labels
 - [`SKILL.md`](SKILL.md) — portable agent procedure (guidance, not a security boundary)
 - [`REVIEW.md`](REVIEW.md) — pull-request lifecycle and review checklist
+- [`docs/adr/0001-rust-only-v1-runtime-and-babysit-pr-boundary.md`](docs/adr/0001-rust-only-v1-runtime-and-babysit-pr-boundary.md) — v1 Rust-only runtime and Codex `babysit-pr` boundary
 - [`docs/workflows/safe-issue-verified-commit.md`](docs/workflows/safe-issue-verified-commit.md) — issue → verified push
 - [`docs/workflows/safe-verified-commit-to-pr.md`](docs/workflows/safe-verified-commit-to-pr.md) — verified push → PR handoff (never merges)
 - [`docs/status-schema.md`](docs/status-schema.md) — `status` / `jobs` JSON
