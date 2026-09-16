@@ -391,6 +391,105 @@ fn partial_create_failure_reports_residual_state_without_deleting_branch() {
     );
 }
 
+fn fork_layout() -> (TestDir, PathBuf, String, String) {
+    let root = TestDir::new();
+    let origin = root.0.join("origin.git");
+    let init = Command::new("git")
+        .current_dir(&root.0)
+        .args(["init", "--bare", origin.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        init.status.success(),
+        "git init --bare failed: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    let repo = init_repo(&root.0);
+    git(
+        &repo,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    );
+    git(&repo, &["push", "origin", "HEAD:refs/heads/trunk"]);
+    let base = git(&repo, &["rev-parse", "HEAD"]);
+
+    let fork = root.0.join("fork");
+    let clone = Command::new("git")
+        .current_dir(&root.0)
+        .args(["clone", origin.to_str().unwrap(), fork.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        clone.status.success(),
+        "git clone failed: {}",
+        String::from_utf8_lossy(&clone.stderr)
+    );
+    git(&fork, &["config", "user.email", "test@example.com"]);
+    git(&fork, &["config", "user.name", "Test User"]);
+    git(&fork, &["commit", "--allow-empty", "-m", "fork"]);
+    let fork_head = git(&fork, &["rev-parse", "HEAD"]);
+    git(&fork, &["push", "origin", "HEAD:refs/pull/42/head"]);
+    (root, repo, base, fork_head)
+}
+
+#[test]
+fn v2_create_imports_fork_pr_head_absent_from_clone() {
+    let (root, repo, base, fork_head) = fork_layout();
+    assert_ne!(base, fork_head);
+    let output = writ_cmd(
+        &root.0,
+        &[
+            "--schema-version",
+            "2",
+            "--repo",
+            repo.to_str().unwrap(),
+            "--start-point",
+            &fork_head,
+            "--pr-number",
+            "42",
+            "--head-repo",
+            "acme/fork",
+            "acme",
+            "sample",
+            "fork-job",
+            "feature/fork",
+        ],
+    );
+    let envelope = json(&output);
+    assert!(
+        output.status.success(),
+        "stderr={:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(envelope["data"]["start_commit"], fork_head);
+    assert_eq!(envelope["data"]["head_commit"], fork_head);
+}
+
+#[test]
+fn v2_create_mismatching_pr_head_reports_residual_without_mutation() {
+    let (root, repo, base, _) = fork_layout();
+    let output = writ_cmd(
+        &root.0,
+        &[
+            "--schema-version",
+            "2",
+            "--repo",
+            repo.to_str().unwrap(),
+            "--start-point",
+            &base,
+            "--pr-number",
+            "42",
+            "acme",
+            "sample",
+            "mismatch",
+            "feature/mismatch",
+        ],
+    );
+    let envelope = assert_error_envelope(&output, 1, 2, "PR_IMPORT_FAILED");
+    assert_eq!(envelope["data"]["cleanup_performed"], false);
+    assert_eq!(envelope["data"]["import_ref_exists"], true);
+    assert_uncreated(&root.0, &repo, "mismatch", "feature/mismatch");
+}
+
 fn collision_repo(root: &Path) -> (PathBuf, String, String) {
     let repo = init_repo(root);
     let branch_commit = git(&repo, &["rev-parse", "HEAD"]);

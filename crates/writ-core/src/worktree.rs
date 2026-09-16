@@ -11,6 +11,7 @@ use crate::identity::{
 use crate::lease::{LeaseGrant, LeaseStore, ResumeKey};
 use crate::paths::{canonicalize_for_tools, derive_worktree_path, worktree_base_path};
 use crate::porcelain;
+use crate::pr_import::{PrHeadImportRequest, import_and_verify_pr_head};
 
 #[derive(Clone, Copy)]
 struct GitArgList<'a>(&'a [&'a str]);
@@ -51,6 +52,12 @@ pub struct WorktreeCreateRequest<'a> {
     pub job_id: &'a str,
     pub branch: &'a str,
     pub start_point: &'a str,
+    /// GitHub pull request number whose `refs/pull/<n>/head` is imported from origin.
+    pub pr_number: Option<u64>,
+    /// Named remote bound to the base repository. Must be `origin` when set.
+    pub source_remote: Option<&'a str>,
+    /// Fork `owner/repo` documentation only; never used as fetch or checkout authority.
+    pub head_repo: Option<&'a str>,
 }
 
 /// Manages isolated git worktrees for hive jobs.
@@ -148,6 +155,9 @@ impl WorktreeManager {
             job_id,
             branch,
             start_point,
+            pr_number: None,
+            source_remote: None,
+            head_repo: None,
         })
     }
 
@@ -161,7 +171,7 @@ impl WorktreeManager {
 
         // Resolve the caller-selected start point before any mutation. Appending
         // ^{commit} rejects trees/blobs and peels annotated tags to commits.
-        let start_commit = resolve_start_commit(request.repo_root, start_point)?;
+        let start_commit = resolve_verified_start_commit(&request, start_point)?;
         let worktree_path = prepare_worktree_path(
             base,
             Owner(request.owner),
@@ -317,6 +327,29 @@ impl WorktreeManager {
         }
 
         Ok(())
+    }
+}
+
+fn resolve_verified_start_commit(
+    request: &WorktreeCreateRequest<'_>,
+    start_point: StartPoint<'_>,
+) -> Result<String> {
+    match request.pr_number {
+        Some(pr_number) => import_and_verify_pr_head(PrHeadImportRequest {
+            repo_root: request.repo_root,
+            owner: request.owner,
+            repo: request.repo,
+            pr_number,
+            expected_oid: start_point.as_str(),
+            source_remote: request.source_remote.unwrap_or("origin"),
+            head_repo: request.head_repo,
+        }),
+        None => {
+            if request.head_repo.is_some() || request.source_remote.is_some() {
+                return Err(Error::PrImportIdentityRequired);
+            }
+            resolve_start_commit(request.repo_root, start_point)
+        }
     }
 }
 
@@ -1183,6 +1216,9 @@ mod tests {
                 job_id,
                 branch,
                 start_point,
+                pr_number: None,
+                source_remote: None,
+                head_repo: None,
             }
         }
 
@@ -1716,6 +1752,112 @@ mod tests {
         );
     }
 
+    fn git_cwd(dir: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    struct ForkWorktree {
+        harness: Harness,
+        fork_head: String,
+        base_head: String,
+    }
+
+    impl ForkWorktree {
+        fn new() -> Self {
+            let harness = Harness::sha1();
+            let origin = harness.temp_path().join("origin.git");
+            git_cwd(
+                harness.temp_path(),
+                &["init", "--bare", origin.to_str().unwrap()],
+            );
+            let base_head = harness.head();
+            harness.git(&["remote", "add", "origin", origin.to_str().unwrap()]);
+            harness.git(&["push", "origin", "HEAD:refs/heads/main"]);
+
+            let fork = harness.temp_path().join("fork");
+            git_cwd(
+                harness.temp_path(),
+                &["clone", origin.to_str().unwrap(), fork.to_str().unwrap()],
+            );
+            git_output(&fork, &["config", "user.email", "test@example.com"]);
+            git_output(&fork, &["config", "user.name", "Test User"]);
+            git_output(&fork, &["commit", "--allow-empty", "-m", "fork head"]);
+            let fork_head = git_output(&fork, &["rev-parse", "HEAD"]);
+            git_output(&fork, &["push", "origin", "HEAD:refs/pull/42/head"]);
+            Self {
+                harness,
+                fork_head,
+                base_head,
+            }
+        }
+
+        fn create(&self, expected: &str, pr_number: Option<u64>) -> Result<Worktree> {
+            let mut request = self.harness.request("job-fork", "feature/fork", expected);
+            request.pr_number = pr_number;
+            request.head_repo = Some("acme/fork");
+            self.harness.manager.create_with_request(request)
+        }
+    }
+
+    #[test]
+    fn create_imports_absent_fork_pr_head_at_exact_commit() {
+        let fork = ForkWorktree::new();
+        assert_ne!(fork.fork_head, fork.base_head);
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&fork.harness.repo_root)
+                .args(["cat-file", "-e", &fork.fork_head])
+                .status()
+                .unwrap()
+                .code()
+                != Some(0)
+        );
+        let wt = fork.create(&fork.fork_head, Some(42)).unwrap();
+        assert_eq!(wt.start_commit.as_deref(), Some(fork.fork_head.as_str()));
+        assert_eq!(wt.head_commit.as_deref(), Some(fork.fork_head.as_str()));
+        assert_eq!(git_output(&wt.path, &["rev-parse", "HEAD"]), fork.fork_head);
+    }
+
+    #[test]
+    fn create_rejects_mismatched_pr_head_without_mutation() {
+        let fork = ForkWorktree::new();
+        let result = fork.create(&fork.base_head, Some(42));
+        assert!(
+            matches!(result, Err(Error::PrImportFailed(_))),
+            "unexpected result: {result:?}"
+        );
+        assert!(
+            git_output(
+                &fork.harness.repo_root,
+                &["branch", "--list", "feature/fork"]
+            )
+            .trim()
+            .is_empty()
+        );
+        assert!(!fork.harness.job_path("job-fork").exists());
+    }
+
+    #[test]
+    fn create_rejects_head_repo_without_pr_number() {
+        let harness = Harness::sha1();
+        let start = harness.head();
+        let mut request = harness.request("job-doc", "feature/doc", &start);
+        request.head_repo = Some("acme/fork");
+        let result = harness.manager.create_with_request(request);
+        assert!(matches!(result, Err(Error::PrImportIdentityRequired)));
+        assert!(!harness.job_path("job-doc").exists());
+    }
+
     #[test]
     fn prune_on_a_non_repository_errors_rather_than_acting() {
         let harness = Harness::sha1();
@@ -1891,6 +2033,9 @@ mod tests {
                 job_id: "job-nl",
                 branch: "feature/newline",
                 start_point: &start,
+                pr_number: None,
+                source_remote: None,
+                head_repo: None,
             })
             .unwrap();
         let listing = Command::new("git")

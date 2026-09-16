@@ -139,6 +139,9 @@ impl CreateInputs {
             job_id: &self.name,
             branch: &self.name,
             start_point: &self.start_commit,
+            pr_number: None,
+            source_remote: None,
+            head_repo: None,
         }
     }
 }

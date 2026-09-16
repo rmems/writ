@@ -1,0 +1,19 @@
+Directory;Absolute Time spent on Inspection Group 'all', s;Percent of Time spent on Inspection Group 'all';Inspections Problem Count in Group 'all';Times Inspection from Group 'all' was Performed
+/data/project;2.65;100.00%;334;2733
+/data/project/python;2.48;93.56%;334;2557
+/data/project/python/tests;1.33;50.09%;187;1202
+/data/project/python/src/worktrees_hives;1.14;43.07%;147;1350
+/data/project/.github;0.08;3.15%;0;21
+/data/project/.github/workflows;0.07;2.66%;0;15
+/data/project/.github/ISSUE_TEMPLATE;0.01;0.50%;0;6
+/data/project/qodana/log;0.03;1.18%;0;37
+/data/project/qodana/log/indexing-diagnostic/project.15375f63;0.02;0.88%;0;18
+/data/project/qodana/log/telemetry;0.01;0.27%;0;7
+/data/project/qodana/log/qodana;0.00;0.00%;0;3
+/data/project/docs/examples;0.03;1.17%;0;24
+/data/project/.claude;0.01;0.51%;0;3
+/data/project/crates;0.00;0.00%;0;40
+/data/project/crates/wh-core;0.00;0.00%;0;32
+/data/project/crates/wh-core/src;0.00;0.00%;0;27
+/data/project/crates/wh;0.00;0.00%;0;8
+/data/project/crates/wh/src;0.00;0.00%;0;3

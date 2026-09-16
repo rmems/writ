@@ -1,0 +1,6 @@
+{
+  "local": {
+    "filename": "qodana.yaml",
+    "content": "####################################################################################################################\n# WARNING: Do not store sensitive information in this file, as its contents will be included in the Qodana report. #\n####################################################################################################################\n\nversion: \"1.0\"\nlinter: qodana-python-community\nprofile:\n  name: qodana.recommended\ninclude:\n  - name: CheckDependencyLicenses"
+  }
+}

@@ -14,6 +14,7 @@ pub mod install;
 pub mod lease;
 pub mod paths;
 pub mod porcelain;
+mod pr_import;
 pub mod state;
 pub mod status;
 pub mod supervisor;

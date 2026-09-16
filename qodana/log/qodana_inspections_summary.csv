@@ -1,0 +1,92 @@
+Inspection ID;Inspection Group;Inspection Name;Inspection Language;Inspection Type;Absolute Time spent on Inspection, s;Percent of Time spent on Inspection;Problems Count;Times Inspection was Performed
+PyStringConversionWithoutDunderMethod;Python;String conversion without dunder method;Python;LOCAL;0.52;19.68%;0;31
+InjectedReferences;General;Injected references;;LOCAL;0.28;10.63%;0;84
+PyUnusedImports;Python;Unused imports;Python;LOCAL;0.18;6.94%;0;26
+PyTypedDict;Python;Invalid TypedDict definition and usages;Python;LOCAL;0.16;5.98%;0;30
+PyTestUnpassedFixture;Python;Fixture is not requested by test functions;Python;LOCAL;0.09;3.56%;0;30
+PyUnresolvedReferences;Python;Unresolved references;Python;LOCAL;0.09;3.39%;0;28
+PyUnusedLocal;Python;Unused local symbols;Python;LOCAL;0.08;2.83%;54;26
+PySetFunctionToLiteral;Python;Function call can be replaced with set literal;Python;LOCAL;0.07;2.70%;0;49
+PyUnboundLocalVariable;Python;Unbound local variables;Python;LOCAL;0.06;2.34%;0;26
+PyStatementEffect;Python;Statement has no effect;Python;LOCAL;0.06;2.18%;0;47
+PyTypeHints;Python;Invalid type hints definitions and usages;Python;LOCAL;0.05;2.07%;116;29
+PyDeprecation;Python;Deprecated function, class, or module;Python;LOCAL;0.05;1.72%;0;26
+PyOverrides;Python;Invalid usages of @override decorator;Python;LOCAL;0.04;1.59%;0;32
+PyUnreachableCode;Python;Unreachable code;Python;LOCAL;0.04;1.52%;0;30
+PyDunderSlots;Python;Invalid usages of classes with '__slots__' definitions;Python;LOCAL;0.03;1.25%;0;30
+PyMethodMayBeStatic;Python;Method is not declared static;Python;LOCAL;0.03;1.11%;9;30
+PyFinal;Python;Invalid usages of final classes, methods, and variables;Python;LOCAL;0.03;1.07%;0;26
+PySuspiciousBooleanCondition;Python;Suspicious boolean condition;Python;LOCAL;0.03;0.97%;0;30
+PyAttributeOutsideInit;Python;An instance attribute is defined outside `__init__`;Python;LOCAL;0.02;0.91%;0;32
+PyTupleItemAssignment;Python;Tuple item assignment is prohibited;Python;LOCAL;0.02;0.90%;0;30
+PyNoneFunctionAssignment;Python;Using function calls that don't return anything as values;Python;LOCAL;0.02;0.88%;0;26
+PyProtocol;Python;Invalid protocol definitions and usages;Python;LOCAL;0.02;0.83%;0;30
+PyVariance;Python;Incorrect variance;Python;LOCAL;0.02;0.81%;0;28
+PyInvalidEscapeSequence;Python;Invalid escape sequence;Python;LOCAL;0.02;0.79%;0;30
+PyInitNewSignature;Python;Incompatible signatures of __new__ and __init__;Python;LOCAL;0.02;0.74%;0;30
+PyClassVar;Python;Invalid usage of ClassVar variables;Python;LOCAL;0.02;0.72%;0;30
+PyPattern;Python;Invalid pattern in pattern matching;Python;LOCAL;0.02;0.66%;0;30
+PyShadowingBuiltins;Python;Shadowing built-in names;Python;LOCAL;0.02;0.66%;0;30
+PyAbstractClass;Python;Invalid abstract class definition and usages;Python;LOCAL;0.02;0.65%;0;28
+PyDefaultArgument;Python;The default argument is mutable;Python;LOCAL;0.02;0.64%;0;30
+PyMissingConstructor;Python;Missed call to '__init__' of the super class;Python;LOCAL;0.02;0.63%;0;30
+PySimplifyBooleanCheck;Python;Redundant boolean variable check;Python;LOCAL;0.02;0.62%;0;30
+PyTypeAliasRedeclaration;Python;Redeclared type alias;Python;LOCAL;0.02;0.58%;0;30
+PyInconsistentReturns;Python;Inconsistent return statements;Python;LOCAL;0.01;0.56%;7;28
+PyComparisonWithNone;Python;Using equality operators to compare with None;Python;LOCAL;0.01;0.56%;0;30
+PyMethodOverriding;Python;Method signature does not match signature of overridden method;Python;LOCAL;0.01;0.55%;0;30
+PyCallingNonCallable;Python;Attempt to call a non-callable object;Python;LOCAL;0.01;0.55%;0;30
+PyTupleAssignmentBalance;Python;Tuple assignment balance is incorrect;Python;LOCAL;0.01;0.51%;0;30
+PyProtectedMember;Python;Accessing a protected member of a class or a module;Python;LOCAL;0.01;0.49%;9;26
+PyDocstringTypes;Python;Type in docstring does not match inferred type;Python;LOCAL;0.01;0.48%;0;30
+PyShadowingNames;Python;Shadowing names from outer scopes;Python;LOCAL;0.01;0.47%;2;26
+PyNewStyleGenericSyntax;Python;Invalid usage of new-style type parameters and type aliases;Python;LOCAL;0.01;0.47%;0;30
+PyMethodParameters;Python;Improper first parameter;Python;LOCAL;0.01;0.47%;0;30
+PyAssertType;Python;typing.assert_type;Python;LOCAL;0.01;0.46%;0;30
+PyAsyncCall;Python;Missing `await` syntax in coroutine calls;Python;LOCAL;0.01;0.45%;0;30
+PyTestParametrized;Python;Incorrect arguments in @pytest.mark.parametrize;Python;LOCAL;0.01;0.43%;0;30
+PyMethodFirstArgAssignment;Python;First argument of the method is reassigned;Python;LOCAL;0.01;0.42%;0;30
+PyByteLiteral;Python;A byte literal contains a non-ASCII character;Python;LOCAL;0.01;0.41%;0;26
+PyGlobalUndefined;Python;Global variable is not defined at the module level;Python;LOCAL;0.01;0.41%;0;30
+PyRedeclaration;Python;Redeclared names without usages;Python;LOCAL;0.01;0.41%;0;26
+PyNonAsciiChar;Python;File contains non-ASCII character;Python;LOCAL;0.01;0.39%;0;28
+PyDecorator;Python;Class-specific decorator is used outside the class;Python;LOCAL;0.01;0.38%;0;30
+PyChainedComparisons;Python;Too complex chained comparisons;Python;LOCAL;0.01;0.38%;0;30
+PyClassHasNoInit;Python;Class has no `__init__` method;Python;LOCAL;0.01;0.37%;135;30
+PyDictCreation;Python;Dictionary creation can be rewritten by dictionary literal;Python;LOCAL;0.01;0.32%;0;28
+PyPropertyAccess;Python;Inappropriate access to properties;Python;LOCAL;0.01;0.32%;0;26
+PyExceptionInherit;Python;Exceptions do not inherit from standard 'Exception' class;Python;LOCAL;0.01;0.31%;0;28
+TomlUnresolvedReference;TOML;Unresolved reference;TOML;LOCAL;0.01;0.30%;0;6
+PyAssignmentToLoopOrWithParameter;Python;Assignments to 'for' loop or 'with' statement parameter;Python;LOCAL;0.01;0.30%;0;28
+PyStringFormat;Python;Errors in string formatting operations;Python;LOCAL;0.01;0.30%;0;28
+PyFromFutureImport;Python;Improper position of from __future__ import;Python;LOCAL;0.01;0.30%;0;28
+PyUnnecessaryBackslash;Python;Unnecessary backslash;Python;LOCAL;0.01;0.29%;0;26
+PyPep8Naming;Python;PEP 8 naming convention violation;Python;LOCAL;0.01;0.29%;0;26
+PyPackageRequirements;Python;Unsatisfied package requirements;none;LOCAL;0.01;0.29%;0;28
+PyRedundantParentheses;Python;Redundant parentheses;Python;LOCAL;0.01;0.28%;1;28
+PyOverloads;Python;Overloads in regular Python files;Python;LOCAL;0.01;0.27%;0;26
+PyInconsistentIndentation;Python;Inconsistent indentation;Python;LOCAL;0.01;0.26%;0;32
+PySingleQuotedDocstring;Python;Single quoted docstring;Python;LOCAL;0.01;0.24%;0;26
+PyUnhashable;Python;Unhashable values in dictionary keys and set elements;Python;LOCAL;0.01;0.23%;0;26
+PyPackages;Python;Suspicious relative imports;Python;LOCAL;0.01;0.22%;0;26
+PyOldStyleClasses;Python;Old-style class contains new-style class features;Python;LOCAL;0.01;0.22%;0;28
+PyTrailingSemicolon;Python;Prohibited trailing semicolon in a statement;Python;LOCAL;0.01;0.22%;0;28
+PyUnnecessaryCast;Python;Unnecessary type cast;Python;LOCAL;0.01;0.21%;0;28
+PyNewType;Python;Invalid usage of NewType;Python;LOCAL;0.01;0.21%;0;26
+PyBroadException;Python;Unclear exception clauses;Python;LOCAL;0.01;0.21%;0;26
+PyIncorrectDocstring;Python;Incorrect docstring;Python;LOCAL;0.01;0.20%;1;26
+PyInvalidCast;Python;Type cast between unrelated types;Python;LOCAL;0.01;0.20%;0;26
+PyStubPackagesAdvertiser;Python;Stub packages advertiser;Python;LOCAL;0.01;0.20%;0;26
+PySuperArguments;Python;Wrong arguments to call super;Python;LOCAL;0.01;0.19%;0;28
+PyStubPackagesCompatibility;Python;Incompatible stub packages;Python;LOCAL;0.01;0.19%;0;26
+PyPropertyDefinition;Python;Incorrect property definition;Python;LOCAL;0.01;0.19%;0;26
+PyReturnFromInit;Python;__init__ method that returns a value;Python;LOCAL;0.00;0.17%;0;26
+PyNamedTuple;Python;Invalid definition of 'typing.NamedTuple';Python;LOCAL;0.00;0.15%;0;26
+PyDictDuplicateKeys;Python;Dictionary contains duplicate keys;Python;LOCAL;0.00;0.14%;0;26
+PyEnum;Python;Invalid Enum definition and usages;Python;LOCAL;0.00;0.13%;0;26
+PyNestedDecorators;Python;Problematic nesting of decorators;Python;LOCAL;0.00;0.13%;0;26
+PyExceptClausesOrder;Python;Wrong order of 'except' clauses;Python;LOCAL;0.00;0.11%;0;26
+PyListCreation;Python;Non-optimal list declaration;Python;LOCAL;0.00;0.10%;0;26
+CustomRegExpInspection;RegExp;Custom RegExp inspection;;LOCAL;0.00;0.07%;0;84
+DuplicatedCode;General;Duplicated code fragment;;LOCAL;0.00;0.07%;0;87
+PoetryPackageVersions;Python;Outdated Poetry package versions;TOML;LOCAL;0.00;0.00%;0;6
