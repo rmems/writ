@@ -324,7 +324,9 @@ pub fn canonicalize_for_tools(path: &Path) -> std::io::Result<PathBuf> {
 /// where paths already match, so no canonicalization is required). Otherwise it
 /// canonicalizes both sides with [`canonicalize_for_tools`] and compares the
 /// results. If either canonicalization fails (for example the path no longer
-/// exists), it falls back to the raw comparison.
+/// exists), it returns `false`; the raw-equal fast path above has already
+/// established that the unresolved paths differ, so there is no additional
+/// comparison to fall back to.
 #[must_use]
 pub fn same_existing_path(a: &Path, b: &Path) -> bool {
     if a == b {
