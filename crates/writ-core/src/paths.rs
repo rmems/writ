@@ -311,6 +311,31 @@ pub fn canonicalize_for_tools(path: &Path) -> std::io::Result<PathBuf> {
     Ok(strip_verbatim_prefix(canonical))
 }
 
+/// Compare two paths for referring to the same on-disk location, tolerating
+/// platform canonicalization differences.
+///
+/// `git worktree list --porcelain` reports the OS-canonical real path of a
+/// worktree. On macOS a temp dir under `/var` resolves through the
+/// `/var -> /private/var` symlink, and on Windows separators / verbatim /
+/// short-vs-long forms differ, so an exact string comparison against an
+/// unresolved stored path yields a false negative.
+///
+/// Returns `true` when the raw paths are equal (the common case, e.g. Linux
+/// where paths already match, so no canonicalization is required). Otherwise it
+/// canonicalizes both sides with [`canonicalize_for_tools`] and compares the
+/// results. If either canonicalization fails (for example the path no longer
+/// exists), it falls back to the raw comparison.
+#[must_use]
+pub fn same_existing_path(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (canonicalize_for_tools(a), canonicalize_for_tools(b)) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => false,
+    }
+}
+
 fn validate_path_segment(field: &'static str, value: &str) -> crate::error::Result<()> {
     use crate::error::Error;
     let invalid = value.is_empty()
@@ -339,7 +364,8 @@ mod tests {
 
     use super::{
         StateRoot, derive_worktree_path, resolve_lease_path_in, resolve_state_path,
-        resolve_state_path_in, resolve_worktree_base_in, user_data_dir, worktree_base_path,
+        resolve_state_path_in, resolve_worktree_base_in, same_existing_path, user_data_dir,
+        worktree_base_path,
     };
 
     fn assert_ends_with(path: &Path, unix: &str, windows: &str) {
@@ -489,5 +515,40 @@ mod tests {
         // Ensure no override for this process snapshot (may already be set in CI).
         let path = worktree_base_path().unwrap();
         assert!(!path.as_os_str().is_empty());
+    }
+
+    #[test]
+    fn same_existing_path_matches_raw_equal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("real");
+        fs::create_dir_all(&dir).unwrap();
+        assert!(same_existing_path(&dir, &dir));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn same_existing_path_treats_symlink_as_real_target() {
+        // Simulates the macOS `/var -> /private/var` situation: a symlinked
+        // path and its real target resolve to the same location even though the
+        // raw path strings differ.
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        fs::create_dir_all(&real).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        assert_ne!(real, link);
+        assert!(same_existing_path(&link, &real));
+        assert!(same_existing_path(&real, &link));
+    }
+
+    #[test]
+    fn same_existing_path_rejects_different_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        assert!(!same_existing_path(&a, &b));
     }
 }

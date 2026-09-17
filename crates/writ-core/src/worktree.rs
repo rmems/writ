@@ -783,8 +783,9 @@ fn inspect_residual_state(
         optional_git_stdout(repo_root, GitArgList(&["worktree", "list", "--porcelain"]))
             .is_some_and(|listing| {
                 listing.lines().any(|line| {
-                    line.strip_prefix("worktree ")
-                        .is_some_and(|path| Path::new(path) == worktree_path)
+                    line.strip_prefix("worktree ").is_some_and(|path| {
+                        crate::paths::same_existing_path(Path::new(path), worktree_path)
+                    })
                 })
             });
     ResidualState {
