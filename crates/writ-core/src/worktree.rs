@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
 use crate::error::{
     Error, PolicyCode, Result, WorktreeCreationFailure, WorktreePostconditionFailure,
@@ -56,37 +57,63 @@ pub struct WorktreeCreateRequest<'a> {
 }
 
 /// Manages isolated git worktrees for hive jobs.
+///
+/// The writable SQLite lease store is opened lazily. `worktree list` and
+/// `worktree prune` are read-only over git state and must not require a
+/// writable state/worktree base, so opening (and creating the WAL files for)
+/// the lease store is deferred to the first lease-dependent operation
+/// (`create`/`remove`). Manager construction only records where the store
+/// lives; it does not touch it.
 #[derive(Debug)]
 pub struct WorktreeManager {
     base_path: Option<PathBuf>,
-    leases: LeaseStore,
+    /// Path the lease store lives at, used to open it on first lease-dependent
+    /// use. `None` when a store was supplied directly (already in `leases`).
+    lease_path: Option<PathBuf>,
+    /// Lazily-opened lease store. Populated eagerly by `with_base_and_leases`
+    /// (which is handed a ready store), otherwise opened on first access via
+    /// [`Self::leases`].
+    leases: OnceLock<LeaseStore>,
 }
 
 impl WorktreeManager {
     /// Create a new manager using the default base path and the durable lease store.
+    ///
+    /// The lease store is NOT opened here: `worktree list`/`prune` must work
+    /// without a writable base. It is opened on first lease-dependent use.
     pub fn new() -> Result<Self> {
-        Self::with_base_and_leases(
-            worktree_base_path()?,
-            LeaseStore::open(crate::paths::lease_store_path())?,
-        )
+        Ok(Self {
+            base_path: Some(worktree_base_path()?),
+            lease_path: Some(crate::paths::lease_store_path()),
+            leases: OnceLock::new(),
+        })
     }
 
     /// Create a new manager with an explicit base path (for testing or overrides).
     ///
     /// The base is created if missing and stored in canonical form so OS path
     /// aliases (e.g. macOS `/var` → `/private/var`) do not trip sandbox checks.
-    /// A per-base SQLite lease file is opened next to the worktrees so tests
-    /// do not share a process-global store.
+    /// A per-base SQLite lease file is opened lazily next to the worktrees so
+    /// tests do not share a process-global store and read-only commands do not
+    /// create it.
     pub fn with_base(base: PathBuf) -> Result<Self> {
         fs::create_dir_all(&base).map_err(|e| Error::Io {
             context: "create worktree base directory",
             source: e,
         })?;
+        let base = canonicalize_for_tools(&base).map_err(|e| Error::Io {
+            context: "canonicalize worktree base directory",
+            source: e,
+        })?;
         let lease_path = base.join("leases.db");
-        Self::with_base_and_leases(base, LeaseStore::open(lease_path)?)
+        Ok(Self {
+            base_path: Some(base),
+            lease_path: Some(lease_path),
+            leases: OnceLock::new(),
+        })
     }
 
-    /// Create a manager with an explicit base path and lease store.
+    /// Create a manager with an explicit base path and an already-open lease store.
     pub fn with_base_and_leases(base: PathBuf, leases: LeaseStore) -> Result<Self> {
         fs::create_dir_all(&base).map_err(|e| Error::Io {
             context: "create worktree base directory",
@@ -98,9 +125,13 @@ impl WorktreeManager {
             context: "canonicalize worktree base directory",
             source: e,
         })?;
+        let cell = OnceLock::new();
+        // A ready store was supplied; install it so no lazy open ever runs.
+        let _ = cell.set(leases);
         Ok(Self {
             base_path: Some(base),
-            leases,
+            lease_path: None,
+            leases: cell,
         })
     }
 
@@ -112,10 +143,34 @@ impl WorktreeManager {
         })
     }
 
-    /// Borrow the lease store used by this manager.
-    #[must_use]
-    pub fn lease_store(&self) -> &LeaseStore {
-        &self.leases
+    /// Borrow the lease store, opening it on first use.
+    ///
+    /// Only lease-dependent operations (`create`/`remove`) call this, so
+    /// read-only `list`/`prune` never open (or create) the store.
+    fn leases(&self) -> Result<&LeaseStore> {
+        if let Some(store) = self.leases.get() {
+            return Ok(store);
+        }
+        let path = self.lease_path.as_ref().ok_or_else(|| Error::LeaseStore {
+            context: "open lease store",
+            message: "lease store path not initialized".to_owned(),
+        })?;
+        let store = LeaseStore::open(path.clone())?;
+        // A concurrent caller may have populated the cell first; keep whichever
+        // won and drop the loser. Either way we return the installed store.
+        let _ = self.leases.set(store);
+        self.leases.get().ok_or_else(|| Error::LeaseStore {
+            context: "open lease store",
+            message: "lease store missing after initialization".to_owned(),
+        })
+    }
+
+    /// Borrow the lease store used by this manager, opening it on first use.
+    ///
+    /// Test/introspection accessor. Prefer the internal [`Self::leases`] in
+    /// library code. Returns an error if the store cannot be opened.
+    pub fn lease_store(&self) -> Result<&LeaseStore> {
+        self.leases()
     }
 
     /// Create a new worktree for the given job.
@@ -172,15 +227,9 @@ impl WorktreeManager {
             Repo(request.repo),
             JobId(request.job_id),
         )?;
-        let mode = decide_create_mode(
-            &request,
-            CommitId(&start_commit),
-            &worktree_path,
-            &self.leases,
-        )?;
-        // Persist identity before Git mutates so a later add/verify error
-        // still has a reclaimable lease. Residual git state is not deleted.
-        self.leases.grant(LeaseGrant {
+        let leases = self.leases()?;
+        let mode = decide_create_mode(&request, CommitId(&start_commit), &worktree_path, leases)?;
+        let grant = LeaseGrant {
             repo: request.repo_root,
             owner: request.owner,
             repo_name: request.repo,
@@ -188,14 +237,30 @@ impl WorktreeManager {
             branch: request.branch,
             worktree_path: &worktree_path,
             start_commit: &start_commit,
-        })?;
+        };
         match mode {
-            CreateMode::AlreadyPresent => {}
+            // AlreadyPresent and Reclaim both required an already-proven lease
+            // (`prove_resume` ran in `decide_create_mode`), so this job already
+            // owns the branch. Persist identity BEFORE any git mutation so a
+            // later add/verify error still leaves a reclaimable lease for the
+            // owner. Residual git state is not deleted.
+            CreateMode::AlreadyPresent => {
+                leases.grant(grant)?;
+            }
             CreateMode::Reclaim => {
+                leases.grant(grant)?;
                 add_worktree(&request, &worktree_path, CommitId(&start_commit), true)?;
             }
+            // Fresh create must NOT persist a lease before winning the ref.
+            // `git worktree add -b` fails if the branch ref already exists, so
+            // it is the exclusive arbiter of who owns a brand-new branch. If we
+            // granted first, two jobs racing the same absent branch would both
+            // persist leases and the loser's stale lease could later prove
+            // ownership of the winner's branch. Grant only AFTER `add -b` wins;
+            // if the add fails, no ownership-proving lease is left behind.
             CreateMode::Fresh => {
                 add_worktree(&request, &worktree_path, CommitId(&start_commit), false)?;
+                leases.grant(grant)?;
             }
         }
 
@@ -317,7 +382,7 @@ impl WorktreeManager {
             if let Ok(repo_root) = find_repo_root_for_worktree(&canonical_path) {
                 prune_stale_registration(&repo_root);
             }
-            self.leases.release_by_path(&canonical_path)?;
+            self.leases()?.release_by_path(&canonical_path)?;
             return Ok(());
         }
 
@@ -351,7 +416,7 @@ impl WorktreeManager {
 
         // Also clean up empty parent directories
         cleanup_empty_parents(&canonical_path, base);
-        self.leases.release_by_path(&canonical_path)?;
+        self.leases()?.release_by_path(&canonical_path)?;
 
         Ok(())
     }
@@ -634,12 +699,115 @@ fn resume_upstream_mismatch(repo_root: &Path, branch: &str) -> Result<Option<Str
         return Ok(None);
     }
     let upstream = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    if tracking_ref_matches_branch(&upstream, branch) {
+    if !tracking_ref_matches_branch(&upstream, branch) {
+        return Ok(Some(format!(
+            "upstream {upstream:?} is not the expected tracking ref"
+        )));
+    }
+    // The upstream ref name is expected; now verify the COMMIT relationship
+    // (AGENTS.md: a published branch may only be equal to or ahead of its
+    // upstream by job-owned commits; stop on behind or divergent state).
+    resume_upstream_commit_mismatch(repo_root, branch, &upstream)
+}
+
+/// Compare the local branch against its configured upstream by commit.
+///
+/// Reclaim is rejected when the branch is BEHIND (the upstream contains commits
+/// the local branch does not) or DIVERGENT (neither commit is an ancestor of
+/// the other). Equal or strictly-ahead is reclaimable.
+///
+/// We deliberately do NOT `git fetch` inside core: fetching is a networked,
+/// side-effecting operation that belongs to the caller's remote-alignment step,
+/// and tests run against local repositories. We compare against the local
+/// remote-tracking state that a prior fetch already recorded, exactly as
+/// `@{upstream}` resolves it.
+fn resume_upstream_commit_mismatch(
+    repo_root: &Path,
+    branch: &str,
+    upstream: &str,
+) -> Result<Option<String>> {
+    let Some(local) = optional_git_stdout(
+        repo_root,
+        GitArgList(&[
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            &format!("refs/heads/{branch}^{{commit}}"),
+        ]),
+    ) else {
+        return Ok(None);
+    };
+    let Some(remote) = optional_git_stdout(
+        repo_root,
+        GitArgList(&[
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            &format!("{upstream}^{{commit}}"),
+        ]),
+    ) else {
+        // The tracking ref name is configured but no local remote-tracking
+        // commit exists yet (nothing fetched). There is no recorded upstream
+        // state to be behind or divergent from, so this is not a mismatch.
+        return Ok(None);
+    };
+    if local == remote {
         return Ok(None);
     }
+    // `--is-ancestor` exits 0 when the first commit is an ancestor of the
+    // second. Local ahead: remote is an ancestor of local (reclaimable).
+    // Behind: local is an ancestor of remote. Divergent: neither.
+    let local_is_ancestor_of_remote = git_is_ancestor(repo_root, &local, &remote)?;
+    let remote_is_ancestor_of_local = git_is_ancestor(repo_root, &remote, &local)?;
+    if remote_is_ancestor_of_local {
+        // Local strictly ahead of upstream by job-owned commits: reclaimable.
+        return Ok(None);
+    }
+    if local_is_ancestor_of_remote {
+        return Ok(Some(format!(
+            "branch is behind its upstream {upstream:?}: \
+             local {local} is an ancestor of remote {remote}"
+        )));
+    }
     Ok(Some(format!(
-        "upstream {upstream:?} is not the expected tracking ref"
+        "branch has diverged from its upstream {upstream:?}: \
+         local {local} and remote {remote} share no ancestor relationship"
     )))
+}
+
+/// True when `ancestor` is an ancestor of `descendant` (or they are equal).
+///
+/// `git merge-base --is-ancestor` exits 0 for ancestor, 1 for not-ancestor,
+/// and anything else is a real error we surface.
+fn git_is_ancestor(repo_root: &Path, ancestor: &str, descendant: &str) -> Result<bool> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args([
+            "merge-base",
+            "--is-ancestor",
+            "--end-of-options",
+            ancestor,
+            descendant,
+        ])
+        .output()
+        .map_err(|e| Error::Io {
+            context: "verify resume upstream ancestry",
+            source: e,
+        })?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(Error::GitCommand {
+            args: vec![
+                "merge-base".into(),
+                "--is-ancestor".into(),
+                ancestor.to_owned(),
+                descendant.to_owned(),
+            ],
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        }),
+    }
 }
 
 /// A configured upstream is reclaimable only when it is the branch itself or
@@ -1783,6 +1951,7 @@ mod tests {
         let lease = harness
             .manager
             .lease_store()
+            .unwrap()
             .find_resume(ResumeKey {
                 owner: "acme",
                 repo_name: "test-repo",
@@ -1818,6 +1987,7 @@ mod tests {
         let lease = harness
             .manager
             .lease_store()
+            .unwrap()
             .find_resume(ResumeKey {
                 owner: "acme",
                 repo_name: "test-repo",
@@ -1949,6 +2119,7 @@ mod tests {
         let lease = harness
             .manager
             .lease_store()
+            .unwrap()
             .find_resume(ResumeKey {
                 owner: "acme",
                 repo_name: "test-repo",
@@ -2107,6 +2278,244 @@ mod tests {
         assert_eq!(
             harness.git(&["rev-parse", "refs/heads/feature/upstream"]),
             start_commit
+        );
+    }
+
+    /// Configure `branch` to track `refs/remotes/<remote>/<branch>` and seed a
+    /// local remote-tracking ref at `remote_commit`, mirroring the local state
+    /// a prior `git fetch` would have recorded (no network required).
+    ///
+    /// The remote is wired to the repo itself with a standard fetch refspec so
+    /// `branch@{upstream}` resolves to the remote-tracking ref name
+    /// (`<remote>/<branch>`), exactly as it would after a real fetch.
+    fn set_local_tracking_upstream(
+        harness: &Harness,
+        remote: &str,
+        branch: &str,
+        remote_commit: &str,
+    ) {
+        harness.git(&["config", &format!("remote.{remote}.url"), "."]);
+        harness.git(&[
+            "config",
+            &format!("remote.{remote}.fetch"),
+            &format!("+refs/heads/*:refs/remotes/{remote}/*"),
+        ]);
+        harness.git(&[
+            "update-ref",
+            &format!("refs/remotes/{remote}/{branch}"),
+            remote_commit,
+        ]);
+        harness.git(&["config", &format!("branch.{branch}.remote"), remote]);
+        harness.git(&[
+            "config",
+            &format!("branch.{branch}.merge"),
+            &format!("refs/heads/{branch}"),
+        ]);
+    }
+
+    #[test]
+    fn reclaim_rejects_branch_behind_its_upstream() {
+        let harness = Harness::sha1();
+        let start_commit = harness.head();
+        let branch = "feature/behind";
+        let wt = harness.create("job-behind", branch, &start_commit).unwrap();
+        harness.manager.remove(&wt.path, false).unwrap();
+        // The recorded remote-tracking commit is ahead of the local branch, so
+        // the local branch is behind its upstream.
+        let ahead_commit =
+            harness.commit_file("ahead.txt", "remote ahead\n", "advance remote-tracking ref");
+        assert_ne!(ahead_commit, start_commit);
+        set_local_tracking_upstream(&harness, "origin", branch, &ahead_commit);
+
+        let result = harness.create("job-behind", branch, &start_commit);
+        match result {
+            Err(Error::PolicyViolation {
+                code: PolicyCode::WorktreeResumeUnproven,
+                message,
+            }) => {
+                assert!(message.contains("behind its upstream"), "{message}");
+                assert!(message.contains("ownership_evidence="), "{message}");
+            }
+            other => panic!("expected unproven resume, got {other:?}"),
+        }
+        assert_eq!(
+            harness.git(&["rev-parse", &format!("refs/heads/{branch}")]),
+            start_commit
+        );
+    }
+
+    #[test]
+    fn reclaim_rejects_branch_divergent_from_its_upstream() {
+        let harness = Harness::sha1();
+        let base_commit = harness.head();
+        let branch = "feature/divergent";
+        // Build a remote-only commit on a sibling line off the shared base so
+        // it is neither an ancestor nor a descendant of the local branch tip.
+        harness.git(&["checkout", "-b", "tmp-remote", &base_commit]);
+        let remote_commit =
+            harness.commit_file("remote.txt", "remote-only line\n", "remote-only commit");
+        harness.git(&["checkout", "main"]);
+        harness.git(&["branch", "-D", "tmp-remote"]);
+        // The local branch advances on its OWN line off the same base, so local
+        // and remote each have commits the other lacks -> divergent.
+        let local_commit =
+            harness.commit_file("local.txt", "local-only line\n", "local-only commit");
+        assert_ne!(local_commit, remote_commit);
+        let wt = harness
+            .create("job-divergent", branch, &local_commit)
+            .unwrap();
+        harness.manager.remove(&wt.path, false).unwrap();
+        set_local_tracking_upstream(&harness, "origin", branch, &remote_commit);
+
+        let result = harness.create("job-divergent", branch, &local_commit);
+        match result {
+            Err(Error::PolicyViolation {
+                code: PolicyCode::WorktreeResumeUnproven,
+                message,
+            }) => {
+                assert!(message.contains("diverged from its upstream"), "{message}");
+            }
+            other => panic!("expected unproven resume, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reclaim_succeeds_when_branch_is_ahead_of_its_upstream() {
+        let harness = Harness::sha1();
+        // The remote-tracking ref stays at the original commit; the local
+        // branch advances ahead of it by a job-owned commit. This is the
+        // reclaimable published-branch case per AGENTS.md.
+        let base_commit = harness.head();
+        let branch = "feature/ahead";
+        // Advance the working history, then create the branch at the newer tip.
+        let ahead_commit = harness.commit_file("ahead.txt", "job work\n", "job-owned commit");
+        assert_ne!(ahead_commit, base_commit);
+        let wt = harness.create("job-ahead", branch, &ahead_commit).unwrap();
+        harness.manager.remove(&wt.path, false).unwrap();
+        // Upstream recorded at the older base commit -> local is strictly ahead.
+        set_local_tracking_upstream(&harness, "origin", branch, &base_commit);
+
+        let second = harness.create("job-ahead", branch, &ahead_commit).unwrap();
+        assert_eq!(second.start_commit.as_deref(), Some(ahead_commit.as_str()));
+        assert_eq!(second.head_commit.as_deref(), Some(ahead_commit.as_str()));
+    }
+
+    #[test]
+    fn reclaim_succeeds_when_branch_equals_its_upstream() {
+        let harness = Harness::sha1();
+        let start_commit = harness.head();
+        let branch = "feature/equal";
+        let wt = harness.create("job-equal", branch, &start_commit).unwrap();
+        harness.manager.remove(&wt.path, false).unwrap();
+        // Upstream equals the local branch commit -> reclaimable.
+        set_local_tracking_upstream(&harness, "origin", branch, &start_commit);
+
+        let second = harness.create("job-equal", branch, &start_commit).unwrap();
+        assert_eq!(second.start_commit.as_deref(), Some(start_commit.as_str()));
+    }
+
+    #[test]
+    fn fresh_create_persists_no_lease_for_a_job_that_never_won_add_b() {
+        // A Fresh create must not leave an ownership-proving lease for a job
+        // that did not win `git worktree add -b`. Simulate a loser: job B tries
+        // to Fresh-create a branch that job A already created. `add -b` fails
+        // for B (ref exists), and B must have no lease afterwards.
+        let harness = Harness::sha1();
+        let start_commit = harness.head();
+        let branch = "feature/race";
+        // Job A wins the ref creation.
+        harness.create("job-a", branch, &start_commit).unwrap();
+
+        // Job B never removed/owned the branch, so it takes the Reclaim path
+        // and is rejected for lack of a proven lease. Either way, B must own no
+        // lease that could later prove ownership.
+        let result = harness.create("job-b", branch, &start_commit);
+        assert_unproven_resume(result);
+
+        let lease_b = harness
+            .manager
+            .lease_store()
+            .unwrap()
+            .find_resume(ResumeKey {
+                owner: "acme",
+                repo_name: "test-repo",
+                job_id: "job-b",
+                branch,
+            })
+            .unwrap();
+        assert!(
+            lease_b.is_none(),
+            "a job that never won `add -b` must hold no lease, got {lease_b:?}"
+        );
+    }
+
+    #[test]
+    fn fresh_create_failure_leaves_no_ownership_proving_lease() {
+        // If `git worktree add -b` fails on the Fresh path, no lease row may be
+        // left that could later prove ownership of the branch.
+        let harness = Harness::sha1();
+        let start_commit = harness.head();
+        let branch = "feature/failed-fresh";
+        // Occupy the target path so `git worktree add` fails.
+        let target = harness.job_path("job-fail");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("occupied"), "force add failure\n").unwrap();
+
+        let result = harness.create("job-fail", branch, &start_commit);
+        assert!(
+            matches!(result, Err(Error::WorktreeCreationFailed(_))),
+            "expected creation failure, got {result:?}"
+        );
+
+        let lease = harness
+            .manager
+            .lease_store()
+            .unwrap()
+            .find_resume(ResumeKey {
+                owner: "acme",
+                repo_name: "test-repo",
+                job_id: "job-fail",
+                branch,
+            })
+            .unwrap();
+        assert!(
+            lease.is_none(),
+            "a failed Fresh create must leave no lease, got {lease:?}"
+        );
+    }
+
+    #[test]
+    fn list_does_not_create_the_lease_store() {
+        // `worktree list` is read-only and must not open (or create) the
+        // writable lease store.
+        let temp = tempdir().unwrap();
+        let base = temp.path().join("worktrees");
+        let manager = WorktreeManager::with_base(base.clone()).unwrap();
+        let leases_db = manager.base_path().unwrap().join("leases.db");
+        assert!(!leases_db.exists());
+
+        let listed = manager.list().unwrap();
+        assert!(listed.is_empty());
+        assert!(
+            !leases_db.exists(),
+            "listing must not create the lease store at {}",
+            leases_db.display()
+        );
+    }
+
+    #[test]
+    fn prune_does_not_create_the_lease_store() {
+        // `worktree prune` is read-only over git state and must not open (or
+        // create) the writable lease store.
+        let harness = Harness::sha1();
+        let leases_db = harness.manager.base_path().unwrap().join("leases.db");
+        assert!(!leases_db.exists());
+
+        harness.manager.prune(&harness.repo_root).unwrap();
+        assert!(
+            !leases_db.exists(),
+            "pruning must not create the lease store at {}",
+            leases_db.display()
         );
     }
 
