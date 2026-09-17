@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 
 /// Manage isolated issue-to-PR jobs and their durable state.
 #[derive(Debug, Parser)]
@@ -101,37 +101,60 @@ enum WorktreeAction {
     },
 }
 
+/// Timeout-policy knobs for `writ supervisor run`, grouped so the many
+/// second-valued budgets travel together instead of as loose primitives.
+#[derive(Debug, Args)]
+struct SupervisorTimeouts {
+    /// Wall-clock timeout in seconds. 0 means no timeout.
+    #[arg(long, default_value_t = writ_core::timeout_policy::DEFAULT_WORKER_SECS)]
+    timeout: u64,
+
+    /// Idle hang detector: no captured output for this many seconds. 0 disables.
+    #[arg(long, default_value_t = writ_core::timeout_policy::DEFAULT_IDLE_SECS)]
+    idle: u64,
+
+    /// Optional per-step cap in seconds. 0 disables.
+    #[arg(long, default_value_t = writ_core::timeout_policy::DEFAULT_STEP_SECS)]
+    step: u64,
+
+    /// Overall wait budget in seconds. 0 falls back to `--timeout`.
+    #[arg(long, default_value_t = writ_core::timeout_policy::DEFAULT_ORCHESTRATOR_SECS)]
+    orchestrator: u64,
+
+    /// Seconds between SIGTERM and SIGKILL (Unix). 0 = kill immediately.
+    #[arg(long, default_value_t = writ_core::timeout_policy::DEFAULT_GRACE_SECS)]
+    grace: u64,
+
+    /// Progress tick interval on stderr while waiting. 0 disables.
+    #[arg(long, default_value_t = writ_core::timeout_policy::DEFAULT_PROGRESS_SECS)]
+    progress_secs: u64,
+
+    /// Harness redispatch budget recorded on the policy. Supervisor never retries.
+    #[arg(long, default_value_t = writ_core::timeout_policy::DEFAULT_MAX_REDISPATCH_PER_ITEM)]
+    max_redispatch: u32,
+}
+
+impl SupervisorTimeouts {
+    /// Build the core timeout policy from the parsed second-valued budgets.
+    fn to_policy(&self) -> writ_core::timeout_policy::TimeoutPolicy {
+        writ_core::timeout_policy::TimeoutPolicy {
+            worker: secs_opt(self.timeout),
+            step: secs_opt(self.step),
+            idle: secs_opt(self.idle),
+            orchestrator: secs_opt(self.orchestrator),
+            grace: Duration::from_secs(self.grace),
+            max_redispatch_per_item: self.max_redispatch,
+            progress_every: secs_opt(self.progress_secs),
+        }
+    }
+}
+
 #[derive(Debug, Subcommand)]
 enum SupervisorAction {
     /// Run a command under supervision.
     Run {
-        /// Wall-clock timeout in seconds. 0 means no timeout.
-        #[arg(long, default_value_t = writ_core::timeout_policy::DEFAULT_WORKER_SECS)]
-        timeout: u64,
-
-        /// Idle hang detector: no captured output for this many seconds. 0 disables.
-        #[arg(long, default_value_t = writ_core::timeout_policy::DEFAULT_IDLE_SECS)]
-        idle: u64,
-
-        /// Optional per-step cap in seconds. 0 disables.
-        #[arg(long, default_value_t = writ_core::timeout_policy::DEFAULT_STEP_SECS)]
-        step: u64,
-
-        /// Overall wait budget in seconds. 0 falls back to `--timeout`.
-        #[arg(long, default_value_t = writ_core::timeout_policy::DEFAULT_ORCHESTRATOR_SECS)]
-        orchestrator: u64,
-
-        /// Seconds between SIGTERM and SIGKILL (Unix). 0 = kill immediately.
-        #[arg(long, default_value_t = writ_core::timeout_policy::DEFAULT_GRACE_SECS)]
-        grace: u64,
-
-        /// Progress tick interval on stderr while waiting. 0 disables.
-        #[arg(long, default_value_t = writ_core::timeout_policy::DEFAULT_PROGRESS_SECS)]
-        progress_secs: u64,
-
-        /// Harness redispatch budget recorded on the policy. Supervisor never retries.
-        #[arg(long, default_value_t = writ_core::timeout_policy::DEFAULT_MAX_REDISPATCH_PER_ITEM)]
-        max_redispatch: u32,
+        #[command(flatten)]
+        timeouts: SupervisorTimeouts,
 
         /// Expected branch for mutating supervised `git` / `gh pr` commands.
         #[arg(long)]
@@ -374,13 +397,7 @@ async fn run(cli: Cli, stdout: &mut impl Write) -> writ_core::error::Result<Exit
         Some(Command::GhSafe { args }) => run_gh_safe(&args, cli.json, stdout),
         Some(Command::Supervisor { action }) => match action {
             SupervisorAction::Run {
-                timeout,
-                idle,
-                step,
-                orchestrator,
-                grace,
-                progress_secs,
-                max_redispatch,
+                timeouts,
                 expected_branch,
                 repo,
                 max_parallel,
@@ -388,13 +405,7 @@ async fn run(cli: Cli, stdout: &mut impl Write) -> writ_core::error::Result<Exit
             } => {
                 run_supervisor(
                     cli.json,
-                    timeout,
-                    idle,
-                    step,
-                    orchestrator,
-                    grace,
-                    progress_secs,
-                    max_redispatch,
+                    &timeouts,
                     expected_branch,
                     repo,
                     max_parallel,
@@ -424,16 +435,9 @@ fn secs_opt(secs: u64) -> Option<Duration> {
 }
 
 /// Run `writ supervisor run` with policy-checked core supervisor and consistent JSON envelopes.
-#[allow(clippy::too_many_arguments)]
 async fn run_supervisor(
     json: bool,
-    timeout_secs: u64,
-    idle_secs: u64,
-    step_secs: u64,
-    orchestrator_secs: u64,
-    grace_secs: u64,
-    progress_secs: u64,
-    max_redispatch: u32,
+    timeouts: &SupervisorTimeouts,
     expected_branch: Option<String>,
     repo: Option<PathBuf>,
     max_parallel: usize,
@@ -451,12 +455,8 @@ async fn run_supervisor(
         }
     };
     let args: Vec<&str> = cmd[1..].iter().map(|s| s.as_str()).collect();
-    let progress_every = if progress_secs == 0 {
-        None
-    } else {
-        Some(Duration::from_secs(progress_secs))
-    };
-    let on_progress = progress_every.map(|_| {
+    let policy = timeouts.to_policy();
+    let on_progress = policy.progress_every.map(|_| {
         std::sync::Arc::new(|snap: &writ_core::timeout_policy::ProgressSnapshot| {
             eprintln!("{}", snap.format_line());
         }) as writ_core::timeout_policy::ProgressCallback
@@ -465,15 +465,6 @@ async fn run_supervisor(
         expected_branch,
         repo,
         on_progress,
-    };
-    let policy = writ_core::timeout_policy::TimeoutPolicy {
-        worker: secs_opt(timeout_secs),
-        step: secs_opt(step_secs),
-        idle: secs_opt(idle_secs),
-        orchestrator: secs_opt(orchestrator_secs),
-        grace: Duration::from_secs(grace_secs),
-        max_redispatch_per_item: max_redispatch,
-        progress_every,
     };
 
     // One-shot CLI: a single awaited child cannot contend with itself.
@@ -723,6 +714,20 @@ mod tests {
         }
     }
 
+    /// Timeout knobs with every second-valued budget disabled, matching the
+    /// hand-built `Run` variants these tests previously constructed inline.
+    fn disabled_timeouts() -> super::SupervisorTimeouts {
+        super::SupervisorTimeouts {
+            timeout: 0,
+            idle: 0,
+            step: 0,
+            orchestrator: 0,
+            grace: 0,
+            progress_secs: 0,
+            max_redispatch: 1,
+        }
+    }
+
     #[test]
     fn command_definition_is_valid() {
         Cli::command().debug_assert();
@@ -754,13 +759,16 @@ mod tests {
         let Some(super::Command::Supervisor {
             action:
                 super::SupervisorAction::Run {
-                    timeout,
-                    idle,
-                    step,
-                    orchestrator,
-                    grace,
-                    progress_secs,
-                    max_redispatch,
+                    timeouts:
+                        super::SupervisorTimeouts {
+                            timeout,
+                            idle,
+                            step,
+                            orchestrator,
+                            grace,
+                            progress_secs,
+                            max_redispatch,
+                        },
                     cmd,
                     ..
                 },
@@ -1023,13 +1031,7 @@ mod tests {
             json: false,
             command: Some(super::Command::Supervisor {
                 action: super::SupervisorAction::Run {
-                    timeout: 0,
-                    idle: 0,
-                    step: 0,
-                    orchestrator: 0,
-                    grace: 0,
-                    progress_secs: 0,
-                    max_redispatch: 1,
+                    timeouts: disabled_timeouts(),
                     expected_branch: None,
                     repo: None,
                     max_parallel: 1,
@@ -1063,13 +1065,7 @@ mod tests {
             json: false,
             command: Some(super::Command::Supervisor {
                 action: super::SupervisorAction::Run {
-                    timeout: 0,
-                    idle: 0,
-                    step: 0,
-                    orchestrator: 0,
-                    grace: 0,
-                    progress_secs: 0,
-                    max_redispatch: 1,
+                    timeouts: disabled_timeouts(),
                     expected_branch: None,
                     repo: None,
                     max_parallel: 1,
@@ -1096,13 +1092,7 @@ mod tests {
             json: true,
             command: Some(super::Command::Supervisor {
                 action: super::SupervisorAction::Run {
-                    timeout: 0,
-                    idle: 0,
-                    step: 0,
-                    orchestrator: 0,
-                    grace: 0,
-                    progress_secs: 0,
-                    max_redispatch: 1,
+                    timeouts: disabled_timeouts(),
                     expected_branch: None,
                     repo: None,
                     max_parallel: 1,
@@ -1144,13 +1134,7 @@ mod tests {
             json: true,
             command: Some(super::Command::Supervisor {
                 action: super::SupervisorAction::Run {
-                    timeout: 0,
-                    idle: 0,
-                    step: 0,
-                    orchestrator: 0,
-                    grace: 0,
-                    progress_secs: 0,
-                    max_redispatch: 1,
+                    timeouts: disabled_timeouts(),
                     expected_branch: None,
                     repo: None,
                     max_parallel: 1,
@@ -1204,13 +1188,7 @@ mod tests {
             json: false,
             command: Some(super::Command::Supervisor {
                 action: super::SupervisorAction::Run {
-                    timeout: 0,
-                    idle: 0,
-                    step: 0,
-                    orchestrator: 0,
-                    grace: 0,
-                    progress_secs: 0,
-                    max_redispatch: 1,
+                    timeouts: disabled_timeouts(),
                     expected_branch: None,
                     repo: None,
                     max_parallel: 1,
@@ -1237,13 +1215,7 @@ mod tests {
             json: true,
             command: Some(super::Command::Supervisor {
                 action: super::SupervisorAction::Run {
-                    timeout: 0,
-                    idle: 0,
-                    step: 0,
-                    orchestrator: 0,
-                    grace: 0,
-                    progress_secs: 0,
-                    max_redispatch: 1,
+                    timeouts: disabled_timeouts(),
                     expected_branch: None,
                     repo: None,
                     max_parallel: 1,

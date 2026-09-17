@@ -604,31 +604,14 @@ async fn await_supervised_child(
                             idle_for_since(wait.spawn_at, &wait.last_activity_ms),
                             SupervisorStep::Draining,
                         );
-                        match hard_deadline {
-                            Some(deadline_at) => {
-                                match drain_pipes_until(deadline_at, wait.pid, stdout_handle, stderr_handle)
-                                    .await
-                                {
-                                    Ok((stdout, stderr)) => output_to_supervised(s, &stdout, &stderr),
-                                    Err((stdout, stderr)) => SupervisedOutput {
-                                        timed_out: true,
-                                        killed: true,
-                                        stdout: String::from_utf8_lossy(&stdout).into_owned(),
-                                        stderr: String::from_utf8_lossy(&stderr).into_owned(),
-                                        stdout_truncated: stdout.len() >= MAX_CAPTURE_BYTES,
-                                        stderr_truncated: stderr.len() >= MAX_CAPTURE_BYTES,
-                                        error_code: Some(SupervisorErrorCode::TimedOut),
-                                        timeout_class: Some(TimeoutClass::Hard),
-                                        ..SupervisedOutput::default()
-                                    },
-                                }
-                            }
-                            None => {
-                                let stdout = stdout_handle.await.unwrap_or_default();
-                                let stderr = stderr_handle.await.unwrap_or_default();
-                                output_to_supervised(s, &stdout, &stderr)
-                            }
-                        }
+                        drain_exited_child(
+                            s,
+                            hard_deadline,
+                            wait.pid,
+                            stdout_handle,
+                            stderr_handle,
+                        )
+                        .await
                     }
                     Err(e) => {
                         emit_progress(
@@ -638,24 +621,82 @@ async fn await_supervised_child(
                             idle_for_since(wait.spawn_at, &wait.last_activity_ms),
                             SupervisorStep::Recovering,
                         );
-                        let mut recovered = recover_child(
+                        recover_lost_child(
                             child,
                             stdout_handle,
                             stderr_handle,
                             wait.policy,
-                            TimeoutClass::LostChild,
                             wait.pid,
+                            &e,
                         )
-                        .await;
-                        if recovered.stderr.is_empty() {
-                            recovered.stderr = format!("process error: {e}");
-                        }
-                        recovered
+                        .await
                     }
                 };
             }
         }
     }
+}
+
+/// Drain a normally-exited child's output pipes, honouring the hard deadline.
+///
+/// When a hard `worker` deadline is configured, pipe draining is bounded by it
+/// and a timeout collapses into a `Hard` timeout outcome; otherwise the pipes
+/// are joined without a bound.
+async fn drain_exited_child(
+    status: std::process::ExitStatus,
+    hard_deadline: Option<Instant>,
+    pid: Option<u32>,
+    stdout_handle: JoinHandle<Vec<u8>>,
+    stderr_handle: JoinHandle<Vec<u8>>,
+) -> SupervisedOutput {
+    match hard_deadline {
+        Some(deadline_at) => {
+            match drain_pipes_until(deadline_at, pid, stdout_handle, stderr_handle).await {
+                Ok((stdout, stderr)) => output_to_supervised(status, &stdout, &stderr),
+                Err((stdout, stderr)) => SupervisedOutput {
+                    timed_out: true,
+                    killed: true,
+                    stdout: String::from_utf8_lossy(&stdout).into_owned(),
+                    stderr: String::from_utf8_lossy(&stderr).into_owned(),
+                    stdout_truncated: stdout.len() >= MAX_CAPTURE_BYTES,
+                    stderr_truncated: stderr.len() >= MAX_CAPTURE_BYTES,
+                    error_code: Some(SupervisorErrorCode::TimedOut),
+                    timeout_class: Some(TimeoutClass::Hard),
+                    ..SupervisedOutput::default()
+                },
+            }
+        }
+        None => {
+            let stdout = stdout_handle.await.unwrap_or_default();
+            let stderr = stderr_handle.await.unwrap_or_default();
+            output_to_supervised(status, &stdout, &stderr)
+        }
+    }
+}
+
+/// Recover a child whose `wait()` failed (a lost/errored process), attaching the
+/// process error to stderr when no captured stderr is available.
+async fn recover_lost_child(
+    child: &mut ProcessGroupChild,
+    stdout_handle: JoinHandle<Vec<u8>>,
+    stderr_handle: JoinHandle<Vec<u8>>,
+    policy: &TimeoutPolicy,
+    pid: Option<u32>,
+    error: &std::io::Error,
+) -> SupervisedOutput {
+    let mut recovered = recover_child(
+        child,
+        stdout_handle,
+        stderr_handle,
+        policy,
+        TimeoutClass::LostChild,
+        pid,
+    )
+    .await;
+    if recovered.stderr.is_empty() {
+        recovered.stderr = format!("process error: {error}");
+    }
+    recovered
 }
 
 async fn recover_child(
@@ -1218,6 +1259,21 @@ mod tests {
         }
     }
 
+    /// Assert the standard "supervisor killed the child on a timeout" outcome:
+    /// the run timed out, the child was killed, the timeout class and error code
+    /// match, and the supervisor never redispatched internally.
+    fn assert_timeout_outcome(
+        output: &SupervisedOutput,
+        expected_class: TimeoutClass,
+        expected_code: SupervisorErrorCode,
+    ) {
+        assert!(output.timed_out, "stderr={}", output.stderr);
+        assert!(output.killed, "stderr={}", output.stderr);
+        assert_eq!(output.timeout_class, Some(expected_class));
+        assert_eq!(output.error_code, Some(expected_code));
+        assert_eq!(output.redispatch_count, 0);
+    }
+
     #[test]
     fn normalize_strips_path_and_exe() {
         assert_eq!(normalize_program_name("/usr/bin/git"), "git");
@@ -1618,11 +1674,11 @@ mod tests {
                 &RunOptions::default(),
             )
             .await;
-        assert!(output.timed_out, "stderr={}", output.stderr);
-        assert!(output.killed);
-        assert_eq!(output.timeout_class, Some(TimeoutClass::Idle));
-        assert_eq!(output.error_code, Some(SupervisorErrorCode::IdleTimedOut));
-        assert_eq!(output.redispatch_count, 0);
+        assert_timeout_outcome(
+            &output,
+            TimeoutClass::Idle,
+            SupervisorErrorCode::IdleTimedOut,
+        );
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "idle detector hung instead of recovering"
