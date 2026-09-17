@@ -386,20 +386,31 @@ fn worktree_response(
     }
 }
 
+/// Emit a JSON-envelope response and return `SUCCESS`.
+///
+/// Shared by the `lease` and `worktree` wrappers, which differ only in how they
+/// build the `Response`; the JSON/human rendering below is byte-for-byte identical.
+fn emit_response(
+    response: &writ_core::contract::Response<serde_json::Value>,
+    json: bool,
+    stdout: &mut impl Write,
+) -> writ_core::error::Result<ExitCode> {
+    if json {
+        serde_json::to_writer(&mut *stdout, response).map_err(io::Error::other)?;
+        stdout.write_all(b"\n")?;
+    } else {
+        writeln!(stdout, "ok={} command={}", response.ok, response.command)?;
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 fn run_worktree(
     action: WorktreeAction,
     json: bool,
     stdout: &mut impl Write,
 ) -> writ_core::error::Result<ExitCode> {
     let response = worktree_response(action)?;
-
-    if json {
-        serde_json::to_writer(&mut *stdout, &response).map_err(io::Error::other)?;
-        stdout.write_all(b"\n")?;
-    } else {
-        writeln!(stdout, "ok={} command={}", response.ok, response.command)?;
-    }
-    Ok(ExitCode::SUCCESS)
+    emit_response(&response, json, stdout)
 }
 
 fn lease_response(
@@ -495,14 +506,7 @@ fn run_lease(
     stdout: &mut impl Write,
 ) -> writ_core::error::Result<ExitCode> {
     let response = lease_response(action)?;
-
-    if json {
-        serde_json::to_writer(&mut *stdout, &response).map_err(io::Error::other)?;
-        stdout.write_all(b"\n")?;
-    } else {
-        writeln!(stdout, "ok={} command={}", response.ok, response.command)?;
-    }
-    Ok(ExitCode::SUCCESS)
+    emit_response(&response, json, stdout)
 }
 
 /// Entry point for CLI commands (status/jobs, git/gh-safe, supervisor, worktree).

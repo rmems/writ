@@ -2054,4 +2054,64 @@ mod tests {
             Some(0)
         );
     }
+
+    // Exercises the `same_existing_path` tolerance inside `inspect_git`'s
+    // `worktree_registered` check (the path-equality fix from this PR). git
+    // reports the OS-canonical real worktree path, while the stored lease path
+    // reaches the same directory through a symlinked prefix (the macOS
+    // `/var -> /private/var` situation). Under the old exact-string comparison
+    // these differ and the worktree would be reported unregistered, wrongly
+    // classifying a clean allocation as `NeedsAttention`. This asserts the
+    // integration-level behaviour, not just the helper.
+    #[cfg(unix)]
+    #[test]
+    fn worktree_registered_tolerates_symlinked_stored_path() {
+        let harness = RepoHarness::new();
+
+        // Create and register the worktree at its real (non-symlinked) path.
+        fs::create_dir_all(harness.worktree.parent().unwrap()).unwrap();
+        git(
+            &harness.repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "hive/job-1",
+                "--",
+                harness.worktree.to_str().unwrap(),
+                &harness.start,
+            ],
+        );
+
+        // Build an alias that reaches the same directory via a symlink, so the
+        // stored path differs from git's reported path only by canonicalization.
+        let real_parent = harness.worktree.parent().unwrap();
+        let alias_parent = harness._temp.path().join("aliased-worktrees");
+        std::os::unix::fs::symlink(real_parent, &alias_parent).unwrap();
+        let aliased_worktree = alias_parent.join("job-1");
+        assert_ne!(aliased_worktree, harness.worktree);
+
+        let evidence = inspect_git(&harness.repo, &aliased_worktree, "hive/job-1");
+        assert!(
+            evidence.worktree_registered,
+            "symlinked stored path should still match git's canonical worktree path"
+        );
+
+        // And the full inspection should classify the allocation as Matching,
+        // proving the tolerance flows through to the reconcile decision.
+        harness.store.prepare_allocate(harness.request()).unwrap();
+        let inspection = harness
+            .store
+            .inspect(InspectRequest {
+                repo_root: &harness.repo,
+                owner: "acme",
+                repo_name: "sample",
+                job_id: "job-1",
+                worktree_path: &aliased_worktree,
+                branch: Some("hive/job-1"),
+            })
+            .unwrap();
+        assert!(inspection.worktree_registered);
+        assert_eq!(inspection.classification, EvidenceClass::Matching);
+    }
 }
