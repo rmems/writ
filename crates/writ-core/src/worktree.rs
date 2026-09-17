@@ -285,14 +285,21 @@ impl WorktreeManager {
     /// The associated branch is NOT deleted by default. The lease row is released
     /// without deleting resume identity so a later create can reclaim the branch.
     pub fn remove(&self, worktree_path: &Path, force: bool) -> Result<()> {
-        if !worktree_path.exists() {
-            self.leases.release_by_path(worktree_path)?;
-            return Ok(());
-        }
-
-        // Verify the path is within our sandbox
         let base = self.base_path()?;
-        if !is_within_base(worktree_path, base)? {
+        // Canonicalize up front so every downstream step -- the sandbox check,
+        // the git `worktree remove` argument, parent cleanup, and the lease
+        // release -- uses the same spelling that `grant` stored. A raw,
+        // non-canonical, or relative path with redundant segments would
+        // otherwise fail to match the stored lease row and leak ownership.
+        let canonical_path = canonicalize_removal_target(worktree_path)?;
+
+        // Enforce sandbox containment BEFORE any lease release, including the
+        // fast path for an already-gone worktree. Releasing a lease for a path
+        // outside the sandbox would let a foreign path drop another job's lock.
+        // `canonical_path` is already canonical (even when the leaf is gone), so
+        // compare against the canonical base directly instead of re-canonicalizing
+        // a possibly non-existent path.
+        if !canonical_path.starts_with(base) {
             return Err(Error::SandboxViolation {
                 base: base.to_path_buf(),
                 candidate: worktree_path.to_path_buf(),
@@ -300,15 +307,29 @@ impl WorktreeManager {
             });
         }
 
+        if !canonical_path.exists() {
+            // The directory is gone but git may still hold a stale registration
+            // for it. Prune it before releasing the lease so a later reclaim's
+            // `git worktree add` is not blocked by a stranded entry. This is
+            // best-effort: if the repo root cannot be resolved (the whole tree
+            // is gone), we keep the historical release-only behavior. We never
+            // delete branches or user content.
+            if let Ok(repo_root) = find_repo_root_for_worktree(&canonical_path) {
+                prune_stale_registration(&repo_root);
+            }
+            self.leases.release_by_path(&canonical_path)?;
+            return Ok(());
+        }
+
         // Find the repo root for this worktree
-        let repo_root = find_repo_root_for_worktree(worktree_path)?;
+        let repo_root = find_repo_root_for_worktree(&canonical_path)?;
 
         let mut args = vec!["worktree".into(), "remove".into()];
         if force {
             args.push("--force".into());
         }
         args.push("--".into());
-        args.push(worktree_path.to_string_lossy().to_string());
+        args.push(canonical_path.to_string_lossy().to_string());
 
         let output = Command::new("git")
             .arg("-C")
@@ -329,8 +350,8 @@ impl WorktreeManager {
         }
 
         // Also clean up empty parent directories
-        cleanup_empty_parents(worktree_path, base);
-        self.leases.release_by_path(worktree_path)?;
+        cleanup_empty_parents(&canonical_path, base);
+        self.leases.release_by_path(&canonical_path)?;
 
         Ok(())
     }
@@ -1122,18 +1143,61 @@ fn reject_symlink_components_under(base: &Path, path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Check if a path is within the base directory (sandbox check).
-fn is_within_base(path: &Path, base: &Path) -> Result<bool> {
-    let canonical_path = canonicalize_for_tools(path).map_err(|e| Error::Io {
-        context: "canonicalize candidate path",
-        source: e,
-    })?;
-    let canonical_base = canonicalize_for_tools(base).map_err(|e| Error::Io {
-        context: "canonicalize base path",
-        source: e,
-    })?;
+/// Resolve a removal target to the canonical spelling `grant` stored.
+///
+/// When the leaf exists we canonicalize it directly. When it is already gone we
+/// cannot canonicalize the leaf, so we canonicalize the nearest existing
+/// ancestor and re-attach the remaining tail. This keeps the sandbox check and
+/// the `release_by_path` lookup using the same canonical form that a live
+/// worktree would have produced. If no ancestor exists (nothing to anchor to),
+/// fall back to the raw path so the caller's sandbox check still runs and
+/// rejects it when appropriate.
+fn canonicalize_removal_target(worktree_path: &Path) -> Result<PathBuf> {
+    if worktree_path.exists() {
+        return canonicalize_for_tools(worktree_path).map_err(|e| Error::Io {
+            context: "canonicalize worktree removal target",
+            source: e,
+        });
+    }
+    let mut tail = PathBuf::new();
+    let mut ancestor = worktree_path;
+    loop {
+        match ancestor.parent() {
+            Some(parent) => {
+                let leaf = ancestor
+                    .file_name()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from(ancestor));
+                if parent.exists() {
+                    let canonical_parent =
+                        canonicalize_for_tools(parent).map_err(|e| Error::Io {
+                            context: "canonicalize worktree removal parent",
+                            source: e,
+                        })?;
+                    return Ok(canonical_parent.join(leaf).join(&tail));
+                }
+                tail = leaf.join(&tail);
+                ancestor = parent;
+            }
+            // No existing ancestor to anchor to; keep the raw path so the
+            // sandbox containment check still runs against it.
+            None => return Ok(worktree_path.to_path_buf()),
+        }
+    }
+}
 
-    Ok(canonical_path.starts_with(&canonical_base))
+/// Best-effort prune of stale worktree administrative entries in `repo_root`.
+///
+/// Only call this for paths already proven to be within the sandbox base. A
+/// failure is intentionally ignored: pruning stale registrations is a courtesy
+/// to a later reclaim, not a correctness precondition for releasing the lease.
+fn prune_stale_registration(repo_root: &Path) {
+    let _ = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .arg("worktree")
+        .arg("prune")
+        .output();
 }
 
 /// Clean up empty parent directories up to the base.
@@ -1699,6 +1763,84 @@ mod tests {
         assert!(wt.path.exists());
         harness.manager.remove(&wt.path, false).unwrap();
         assert!(!wt.path.exists());
+    }
+
+    #[test]
+    fn remove_via_non_canonical_path_still_releases_lease() {
+        let harness = Harness::sha1();
+        let start_commit = harness.head();
+        let wt = harness
+            .create("job-noncanon", "feature/noncanon", &start_commit)
+            .unwrap();
+        assert!(wt.path.exists());
+
+        // Spell the same worktree path with a redundant `.` segment so it is
+        // not byte-identical to the canonical path stored by `grant`.
+        let noncanonical = wt.path.join(".");
+        harness.manager.remove(&noncanonical, false).unwrap();
+        assert!(!wt.path.exists());
+
+        let lease = harness
+            .manager
+            .lease_store()
+            .find_resume(ResumeKey {
+                owner: "acme",
+                repo_name: "test-repo",
+                job_id: "job-noncanon",
+                branch: "feature/noncanon",
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(lease.mode, LeaseMode::Unassigned);
+        assert!(lease.released_at.is_some());
+    }
+
+    #[test]
+    fn remove_out_of_sandbox_path_is_rejected_and_releases_no_lease() {
+        let harness = Harness::sha1();
+        let start_commit = harness.head();
+        // Grant a lease for an in-sandbox job so we can prove it stays held.
+        let wt = harness
+            .create("job-guarded", "feature/guarded", &start_commit)
+            .unwrap();
+        assert!(wt.path.exists());
+
+        // A path outside the configured base must be rejected up front.
+        let outside = harness.temp_path().join("outside-sandbox");
+        fs::create_dir_all(&outside).unwrap();
+        let result = harness.manager.remove(&outside, false);
+        assert!(
+            matches!(result, Err(Error::SandboxViolation { .. })),
+            "expected SandboxViolation, got {result:?}"
+        );
+
+        // The in-sandbox lease must remain held (not released by the foreign path).
+        let lease = harness
+            .manager
+            .lease_store()
+            .find_resume(ResumeKey {
+                owner: "acme",
+                repo_name: "test-repo",
+                job_id: "job-guarded",
+                branch: "feature/guarded",
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(lease.mode, LeaseMode::WriterLocked);
+        assert!(lease.released_at.is_none());
+    }
+
+    #[test]
+    fn remove_out_of_sandbox_nonexistent_path_is_rejected_before_release() {
+        let harness = Harness::sha1();
+        // A non-existent out-of-sandbox path must still be rejected (the
+        // containment check runs before the release fast path).
+        let outside = harness.temp_path().join("gone-outside/leaf");
+        let result = harness.manager.remove(&outside, false);
+        assert!(
+            matches!(result, Err(Error::SandboxViolation { .. })),
+            "expected SandboxViolation, got {result:?}"
+        );
     }
 
     #[test]

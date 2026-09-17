@@ -39,14 +39,24 @@ impl LeaseMode {
         }
     }
 
-    fn parse(value: &str) -> Self {
+    /// Parse a stored mode string, failing closed on unrecognized values.
+    ///
+    /// A corrupted or unknown mode must NOT decay to `Unassigned`: a released
+    /// (`Unassigned`) lease is treated as reclaimable by `prove_resume`, so
+    /// silently mapping garbage to `Unassigned` would hand ownership of a branch
+    /// to a caller who never held the lease. Surface it as an error instead.
+    fn parse(value: &str) -> Result<Self> {
         match value {
-            "WRITER_LOCKED" => Self::WriterLocked,
-            "REVIEW_ONLY" => Self::ReviewOnly,
-            "NEEDS_HUMAN" => Self::NeedsHuman,
-            "BLOCKED" => Self::Blocked,
-            "MERGE_READY" => Self::MergeReady,
-            _ => Self::Unassigned,
+            "UNASSIGNED" => Ok(Self::Unassigned),
+            "WRITER_LOCKED" => Ok(Self::WriterLocked),
+            "REVIEW_ONLY" => Ok(Self::ReviewOnly),
+            "NEEDS_HUMAN" => Ok(Self::NeedsHuman),
+            "BLOCKED" => Ok(Self::Blocked),
+            "MERGE_READY" => Ok(Self::MergeReady),
+            other => Err(Error::LeaseStore {
+                context: "parse lease mode",
+                message: format!("unrecognized lease mode: {other:?}"),
+            }),
         }
     }
 }
@@ -300,6 +310,20 @@ impl LeaseStore {
 }
 
 fn lease_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Lease> {
+    let mode_text = row.get::<_, String>(8)?;
+    // Map an unrecognized mode to a rusqlite conversion failure so the existing
+    // `lease_err` wrapping in `query_lease` surfaces it as `Error::LeaseStore`
+    // instead of decaying to a reclaimable `Unassigned` lease.
+    let mode = LeaseMode::parse(&mode_text).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(
+            8,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                e.to_string(),
+            )),
+        )
+    })?;
     Ok(Lease {
         repo: row.get(0)?,
         owner: row.get(1)?,
@@ -309,7 +333,7 @@ fn lease_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Lease> {
         branch_ref: row.get(5)?,
         worktree_path: row.get(6)?,
         start_commit: row.get(7)?,
-        mode: LeaseMode::parse(&row.get::<_, String>(8)?),
+        mode,
         ttl: row.get(9)?,
         heartbeat: row.get(10)?,
         max_files: row.get(11)?,
@@ -395,6 +419,67 @@ mod tests {
             .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
             .unwrap();
         assert_eq!(timeout, 5000);
+    }
+
+    #[test]
+    fn unrecognized_mode_fails_closed_instead_of_becoming_unassigned() {
+        let tmp = tempdir().unwrap();
+        let store = LeaseStore::open(tmp.path().join("leases.db")).unwrap();
+        let repo = tmp.path().join("repo");
+        let wt = tmp.path().join("worktrees/acme/sample/gh-42");
+        store
+            .grant(LeaseGrant {
+                repo: &repo,
+                owner: "acme",
+                repo_name: "sample",
+                job_id: "gh-42",
+                branch: "hive/gh-42",
+                worktree_path: &wt,
+                start_commit: "abc123",
+            })
+            .unwrap();
+
+        // Corrupt the stored mode to a value outside the known set.
+        {
+            let conn = store.lock().unwrap();
+            conn.execute(
+                "UPDATE leases SET mode = 'FUTURE_MODE' WHERE owner = ?1",
+                params!["acme"],
+            )
+            .unwrap();
+        }
+
+        // A corrupted mode must fail closed, not decay to a reclaimable Unassigned.
+        let resume = store.find_resume(ResumeKey {
+            owner: "acme",
+            repo_name: "sample",
+            job_id: "gh-42",
+            branch: "hive/gh-42",
+        });
+        assert!(
+            matches!(resume, Err(Error::LeaseStore { .. })),
+            "expected LeaseStore error, got {resume:?}"
+        );
+
+        let by_path = store.find_by_path(&wt);
+        assert!(
+            matches!(by_path, Err(Error::LeaseStore { .. })),
+            "expected LeaseStore error, got {by_path:?}"
+        );
+    }
+
+    #[test]
+    fn every_known_mode_round_trips_through_as_str() {
+        for mode in [
+            LeaseMode::Unassigned,
+            LeaseMode::WriterLocked,
+            LeaseMode::ReviewOnly,
+            LeaseMode::NeedsHuman,
+            LeaseMode::Blocked,
+            LeaseMode::MergeReady,
+        ] {
+            assert_eq!(LeaseMode::parse(mode.as_str()).unwrap(), mode);
+        }
     }
 
     #[test]
