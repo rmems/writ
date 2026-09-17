@@ -132,24 +132,11 @@ pub fn status_error(command: &'static str, message: String) -> StatusReport {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
     use crate::contract::SCHEMA_VERSION;
-
-    fn sample_job() -> JobStatus {
-        JobStatus {
-            job_id: "writ-100".to_owned(),
-            owner: "acme".to_owned(),
-            repo: "example-org".to_owned(),
-            issue_number: Some(29),
-            pr_number: Some(42),
-            worktree_path: "/tmp/worktrees/acme/example-org/writ-100".to_owned(),
-            branch: "feature/status-json-cli".to_owned(),
-            process_state: ProcessState::Running,
-            last_error: None,
-            timeout_residual: None,
-            ci_class: CiClass::Pending,
-        }
-    }
+    use crate::test_support::sample_job;
 
     #[test]
     fn job_status_serializes_with_optional_fields_present() {
@@ -157,20 +144,25 @@ mod tests {
             last_error: Some("task failed: permission denied".to_owned()),
             ..sample_job()
         };
-        let json = serde_json::to_string(&job).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let v = serde_json::to_value(&job).unwrap();
 
-        assert_eq!(v.get("job_id").expect("missing job_id"), "writ-100");
+        // A single subset comparison checks every populated field at once
+        // (job_id, process_state, ci_class, issue_number, pr_number,
+        // last_error) without a large assertion block.
         assert_eq!(
-            v.get("process_state").expect("missing process_state"),
-            "running"
-        );
-        assert_eq!(v.get("ci_class").expect("missing ci_class"), "pending");
-        assert_eq!(v.get("issue_number").expect("missing issue_number"), 29);
-        assert_eq!(v.get("pr_number").expect("missing pr_number"), 42);
-        assert_eq!(
-            v.get("last_error").expect("missing last_error"),
-            "task failed: permission denied"
+            v,
+            json!({
+                "job_id": "writ-100",
+                "owner": "acme",
+                "repo": "example-org",
+                "issue_number": 29,
+                "pr_number": 42,
+                "worktree_path": "/tmp/worktrees/acme/example-org/writ-100",
+                "branch": "feature/status-json-cli",
+                "process_state": "running",
+                "last_error": "task failed: permission denied",
+                "ci_class": "pending",
+            })
         );
     }
 
@@ -182,13 +174,23 @@ mod tests {
             last_error: None,
             ..sample_job()
         };
-        let json = serde_json::to_string(&job).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let v = serde_json::to_value(&job).unwrap();
 
-        assert!(v.get("issue_number").is_none());
-        assert!(v.get("pr_number").is_none());
-        assert!(v.get("last_error").is_none());
-        assert!(v.get("timeout_residual").is_none());
+        // Exact-match comparison: the expected object omits issue_number,
+        // pr_number, last_error, and timeout_residual, so any of those keys
+        // leaking into the output fails this single assertion.
+        assert_eq!(
+            v,
+            json!({
+                "job_id": "writ-100",
+                "owner": "acme",
+                "repo": "example-org",
+                "worktree_path": "/tmp/worktrees/acme/example-org/writ-100",
+                "branch": "feature/status-json-cli",
+                "process_state": "running",
+                "ci_class": "pending",
+            })
+        );
     }
 
     #[test]
@@ -208,38 +210,41 @@ mod tests {
             ..sample_job()
         };
         let v = serde_json::to_value(&job).unwrap();
-        assert_eq!(v["timeout_residual"]["reason"], "wall_clock");
-        assert_eq!(v["timeout_residual"]["recovery_stage"], "kill");
-        assert_eq!(v["timeout_residual"]["max_redispatch_per_item"], 1);
-        assert!(v["timeout_residual"].get("sha").is_none());
+
+        // Exact-match of the residual object verifies reason, recovery_stage,
+        // and max_redispatch_per_item, and (being an exact match) also proves
+        // no `sha` key is emitted.
+        assert_eq!(
+            v["timeout_residual"],
+            json!({
+                "reason": "wall_clock",
+                "recovery_stage": "kill",
+                "redispatch_count": 1,
+                "max_redispatch_per_item": 1,
+                "elapsed_ms": 1_800_000,
+            })
+        );
     }
 
     #[test]
     fn status_response_uses_v1_envelope() {
         let response = status_response("cli.status", vec![sample_job()]);
-        let json = serde_json::to_string(&response).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let v = serde_json::to_value(&response).unwrap();
 
-        // Verify envelope keys exist (not Null from missing keys).
+        // One exact-match comparison verifies the whole envelope: the
+        // schema_version / command / ok / explicit-null error keys, that jobs
+        // live under `data` (not at the top level), and that exactly one job
+        // is present.
         assert_eq!(
-            v.get("schema_version").expect("missing schema_version"),
-            SCHEMA_VERSION
+            v,
+            json!({
+                "ok": true,
+                "schema_version": SCHEMA_VERSION,
+                "command": "cli.status",
+                "data": { "jobs": [serde_json::to_value(sample_job()).unwrap()] },
+                "error": null,
+            })
         );
-        assert_eq!(v.get("command").expect("missing command"), "cli.status");
-        assert!(v.get("ok").expect("missing ok").as_bool().unwrap());
-        assert!(
-            v.get("error").expect("missing error").is_null(),
-            "error must be explicitly null, not absent"
-        );
-        // Verify jobs live under data, not at top level.
-        assert!(v.get("jobs").is_none(), "jobs must not be at top level");
-        let data = v.get("data").expect("missing data");
-        let jobs = data
-            .get("jobs")
-            .expect("missing data.jobs")
-            .as_array()
-            .expect("data.jobs must be an array");
-        assert_eq!(jobs.len(), 1);
     }
 
     #[test]
@@ -252,42 +257,40 @@ mod tests {
     #[test]
     fn status_error_sets_ok_false_and_error_payload() {
         let response = status_error("cli.status", "parse failed".to_owned());
-        let json = serde_json::to_string(&response).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let v = serde_json::to_value(&response).unwrap();
 
-        assert_eq!(v.get("ok").expect("missing ok"), false);
-        assert_eq!(v.get("command").expect("missing command"), "cli.status");
-        let err = v.get("error").expect("missing error");
-        assert_eq!(err.get("code").expect("missing code"), "STATE_LOAD_FAILED");
-        assert_eq!(err.get("message").expect("missing message"), "parse failed");
-        let jobs = v
-            .get("data")
-            .expect("missing data")
-            .get("jobs")
-            .expect("missing data.jobs")
-            .as_array()
-            .expect("data.jobs must be array");
-        assert!(jobs.is_empty());
+        // Exact-match verifies ok=false, command, the error code/message
+        // payload, and an empty jobs list in a single assertion.
+        assert_eq!(
+            v,
+            json!({
+                "ok": false,
+                "schema_version": SCHEMA_VERSION,
+                "command": "cli.status",
+                "data": { "jobs": [] },
+                "error": { "code": "STATE_LOAD_FAILED", "message": "parse failed" },
+            })
+        );
     }
 
     #[test]
     fn roundtrip_through_json() {
         let response = status_response("cli.status", vec![sample_job()]);
+        // Round-trip through a JSON string and back into a typed value.
         let json = serde_json::to_string(&response).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(v.get("command").expect("missing command"), "cli.status");
-        let data = v.get("data").expect("missing data");
-        let jobs = data
-            .get("jobs")
-            .expect("missing data.jobs")
-            .as_array()
-            .expect("data.jobs must be an array");
-        assert_eq!(jobs.len(), 1);
-        assert_eq!(jobs[0].get("job_id").expect("missing job_id"), "writ-100");
+        // Single subset comparison covers the command plus the single job's
+        // identifying fields (job_id, branch) surviving the round-trip.
         assert_eq!(
-            jobs[0].get("branch").expect("missing branch"),
-            "feature/status-json-cli"
+            v,
+            json!({
+                "ok": true,
+                "schema_version": SCHEMA_VERSION,
+                "command": "cli.status",
+                "data": { "jobs": [serde_json::to_value(sample_job()).unwrap()] },
+                "error": null,
+            })
         );
     }
 

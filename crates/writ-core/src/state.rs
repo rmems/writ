@@ -61,21 +61,19 @@ mod tests {
 
     use super::load_jobs_from;
     use crate::paths::resolve_state_path;
-    use crate::status::{CiClass, JobStatus, ProcessState};
+    use crate::status::JobStatus;
+    use crate::test_support::sample_job;
 
-    fn sample_job() -> JobStatus {
+    /// Job fixture for state-store tests: overrides the shared `sample_job()`
+    /// base with the identifiers this module's assertions depend on.
+    fn sample_state_job() -> JobStatus {
         JobStatus {
             job_id: "writ-1".to_owned(),
-            owner: "acme".to_owned(),
-            repo: "example-org".to_owned(),
             issue_number: Some(1),
             pr_number: None,
             worktree_path: "/tmp/worktrees/acme/example-org/writ-1".to_owned(),
             branch: "feature/status".to_owned(),
-            process_state: ProcessState::Running,
-            last_error: None,
-            timeout_residual: None,
-            ci_class: CiClass::Pending,
+            ..sample_job()
         }
     }
 
@@ -94,7 +92,7 @@ mod tests {
     fn writ_state_path_load_success() {
         // Simulate WRIT_STATE_PATH pointing at a valid watched.json.
         let path = resolve_state_path(Some(unique_path("writ-state-ok").as_os_str()));
-        let jobs = vec![sample_job()];
+        let jobs = vec![sample_state_job()];
         fs::write(&path, serde_json::to_string(&jobs).unwrap()).unwrap();
 
         let loaded = load_jobs_from(&path).expect("load success");

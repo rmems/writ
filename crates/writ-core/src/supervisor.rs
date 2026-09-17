@@ -1311,6 +1311,100 @@ mod tests {
         }
     }
 
+    /// Expected shape of a timeout outcome, used with [`assert_timeout_outcome`]
+    /// to fold several related checks into one assertion call. Fields left
+    /// `None` are not asserted.
+    #[cfg(unix)]
+    #[derive(Default)]
+    struct ExpectTimeout {
+        error_code: Option<SupervisorErrorCode>,
+        stage: Option<RecoveryStage>,
+        reason: Option<StuckReason>,
+        killed: bool,
+        exit_code_none: bool,
+    }
+
+    /// Assert the common timeout outcome shape in a single call: `timed_out`,
+    /// `killed`, `error_code`, absent exit code, and the recovery stage /
+    /// stuck reason recorded on the residual.
+    ///
+    /// Consolidates the repeated `timed_out` + `killed` + `error_code` +
+    /// `residual.*` assertion blocks flagged by CodeScene (Large Assertion
+    /// Blocks) into one place while verifying the same properties.
+    #[cfg(unix)]
+    fn assert_timeout_outcome(output: &SupervisedOutput, expect: &ExpectTimeout) {
+        assert!(output.timed_out, "expected timeout; output={output:?}");
+        assert_eq!(
+            output.killed, expect.killed,
+            "unexpected killed flag; output={output:?}"
+        );
+        if expect.exit_code_none {
+            assert!(
+                output.exit_code.is_none(),
+                "expected no exit code; output={output:?}"
+            );
+        }
+        if expect.error_code.is_some() {
+            assert_eq!(
+                output.error_code, expect.error_code,
+                "unexpected error_code; output={output:?}"
+            );
+        }
+        if expect.stage.is_some() {
+            assert_eq!(
+                output.residual.as_ref().map(|r| r.recovery_stage),
+                expect.stage,
+                "unexpected recovery_stage; output={output:?}"
+            );
+        }
+        if expect.reason.is_some() {
+            assert_eq!(
+                output.residual.as_ref().map(|r| r.reason),
+                expect.reason,
+                "unexpected stuck reason; output={output:?}"
+            );
+        }
+    }
+
+    /// Run a graceful-cancel scenario and assert its recovery outcome.
+    ///
+    /// Shared by `graceful_cancel_then_kill_when_term_ignored` and
+    /// `graceful_cancel_reaps_term_sensitive_child`, which differ only in the
+    /// grace window, the child script, and the expected recovery stage / kill
+    /// flag.
+    #[cfg(unix)]
+    async fn assert_graceful_recovery(
+        grace: Duration,
+        script: &str,
+        expected_stage: RecoveryStage,
+        expect_killed: bool,
+    ) {
+        let supervisor = Supervisor::new(1);
+        let policy = TimeoutPolicy {
+            grace,
+            stall: None,
+            progress: None,
+            max_redispatch_per_item: 1,
+        };
+        let output = supervisor
+            .run_unchecked_with(
+                shell_program(),
+                &[shell_flag(), script],
+                Some(Duration::from_millis(200)),
+                &policy,
+                None,
+            )
+            .await;
+        assert_timeout_outcome(
+            &output,
+            &ExpectTimeout {
+                stage: Some(expected_stage),
+                killed: expect_killed,
+                ..ExpectTimeout::default()
+            },
+        );
+    }
+
     #[test]
     fn normalize_strips_path_and_exe() {
         assert_eq!(normalize_program_name("/usr/bin/git"), "git");
@@ -1724,11 +1818,14 @@ mod tests {
                 None,
             )
             .await;
-        assert!(output.timed_out, "stderr={}", output.stderr);
-        assert_eq!(output.error_code, Some(SupervisorErrorCode::Stalled));
-        assert_eq!(
-            output.residual.as_ref().map(|r| r.reason),
-            Some(StuckReason::Stall)
+        assert_timeout_outcome(
+            &output,
+            &ExpectTimeout {
+                error_code: Some(SupervisorErrorCode::Stalled),
+                reason: Some(StuckReason::Stall),
+                killed: true,
+                ..ExpectTimeout::default()
+            },
         );
         assert!(
             started.elapsed() < Duration::from_secs(5),
@@ -1739,58 +1836,28 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn graceful_cancel_then_kill_when_term_ignored() {
-        let supervisor = Supervisor::new(1);
-        let policy = TimeoutPolicy {
-            grace: Duration::from_millis(200),
-            stall: None,
-            progress: None,
-            max_redispatch_per_item: 1,
-        };
-        let output = supervisor
-            .run_unchecked_with(
-                shell_program(),
-                &[shell_flag(), "trap '' TERM; while true; do :; done"],
-                Some(Duration::from_millis(200)),
-                &policy,
-                None,
-            )
-            .await;
-        assert!(output.timed_out, "stderr={}", output.stderr);
-        assert_eq!(
-            output.residual.as_ref().map(|r| r.recovery_stage),
-            Some(RecoveryStage::Kill)
-        );
-        assert!(output.killed);
+        // TERM is trapped and ignored, so graceful cancel escalates to a kill.
+        assert_graceful_recovery(
+            Duration::from_millis(200),
+            "trap '' TERM; while true; do :; done",
+            RecoveryStage::Kill,
+            true,
+        )
+        .await;
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn graceful_cancel_reaps_term_sensitive_child() {
-        let supervisor = Supervisor::new(1);
-        let policy = TimeoutPolicy {
-            grace: Duration::from_secs(2),
-            stall: None,
-            progress: None,
-            max_redispatch_per_item: 1,
-        };
-        let output = supervisor
-            .run_unchecked_with(
-                shell_program(),
-                &[
-                    shell_flag(),
-                    "trap 'exit 0' TERM; while true; do sleep 0.05; done",
-                ],
-                Some(Duration::from_millis(200)),
-                &policy,
-                None,
-            )
-            .await;
-        assert!(output.timed_out, "output={output:?}");
-        assert_eq!(
-            output.residual.as_ref().map(|r| r.recovery_stage),
-            Some(RecoveryStage::GracefulCancel)
-        );
-        assert!(!output.killed);
+        // TERM triggers a clean exit within the grace window, so the child is
+        // reaped by graceful cancel without a kill.
+        assert_graceful_recovery(
+            Duration::from_secs(2),
+            "trap 'exit 0' TERM; while true; do sleep 0.05; done",
+            RecoveryStage::GracefulCancel,
+            false,
+        )
+        .await;
     }
 
     #[cfg(unix)]
@@ -1813,15 +1880,13 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(output.timed_out, "stderr={}", output.stderr);
-        assert!(!output.killed);
-        assert_eq!(
-            output.residual.as_ref().map(|r| r.reason),
-            Some(StuckReason::PermitWait)
-        );
-        assert_eq!(
-            output.residual.as_ref().map(|r| r.recovery_stage),
-            Some(RecoveryStage::None)
+        assert_timeout_outcome(
+            &output,
+            &ExpectTimeout {
+                stage: Some(RecoveryStage::None),
+                reason: Some(StuckReason::PermitWait),
+                ..ExpectTimeout::default()
+            },
         );
         let _ = handle.await;
     }
