@@ -380,13 +380,17 @@ fn classify_class(entry: &CheckEntry) -> CheckClass {
     if is_class_c(&text, &entry.details_url) {
         return CheckClass::C;
     }
-    if is_github_actions_url(&entry.details_url)
-        || is_azure_build_url(&entry.details_url)
-        || !entry.workflow_name.trim().is_empty()
-    {
+    if is_class_a(entry) {
         return CheckClass::A;
     }
     CheckClass::C
+}
+
+/// First-party CI: a GitHub Actions/Azure build URL, or any named workflow.
+fn is_class_a(entry: &CheckEntry) -> bool {
+    is_github_actions_url(&entry.details_url)
+        || is_azure_build_url(&entry.details_url)
+        || !entry.workflow_name.trim().is_empty()
 }
 
 fn is_class_b(text: &str, url: &str) -> bool {
@@ -400,17 +404,28 @@ fn is_class_b(text: &str, url: &str) -> bool {
 }
 
 fn is_class_c(text: &str, url: &str) -> bool {
-    contains_word(text, "kilo")
+    is_class_c_vendor_text(text) || is_review_bot_text(text) || is_class_c_vendor_url(url)
+}
+
+/// Word-boundary vendor keywords that mark a third-party (Class C) review check.
+fn is_class_c_vendor_text(text: &str) -> bool {
+    const WORD_NEEDLES: &[&str] = &["kilo", "gitar", "dependabot", "renovate"];
+    WORD_NEEDLES.iter().any(|word| contains_word(text, word))
         || contains_any(text, &["coderabbit", "code rabbit"])
-        || contains_word(text, "gitar")
-        || contains_any(text, &["code review"])
-        || contains_word(text, "dependabot")
-        || contains_word(text, "renovate")
+}
+
+/// Review-bot phrases: an explicit "code review" gate, or Copilot review checks.
+fn is_review_bot_text(text: &str) -> bool {
+    contains_any(text, &["code review"])
         || (contains_word(text, "copilot") && contains_word(text, "review"))
-        || contains_any(
-            url,
-            &["kilo.ai", "app.kilo.ai", "coderabbit.ai", "gitar.ai"],
-        )
+}
+
+/// Vendor hostnames that mark a third-party (Class C) review check.
+fn is_class_c_vendor_url(url: &str) -> bool {
+    contains_any(
+        url,
+        &["kilo.ai", "app.kilo.ai", "coderabbit.ai", "gitar.ai"],
+    )
 }
 
 fn is_github_actions_url(url: &str) -> bool {
@@ -505,11 +520,8 @@ fn recommended_action(
     if entry.conclusion == CheckConclusion::Pending {
         return RecommendedAction::Wait;
     }
-    if check_class == CheckClass::A
-        && policies.contains(&Policy::Rerun)
-        && let Some(run_id) = entry.run_id
-    {
-        return RecommendedAction::Rerun { run_id };
+    if let Some(rerun) = rerun_action(check_class, entry, policies) {
+        return rerun;
     }
     if policies.contains(&Policy::FixSource) && residual.is_none() {
         return RecommendedAction::FixSource;
@@ -523,6 +535,20 @@ fn recommended_action(
         return RecommendedAction::FixSource;
     }
     RecommendedAction::Ignore
+}
+
+/// Official rerun for a Class A flake that carries a `Rerun` policy and a run id.
+fn rerun_action(
+    check_class: CheckClass,
+    entry: &CheckEntry,
+    policies: &BTreeSet<Policy>,
+) -> Option<RecommendedAction> {
+    if check_class == CheckClass::A && policies.contains(&Policy::Rerun) {
+        return entry
+            .run_id
+            .map(|run_id| RecommendedAction::Rerun { run_id });
+    }
+    None
 }
 
 fn explain(check_class: CheckClass, entry: &CheckEntry) -> String {
@@ -542,30 +568,82 @@ fn explain(check_class: CheckClass, entry: &CheckEntry) -> String {
     }
 }
 
+/// How a vendor's text keywords are matched, preserving the original per-vendor
+/// semantics: `codacy`/`coderabbit` matched by substring (`contains_any`);
+/// `kilo`/`gitar` matched on word boundaries (`contains_word`).
+#[derive(Clone, Copy)]
+enum TextMatch {
+    /// Substring match over any of the needles.
+    Substring,
+    /// Word-boundary match over any of the needles.
+    Word,
+}
+
+/// One vendor fingerprint: canonical slug, text keywords + how they match, and
+/// a lowercase url substring.
+struct VendorMatch {
+    slug: &'static str,
+    text_needles: &'static [&'static str],
+    text_match: TextMatch,
+    url_needle: &'static str,
+}
+
+/// Known residual vendors, in precedence order (codacy first, matching the
+/// prior if-chain).
+const VENDOR_MATCHES: &[VendorMatch] = &[
+    VendorMatch {
+        slug: "codacy",
+        text_needles: &["codacy"],
+        text_match: TextMatch::Substring,
+        url_needle: "codacy",
+    },
+    VendorMatch {
+        slug: "kilo",
+        text_needles: &["kilo"],
+        text_match: TextMatch::Word,
+        url_needle: "kilo",
+    },
+    VendorMatch {
+        slug: "coderabbit",
+        text_needles: &["coderabbit", "code rabbit"],
+        text_match: TextMatch::Substring,
+        url_needle: "coderabbit",
+    },
+    VendorMatch {
+        slug: "gitar",
+        text_needles: &["gitar"],
+        text_match: TextMatch::Word,
+        url_needle: "gitar",
+    },
+];
+
 fn vendor_slug(check_class: CheckClass, entry: &CheckEntry) -> String {
     let text = combined_text(entry);
-    if contains_any(&text, &["codacy"]) || entry.details_url.to_ascii_lowercase().contains("codacy")
+    let url = entry.details_url.to_ascii_lowercase();
+    if let Some(vendor) = VENDOR_MATCHES
+        .iter()
+        .find(|vendor| vendor.matches(&text, &url))
     {
-        return "codacy".to_owned();
-    }
-    if contains_word(&text, "kilo") || entry.details_url.to_ascii_lowercase().contains("kilo") {
-        return "kilo".to_owned();
-    }
-    if contains_any(&text, &["coderabbit", "code rabbit"])
-        || entry
-            .details_url
-            .to_ascii_lowercase()
-            .contains("coderabbit")
-    {
-        return "coderabbit".to_owned();
-    }
-    if contains_word(&text, "gitar") || entry.details_url.to_ascii_lowercase().contains("gitar") {
-        return "gitar".to_owned();
+        return vendor.slug.to_owned();
     }
     match check_class {
         CheckClass::B => "quality".to_owned(),
         CheckClass::C => "third_party".to_owned(),
         CheckClass::A => slug_name(&entry.name),
+    }
+}
+
+impl VendorMatch {
+    /// Text OR url match, preserving the original word/substring semantics.
+    fn matches(&self, text: &str, lower_url: &str) -> bool {
+        self.matches_text(text) || lower_url.contains(self.url_needle)
+    }
+
+    fn matches_text(&self, text: &str) -> bool {
+        match self.text_match {
+            TextMatch::Substring => contains_any(text, self.text_needles),
+            TextMatch::Word => self.text_needles.iter().any(|w| contains_word(text, w)),
+        }
     }
 }
 
@@ -724,6 +802,49 @@ mod tests {
         classify_check(parse_check_entry(&raw_check(name, workflow, bucket, link)))
     }
 
+    /// Assert a classified check's class, its exact recommended action, and its
+    /// residual code (`None` for no residual), collapsing the common trio of
+    /// per-check assertions into one call.
+    fn assert_outcome(
+        classified: &ClassifiedCheck,
+        expected_class: CheckClass,
+        expected_action: &RecommendedAction,
+        expected_residual: Option<&str>,
+    ) {
+        assert_eq!(classified.check_class, expected_class);
+        assert_eq!(&classified.recommended_action, expected_action);
+        assert_eq!(classified.residual_code.as_deref(), expected_residual);
+    }
+
+    /// Assert that a classified check carries every policy in `present` and none
+    /// of the policies in `absent`.
+    fn assert_policies(classified: &ClassifiedCheck, present: &[Policy], absent: &[Policy]) {
+        for policy in present {
+            assert!(
+                classified.policies.contains(policy),
+                "expected policy {policy:?} to be present"
+            );
+        }
+        for policy in absent {
+            assert!(
+                !classified.policies.contains(policy),
+                "expected policy {policy:?} to be absent"
+            );
+        }
+    }
+
+    /// Per-class check counts for a report: `(class_a, class_b, class_c)`.
+    fn assert_class_counts(report: &ClassificationReport, expected: (usize, usize, usize)) {
+        assert_eq!(
+            (
+                report.class_a().len(),
+                report.class_b().len(),
+                report.class_c().len(),
+            ),
+            expected
+        );
+    }
+
     #[test]
     fn gh_bucket_aliases_normalize() {
         assert_eq!(
@@ -784,12 +905,12 @@ mod tests {
     #[test]
     fn class_a_actions_and_azure() {
         let ci = classify_named("Build & Test", "CI", "fail", actions_url());
-        assert_eq!(ci.check_class, CheckClass::A);
-        assert!(ci.policies.contains(&Policy::FixSource));
-        assert!(ci.policies.contains(&Policy::ForbidEmptyCommit));
-        assert!(!ci.policies.contains(&Policy::Rerun));
-        assert_eq!(ci.recommended_action, RecommendedAction::FixSource);
-        assert!(ci.residual_code.is_none());
+        assert_outcome(&ci, CheckClass::A, &RecommendedAction::FixSource, None);
+        assert_policies(
+            &ci,
+            &[Policy::FixSource, Policy::ForbidEmptyCommit],
+            &[Policy::Rerun],
+        );
 
         let azure = classify_named(
             "Limen-Neural.neuromod (BuildTest linux)",
@@ -821,11 +942,12 @@ mod tests {
             "fail",
             "https://app.codacy.com/gh/acme/example-org/pull-requests/12",
         );
-        assert_eq!(fail.check_class, CheckClass::B);
-        assert!(fail.policies.contains(&Policy::FixSource));
-        assert!(!fail.policies.contains(&Policy::Rerun));
-        assert!(fail.policies.contains(&Policy::ForbidEmptyCommit));
-        assert_eq!(fail.recommended_action, RecommendedAction::FixSource);
+        assert_outcome(&fail, CheckClass::B, &RecommendedAction::FixSource, None);
+        assert_policies(
+            &fail,
+            &[Policy::FixSource, Policy::ForbidEmptyCommit],
+            &[Policy::Rerun],
+        );
 
         let gate = classify_check(parse_check_entry(&json!({
             "name": "Codacy Static Code Analysis",
@@ -833,18 +955,15 @@ mod tests {
             "conclusion": "ACTION_REQUIRED",
             "__typename": "CheckRun",
         })));
-        assert_eq!(gate.check_class, CheckClass::B);
-        assert!(gate.policies.contains(&Policy::MarkResidual));
-        assert_eq!(
-            gate.residual_code.as_deref(),
-            Some("class_b:codacy_action_required")
+        assert_outcome(
+            &gate,
+            CheckClass::B,
+            &RecommendedAction::Residual {
+                code: "class_b:codacy_action_required".to_owned(),
+            },
+            Some("class_b:codacy_action_required"),
         );
-        assert_eq!(
-            gate.recommended_action,
-            RecommendedAction::Residual {
-                code: "class_b:codacy_action_required".to_owned()
-            }
-        );
+        assert_policies(&gate, &[Policy::MarkResidual], &[]);
         assert!(!should_rerun(&gate));
     }
 
@@ -856,23 +975,35 @@ mod tests {
             ("Gitar", "https://gitar.ai/r/1", "gitar"),
         ] {
             let pending = classify_named(name, "", "pending", link);
-            assert_eq!(pending.check_class, CheckClass::C);
-            assert!(pending.policies.is_empty());
-            assert_eq!(pending.recommended_action, RecommendedAction::Wait);
-            assert_eq!(
-                pending.residual_code,
-                Some(format!("class_c:{vendor}_pending"))
+            let pending_residual = format!("class_c:{vendor}_pending");
+            assert_outcome(
+                &pending,
+                CheckClass::C,
+                &RecommendedAction::Wait,
+                Some(pending_residual.as_str()),
             );
+            assert!(pending.policies.is_empty());
             assert!(!should_rerun(&pending));
 
             let fail = classify_named(name, "", "fail", link);
-            assert_eq!(fail.check_class, CheckClass::C);
-            assert!(fail.policies.contains(&Policy::ReportOnly));
-            assert!(fail.policies.contains(&Policy::MarkResidual));
-            assert!(fail.policies.contains(&Policy::ForbidEmptyCommit));
-            assert!(!fail.policies.contains(&Policy::FixSource));
-            assert!(!fail.policies.contains(&Policy::Rerun));
-            assert_eq!(fail.residual_code, Some(format!("class_c:{vendor}_fail")));
+            let fail_residual = format!("class_c:{vendor}_fail");
+            assert_outcome(
+                &fail,
+                CheckClass::C,
+                &RecommendedAction::Residual {
+                    code: fail_residual.clone(),
+                },
+                Some(fail_residual.as_str()),
+            );
+            assert_policies(
+                &fail,
+                &[
+                    Policy::ReportOnly,
+                    Policy::MarkResidual,
+                    Policy::ForbidEmptyCommit,
+                ],
+                &[Policy::FixSource, Policy::Rerun],
+            );
         }
     }
 
@@ -920,6 +1051,13 @@ mod tests {
     #[test]
     fn class_a_timeout_prefers_official_rerun() {
         let classified = classify_named("Build & Test", "CI", "timed_out", actions_url());
+        assert_outcome(
+            &classified,
+            CheckClass::A,
+            &RecommendedAction::Rerun { run_id: 12345 },
+            None,
+        );
+        assert_policies(&classified, &[Policy::ForbidEmptyCommit], &[]);
         assert!(should_rerun(&classified));
         assert_eq!(
             rerun_command(&classified),
@@ -929,11 +1067,6 @@ mod tests {
                 "12345".to_owned()
             ])
         );
-        assert_eq!(
-            classified.recommended_action,
-            RecommendedAction::Rerun { run_id: 12345 }
-        );
-        assert!(classified.policies.contains(&Policy::ForbidEmptyCommit));
     }
 
     #[test]
@@ -980,9 +1113,7 @@ mod tests {
             report.residual_codes(),
             vec!["class_c:kilo_fail".to_owned()]
         );
-        assert_eq!(report.class_a().len(), 1);
-        assert_eq!(report.class_b().len(), 1);
-        assert_eq!(report.class_c().len(), 2);
+        assert_class_counts(&report, (1, 1, 2));
     }
 
     #[test]
