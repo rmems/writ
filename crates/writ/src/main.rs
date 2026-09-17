@@ -367,6 +367,13 @@ fn run_attribution(
             placement,
             pr_comment,
         } => {
+            if body.trim().is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "attribution body must not be empty",
+                )
+                .into());
+            }
             let mut config = writ_core::attribution::AttributionConfig::from_env();
             if let Some(id) = agent_id.as_deref().filter(|id| !id.trim().is_empty()) {
                 config.agent_id = writ_core::attribution::canonicalize_agent_id(id);
@@ -866,6 +873,26 @@ mod tests {
         );
         assert!(v["data"]["commit_sha"].is_null());
         assert_eq!(v["data"]["is_thread_reply"], false);
+    }
+
+    #[tokio::test]
+    async fn attribution_format_rejects_empty_body() {
+        let cli = Cli {
+            json: false,
+            command: Some(super::Command::Attribution {
+                action: super::AttributionAction::Format {
+                    body: "   ".to_owned(),
+                    agent_id: None,
+                    commit_sha: None,
+                    placement: None,
+                    pr_comment: false,
+                },
+            }),
+        };
+        let mut stdout = Vec::new();
+        let result = run(cli, &mut stdout).await;
+        assert!(result.is_err(), "empty/whitespace body must be rejected");
+        assert!(stdout.is_empty(), "no reply should be emitted");
     }
 
     #[test]

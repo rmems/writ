@@ -413,22 +413,38 @@ mod tests {
         assert_eq!(sanitize_commit_sha(Some("not a sha")), None);
     }
 
+    /// Render a reply case through both the direct [`ReplyTemplate`] path (when
+    /// no config override is given) and [`format_reply`], asserting both match
+    /// `expected`. Keeps the reply-template assertions identical across the
+    /// focused tests below.
+    fn assert_reply(
+        body: &str,
+        config: Option<&AttributionConfig>,
+        sha: Option<&str>,
+        thread: bool,
+        expected: &str,
+    ) {
+        let rendered = match config {
+            None => ReplyTemplate {
+                body: body.to_owned(),
+                attribution_config: AttributionConfig::default(),
+                commit_sha: sha.map(str::to_owned),
+                is_thread_reply: thread,
+            }
+            .render(),
+            Some(config) => format_reply(body, Some(config), sha, thread),
+        };
+        let via_format = format_reply(body, config, sha, thread);
+        assert_eq!(rendered, expected, "{body}");
+        assert_eq!(via_format, expected, "format_reply {body}");
+    }
+
     #[test]
-    fn reply_templates_table() {
+    fn reply_templates_placement_defaults_and_header() {
         let header = AttributionConfig {
             placement: AttributionPlacement::Header,
             ..AttributionConfig::default()
         };
-        let custom = AttributionConfig {
-            agent_id: "Custom Bot".to_owned(),
-            ..AttributionConfig::default()
-        };
-        let no_sha_flag = AttributionConfig {
-            include_sha_on_fix: false,
-            ..AttributionConfig::default()
-        };
-        let claude = AttributionConfig::for_platform("Claude Code");
-
         for (body, config, sha, thread, expected) in [
             (
                 "Looks good!",
@@ -460,17 +476,34 @@ mod tests {
             ),
             (
                 "Fixed the issue.",
-                None,
-                Some("abc1234"),
-                true,
-                "Fixed the issue.\n\n---\nworktrees-hives agent: fixed in abc1234",
-            ),
-            (
-                "Fixed the issue.",
                 Some(&header),
                 Some("abc1234"),
                 true,
                 "worktrees-hives agent: fixed in abc1234\n\n---\nFixed the issue.",
+            ),
+        ] {
+            assert_reply(body, config, sha, thread, expected);
+        }
+    }
+
+    #[test]
+    fn reply_templates_sha_and_agent_variants() {
+        let custom = AttributionConfig {
+            agent_id: "Custom Bot".to_owned(),
+            ..AttributionConfig::default()
+        };
+        let no_sha_flag = AttributionConfig {
+            include_sha_on_fix: false,
+            ..AttributionConfig::default()
+        };
+        let claude = AttributionConfig::for_platform("Claude Code");
+        for (body, config, sha, thread, expected) in [
+            (
+                "Fixed the issue.",
+                None,
+                Some("abc1234"),
+                true,
+                "Fixed the issue.\n\n---\nworktrees-hives agent: fixed in abc1234",
             ),
             (
                 "Looks good!",
@@ -508,21 +541,7 @@ mod tests {
                 "Fixed.\n\n---\nworktrees-hives agent: fixed in abc1234",
             ),
         ] {
-            let rendered = match config {
-                None => {
-                    let template = ReplyTemplate {
-                        body: body.to_owned(),
-                        attribution_config: AttributionConfig::default(),
-                        commit_sha: sha.map(str::to_owned),
-                        is_thread_reply: thread,
-                    };
-                    template.render()
-                }
-                Some(config) => format_reply(body, Some(config), sha, thread),
-            };
-            let via_format = format_reply(body, config, sha, thread);
-            assert_eq!(rendered, expected, "{body}");
-            assert_eq!(via_format, expected, "format_reply {body}");
+            assert_reply(body, config, sha, thread, expected);
         }
     }
 }
