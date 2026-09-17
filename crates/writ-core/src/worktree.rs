@@ -598,6 +598,16 @@ impl CreationPostconditions<'_> {
     }
 }
 
+/// Verifies the newly created worktree matches the requested branch and commit.
+///
+/// The checks form a best-effort, non-atomic evidence chain: each step
+/// (`actual_branch_ref`, `branch_commit`, `head_commit`, `verify_identity`, and
+/// `verify_registration`) runs a separate `git` subprocess, and Git offers no
+/// cross-invocation lock spanning them, so the observed state could in principle
+/// change between calls. This is intentional and not a correctness gap. True
+/// atomicity across sequential subprocesses is not achievable, and writ's
+/// one-writer-per-worktree concurrency model (see AGENTS.md) is what bounds
+/// concurrent mutation of a freshly created worktree, not this sequence.
 fn verify_creation_postconditions(postconditions: CreationPostconditions<'_>) -> Result<String> {
     let actual_branch_ref = postconditions.actual_branch_ref()?;
     let actual_branch = BranchRef(&actual_branch_ref);
