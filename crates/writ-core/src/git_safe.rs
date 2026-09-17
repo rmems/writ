@@ -354,6 +354,19 @@ impl SafeGhCommand {
     ///
     /// Returns an error if the command violates any safety policy.
     pub fn new(args: &[String]) -> Result<Self> {
+        let subcommand = Self::validate_gh_subcommand(args)?;
+        Self::validate_gh_pr_subcommand(subcommand, args)?;
+        Self::validate_gh_run_subcommand(subcommand, args)?;
+        Self::validate_gh_repo_clone(subcommand, args)?;
+        Self::validate_gh_blocked_flags(args)?;
+
+        Ok(Self {
+            args: args.to_vec(),
+        })
+    }
+
+    /// Validate the leading subcommand against the allowlist, returning it on success.
+    fn validate_gh_subcommand(args: &[String]) -> Result<&str> {
         if args.is_empty() {
             return Err(Error::PolicyViolation {
                 code: PolicyCode::GhSubcommandNotAllowed,
@@ -362,8 +375,6 @@ impl SafeGhCommand {
         }
 
         let subcommand = &args[0];
-
-        // Validate subcommand against allowlist.
         let allowed: HashSet<&str> = ALLOWED_GH_SUBCOMMANDS.iter().copied().collect();
         if !allowed.contains(subcommand.as_str()) {
             return Err(Error::PolicyViolation {
@@ -372,8 +383,12 @@ impl SafeGhCommand {
             });
         }
 
-        // Block `gh pr merge` / `ready` / `update-branch` even when inherited flags
-        // precede the subcommand, e.g. `gh pr -R owner/repo merge 1`.
+        Ok(subcommand.as_str())
+    }
+
+    /// Block `gh pr merge` / `ready` / `update-branch` even when inherited flags
+    /// precede the subcommand, e.g. `gh pr -R owner/repo merge 1`.
+    fn validate_gh_pr_subcommand(subcommand: &str, args: &[String]) -> Result<()> {
         if subcommand == "pr"
             && let Some(pr_sub) = first_positional_after(&args[1..])
         {
@@ -386,30 +401,41 @@ impl SafeGhCommand {
             }
         }
 
-        if subcommand == "run" {
-            match first_positional_after(&args[1..]) {
-                Some(run_sub) => {
-                    let allowed_run: HashSet<&str> =
-                        ALLOWED_GH_RUN_SUBSUBCOMMANDS.iter().copied().collect();
-                    if !allowed_run.contains(run_sub) {
-                        return Err(Error::PolicyViolation {
-                            code: PolicyCode::GhSubcommandNotAllowed,
-                            message: format!("`gh run {run_sub}` is not allowed"),
-                        });
-                    }
-                }
-                None => {
+        Ok(())
+    }
+
+    /// Enforce the `gh run` verb allowlist and require a verb to be present.
+    fn validate_gh_run_subcommand(subcommand: &str, args: &[String]) -> Result<()> {
+        if subcommand != "run" {
+            return Ok(());
+        }
+
+        match first_positional_after(&args[1..]) {
+            Some(run_sub) => {
+                let allowed_run: HashSet<&str> =
+                    ALLOWED_GH_RUN_SUBSUBCOMMANDS.iter().copied().collect();
+                if !allowed_run.contains(run_sub) {
                     return Err(Error::PolicyViolation {
                         code: PolicyCode::GhSubcommandNotAllowed,
-                        message:
-                            "`gh run` requires an allowed verb (view, list, watch, rerun, download)"
-                                .to_owned(),
+                        message: format!("`gh run {run_sub}` is not allowed"),
                     });
                 }
             }
+            None => {
+                return Err(Error::PolicyViolation {
+                    code: PolicyCode::GhSubcommandNotAllowed,
+                    message:
+                        "`gh run` requires an allowed verb (view, list, watch, rerun, download)"
+                            .to_owned(),
+                });
+            }
         }
 
-        // `gh repo clone <repo> [<dir>]` can write outside the worktree.
+        Ok(())
+    }
+
+    /// `gh repo clone <repo> [<dir>]` can write outside the worktree.
+    fn validate_gh_repo_clone(subcommand: &str, args: &[String]) -> Result<()> {
         if subcommand == "repo"
             && let Some(repo_sub) = first_positional_after(&args[1..])
             && repo_sub == "clone"
@@ -420,7 +446,11 @@ impl SafeGhCommand {
             }
         }
 
-        // Block merge-related flags anywhere in the argument list.
+        Ok(())
+    }
+
+    /// Block merge-related flags anywhere in the argument list.
+    fn validate_gh_blocked_flags(args: &[String]) -> Result<()> {
         let blocked_flags: HashSet<&str> = BLOCKED_GH_FLAGS.iter().copied().collect();
         for arg in &args[1..] {
             if blocked_flags.contains(arg.as_str()) {
@@ -431,9 +461,7 @@ impl SafeGhCommand {
             }
         }
 
-        Ok(Self {
-            args: args.to_vec(),
-        })
+        Ok(())
     }
 
     /// Execute the validated gh command, returning stdout, stderr, and exit code.
