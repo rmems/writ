@@ -1632,6 +1632,26 @@ mod tests {
     #[tokio::test]
     async fn idle_timeout_does_not_fire_when_output_keeps_arriving() {
         let supervisor = Supervisor::new(1);
+        // The idle/worker margins are platform-specific because the two shells
+        // produce output at different cadences. On Unix the script emits a line
+        // every 150ms, so a tight 400ms idle timeout still proves that a steady
+        // stream suppresses the idle detector. On Windows, cmd.exe treats `&` as
+        // a *sequential* separator (not background), and `ping -n 2` waits ~1000ms
+        // between its two requests, so there is a ~1s gap with no captured output
+        // between `echo a` and `echo b`. A 400ms idle timeout would fire during
+        // that gap, so Windows uses a 2500ms idle (comfortably above the ~1s gap)
+        // and a 15s worker timeout (well above the ~1s total runtime). Both
+        // platforms therefore verify the same property: steady output must not
+        // trip the idle timeout, and the process runs to completion.
+        #[cfg(windows)]
+        let policy = TimeoutPolicy {
+            idle: Some(Duration::from_millis(2500)),
+            worker: Some(Duration::from_secs(15)),
+            grace: Duration::ZERO,
+            progress_every: None,
+            ..TimeoutPolicy::from_worker_timeout(None)
+        };
+        #[cfg(not(windows))]
         let policy = TimeoutPolicy {
             idle: Some(Duration::from_millis(400)),
             worker: Some(Duration::from_secs(5)),
