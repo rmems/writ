@@ -250,37 +250,13 @@ impl Supervisor {
         let deadline = timeout.map(|limit| started + limit);
 
         // Wall-clock timeout includes permit wait so saturated pools still time out.
-        let acquire = self.semaphore.acquire();
-        tokio::pin!(acquire);
-        let mut progress = interval_opt(options.timeout_policy.progress);
-        let permit = loop {
-            tokio::select! {
-                biased;
-                permit = &mut acquire => {
-                    break permit.expect("supervisor semaphore closed");
-                }
-                _ = sleep_until_opt(deadline) => {
-                    return Ok(permit_wait_timeout(
-                        started,
-                        &options.timeout_policy,
-                        "timed out waiting for max-parallel permit",
-                    ));
-                }
-                _ = wait_interval(&mut progress) => {
-                    emit_progress(
-                        options.on_progress.as_ref(),
-                        progress_report(
-                            started,
-                            deadline,
-                            None,
-                            WaitPhase::PermitWait,
-                            self.active(),
-                        ),
-                    );
-                }
-            }
+        let _permit = match self
+            .acquire_permit_or_timeout(started, deadline, options)
+            .await
+        {
+            PermitOrTimeout::Acquired(permit) => permit,
+            PermitOrTimeout::TimedOut(output) => return Ok(*output),
         };
-        let _permit = permit;
 
         // Remaining time for the child after queueing (if any).
         let child_timeout = deadline.map(|at| at.saturating_duration_since(Instant::now()));
@@ -316,6 +292,53 @@ impl Supervisor {
             .await;
         guard.defuse();
         Ok(output)
+    }
+
+    /// Acquire a max-parallel permit, honoring the wall-clock deadline and
+    /// emitting permit-wait progress. Returns the acquired permit or, if the
+    /// deadline elapses first, the `permit_wait_timeout` output to surface.
+    ///
+    /// Extracted from [`Supervisor::run`] verbatim; the `biased` `select!`
+    /// ordering (acquire, deadline, progress) and the timeout message are
+    /// unchanged.
+    async fn acquire_permit_or_timeout(
+        &self,
+        started: Instant,
+        deadline: Option<Instant>,
+        options: &RunOptions,
+    ) -> PermitOrTimeout<'_> {
+        let acquire = self.semaphore.acquire();
+        tokio::pin!(acquire);
+        let mut progress = interval_opt(options.timeout_policy.progress);
+        loop {
+            tokio::select! {
+                biased;
+                permit = &mut acquire => {
+                    return PermitOrTimeout::Acquired(
+                        permit.expect("supervisor semaphore closed"),
+                    );
+                }
+                _ = sleep_until_opt(deadline) => {
+                    return PermitOrTimeout::TimedOut(Box::new(permit_wait_timeout(
+                        started,
+                        &options.timeout_policy,
+                        "timed out waiting for max-parallel permit",
+                    )));
+                }
+                _ = wait_interval(&mut progress) => {
+                    emit_progress(
+                        options.on_progress.as_ref(),
+                        progress_report(
+                            started,
+                            deadline,
+                            None,
+                            WaitPhase::PermitWait,
+                            self.active(),
+                        ),
+                    );
+                }
+            }
+        }
     }
 
     /// Low-level run **without** policy checks — **test-only** (not part of the public API).
@@ -437,6 +460,14 @@ struct WaitContext<'a> {
     active: usize,
 }
 
+/// Result of [`Supervisor::acquire_permit_or_timeout`]: either the acquired
+/// max-parallel permit or the timeout output to return when the wall-clock
+/// deadline elapses first.
+enum PermitOrTimeout<'a> {
+    Acquired(tokio::sync::SemaphorePermit<'a>),
+    TimedOut(Box<SupervisedOutput>),
+}
+
 fn permit_wait_timeout(started: Instant, policy: &TimeoutPolicy, stderr: &str) -> SupervisedOutput {
     SupervisedOutput {
         timed_out: true,
@@ -453,10 +484,96 @@ fn permit_wait_timeout(started: Instant, policy: &TimeoutPolicy, stderr: &str) -
     })
 }
 
-async fn wait_supervised_child(
+/// Build the [`SupervisedOutput`] for a child that exited on its own (the
+/// `child.wait()` completion arm of the supervise loop). On a clean wait, drains
+/// the pipes within the deadline; a drain timeout is reported as a killed
+/// wall-clock timeout, mirroring the original inline behavior exactly.
+async fn finish_completed_child(
+    status: std::io::Result<std::process::ExitStatus>,
+    pid: Option<u32>,
+    stdout_handle: JoinHandle<Vec<u8>>,
+    stderr_handle: JoinHandle<Vec<u8>>,
+    wait: &WaitContext<'_>,
+    last_byte_ms: &Arc<AtomicU64>,
+) -> SupervisedOutput {
+    match status {
+        Ok(s) => match drain_pipes_until(
+            drain_deadline(wait.deadline),
+            pid,
+            stdout_handle,
+            stderr_handle,
+        )
+        .await
+        {
+            Ok((stdout, stderr)) => output_to_supervised(s, &stdout, &stderr),
+            Err((stdout, stderr)) => SupervisedOutput {
+                timed_out: true,
+                killed: true,
+                stdout: String::from_utf8_lossy(&stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&stderr).into_owned(),
+                stdout_truncated: stdout.len() >= MAX_CAPTURE_BYTES,
+                stderr_truncated: stderr.len() >= MAX_CAPTURE_BYTES,
+                ..SupervisedOutput::default()
+            }
+            .with_residual(TimeoutResidual {
+                reason: StuckReason::WallClock,
+                recovery_stage: RecoveryStage::Kill,
+                redispatch_count: 0,
+                max_redispatch_per_item: wait.policy.max_redispatch_per_item,
+                elapsed_ms: elapsed_ms(wait.started),
+                last_output_ms: nonzero_ms(last_byte_ms),
+            }),
+        },
+        Err(e) => SupervisedOutput {
+            stderr: format!("process error: {e}"),
+            error_code: Some(SupervisorErrorCode::WaitFailed),
+            ..SupervisedOutput::default()
+        },
+    }
+}
+
+/// Outcome of a stall-poll tick. Either keep polling (returning ownership of the
+/// pipe handles to the loop) or recovery has produced a final output.
+enum StallOutcome {
+    Continue(JoinHandle<Vec<u8>>, JoinHandle<Vec<u8>>),
+    Recovered(Box<SupervisedOutput>),
+}
+
+/// Handle a stall-poll tick: if the child has gone quiet past the stall budget
+/// and has not already exited, recover it; otherwise keep polling. Extracted so
+/// the `select!` arm carries no nested conditionals.
+async fn handle_stall_tick(
     child: &mut ProcessGroupChild,
     stdout_handle: JoinHandle<Vec<u8>>,
     stderr_handle: JoinHandle<Vec<u8>>,
+    wait: WaitContext<'_>,
+    last_byte_ms: Arc<AtomicU64>,
+) -> StallOutcome {
+    let quiet = stalled(
+        &last_byte_ms,
+        wait.started,
+        wait.stall_origin,
+        wait.policy.stall,
+    );
+    if !quiet || matches!(child.try_wait(), Ok(Some(_))) {
+        return StallOutcome::Continue(stdout_handle, stderr_handle);
+    }
+    let output = recover_child(
+        child,
+        stdout_handle,
+        stderr_handle,
+        wait,
+        last_byte_ms,
+        StuckReason::Stall,
+    )
+    .await;
+    StallOutcome::Recovered(Box::new(output))
+}
+
+async fn wait_supervised_child(
+    child: &mut ProcessGroupChild,
+    mut stdout_handle: JoinHandle<Vec<u8>>,
+    mut stderr_handle: JoinHandle<Vec<u8>>,
     wait: WaitContext<'_>,
     last_byte_ms: Arc<AtomicU64>,
 ) -> SupervisedOutput {
@@ -481,60 +598,31 @@ async fn wait_supervised_child(
             }
             status = child.wait() => {
                 child.disarm();
-                return match status {
-                    Ok(s) => match drain_pipes_until(
-                        drain_deadline(wait.deadline),
-                        pid,
-                        stdout_handle,
-                        stderr_handle,
-                    )
-                    .await
-                    {
-                        Ok((stdout, stderr)) => output_to_supervised(s, &stdout, &stderr),
-                        Err((stdout, stderr)) => SupervisedOutput {
-                            timed_out: true,
-                            killed: true,
-                            stdout: String::from_utf8_lossy(&stdout).into_owned(),
-                            stderr: String::from_utf8_lossy(&stderr).into_owned(),
-                            stdout_truncated: stdout.len() >= MAX_CAPTURE_BYTES,
-                            stderr_truncated: stderr.len() >= MAX_CAPTURE_BYTES,
-                            ..SupervisedOutput::default()
-                        }
-                        .with_residual(TimeoutResidual {
-                            reason: StuckReason::WallClock,
-                            recovery_stage: RecoveryStage::Kill,
-                            redispatch_count: 0,
-                            max_redispatch_per_item: wait.policy.max_redispatch_per_item,
-                            elapsed_ms: elapsed_ms(wait.started),
-                            last_output_ms: nonzero_ms(&last_byte_ms),
-                        }),
-                    },
-                    Err(e) => SupervisedOutput {
-                        stderr: format!("process error: {e}"),
-                        error_code: Some(SupervisorErrorCode::WaitFailed),
-                        ..SupervisedOutput::default()
-                    },
-                };
+                return finish_completed_child(
+                    status,
+                    pid,
+                    stdout_handle,
+                    stderr_handle,
+                    &wait,
+                    &last_byte_ms,
+                )
+                .await;
             }
             _ = wait_interval(&mut stall_poll) => {
-                if stalled(
-                    &last_byte_ms,
-                    wait.started,
-                    wait.stall_origin,
-                    wait.policy.stall,
-                ) {
-                    if let Ok(Some(_)) = child.try_wait() {
-                        continue;
+                match handle_stall_tick(
+                    child,
+                    stdout_handle,
+                    stderr_handle,
+                    wait,
+                    Arc::clone(&last_byte_ms),
+                )
+                .await
+                {
+                    StallOutcome::Continue(out, err) => {
+                        stdout_handle = out;
+                        stderr_handle = err;
                     }
-                    return recover_child(
-                        child,
-                        stdout_handle,
-                        stderr_handle,
-                        wait,
-                        last_byte_ms,
-                        StuckReason::Stall,
-                    )
-                    .await;
+                    StallOutcome::Recovered(output) => return *output,
                 }
             }
             _ = wait_interval(&mut progress) => {
@@ -1084,43 +1172,53 @@ async fn join_with_timeout(handle: JoinHandle<Vec<u8>>) -> Vec<u8> {
     }
 }
 
+/// Record the timestamp of the most recent byte read from a child pipe.
+///
+/// Uses `.max(1)` so a byte observed at `origin` still registers as non-zero
+/// progress (zero is reserved for "no output yet").
+fn stamp_last_byte(last_byte_ms: &Option<Arc<AtomicU64>>, origin: Instant) {
+    if let Some(stamp) = last_byte_ms {
+        stamp.store(elapsed_ms(origin).max(1), Ordering::Relaxed);
+    }
+}
+
+/// Append `chunk` into `buf` up to [`MAX_CAPTURE_BYTES`], returning the new
+/// `capped` state. Once capped, the caller keeps draining the pipe so the child
+/// does not get SIGPIPE/EPIPE, but no further bytes are retained.
+fn capture_chunk(buf: &mut Vec<u8>, chunk: &[u8], capped: bool) -> bool {
+    if capped {
+        return true;
+    }
+    let n = chunk.len();
+    let room = MAX_CAPTURE_BYTES.saturating_sub(buf.len());
+    if room > 0 {
+        buf.extend_from_slice(&chunk[..n.min(room)]);
+    }
+    n > room || buf.len() >= MAX_CAPTURE_BYTES
+}
+
 async fn read_pipe<R: AsyncReadExt + Unpin>(
     pipe: &mut Option<R>,
     last_byte_ms: Option<Arc<AtomicU64>>,
     origin: Instant,
 ) -> Vec<u8> {
-    match pipe.as_mut() {
-        Some(reader) => {
-            let mut buf = Vec::new();
-            let mut chunk = [0u8; 8192];
-            let mut capped = false;
-            loop {
-                match reader.read(&mut chunk).await {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        if n > 0
-                            && let Some(stamp) = &last_byte_ms
-                        {
-                            stamp.store(elapsed_ms(origin).max(1), Ordering::Relaxed);
-                        }
-                        if !capped {
-                            let room = MAX_CAPTURE_BYTES.saturating_sub(buf.len());
-                            if room > 0 {
-                                buf.extend_from_slice(&chunk[..n.min(room)]);
-                            }
-                            if n > room || buf.len() >= MAX_CAPTURE_BYTES {
-                                capped = true;
-                            }
-                        }
-                        // When capped, keep draining so the child does not get SIGPIPE/EPIPE.
-                    }
-                    Err(_) => break,
-                }
+    let Some(reader) = pipe.as_mut() else {
+        return Vec::new();
+    };
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    let mut capped = false;
+    loop {
+        match reader.read(&mut chunk).await {
+            Ok(0) => break,
+            Ok(n) => {
+                stamp_last_byte(&last_byte_ms, origin);
+                capped = capture_chunk(&mut buf, &chunk[..n], capped);
             }
-            buf
+            Err(_) => break,
         }
-        None => Vec::new(),
     }
+    buf
 }
 
 #[cfg(unix)]
