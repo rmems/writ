@@ -511,17 +511,10 @@ fn add_worktree(
     // actor creates the ref first, Git fails rather than attaching to it.
     run_worktree_add(
         request.repo_root,
-        &[
-            "worktree",
-            "add",
-            "-b",
-            branch.as_str(),
-            "--",
-            &worktree_path.to_string_lossy(),
-            start_commit.as_str(),
-        ],
-        IoContext("spawn git worktree add"),
+        &["worktree", "add", "-b", branch.as_str(), "--"],
         worktree_path,
+        &[start_commit.as_str()],
+        IoContext("spawn git worktree add"),
         branch,
     )
 }
@@ -530,15 +523,10 @@ fn add_existing_worktree(request: &WorktreeCreateRequest<'_>, worktree_path: &Pa
     let branch = BranchName(request.branch);
     run_worktree_add(
         request.repo_root,
-        &[
-            "worktree",
-            "add",
-            "--",
-            &worktree_path.to_string_lossy(),
-            branch.as_str(),
-        ],
-        IoContext("spawn git worktree add for existing branch"),
+        &["worktree", "add", "--"],
         worktree_path,
+        &[branch.as_str()],
+        IoContext("spawn git worktree add for existing branch"),
         branch,
     )
 }
@@ -547,20 +535,26 @@ fn add_existing_worktree(request: &WorktreeCreateRequest<'_>, worktree_path: &Pa
 /// caller-provided argument list, return `Ok` on success, otherwise inspect the
 /// residual state and build the identical `Error::WorktreeCreationFailed`.
 ///
-/// The two callers differ only in the argument list (`-b branch ... start` vs
-/// `branch`) and the spawn `IoContext`, both passed in, so the subprocess args,
-/// IoContext strings, and error shape are byte-for-byte unchanged.
+/// The two callers differ only in the arguments (`-b branch ... start` vs
+/// `branch`) and the spawn `IoContext`, both passed in. The worktree path is
+/// forwarded as a raw `&Path` (`Command::arg`) between `pre_args` and
+/// `post_args`, preserving the exact argument ordering and the raw OS path
+/// bytes so the subprocess args, IoContext strings, and error shape are
+/// byte-for-byte unchanged.
 fn run_worktree_add(
     repo_root: &Path,
-    args: &[&str],
-    spawn_context: IoContext,
+    pre_args: &[&str],
     worktree_path: &Path,
+    post_args: &[&str],
+    spawn_context: IoContext,
     branch: BranchName<'_>,
 ) -> Result<()> {
     let output = Command::new("git")
         .arg("-C")
         .arg(repo_root)
-        .args(args)
+        .args(pre_args)
+        .arg(worktree_path)
+        .args(post_args)
         .output()
         .map_err(|e| Error::Io {
             context: spawn_context.0,
