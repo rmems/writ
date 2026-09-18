@@ -224,6 +224,23 @@ fn enforce_bash_command(command: &str, ctx: &HookContext, cwd: Option<&str>) -> 
     if words.is_empty() {
         return Ok(());
     }
+    reject_compound_or_protected(words, ctx)?;
+    let program = normalize_program_name(&words[0]);
+    let args = &words[1..];
+    if is_forbidden_wrapper(&program) {
+        return Err(Error::PolicyViolation {
+            code: PolicyCode::SubcommandNotAllowed,
+            message: format!(
+                "program `{program}` can launch unreviewed commands and is not allowed at PreToolUse"
+            ),
+        });
+    }
+    route_program(&program, args, ctx, cwd)
+}
+
+/// Fail closed on compound shell control, multiple git/gh invocations, or a
+/// write that targets a protected path. Guards run in the original order.
+fn reject_compound_or_protected(words: &[String], ctx: &HookContext) -> Result<()> {
     if looks_like_shell_control(words) {
         return Err(Error::HookFailClosed {
             reason: "compound shell command is not a single git/gh invocation".to_owned(),
@@ -243,17 +260,18 @@ fn enforce_bash_command(command: &str, ctx: &HookContext, cwd: Option<&str>) -> 
             ),
         });
     }
-    let program = normalize_program_name(&words[0]);
-    let args = &words[1..];
-    if is_forbidden_wrapper(&program) {
-        return Err(Error::PolicyViolation {
-            code: PolicyCode::SubcommandNotAllowed,
-            message: format!(
-                "program `{program}` can launch unreviewed commands and is not allowed at PreToolUse"
-            ),
-        });
-    }
-    match program.as_str() {
+    Ok(())
+}
+
+/// Dispatch the already-validated program through the git/gh allowlists.
+/// Programs other than git/gh are accepted unchanged.
+fn route_program(
+    program: &str,
+    args: &[String],
+    ctx: &HookContext,
+    cwd: Option<&str>,
+) -> Result<()> {
+    match program {
         "git" => {
             let cmd = SafeGitCommand::new(args)?;
             if let Some(expected) = expected_branch_for(ctx, cwd)?
@@ -416,19 +434,8 @@ fn path_eq(left: &Path, right: &Path) -> bool {
 }
 
 fn protected_write_target(words: &[String], ctx: &HookContext) -> Option<PathBuf> {
-    let program = normalize_program_name(&words[0]);
-    if matches!(
-        program.as_str(),
-        "tee" | "cp" | "mv" | "install" | "touch" | "dd"
-    ) {
-        for word in &words[1..] {
-            if word.starts_with('-') {
-                continue;
-            }
-            if is_protected_path(Path::new(word), ctx) {
-                return Some(PathBuf::from(word));
-            }
-        }
+    if let Some(path) = first_protected_positional(words, ctx) {
+        return Some(path);
     }
     for dest in redirect_destinations(words) {
         if is_protected_path(Path::new(dest), ctx) {
@@ -436,6 +443,24 @@ fn protected_write_target(words: &[String], ctx: &HookContext) -> Option<PathBuf
         }
     }
     None
+}
+
+/// For file-writing commands (tee/cp/mv/install/touch/dd), return the first
+/// positional argument that names a protected path. Flags (`-` prefixed) are
+/// skipped; non-writing programs yield `None`.
+fn first_protected_positional(words: &[String], ctx: &HookContext) -> Option<PathBuf> {
+    let program = normalize_program_name(&words[0]);
+    if !matches!(
+        program.as_str(),
+        "tee" | "cp" | "mv" | "install" | "touch" | "dd"
+    ) {
+        return None;
+    }
+    words[1..]
+        .iter()
+        .filter(|word| !word.starts_with('-'))
+        .find(|word| is_protected_path(Path::new(word), ctx))
+        .map(PathBuf::from)
 }
 
 fn redirect_destinations(words: &[String]) -> Vec<&str> {
@@ -451,16 +476,25 @@ fn redirect_destinations(words: &[String]) -> Vec<&str> {
             pending = true;
             continue;
         }
-        for prefix in [">>", ">", "2>>", "2>"] {
-            if let Some(rest) = word.strip_prefix(prefix)
-                && !rest.is_empty()
-            {
-                dests.push(rest);
-                break;
-            }
+        if let Some(dest) = redirect_dest_from_word(word) {
+            dests.push(dest);
         }
     }
     dests
+}
+
+/// Extract a glued redirect destination (e.g. `>out`, `2>>log`) from a single
+/// word. Returns `None` when the word is not a glued redirect. Prefixes are
+/// checked longest-first so `>>` wins over `>` and `2>>` over `2>`.
+fn redirect_dest_from_word(word: &str) -> Option<&str> {
+    for prefix in [">>", ">", "2>>", "2>"] {
+        if let Some(rest) = word.strip_prefix(prefix)
+            && !rest.is_empty()
+        {
+            return Some(rest);
+        }
+    }
+    None
 }
 
 fn extra_git_or_gh_tokens(words: &[String]) -> bool {
@@ -503,56 +537,87 @@ fn is_env_assignment(word: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// Which quote context the tokenizer is currently inside.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum QuoteState {
+    None,
+    Single,
+    Double,
+}
+
+/// Consume one char while inside a single-quoted literal. Returns the next
+/// quote state. Single quotes take every character verbatim until the close.
+fn handle_single_quote(ch: char, current: &mut String) -> QuoteState {
+    if ch == '\'' {
+        QuoteState::None
+    } else {
+        current.push(ch);
+        QuoteState::Single
+    }
+}
+
+/// Consume one char while inside a double-quoted literal, honouring the
+/// backslash escape of the following character. Returns the next quote state.
+fn handle_double_quote(
+    ch: char,
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    current: &mut String,
+) -> QuoteState {
+    if ch == '"' {
+        QuoteState::None
+    } else if ch == '\\' {
+        if let Some(next) = chars.next() {
+            current.push(next);
+        }
+        QuoteState::Double
+    } else {
+        current.push(ch);
+        QuoteState::Double
+    }
+}
+
+/// Reject the unquoted separator / substitution characters the classifier
+/// refuses to reason about. Returns `Err` with the exact fail-closed reason
+/// for the offending character, otherwise `Ok(())`.
+fn reject_unquoted_control(
+    ch: char,
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) -> Result<()> {
+    let reason = match ch {
+        '\n' | '\r' => "unquoted newline is a command separator",
+        ';' => "unquoted semicolon is a command separator",
+        '`' => "backtick substitution is not classified",
+        '$' if matches!(chars.peek(), Some('(' | '{')) => {
+            "command or parameter substitution is not classified"
+        }
+        _ => return Ok(()),
+    };
+    Err(Error::HookFailClosed {
+        reason: reason.to_owned(),
+    })
+}
+
 fn split_shell_words(command: &str) -> Result<Vec<String>> {
     let mut words = Vec::new();
     let mut current = String::new();
     let mut chars = command.chars().peekable();
-    let mut in_single = false;
-    let mut in_double = false;
+    let mut quote = QuoteState::None;
     while let Some(ch) = chars.next() {
-        if in_single {
-            if ch == '\'' {
-                in_single = false;
-            } else {
-                current.push(ch);
+        match quote {
+            QuoteState::Single => {
+                quote = handle_single_quote(ch, &mut current);
+                continue;
             }
-            continue;
-        }
-        if in_double {
-            if ch == '"' {
-                in_double = false;
-            } else if ch == '\\' {
-                if let Some(next) = chars.next() {
-                    current.push(next);
-                }
-            } else {
-                current.push(ch);
+            QuoteState::Double => {
+                quote = handle_double_quote(ch, &mut chars, &mut current);
+                continue;
             }
-            continue;
+            QuoteState::None => {}
         }
+        reject_unquoted_control(ch, &mut chars)?;
         match ch {
-            '\n' | '\r' => {
-                return Err(Error::HookFailClosed {
-                    reason: "unquoted newline is a command separator".to_owned(),
-                });
-            }
-            ';' => {
-                return Err(Error::HookFailClosed {
-                    reason: "unquoted semicolon is a command separator".to_owned(),
-                });
-            }
-            '\'' => in_single = true,
-            '"' => in_double = true,
-            '`' => {
-                return Err(Error::HookFailClosed {
-                    reason: "backtick substitution is not classified".to_owned(),
-                });
-            }
-            '$' if matches!(chars.peek(), Some('(' | '{')) => {
-                return Err(Error::HookFailClosed {
-                    reason: "command or parameter substitution is not classified".to_owned(),
-                });
-            }
+            '\'' => quote = QuoteState::Single,
+            '"' => quote = QuoteState::Double,
             ch if ch.is_whitespace() => {
                 if !current.is_empty() {
                     words.push(std::mem::take(&mut current));
@@ -561,7 +626,7 @@ fn split_shell_words(command: &str) -> Result<Vec<String>> {
             _ => current.push(ch),
         }
     }
-    if in_single || in_double {
+    if quote != QuoteState::None {
         return Err(Error::HookFailClosed {
             reason: "unterminated quote in hook command".to_owned(),
         });
