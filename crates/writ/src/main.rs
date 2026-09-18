@@ -865,27 +865,20 @@ mod tests {
     use std::str;
 
     use clap::{CommandFactory, Parser};
-    use writ_core::status::{CiClass, JobStatus, ProcessState};
+    use writ_core::status::JobStatus;
 
     use super::{Cli, run, run_status, run_with_jobs, supervised_exit_code};
 
     fn sample_job() -> JobStatus {
-        JobStatus {
-            job_id: "writ-1".to_owned(),
-            owner: "acme".to_owned(),
-            repo: "example-org".to_owned(),
-            issue_number: Some(29),
-            pr_number: None,
-            worktree_path: "/tmp/wt/writ-1".to_owned(),
-            branch: "feature/foo".to_owned(),
-            process_state: ProcessState::Running,
-            last_error: None,
-            ci_class: CiClass::Pending,
-            timeout_class: None,
-            residual_blockers: Vec::new(),
-            redispatch_count: None,
-            fix_count: None,
-        }
+        let mut job = JobStatus::new(
+            "writ-1",
+            "acme",
+            "example-org",
+            "/tmp/wt/writ-1",
+            "feature/foo",
+        );
+        job.issue_number = Some(29);
+        job
     }
 
     /// Timeout knobs with every second-valued budget disabled, matching the

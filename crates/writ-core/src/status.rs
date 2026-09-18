@@ -103,6 +103,34 @@ pub struct JobStatus {
     pub fix_count: Option<u32>,
 }
 
+impl JobStatus {
+    /// Construct a running job with additive timeout residuals unset.
+    pub fn new(
+        job_id: impl Into<String>,
+        owner: impl Into<String>,
+        repo: impl Into<String>,
+        worktree_path: impl Into<String>,
+        branch: impl Into<String>,
+    ) -> Self {
+        Self {
+            job_id: job_id.into(),
+            owner: owner.into(),
+            repo: repo.into(),
+            issue_number: None,
+            pr_number: None,
+            worktree_path: worktree_path.into(),
+            branch: branch.into(),
+            process_state: ProcessState::Running,
+            last_error: None,
+            ci_class: CiClass::Pending,
+            timeout_class: None,
+            residual_blockers: Vec::new(),
+            redispatch_count: None,
+            fix_count: None,
+        }
+    }
+}
+
 /// Payload for `writ status` and `writ jobs` v1 envelope responses.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct JobsData {
@@ -146,22 +174,16 @@ mod tests {
     use crate::timeout_policy::TimeoutClass;
 
     fn sample_job() -> JobStatus {
-        JobStatus {
-            job_id: "writ-100".to_owned(),
-            owner: "acme".to_owned(),
-            repo: "example-org".to_owned(),
-            issue_number: Some(29),
-            pr_number: Some(42),
-            worktree_path: "/tmp/worktrees/acme/example-org/writ-100".to_owned(),
-            branch: "feature/status-json-cli".to_owned(),
-            process_state: ProcessState::Running,
-            last_error: None,
-            ci_class: CiClass::Pending,
-            timeout_class: None,
-            residual_blockers: Vec::new(),
-            redispatch_count: None,
-            fix_count: None,
-        }
+        let mut job = JobStatus::new(
+            "writ-100",
+            "acme",
+            "example-org",
+            "/tmp/worktrees/acme/example-org/writ-100",
+            "feature/status-json-cli",
+        );
+        job.issue_number = Some(29);
+        job.pr_number = Some(42);
+        job
     }
 
     #[test]

@@ -525,6 +525,39 @@ struct ChildWait<'a> {
     pid: Option<u32>,
 }
 
+impl ChildWait<'_> {
+    fn idle_for(&self) -> Duration {
+        idle_for_since(self.spawn_at, &self.last_activity_ms)
+    }
+
+    fn idle_deadline(&self) -> Option<Instant> {
+        self.policy.idle.map(|idle| {
+            let last = self.last_activity_ms.load(Ordering::Relaxed);
+            self.spawn_at + Duration::from_millis(last) + idle
+        })
+    }
+
+    fn progress_deadline(&self) -> Option<Instant> {
+        self.on_progress
+            .and(self.policy.progress_every)
+            .map(|every| Instant::now() + every)
+    }
+
+    fn idle_expired(&self) -> bool {
+        self.policy.idle.is_some_and(|idle| self.idle_for() >= idle)
+    }
+
+    fn emit(&self, supervisor: &Supervisor, step: SupervisorStep) {
+        emit_progress(
+            supervisor,
+            self.on_progress,
+            self.run_started,
+            self.idle_for(),
+            step,
+        );
+    }
+}
+
 async fn await_supervised_child(
     supervisor: &Supervisor,
     child: &mut ProcessGroupChild,
@@ -535,104 +568,96 @@ async fn await_supervised_child(
     let hard_deadline = wait.policy.worker.map(|limit| Instant::now() + limit);
 
     loop {
-        let idle_deadline = wait.policy.idle.map(|idle| {
-            let last = wait.last_activity_ms.load(Ordering::Relaxed);
-            wait.spawn_at + Duration::from_millis(last) + idle
-        });
-        let progress_deadline = wait
-            .on_progress
-            .and(wait.policy.progress_every)
-            .map(|every| Instant::now() + every);
-
         tokio::select! {
             biased;
             _ = sleep_until_opt(hard_deadline) => {
-                emit_progress(
+                return recover_classified(
                     supervisor,
-                    wait.on_progress,
-                    wait.run_started,
-                    idle_for_since(wait.spawn_at, &wait.last_activity_ms),
-                    SupervisorStep::Recovering,
-                );
-                return recover_child(
                     child,
                     stdout_handle,
                     stderr_handle,
-                    wait.policy,
+                    &wait,
                     TimeoutClass::Hard,
-                    wait.pid,
                 )
                 .await;
             }
-            _ = sleep_until_opt(idle_deadline) => {
-                let idle_for = idle_for_since(wait.spawn_at, &wait.last_activity_ms);
-                if wait.policy.idle.is_some_and(|idle| idle_for >= idle) {
-                    emit_progress(
+            _ = sleep_until_opt(wait.idle_deadline()) => {
+                if wait.idle_expired() {
+                    return recover_classified(
                         supervisor,
-                        wait.on_progress,
-                        wait.run_started,
-                        idle_for,
-                        SupervisorStep::Recovering,
-                    );
-                    return recover_child(
                         child,
                         stdout_handle,
                         stderr_handle,
-                        wait.policy,
+                        &wait,
                         TimeoutClass::Idle,
-                        wait.pid,
                     )
                     .await;
                 }
             }
-            _ = sleep_until_opt(progress_deadline) => {
-                emit_progress(
-                    supervisor,
-                    wait.on_progress,
-                    wait.run_started,
-                    idle_for_since(wait.spawn_at, &wait.last_activity_ms),
-                    SupervisorStep::Running,
-                );
+            _ = sleep_until_opt(wait.progress_deadline()) => {
+                wait.emit(supervisor, SupervisorStep::Running);
             }
             status = child.wait() => {
-                return match status {
-                    Ok(s) => {
-                        emit_progress(
-                            supervisor,
-                            wait.on_progress,
-                            wait.run_started,
-                            idle_for_since(wait.spawn_at, &wait.last_activity_ms),
-                            SupervisorStep::Draining,
-                        );
-                        drain_exited_child(
-                            s,
-                            hard_deadline,
-                            wait.pid,
-                            stdout_handle,
-                            stderr_handle,
-                        )
-                        .await
-                    }
-                    Err(e) => {
-                        emit_progress(
-                            supervisor,
-                            wait.on_progress,
-                            wait.run_started,
-                            idle_for_since(wait.spawn_at, &wait.last_activity_ms),
-                            SupervisorStep::Recovering,
-                        );
-                        recover_lost_child(
-                            child,
-                            stdout_handle,
-                            stderr_handle,
-                            wait.policy,
-                            wait.pid,
-                            &e,
-                        )
-                        .await
-                    }
-                };
+                return complete_child_wait(
+                    supervisor,
+                    child,
+                    stdout_handle,
+                    stderr_handle,
+                    &wait,
+                    hard_deadline,
+                    status,
+                )
+                .await;
             }
+        }
+    }
+}
+
+async fn recover_classified(
+    supervisor: &Supervisor,
+    child: &mut ProcessGroupChild,
+    stdout_handle: JoinHandle<Vec<u8>>,
+    stderr_handle: JoinHandle<Vec<u8>>,
+    wait: &ChildWait<'_>,
+    class: TimeoutClass,
+) -> SupervisedOutput {
+    wait.emit(supervisor, SupervisorStep::Recovering);
+    recover_child(
+        child,
+        stdout_handle,
+        stderr_handle,
+        wait.policy,
+        class,
+        wait.pid,
+    )
+    .await
+}
+
+async fn complete_child_wait(
+    supervisor: &Supervisor,
+    child: &mut ProcessGroupChild,
+    stdout_handle: JoinHandle<Vec<u8>>,
+    stderr_handle: JoinHandle<Vec<u8>>,
+    wait: &ChildWait<'_>,
+    hard_deadline: Option<Instant>,
+    status: std::io::Result<std::process::ExitStatus>,
+) -> SupervisedOutput {
+    match status {
+        Ok(s) => {
+            wait.emit(supervisor, SupervisorStep::Draining);
+            drain_exited_child(s, hard_deadline, wait.pid, stdout_handle, stderr_handle).await
+        }
+        Err(e) => {
+            wait.emit(supervisor, SupervisorStep::Recovering);
+            recover_lost_child(
+                child,
+                stdout_handle,
+                stderr_handle,
+                wait.policy,
+                wait.pid,
+                &e,
+            )
+            .await
         }
     }
 }
@@ -1267,11 +1292,54 @@ mod tests {
         expected_class: TimeoutClass,
         expected_code: SupervisorErrorCode,
     ) {
-        assert!(output.timed_out, "stderr={}", output.stderr);
-        assert!(output.killed, "stderr={}", output.stderr);
-        assert_eq!(output.timeout_class, Some(expected_class));
-        assert_eq!(output.error_code, Some(expected_code));
-        assert_eq!(output.redispatch_count, 0);
+        assert!(
+            output.timed_out
+                && output.killed
+                && output.timeout_class == Some(expected_class)
+                && output.error_code == Some(expected_code)
+                && output.redispatch_count == 0,
+            "timeout outcome mismatch: {output:?}"
+        );
+    }
+
+    fn hanging_script() -> &'static str {
+        #[cfg(windows)]
+        {
+            "ping -n 60 127.0.0.1 >NUL"
+        }
+        #[cfg(not(windows))]
+        {
+            "sleep 60"
+        }
+    }
+
+    fn assert_json_contains(json: &str, needles: &[&str]) {
+        for needle in needles {
+            assert!(json.contains(needle), "{json}");
+        }
+    }
+
+    fn assert_completed_without_idle(output: &SupervisedOutput) {
+        assert_eq!(output.exit_code, Some(0), "stderr={}", output.stderr);
+        assert!(!output.timed_out);
+        assert_ne!(output.timeout_class, Some(TimeoutClass::Idle));
+    }
+
+    fn assert_permit_wait_timeout(output: &SupervisedOutput) {
+        assert!(
+            output.timed_out
+                && !output.killed
+                && output.timeout_class == Some(TimeoutClass::Hard)
+                && output.stderr.contains("max-parallel permit"),
+            "permit-wait timeout mismatch: {output:?}"
+        );
+    }
+
+    fn assert_policy_code(err: Error, expected: PolicyCode) {
+        assert!(matches!(
+            err,
+            Error::PolicyViolation { code, .. } if code == expected
+        ));
     }
 
     #[test]
@@ -1480,22 +1548,16 @@ mod tests {
     #[tokio::test]
     async fn timeout_kills_process_group() {
         let supervisor = Supervisor::new(4);
-        #[cfg(windows)]
-        let script = "ping -n 60 127.0.0.1 >NUL";
-        #[cfg(not(windows))]
-        let script = "sleep 60";
         let output = supervisor
             .run_unchecked(
                 shell_program(),
-                &[shell_flag(), script],
+                &[shell_flag(), hanging_script()],
                 Some(Duration::from_millis(200)),
             )
             .await;
 
-        assert!(output.timed_out, "stderr={}", output.stderr);
-        assert!(output.killed);
+        assert_timeout_outcome(&output, TimeoutClass::Hard, SupervisorErrorCode::TimedOut);
         assert!(output.exit_code.is_none());
-        assert_eq!(output.error_code, Some(SupervisorErrorCode::TimedOut));
     }
 
     #[cfg(unix)]
@@ -1587,36 +1649,41 @@ mod tests {
         };
 
         let json = serde_json::to_string(&output).unwrap();
-        assert!(json.contains("\"exit_code\":0"));
-        assert!(json.contains("\"timed_out\":false"));
-        assert!(json.contains("\"killed\":false"));
-        assert!(json.contains("\"stdout\":\"hello\\n\""));
-        assert!(json.contains("\"stderr\":\"\""));
+        assert_json_contains(
+            &json,
+            &[
+                "\"exit_code\":0",
+                "\"timed_out\":false",
+                "\"killed\":false",
+                "\"stdout\":\"hello\\n\"",
+                "\"stderr\":\"\"",
+            ],
+        );
     }
 
     #[tokio::test]
     async fn timeout_output_serializes_correctly() {
         let supervisor = Supervisor::new(4);
-        #[cfg(windows)]
-        let script = "ping -n 60 127.0.0.1 >NUL";
-        #[cfg(not(windows))]
-        let script = "sleep 60";
         let output = supervisor
             .run_unchecked(
                 shell_program(),
-                &[shell_flag(), script],
+                &[shell_flag(), hanging_script()],
                 Some(Duration::from_millis(200)),
             )
             .await;
 
+        assert_timeout_outcome(&output, TimeoutClass::Hard, SupervisorErrorCode::TimedOut);
         let json = serde_json::to_string(&output).unwrap();
-        assert!(json.contains("\"timed_out\":true"), "{json}");
-        assert!(json.contains("\"killed\":true"), "{json}");
-        assert!(json.contains("\"exit_code\":null"), "{json}");
-        assert!(json.contains("TIMED_OUT"), "{json}");
-        assert!(json.contains("\"timeout_class\":\"hard\""), "{json}");
-        assert_eq!(output.timeout_class, Some(TimeoutClass::Hard));
-        assert_eq!(output.redispatch_count, 0);
+        assert_json_contains(
+            &json,
+            &[
+                "\"timed_out\":true",
+                "\"killed\":true",
+                "\"exit_code\":null",
+                "TIMED_OUT",
+                "\"timeout_class\":\"hard\"",
+            ],
+        );
     }
 
     #[tokio::test]
@@ -1643,13 +1710,7 @@ mod tests {
             .run("gh", &["pr", "merge"], None, &RunOptions::default())
             .await
             .unwrap_err();
-        assert!(matches!(
-            err,
-            Error::PolicyViolation {
-                code: PolicyCode::MergeBlocked,
-                ..
-            }
-        ));
+        assert_policy_code(err, PolicyCode::MergeBlocked);
     }
 
     #[tokio::test]
@@ -1661,15 +1722,11 @@ mod tests {
             progress_every: None,
             ..TimeoutPolicy::from_worker_timeout(None)
         };
-        #[cfg(windows)]
-        let script = "ping -n 60 127.0.0.1 >NUL";
-        #[cfg(not(windows))]
-        let script = "sleep 60";
         let started = Instant::now();
         let output = supervisor
             .run_unchecked_with_policy(
                 shell_program(),
-                &[shell_flag(), script],
+                &[shell_flag(), hanging_script()],
                 &policy,
                 &RunOptions::default(),
             )
@@ -1727,9 +1784,7 @@ mod tests {
                 &RunOptions::default(),
             )
             .await;
-        assert_eq!(output.exit_code, Some(0), "stderr={}", output.stderr);
-        assert!(!output.timed_out);
-        assert_ne!(output.timeout_class, Some(TimeoutClass::Idle));
+        assert_completed_without_idle(&output);
     }
 
     #[tokio::test]
@@ -1751,12 +1806,13 @@ mod tests {
             progress_every: Some(Duration::from_millis(50)),
             ..TimeoutPolicy::from_worker_timeout(None)
         };
-        #[cfg(windows)]
-        let script = "ping -n 60 127.0.0.1 >NUL";
-        #[cfg(not(windows))]
-        let script = "sleep 60";
         let output = supervisor
-            .run_unchecked_with_policy(shell_program(), &[shell_flag(), script], &policy, &options)
+            .run_unchecked_with_policy(
+                shell_program(),
+                &[shell_flag(), hanging_script()],
+                &policy,
+                &options,
+            )
             .await;
         assert!(output.timed_out);
         assert!(
@@ -1777,24 +1833,12 @@ mod tests {
             .run_with_policy("gh", &["pr", "merge"], &policy, &RunOptions::default())
             .await
             .unwrap_err();
-        assert!(matches!(
-            merge,
-            Error::PolicyViolation {
-                code: PolicyCode::MergeBlocked,
-                ..
-            }
-        ));
+        assert_policy_code(merge, PolicyCode::MergeBlocked);
         let force = supervisor
             .run_with_policy("git", &["push", "--force"], &policy, &RunOptions::default())
             .await
             .unwrap_err();
-        assert!(matches!(
-            force,
-            Error::PolicyViolation {
-                code: PolicyCode::BareForcePush,
-                ..
-            }
-        ));
+        assert_policy_code(force, PolicyCode::BareForcePush);
     }
 
     #[tokio::test]
@@ -1803,25 +1847,12 @@ mod tests {
         let output = supervisor
             .run_unchecked(
                 shell_program(),
-                &[shell_flag(), {
-                    #[cfg(windows)]
-                    {
-                        "ping -n 60 127.0.0.1 >NUL"
-                    }
-                    #[cfg(not(windows))]
-                    {
-                        "sleep 60"
-                    }
-                }],
+                &[shell_flag(), hanging_script()],
                 Some(Duration::from_millis(150)),
             )
             .await;
-        assert!(output.timed_out);
-        assert_eq!(
-            output.redispatch_count, 0,
-            "supervisor must not retry internally"
-        );
-        assert!(!crate::timeout_policy::TimeoutClass::Hard.counts_toward_fix_cap());
+        assert_timeout_outcome(&output, TimeoutClass::Hard, SupervisorErrorCode::TimedOut);
+        assert!(!TimeoutClass::Hard.counts_toward_fix_cap());
     }
 
     #[tokio::test]
@@ -1867,14 +1898,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(output.timed_out, "stderr={}", output.stderr);
-        assert!(!output.killed, "permit-wait timeout must not kill a child");
-        assert_eq!(output.timeout_class, Some(TimeoutClass::Hard));
-        assert!(
-            output.stderr.contains("max-parallel permit"),
-            "stderr={}",
-            output.stderr
-        );
+        assert_permit_wait_timeout(&output);
         assert!(
             queued.elapsed() < Duration::from_secs(2),
             "queued run should time out without waiting for the holder"
