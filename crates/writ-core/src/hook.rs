@@ -668,6 +668,17 @@ mod tests {
         }
     }
 
+    /// Dispatch a PreToolUse/Bash payload for `command` in a fresh context.
+    /// Each caller keeps its own explicit exit-code and stderr-substring assertions.
+    fn bash_outcome(ctx: &HookContext, command: &str) -> HookOutcome {
+        let payload = serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": command}
+        });
+        dispatch_hook(payload.to_string().as_bytes(), ctx)
+    }
+
     #[test]
     fn malformed_json_fails_closed() {
         let dir = tempdir().unwrap();
@@ -695,12 +706,7 @@ mod tests {
     #[test]
     fn pre_tool_use_blocks_merge_with_stderr_reason() {
         let dir = tempdir().unwrap();
-        let payload = serde_json::json!({
-            "hook_event_name": "PreToolUse",
-            "tool_name": "Bash",
-            "tool_input": {"command": "git merge feature"}
-        });
-        let outcome = dispatch_hook(payload.to_string().as_bytes(), &ctx(dir.path()));
+        let outcome = bash_outcome(&ctx(dir.path()), "git merge feature");
         assert_eq!(outcome.exit_code, 2);
         assert!(outcome.stderr.contains("MERGE_BLOCKED"));
         assert!(outcome.stdout.is_empty());
@@ -754,12 +760,7 @@ mod tests {
     #[test]
     fn protected_hook_config_write_is_blocked() {
         let dir = tempdir().unwrap();
-        let payload = serde_json::json!({
-            "hook_event_name": "PreToolUse",
-            "tool_name": "Bash",
-            "tool_input": {"command": "tee .claude/settings.json"}
-        });
-        let outcome = dispatch_hook(payload.to_string().as_bytes(), &ctx(dir.path()));
+        let outcome = bash_outcome(&ctx(dir.path()), "tee .claude/settings.json");
         assert_eq!(outcome.exit_code, 2);
         assert!(outcome.stderr.contains("PROTECTED_PATH"));
     }
@@ -767,12 +768,7 @@ mod tests {
     #[test]
     fn newline_separated_merge_fails_closed() {
         let dir = tempdir().unwrap();
-        let payload = serde_json::json!({
-            "hook_event_name": "PreToolUse",
-            "tool_name": "Bash",
-            "tool_input": {"command": "git status\ngit merge feature"}
-        });
-        let outcome = dispatch_hook(payload.to_string().as_bytes(), &ctx(dir.path()));
+        let outcome = bash_outcome(&ctx(dir.path()), "git status\ngit merge feature");
         assert_eq!(outcome.exit_code, 2, "{}", outcome.stderr);
         assert!(
             outcome.stderr.contains("newline") || outcome.stderr.contains("failed closed"),
@@ -784,12 +780,7 @@ mod tests {
     #[test]
     fn cp_to_hook_config_is_blocked() {
         let dir = tempdir().unwrap();
-        let payload = serde_json::json!({
-            "hook_event_name": "PreToolUse",
-            "tool_name": "Bash",
-            "tool_input": {"command": "cp foo .claude/settings.json"}
-        });
-        let outcome = dispatch_hook(payload.to_string().as_bytes(), &ctx(dir.path()));
+        let outcome = bash_outcome(&ctx(dir.path()), "cp foo .claude/settings.json");
         assert_eq!(outcome.exit_code, 2);
         assert!(outcome.stderr.contains("PROTECTED_PATH"));
     }
@@ -797,24 +788,17 @@ mod tests {
     #[test]
     fn git_status_redirecting_stderr_is_not_a_false_positive() {
         let dir = tempdir().unwrap();
-        let payload = serde_json::json!({
-            "hook_event_name": "PreToolUse",
-            "tool_name": "Bash",
-            "tool_input": {"command": "git status .claude/settings.json 2>/dev/null"}
-        });
-        let outcome = dispatch_hook(payload.to_string().as_bytes(), &ctx(dir.path()));
+        let outcome = bash_outcome(
+            &ctx(dir.path()),
+            "git status .claude/settings.json 2>/dev/null",
+        );
         assert_eq!(outcome.exit_code, 0, "{}", outcome.stderr);
     }
 
     #[test]
     fn wrapper_launching_git_is_blocked() {
         let dir = tempdir().unwrap();
-        let payload = serde_json::json!({
-            "hook_event_name": "PreToolUse",
-            "tool_name": "Bash",
-            "tool_input": {"command": "sh -c \"git merge feature\""}
-        });
-        let outcome = dispatch_hook(payload.to_string().as_bytes(), &ctx(dir.path()));
+        let outcome = bash_outcome(&ctx(dir.path()), "sh -c \"git merge feature\"");
         assert_eq!(outcome.exit_code, 2, "{}", outcome.stderr);
     }
 

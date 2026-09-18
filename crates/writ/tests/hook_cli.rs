@@ -91,6 +91,28 @@ fn bash(command: &str) -> serde_json::Value {
     })
 }
 
+/// Run `writ hook` for a WorktreeCreate `payload` expected to be rejected, and
+/// assert the shared invariant shared by every rejection test: the hook exits
+/// nonzero and no lease row is granted (zero rows if the db was created at all).
+/// The `Output` is returned so each test keeps its own unique assertions
+/// (stderr substring, escape path, worktree dir).
+fn assert_worktree_create_rejected_without_lease(
+    root: &Path,
+    payload: &serde_json::Value,
+) -> Output {
+    let output = writ_hook(root, payload);
+    assert_ne!(output.status.code(), Some(0));
+    let lease_path = root.join("leases.sqlite");
+    if lease_path.exists() {
+        let conn = rusqlite::Connection::open(&lease_path).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM leases", [], |row| row.get(0))
+            .unwrap_or(0);
+        assert_eq!(count, 0);
+    }
+    output
+}
+
 #[test]
 fn pretooluse_exit_2_blocks_with_stderr_reason() {
     let root = TestDir::new();
@@ -172,16 +194,8 @@ fn worktree_create_refuses_a_lease_on_hook_config() {
         "branch": "feature/protected",
         "start_point": start,
     });
-    let output = writ_hook(&root.0, &payload);
-    assert_ne!(output.status.code(), Some(0));
+    let output = assert_worktree_create_rejected_without_lease(&root.0, &payload);
     assert!(String::from_utf8_lossy(&output.stderr).contains("PROTECTED_PATH"));
-    if root.0.join("leases.sqlite").exists() {
-        let conn = rusqlite::Connection::open(root.0.join("leases.sqlite")).unwrap();
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM leases", [], |row| row.get(0))
-            .unwrap_or(0);
-        assert_eq!(count, 0);
-    }
 }
 
 #[test]
@@ -206,16 +220,8 @@ fn worktree_create_rejects_path_escape() {
         "branch": "feature/escape",
         "start_point": start,
     });
-    let output = writ_hook(&root.0, &payload);
-    assert_ne!(output.status.code(), Some(0));
+    let _output = assert_worktree_create_rejected_without_lease(&root.0, &payload);
     assert!(!root.0.join("worktrees").join("..").join("escape").exists());
-    if root.0.join("leases.sqlite").exists() {
-        let conn = rusqlite::Connection::open(root.0.join("leases.sqlite")).unwrap();
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM leases", [], |row| row.get(0))
-            .unwrap_or(0);
-        assert_eq!(count, 0);
-    }
 }
 
 #[test]
@@ -232,16 +238,8 @@ fn worktree_create_nonzero_aborts_without_a_lease_row() {
         "branch": "feature/invalid",
         "start_point": "does-not-exist",
     });
-    let output = writ_hook(&root.0, &payload);
-    assert_ne!(output.status.code(), Some(0));
+    let _output = assert_worktree_create_rejected_without_lease(&root.0, &payload);
     assert!(!root.0.join("worktrees/acme/sample/invalid").exists());
-    if root.0.join("leases.sqlite").exists() {
-        let conn = rusqlite::Connection::open(root.0.join("leases.sqlite")).unwrap();
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM leases", [], |row| row.get(0))
-            .unwrap_or(0);
-        assert_eq!(count, 0);
-    }
 }
 
 #[test]
