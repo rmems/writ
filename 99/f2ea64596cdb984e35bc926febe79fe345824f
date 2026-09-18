@@ -1,0 +1,23 @@
+crates/writ-core/src/timeout_policy.rs
+  s_81caa774cffac4::t_fdec4cfd0270c9 201
+  s_81caa774cffac4::t_eea7640501204f 239,242
+  s_81caa774cffac4::t_8422c11b61ee99 238,240-241
+crates/writ-core/src/supervisor.rs
+  s_81caa774cffac4::t_f0f566d99d8d08 761-765
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "99f2ea64596cdb984e35bc926febe79fe345824f",
+  "prompts": {},
+  "sessions": {
+    "s_81caa774cffac4": {
+      "agent_id": {
+        "tool": "cursor",
+        "id": "12226723-e525-41ca-ad4a-8d0ef9881119",
+        "model": "grok-4.6"
+      },
+      "human_author": "Raul Cardenas Montoya <montoyaraul34@gmail.com>"
+    }
+  }
+}
