@@ -1,6 +1,11 @@
+---
+name: writ
+description: Use when discovering GitHub or Linear work, spawning isolated worker agents, running Safe Issue → Verified Commit or PR handoff, or applying writ safety rules (no merge, force-with-lease only, assigned worktrees). Portable procedure for the writ Rust enforcement core; not a security boundary.
+---
+
 # writ Skill
 
-Installable agent skill for the `writ` Rust enforcement core.
+Installable agent skill for the `writ` Rust enforcement core. Directory name and frontmatter `name` are both `writ`. Install with [`scripts/install-skill.sh`](scripts/install-skill.sh); see [`docs/install.md`](docs/install.md).
 
 [`AGENTS.md`](AGENTS.md) is the authoritative repository contribution and autonomy contract. This portable skill supplies platform-neutral procedures and must not broaden or relax that policy.
 

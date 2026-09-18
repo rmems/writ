@@ -82,6 +82,7 @@ const STATE_PATH_ENV: &str = "WRIT_STATE_PATH";
 const LEGACY_STATE_PATH_ENV: &str = "WH_STATE_PATH";
 const WORKTREE_BASE_ENV: &str = "WRIT_WORKTREE_BASE";
 const LEGACY_WORKTREE_BASE_ENV: &str = "WH_WORKTREE_BASE";
+const LEASE_PATH_ENV: &str = "WRIT_LEASE_PATH";
 
 /// Named root for writ durable state under the user data directory.
 ///
@@ -125,6 +126,12 @@ impl StateRoot {
     #[must_use]
     pub fn watched_json(&self) -> PathBuf {
         self.path.join("watched.json")
+    }
+
+    /// Path to the SQLite lease store under this root.
+    #[must_use]
+    pub fn leases_db(&self) -> PathBuf {
+        self.path.join("leases.db")
     }
 }
 
@@ -185,6 +192,25 @@ pub fn state_path() -> PathBuf {
         std::env::var_os(STATE_PATH_ENV).as_deref(),
         std::env::var_os(LEGACY_STATE_PATH_ENV).as_deref(),
     )
+}
+
+/// Resolve the SQLite lease-store path.
+///
+/// Honours `WRIT_LEASE_PATH` when set and non-empty; otherwise
+/// `{resolved_state_root}/leases.db`.
+#[must_use]
+pub fn lease_store_path() -> PathBuf {
+    resolve_lease_path_in(
+        &user_data_dir(),
+        std::env::var_os(LEASE_PATH_ENV).as_deref(),
+    )
+}
+
+fn resolve_lease_path_in(user_data: &Path, writ_lease_path: Option<&OsStr>) -> PathBuf {
+    if let Some(custom) = writ_lease_path.filter(|v| !v.is_empty()) {
+        return PathBuf::from(custom);
+    }
+    StateRoot::from_user_data(user_data).leases_db()
 }
 
 /// Resolve the configured worktree base path.

@@ -1,0 +1,16 @@
+{
+  "languages": [
+    "JSON",
+    "Markdown",
+    "XML",
+    ".gitignore (GitIgnore)",
+    "Plain text",
+    "JSON Lines",
+    "textmate",
+    "TOML",
+    "Python",
+    "HTML",
+    "YAML",
+    "Shell Script"
+  ]
+}
