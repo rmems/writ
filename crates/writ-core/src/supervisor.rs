@@ -599,15 +599,20 @@ async fn await_supervised_child(
     wait: ChildWait<'_>,
 ) -> SupervisedOutput {
     let hard_deadline = wait.policy.worker.map(|limit| Instant::now() + limit);
+    let pipes = PipePair {
+        stdout: stdout_handle,
+        stderr: stderr_handle,
+    };
     loop {
         match next_wait_tick(child, &wait, hard_deadline).await {
             WaitTick::Recover(class) => {
                 return recover_classified(
-                    supervisor,
-                    child,
-                    stdout_handle,
-                    stderr_handle,
-                    &wait,
+                    ChildFinish {
+                        supervisor,
+                        child,
+                        pipes,
+                        wait: &wait,
+                    },
                     class,
                 )
                 .await;
@@ -616,11 +621,12 @@ async fn await_supervised_child(
             WaitTick::Continue => {}
             WaitTick::Finished(status) => {
                 return complete_child_wait(
-                    supervisor,
-                    child,
-                    stdout_handle,
-                    stderr_handle,
-                    &wait,
+                    ChildFinish {
+                        supervisor,
+                        child,
+                        pipes,
+                        wait: &wait,
+                    },
                     hard_deadline,
                     status,
                 )
@@ -630,48 +636,59 @@ async fn await_supervised_child(
     }
 }
 
-async fn recover_classified(
-    supervisor: &Supervisor,
-    child: &mut ProcessGroupChild,
-    stdout_handle: JoinHandle<Vec<u8>>,
-    stderr_handle: JoinHandle<Vec<u8>>,
-    wait: &ChildWait<'_>,
-    class: TimeoutClass,
-) -> SupervisedOutput {
-    wait.emit(supervisor, SupervisorStep::Recovering);
+struct PipePair {
+    stdout: JoinHandle<Vec<u8>>,
+    stderr: JoinHandle<Vec<u8>>,
+}
+
+struct ChildFinish<'a> {
+    supervisor: &'a Supervisor,
+    child: &'a mut ProcessGroupChild,
+    pipes: PipePair,
+    wait: &'a ChildWait<'a>,
+}
+
+async fn recover_classified(finish: ChildFinish<'_>, class: TimeoutClass) -> SupervisedOutput {
+    finish
+        .wait
+        .emit(finish.supervisor, SupervisorStep::Recovering);
     recover_child(
-        child,
-        stdout_handle,
-        stderr_handle,
-        wait.policy,
+        finish.child,
+        RecoverIo {
+            stdout_handle: finish.pipes.stdout,
+            stderr_handle: finish.pipes.stderr,
+            policy: finish.wait.policy,
+            pid: finish.wait.pid,
+        },
         class,
-        wait.pid,
     )
     .await
 }
 
 async fn complete_child_wait(
-    supervisor: &Supervisor,
-    child: &mut ProcessGroupChild,
-    stdout_handle: JoinHandle<Vec<u8>>,
-    stderr_handle: JoinHandle<Vec<u8>>,
-    wait: &ChildWait<'_>,
+    finish: ChildFinish<'_>,
     hard_deadline: Option<Instant>,
     status: std::io::Result<std::process::ExitStatus>,
 ) -> SupervisedOutput {
     match status {
         Ok(s) => {
-            wait.emit(supervisor, SupervisorStep::Draining);
-            drain_exited_child(s, hard_deadline, wait.pid, stdout_handle, stderr_handle).await
+            finish
+                .wait
+                .emit(finish.supervisor, SupervisorStep::Draining);
+            drain_exited_child(s, hard_deadline, finish.wait.pid, finish.pipes).await
         }
         Err(e) => {
-            wait.emit(supervisor, SupervisorStep::Recovering);
+            finish
+                .wait
+                .emit(finish.supervisor, SupervisorStep::Recovering);
             recover_lost_child(
-                child,
-                stdout_handle,
-                stderr_handle,
-                wait.policy,
-                wait.pid,
+                finish.child,
+                RecoverIo {
+                    stdout_handle: finish.pipes.stdout,
+                    stderr_handle: finish.pipes.stderr,
+                    policy: finish.wait.policy,
+                    pid: finish.wait.pid,
+                },
                 &e,
             )
             .await
@@ -688,9 +705,12 @@ async fn drain_exited_child(
     status: std::process::ExitStatus,
     hard_deadline: Option<Instant>,
     pid: Option<u32>,
-    stdout_handle: JoinHandle<Vec<u8>>,
-    stderr_handle: JoinHandle<Vec<u8>>,
+    pipes: PipePair,
 ) -> SupervisedOutput {
+    let PipePair {
+        stdout: stdout_handle,
+        stderr: stderr_handle,
+    } = pipes;
     match hard_deadline {
         Some(deadline_at) => {
             match drain_pipes_until(deadline_at, pid, stdout_handle, stderr_handle).await {
@@ -718,23 +738,19 @@ async fn drain_exited_child(
 
 /// Recover a child whose `wait()` failed (a lost/errored process), attaching the
 /// process error to stderr when no captured stderr is available.
-async fn recover_lost_child(
-    child: &mut ProcessGroupChild,
+struct RecoverIo<'a> {
     stdout_handle: JoinHandle<Vec<u8>>,
     stderr_handle: JoinHandle<Vec<u8>>,
-    policy: &TimeoutPolicy,
+    policy: &'a TimeoutPolicy,
     pid: Option<u32>,
+}
+
+async fn recover_lost_child(
+    child: &mut ProcessGroupChild,
+    io: RecoverIo<'_>,
     error: &std::io::Error,
 ) -> SupervisedOutput {
-    let mut recovered = recover_child(
-        child,
-        stdout_handle,
-        stderr_handle,
-        policy,
-        TimeoutClass::LostChild,
-        pid,
-    )
-    .await;
+    let mut recovered = recover_child(child, io, TimeoutClass::LostChild).await;
     if recovered.stderr.is_empty() {
         recovered.stderr = format!("process error: {error}");
     }
@@ -743,12 +759,15 @@ async fn recover_lost_child(
 
 async fn recover_child(
     child: &mut ProcessGroupChild,
-    stdout_handle: JoinHandle<Vec<u8>>,
-    stderr_handle: JoinHandle<Vec<u8>>,
-    policy: &TimeoutPolicy,
+    io: RecoverIo<'_>,
     class: TimeoutClass,
-    pid: Option<u32>,
 ) -> SupervisedOutput {
+    let RecoverIo {
+        stdout_handle,
+        stderr_handle,
+        policy,
+        pid,
+    } = io;
     let error_code = match class {
         TimeoutClass::Idle => SupervisorErrorCode::IdleTimedOut,
         TimeoutClass::LostChild => SupervisorErrorCode::LostChild,
