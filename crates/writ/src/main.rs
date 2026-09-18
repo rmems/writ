@@ -57,6 +57,12 @@ enum Command {
         action: WorktreeAction,
     },
 
+    /// Format an attributed PR thread reply or summary comment.
+    Attribution {
+        #[command(subcommand)]
+        action: AttributionAction,
+    },
+
     /// Dispatch a Claude Code hook event from JSON on stdin.
     Hook,
 
@@ -124,6 +130,28 @@ enum WorktreeAction {
 }
 
 #[derive(Debug, Subcommand)]
+enum AttributionAction {
+    /// Render a reply body with attribution and optional commit SHA.
+    Format {
+        /// Main reply content.
+        #[arg(long, allow_hyphen_values = true)]
+        body: String,
+        /// Identity line. Overrides `WRIT_AGENT_ID` / `WRIT_ATTRIBUTION`.
+        #[arg(long)]
+        agent_id: Option<String>,
+        /// Pushed commit SHA after a successful fix. Omit when no code changed.
+        #[arg(long)]
+        commit_sha: Option<String>,
+        /// `footer` (default) or `header`.
+        #[arg(long)]
+        placement: Option<String>,
+        /// Format as a PR-level comment instead of a review thread reply.
+        #[arg(long)]
+        pr_comment: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum SupervisorAction {
     /// Run a command under supervision.
     Run {
@@ -154,27 +182,20 @@ enum SupervisorAction {
 async fn main() -> ExitCode {
     let cli = Cli::parse();
     let json = cli.json;
-    let worktree_command = worktree_command_name(&cli);
+    let envelope_command = json_error_command(&cli);
     let worktree_schema_version = worktree_schema_version(&cli);
 
     match run(cli, &mut io::stdout()).await {
         Ok(code) => code,
         Err(error) => {
-            if json && let Some(command) = worktree_command {
-                let response = writ_core::contract::Response {
-                    ok: false,
-                    schema_version: worktree_schema_version,
-                    command,
-                    data: worktree_error_data(&error),
-                    error: Some(writ_core::contract::ErrorData {
-                        code: error.code().to_owned(),
-                        message: error.to_string(),
-                    }),
-                };
+            if json && let Some(command) = envelope_command {
                 let mut stdout = io::stdout();
-                if serde_json::to_writer(&mut stdout, &response).is_ok() {
-                    let _ = stdout.write_all(b"\n");
-                }
+                let _ = write_json_error_envelope(
+                    command,
+                    worktree_schema_version,
+                    &error,
+                    &mut stdout,
+                );
             }
             let _ = writeln!(io::stderr(), "writ: {error}");
             ExitCode::from(error.exit_code())
@@ -318,6 +339,33 @@ fn worktree_command_name(cli: &Cli) -> Option<&'static str> {
     }
 }
 
+fn json_error_command(cli: &Cli) -> Option<&'static str> {
+    worktree_command_name(cli).or(match &cli.command {
+        Some(Command::Attribution { .. }) => Some("attribution.format"),
+        _ => None,
+    })
+}
+
+fn write_json_error_envelope(
+    command: &'static str,
+    schema_version: u8,
+    error: &writ_core::error::Error,
+    stdout: &mut impl Write,
+) -> io::Result<()> {
+    let response = writ_core::contract::Response {
+        ok: false,
+        schema_version,
+        command,
+        data: worktree_error_data(error),
+        error: Some(writ_core::contract::ErrorData {
+            code: error.code().to_owned(),
+            message: error.to_string(),
+        }),
+    };
+    serde_json::to_writer(&mut *stdout, &response).map_err(io::Error::other)?;
+    stdout.write_all(b"\n")
+}
+
 fn worktree_response(
     action: WorktreeAction,
 ) -> writ_core::error::Result<writ_core::contract::Response<serde_json::Value>> {
@@ -424,6 +472,70 @@ fn run_worktree(
     Ok(ExitCode::SUCCESS)
 }
 
+fn run_attribution(
+    action: AttributionAction,
+    json: bool,
+    stdout: &mut impl Write,
+) -> writ_core::error::Result<ExitCode> {
+    match action {
+        AttributionAction::Format {
+            body,
+            agent_id,
+            commit_sha,
+            placement,
+            pr_comment,
+        } => {
+            if body.trim().is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "attribution body must not be empty",
+                )
+                .into());
+            }
+            let mut config = writ_core::attribution::AttributionConfig::from_env();
+            if let Some(id) = agent_id.as_deref() {
+                config.agent_id = writ_core::attribution::canonicalize_agent_id(id);
+            }
+            if let Some(placement) = placement {
+                config.placement = writ_core::attribution::AttributionPlacement::coerce(&placement);
+            }
+            let raw_sha = commit_sha.as_deref();
+            let commit_sha = match raw_sha.map(str::trim) {
+                None | Some("") => None,
+                Some(sha) => Some(
+                    writ_core::attribution::sanitize_commit_sha(Some(sha)).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("invalid --commit-sha '{sha}'"),
+                        )
+                    })?,
+                ),
+            };
+            let text =
+                writ_core::attribution::format_reply(body, Some(&config), commit_sha, !pr_comment);
+            if json {
+                let response = writ_core::contract::Response::success(
+                    "attribution.format",
+                    serde_json::json!({
+                        "text": text,
+                        "agent_id": config.agent_id,
+                        "include_sha_on_fix": config.include_sha_on_fix,
+                        "placement": config.placement,
+                        "commit_sha": commit_sha,
+                        "is_thread_reply": !pr_comment,
+                    }),
+                );
+                serde_json::to_writer(&mut *stdout, &response).map_err(io::Error::other)?;
+                stdout.write_all(b"\n")?;
+            } else {
+                writeln!(stdout, "{text}")?;
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+    }
+}
+
+/// Entry point for CLI commands (status/jobs, git/gh-safe, supervisor, worktree, attribution).
 fn run_hook(stdout: &mut impl Write) -> writ_core::error::Result<ExitCode> {
     let mut input = String::new();
     io::stdin().read_to_string(&mut input)?;
@@ -496,7 +608,6 @@ fn writ_command(writ_bin: Option<PathBuf>) -> String {
     "writ".to_owned()
 }
 
-/// Entry point for CLI commands (status/jobs, git/gh-safe, supervisor, worktree).
 async fn run(cli: Cli, stdout: &mut impl Write) -> writ_core::error::Result<ExitCode> {
     match cli.command {
         Some(Command::Status) => {
@@ -539,6 +650,7 @@ async fn run(cli: Cli, stdout: &mut impl Write) -> writ_core::error::Result<Exit
             }
         },
         Some(Command::Worktree { action }) => run_worktree(action, cli.json, stdout),
+        Some(Command::Attribution { action }) => run_attribution(action, cli.json, stdout),
         Some(Command::Hook) => run_hook(stdout),
         Some(Command::Install { settings, writ_bin }) => {
             run_install(settings, writ_bin, cli.json, stdout)
@@ -811,7 +923,10 @@ mod tests {
     use clap::{CommandFactory, Parser};
     use writ_core::status::{CiClass, JobStatus, ProcessState};
 
-    use super::{Cli, run, run_status, run_with_jobs, supervised_exit_code};
+    use super::{
+        Cli, json_error_command, run, run_status, run_with_jobs, supervised_exit_code,
+        write_json_error_envelope,
+    };
 
     fn sample_job() -> JobStatus {
         JobStatus {
@@ -831,6 +946,286 @@ mod tests {
     #[test]
     fn command_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn attribution_format_parser_accepts_thread_and_pr_shapes() {
+        let parsed = Cli::try_parse_from([
+            "writ",
+            "attribution",
+            "format",
+            "--body",
+            "Looks good!",
+            "--agent-id",
+            "Claude Code: worktrees-hives agent",
+            "--commit-sha",
+            "abc1234",
+        ])
+        .unwrap();
+        let Some(super::Command::Attribution {
+            action:
+                super::AttributionAction::Format {
+                    body,
+                    agent_id,
+                    commit_sha,
+                    pr_comment: false,
+                    ..
+                },
+        }) = parsed.command
+        else {
+            panic!("expected attribution format command")
+        };
+        assert_eq!(body, "Looks good!");
+        assert_eq!(
+            agent_id.as_deref(),
+            Some("Claude Code: worktrees-hives agent")
+        );
+        assert_eq!(commit_sha.as_deref(), Some("abc1234"));
+
+        let hyphenated = Cli::try_parse_from([
+            "writ",
+            "attribution",
+            "format",
+            "--body",
+            "- Fixed the branch check.",
+        ])
+        .unwrap();
+        let Some(super::Command::Attribution {
+            action:
+                super::AttributionAction::Format {
+                    body: hyphen_body, ..
+                },
+        }) = hyphenated.command
+        else {
+            panic!("expected hyphenated attribution body")
+        };
+        assert_eq!(hyphen_body, "- Fixed the branch check.");
+
+        let pr = Cli::try_parse_from([
+            "writ",
+            "attribution",
+            "format",
+            "--body",
+            "All checks passed.",
+            "--pr-comment",
+        ])
+        .unwrap();
+        let Some(super::Command::Attribution {
+            action:
+                super::AttributionAction::Format {
+                    pr_comment: true, ..
+                },
+        }) = pr.command
+        else {
+            panic!("expected PR comment attribution format")
+        };
+    }
+
+    struct FormatCase {
+        json: bool,
+        body: &'static str,
+        agent_id: Option<&'static str>,
+        commit_sha: Option<&'static str>,
+        placement: Option<&'static str>,
+        pr_comment: bool,
+    }
+
+    fn format_cli(case: FormatCase) -> Cli {
+        Cli {
+            json: case.json,
+            command: Some(super::Command::Attribution {
+                action: super::AttributionAction::Format {
+                    body: case.body.to_owned(),
+                    agent_id: case.agent_id.map(str::to_owned),
+                    commit_sha: case.commit_sha.map(str::to_owned),
+                    placement: case.placement.map(str::to_owned),
+                    pr_comment: case.pr_comment,
+                },
+            }),
+        }
+    }
+
+    async fn run_format(case: FormatCase) -> (writ_core::error::Result<ExitCode>, Vec<u8>) {
+        let mut stdout = Vec::new();
+        let result = run(format_cli(case), &mut stdout).await;
+        (result, stdout)
+    }
+
+    fn parse_stdout_json(stdout: &[u8]) -> serde_json::Value {
+        serde_json::from_str(str::from_utf8(stdout).unwrap().trim()).unwrap()
+    }
+
+    fn format_envelope_ok(value: &serde_json::Value) -> bool {
+        value["ok"] == true
+            && value["schema_version"] == 1
+            && value["command"] == "attribution.format"
+            && value["error"].is_null()
+    }
+
+    async fn format_ok(case: FormatCase) -> Vec<u8> {
+        let (result, stdout) = run_format(case).await;
+        assert_eq!(result.unwrap(), ExitCode::SUCCESS);
+        stdout
+    }
+
+    fn format_data(value: &serde_json::Value) -> (Option<&str>, Option<&str>, Option<bool>, bool) {
+        (
+            value["data"]["text"].as_str(),
+            value["data"]["commit_sha"].as_str(),
+            value["data"]["is_thread_reply"].as_bool(),
+            value["data"]["commit_sha"].is_null(),
+        )
+    }
+
+    #[tokio::test]
+    async fn attribution_format_success_cases() {
+        let human = format_ok(FormatCase {
+            json: false,
+            body: "Looks good!",
+            agent_id: Some("worktrees-hives agent"),
+            commit_sha: None,
+            placement: None,
+            pr_comment: false,
+        })
+        .await;
+        assert_eq!(
+            str::from_utf8(&human).unwrap(),
+            "Looks good!\n\n---\nworktrees-hives agent\n"
+        );
+
+        let with_sha = parse_stdout_json(
+            &format_ok(FormatCase {
+                json: true,
+                body: "Fixed the issue.",
+                agent_id: Some("worktrees-hives agent"),
+                commit_sha: Some("abc1234"),
+                placement: Some("footer"),
+                pr_comment: false,
+            })
+            .await,
+        );
+        assert!(format_envelope_ok(&with_sha), "{with_sha}");
+        assert_eq!(
+            format_data(&with_sha),
+            (
+                Some("Fixed the issue.\n\n---\nworktrees-hives agent: fixed in abc1234"),
+                Some("abc1234"),
+                Some(true),
+                false
+            )
+        );
+
+        let omit_sha = parse_stdout_json(
+            &format_ok(FormatCase {
+                json: true,
+                body: "No code change.",
+                agent_id: Some("Codex: worktrees-hives agent"),
+                commit_sha: Some("  "),
+                placement: None,
+                pr_comment: true,
+            })
+            .await,
+        );
+        assert_eq!(
+            format_data(&omit_sha),
+            (
+                Some("No code change.\n\nCodex: worktrees-hives agent"),
+                None,
+                Some(false),
+                true
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn attribution_format_rejects_invalid_inputs() {
+        for case in [
+            FormatCase {
+                json: false,
+                body: "   ",
+                agent_id: None,
+                commit_sha: None,
+                placement: None,
+                pr_comment: false,
+            },
+            FormatCase {
+                json: false,
+                body: "Looks good!",
+                agent_id: None,
+                commit_sha: Some("not-a-sha"),
+                placement: None,
+                pr_comment: false,
+            },
+        ] {
+            let (result, stdout) = run_format(case).await;
+            assert!(result.is_err() && stdout.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn attribution_format_json_rejects_empty_body_with_envelope() {
+        let cli = format_cli(FormatCase {
+            json: true,
+            body: "",
+            agent_id: None,
+            commit_sha: None,
+            placement: None,
+            pr_comment: false,
+        });
+        assert_eq!(json_error_command(&cli), Some("attribution.format"));
+        let (result, mut stdout) = run_format(FormatCase {
+            json: true,
+            body: "",
+            agent_id: None,
+            commit_sha: None,
+            placement: None,
+            pr_comment: false,
+        })
+        .await;
+        let error = result.expect_err("empty body must be rejected");
+        assert!(stdout.is_empty());
+        write_json_error_envelope(
+            "attribution.format",
+            writ_core::contract::SCHEMA_VERSION,
+            &error,
+            &mut stdout,
+        )
+        .unwrap();
+        let value = parse_stdout_json(&stdout);
+        assert_eq!(
+            (
+                value["ok"].as_bool(),
+                value["schema_version"].as_u64(),
+                value["command"].as_str(),
+                value["error"]["message"].as_str(),
+                value["error"]["code"]
+                    .as_str()
+                    .is_some_and(|code| !code.is_empty())
+            ),
+            (
+                Some(false),
+                Some(1),
+                Some("attribution.format"),
+                Some("io operation: attribution body must not be empty"),
+                true
+            )
+        );
+
+        let empty_agent = parse_stdout_json(
+            &format_ok(FormatCase {
+                json: true,
+                body: "Looks good!",
+                agent_id: Some("   "),
+                commit_sha: None,
+                placement: None,
+                pr_comment: false,
+            })
+            .await,
+        );
+        assert_eq!(
+            empty_agent["data"]["agent_id"],
+            writ_core::attribution::DEFAULT_AGENT_ID
+        );
     }
 
     #[test]

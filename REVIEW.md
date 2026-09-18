@@ -75,10 +75,15 @@ cargo test --workspace
 
 ## Review replies
 
-Post a fix reply only after its commit is pushed. Include the short or full SHA and attribution, for example:
+Post a fix reply only after its commit is pushed. Include attribution on every automated thread reply and optional PR comment. After a code fix, include the pushed SHA; when no code changed, include attribution without inventing a SHA.
+
+Render with `writ attribution format` so platforms set `agent_id` (`WRIT_AGENT_ID`) without forking reply logic. Canonical templates live in [`SKILL.md`](SKILL.md#reply-attribution). Thread reply after a successful push:
 
 ```text
-Grok Build agent: fixed the branch check in abc1234 and added the mismatch regression test.
+Fixed the branch check and added the mismatch regression test.
+
+---
+worktrees-hives agent: fixed in abc1234
 ```
 
 Replies may explain why no code change is needed. Resolve a thread only when the concern is addressed or the reviewer has accepted the explanation.

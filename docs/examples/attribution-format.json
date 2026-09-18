@@ -1,0 +1,14 @@
+{
+  "ok": true,
+  "schema_version": 1,
+  "command": "attribution.format",
+  "data": {
+    "agent_id": "worktrees-hives agent",
+    "commit_sha": null,
+    "include_sha_on_fix": true,
+    "is_thread_reply": true,
+    "placement": "footer",
+    "text": "Looks good!\n\n---\nworktrees-hives agent"
+  },
+  "error": null
+}

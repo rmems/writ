@@ -23,6 +23,7 @@ All of them, under `--json`:
 | `status` / `jobs` | `cli.status` / `cli.jobs` |
 | `git-safe` / `gh-safe` | `git.safe` / `gh.safe` |
 | `worktree create\|list\|remove\|prune` | `worktree.create` etc. |
+| `attribution format` | `attribution.format` |
 | `install` | `cli.install` |
 | `hook` | no envelope: PreToolUse is allow/block via exit code; WorktreeCreate prints the worktree path |
 
@@ -53,6 +54,7 @@ writ --json                                   # cli.bootstrap
 writ --json status                            # cli.status
 writ --json git-safe --repo <repo> rev-parse --is-inside-work-tree   # git.safe
 writ --json worktree list                     # worktree.list
+writ --json attribution format --body "Looks good!"   # attribution.format
 # error envelope, no repository mutation:
 writ --json worktree create --schema-version 2 --repo <repo> <owner> <repo-name> <job> <branch>
 ```
