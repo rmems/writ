@@ -11,7 +11,7 @@ Claude Code's published rule is:
 - `PreToolUse` exit `2` blocks the tool call. Stderr is the reason. A JSON `permissionDecision` of `"allow"` from this hook or a competing hook cannot override exit `2`.
 - `WorktreeCreate` treats **any** non-zero exit as abort. Command-hook stdout is the created path, not JSON.
 
-`writ_core::hook::compose_pre_tool_use` applies that first rule to real `writ hook` outcomes plus a competitor that prints `permissionDecision: "allow"`. That is the CI proof. A live session is still required once per [#124](https://github.com/rmems/writ/issues/124) burn-in, because only the host can run two hooks.
+CI proves the fail-closed exit: `writ hook` returns 2 with a policy reason on stderr for blocked `git`/`gh` mutations. A JSON `permissionDecision: "allow"` from this process is never emitted on that path. A live two-hook session is still required once per [#124](https://github.com/rmems/writ/issues/124) burn-in, because only the host can run a competing hook.
 
 ## Manual end-to-end (once per #124 exit)
 

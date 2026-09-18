@@ -3,13 +3,18 @@
 //! The module boundaries are established in the R1 scaffold. Their behavior is
 //! implemented by the linked foundation issues.
 
+mod bash_argv;
 pub mod contract;
 pub mod error;
+mod git_cmd;
 pub mod git_safe;
 pub mod hook;
-mod identity;
+pub mod identity;
+pub mod install;
 pub mod lease;
 pub mod paths;
+pub mod porcelain;
+mod pr_import;
 pub mod state;
 pub mod status;
 pub mod supervisor;

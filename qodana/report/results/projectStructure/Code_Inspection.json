@@ -1,0 +1,31 @@
+{
+  "modules": [
+    {
+      "name": "worktrees-hives",
+      "contentEntries": [
+        {
+          "path": "file://$PROJECT_DIR$",
+          "excludePatterns": [],
+          "excludeFolders": [],
+          "sourceFolders": [
+            {
+              "path": "file://$PROJECT_DIR$/src",
+              "type": "Source",
+              "packagePrefix": ""
+            }
+          ]
+        }
+      ],
+      "orderEntries": [
+        {
+          "name": "Python 3.12",
+          "type": "SDK"
+        },
+        {
+          "name": "<Module source>",
+          "type": "Own sources"
+        }
+      ]
+    }
+  ]
+}

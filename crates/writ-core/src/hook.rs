@@ -1,138 +1,77 @@
-//! Claude Code hook dispatcher: the production enforcement boundary.
+//! Claude Code hook dispatcher.
 //!
-//! `writ hook` reads one JSON payload from stdin and exits 0 or 2. Policy
-//! rejections on `PreToolUse` always use exit 2 so the host cannot override
-//! them with a competing hook's `permissionDecision: "allow"`.
+//! Reads hook JSON on stdin. Exit 0 allows; exit 2 blocks and writes a reason
+//! on stderr that Claude Code shows to the model. `WorktreeCreate` also prints
+//! the admitted worktree path as the last stdout line. Exact-base create
+//! requires a hook-supplied start ref (`source_ref` and aliases); there is no
+//! ambient `HEAD` fallback.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::bash_argv::{GitGhTool, ShellText, git_gh_invocations};
 use crate::error::{Error, PolicyCode, Result};
 use crate::git_safe::{SafeGhCommand, SafeGitCommand};
-use crate::lease::{Lease, LeaseMode, LeaseStore, path_key};
-use crate::paths::{derive_worktree_path, worktree_base_path};
-use crate::supervisor::{is_forbidden_wrapper, normalize_program_name};
+use crate::identity::{StartPoint, resolve_start_commit};
+use crate::lease::{AgentIdentity, LeaseStore};
 use crate::worktree::{WorktreeCreateRequest, WorktreeManager};
 
-/// Paths an accidental agent must not rewrite: hook config and the enforcer.
-const HOOK_CONFIG_SUFFIXES: &[&str] = &[".claude/settings.json", ".claude/settings.local.json"];
-
-/// Result of dispatching one hook payload.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct HookOutcome {
-    pub exit_code: u8,
-    pub stdout: String,
-    pub stderr: String,
+/// Process-local paths for hook dispatch (tests inject temp dirs).
+#[derive(Debug, Clone, Default)]
+pub struct HookRuntime {
+    pub worktree_base: Option<PathBuf>,
+    pub lease_path: Option<PathBuf>,
 }
 
-impl HookOutcome {
-    #[must_use]
-    pub fn success() -> Self {
-        Self {
-            exit_code: 0,
-            stdout: String::new(),
-            stderr: String::new(),
-        }
-    }
-
-    #[must_use]
-    pub fn allow_path(path: impl Into<String>) -> Self {
-        Self {
-            exit_code: 0,
-            stdout: path.into(),
-            stderr: String::new(),
-        }
-    }
-
-    #[must_use]
-    pub fn fail_closed(reason: impl Into<String>) -> Self {
-        let reason = reason.into();
-        Self {
-            exit_code: 2,
-            stdout: String::new(),
-            stderr: format!("writ: hook failed closed: {reason}\n"),
-        }
-    }
-
-    #[must_use]
-    pub fn from_error(error: &Error) -> Self {
-        Self {
-            exit_code: error.exit_code(),
-            stdout: String::new(),
-            stderr: format!("writ: {error}\n"),
+/// Dispatch one Claude Code hook event. Returns the process exit code.
+pub fn dispatch(
+    input: &str,
+    runtime: &HookRuntime,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> u8 {
+    match dispatch_inner(HookJson(input), runtime, stdout) {
+        Ok(()) => 0,
+        Err(err) => {
+            let _ = writeln!(stderr, "writ hook: [{}] {err}", err.code());
+            2
         }
     }
 }
 
-/// Claude Code's documented PreToolUse composition rule.
-///
-/// Exit 2 from any hook blocks the tool call. JSON `permissionDecision: "allow"`
-/// from another hook cannot override it. This models the host contract so
-/// tests can prove the claim without a live Claude Code session.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub enum ComposedPreToolUse {
-    Block { reason: String },
-    Continue,
-}
+struct HookJson<'a>(&'a str);
 
-/// Apply the host composition rule to already-run hook processes.
-#[must_use]
-pub fn compose_pre_tool_use(hooks: &[HookOutcome]) -> ComposedPreToolUse {
-    for hook in hooks {
-        if hook.exit_code == 2 {
-            return ComposedPreToolUse::Block {
-                reason: hook.stderr.clone(),
-            };
-        }
-    }
-    ComposedPreToolUse::Continue
-}
-
-/// Runtime paths injected by the CLI or tests.
-#[derive(Debug, Clone)]
-pub struct HookContext {
-    pub lease_path: PathBuf,
-    pub worktree_base: PathBuf,
-    pub enforcer_path: PathBuf,
-    pub expected_branch: Option<String>,
-}
-
-impl HookContext {
-    /// Resolve context from process environment.
-    pub fn from_env() -> Result<Self> {
-        let lease_path = match std::env::var_os("WRIT_LEASE_PATH") {
-            Some(value) if !value.is_empty() => PathBuf::from(value),
-            _ => crate::paths::StateRoot::default_root()
-                .as_path()
-                .join("leases.sqlite"),
-        };
-        let enforcer_path = match std::env::var_os("WRIT_BIN") {
-            Some(value) if !value.is_empty() => PathBuf::from(value),
-            _ => std::env::current_exe().unwrap_or_else(|_| PathBuf::from("writ")),
-        };
-        let expected_branch = std::env::var("WRIT_EXPECTED_BRANCH")
-            .ok()
-            .filter(|v| !v.is_empty());
-        Ok(Self {
-            lease_path,
-            worktree_base: worktree_base_path()?,
-            enforcer_path,
-            expected_branch,
-        })
+fn dispatch_inner(
+    input: HookJson<'_>,
+    runtime: &HookRuntime,
+    stdout: &mut impl Write,
+) -> Result<()> {
+    let event: HookEvent = serde_json::from_str(input.0).map_err(|e| Error::Io {
+        context: "parse hook JSON",
+        source: std::io::Error::new(std::io::ErrorKind::InvalidData, e),
+    })?;
+    match event.hook_event_name.as_str() {
+        "PreToolUse" => handle_pre_tool_use(&event),
+        "WorktreeCreate" => handle_worktree_create(&event, runtime, stdout),
+        "WorktreeRemove" => handle_worktree_remove(&event, runtime),
+        "SubagentStart" => handle_subagent_start(&event, runtime),
+        "SubagentStop" => handle_subagent_stop(&event, runtime),
+        _ => Ok(()),
     }
 }
 
 #[derive(Debug, Deserialize)]
-struct HookPayload {
-    hook_event_name: Option<String>,
+struct HookEvent {
+    hook_event_name: String,
+    #[serde(default)]
+    cwd: Option<String>,
     #[serde(default)]
     tool_name: Option<String>,
     #[serde(default)]
     tool_input: Option<ToolInput>,
-    #[serde(default)]
-    cwd: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "worktree_name")]
     name: Option<String>,
     #[serde(default)]
     worktree_path: Option<String>,
@@ -142,16 +81,14 @@ struct HookPayload {
     agent_type: Option<String>,
     #[serde(default)]
     session_id: Option<String>,
-    #[serde(default)]
-    owner: Option<String>,
-    #[serde(default)]
-    repo: Option<String>,
-    #[serde(default)]
-    job_id: Option<String>,
-    #[serde(default)]
-    branch: Option<String>,
-    #[serde(default)]
-    start_point: Option<String>,
+    #[serde(
+        default,
+        alias = "sourceRef",
+        alias = "start_point",
+        alias = "base_ref",
+        alias = "baseRef"
+    )]
+    source_ref: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -160,657 +97,436 @@ struct ToolInput {
     command: Option<String>,
 }
 
-/// Dispatch one Claude Code hook payload.
-#[must_use]
-pub fn dispatch_hook(stdin: &[u8], ctx: &HookContext) -> HookOutcome {
-    let payload = match parse_payload(stdin) {
-        Ok(payload) => payload,
-        Err(reason) => return HookOutcome::fail_closed(reason),
-    };
-    let Some(event) = payload.hook_event_name.as_deref() else {
-        return HookOutcome::fail_closed("missing hook_event_name");
-    };
-    match event {
-        "PreToolUse" => dispatch_pre_tool_use(&payload, ctx),
-        "WorktreeCreate" => dispatch_worktree_create(&payload, ctx),
-        "WorktreeRemove" => dispatch_worktree_remove(&payload, ctx),
-        "SubagentStart" => dispatch_subagent_start(&payload, ctx),
-        "SubagentStop" => dispatch_subagent_stop(&payload, ctx),
-        _ => HookOutcome::success(),
-    }
-}
-
-fn parse_payload(stdin: &[u8]) -> std::result::Result<HookPayload, String> {
-    if stdin.iter().all(u8::is_ascii_whitespace) {
-        return Err("empty hook payload".to_owned());
-    }
-    serde_json::from_slice(stdin).map_err(|err| format!("malformed hook JSON: {err}"))
-}
-
-fn dispatch_pre_tool_use(payload: &HookPayload, ctx: &HookContext) -> HookOutcome {
-    let Some(tool_name) = payload.tool_name.as_deref() else {
-        return HookOutcome::fail_closed("PreToolUse missing tool_name");
-    };
+fn handle_pre_tool_use(event: &HookEvent) -> Result<()> {
+    let tool_name = event.tool_name.as_deref().unwrap_or("");
     if !tool_name.eq_ignore_ascii_case("Bash") {
-        // Edit/Write protection is Phase 5. Unknown tools must not false-positive.
-        return HookOutcome::success();
+        return Ok(());
     }
-    let Some(command) = payload
+    let Some(command) = event
         .tool_input
         .as_ref()
         .and_then(|input| input.command.as_deref())
     else {
-        return HookOutcome::fail_closed("PreToolUse Bash missing tool_input.command");
-    };
-    if let Err(error) = enforce_bash_command(command, ctx, payload.cwd.as_deref()) {
-        return pre_tool_use_error(&error);
-    }
-    HookOutcome::success()
-}
-
-fn pre_tool_use_error(error: &Error) -> HookOutcome {
-    // PreToolUse only blocks on exit 2. Operational failures must not leak as
-    // a non-blocking exit 1.
-    HookOutcome {
-        exit_code: 2,
-        stdout: String::new(),
-        stderr: format!("writ: {error}\n"),
-    }
-}
-
-fn enforce_bash_command(command: &str, ctx: &HookContext, cwd: Option<&str>) -> Result<()> {
-    let words = split_shell_words(command)?;
-    let words = strip_env_assignments(&words);
-    if words.is_empty() {
         return Ok(());
-    }
-    reject_compound_or_protected(words, ctx)?;
-    let program = normalize_program_name(&words[0]);
-    let args = &words[1..];
-    if is_forbidden_wrapper(&program) {
-        return Err(Error::PolicyViolation {
-            code: PolicyCode::SubcommandNotAllowed,
-            message: format!(
-                "program `{program}` can launch unreviewed commands and is not allowed at PreToolUse"
-            ),
-        });
-    }
-    route_program(&program, args, ctx, cwd)
-}
-
-/// Fail closed on compound shell control, multiple git/gh invocations, or a
-/// write that targets a protected path. Guards run in the original order.
-fn reject_compound_or_protected(words: &[String], ctx: &HookContext) -> Result<()> {
-    if looks_like_shell_control(words) {
-        return Err(Error::HookFailClosed {
-            reason: "compound shell command is not a single git/gh invocation".to_owned(),
-        });
-    }
-    if extra_git_or_gh_tokens(words) {
-        return Err(Error::HookFailClosed {
-            reason: "multiple git/gh invocations in one Bash payload".to_owned(),
-        });
-    }
-    if let Some(path) = protected_write_target(words, ctx) {
-        return Err(Error::PolicyViolation {
-            code: PolicyCode::ProtectedPath,
-            message: format!(
-                "refusing to write protected path `{}`",
-                path.to_string_lossy()
-            ),
-        });
-    }
-    Ok(())
-}
-
-/// Dispatch the already-validated program through the git/gh allowlists.
-/// Programs other than git/gh are accepted unchanged.
-fn route_program(
-    program: &str,
-    args: &[String],
-    ctx: &HookContext,
-    cwd: Option<&str>,
-) -> Result<()> {
-    match program {
-        "git" => {
-            let cmd = SafeGitCommand::new(args)?;
-            if let Some(expected) = expected_branch_for(ctx, cwd)?
-                && cmd.requires_branch_check()
-            {
-                let repo = cwd.map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
-                cmd.verify_branch(&repo, &expected)?;
-            }
-            Ok(())
-        }
-        "gh" => {
-            SafeGhCommand::new(args)?;
-            Ok(())
-        }
-        _ => Ok(()),
-    }
-}
-
-fn expected_branch_for(ctx: &HookContext, cwd: Option<&str>) -> Result<Option<String>> {
-    if let Some(branch) = ctx.expected_branch.as_deref() {
-        return Ok(Some(branch.to_owned()));
-    }
-    let Some(cwd) = cwd else {
-        return Ok(None);
     };
-    let store = LeaseStore::open(&ctx.lease_path)?;
-    Ok(store.get(Path::new(cwd))?.map(|lease| lease.branch))
+    admit_bash_command(ShellText(command))
 }
 
-fn dispatch_worktree_create(payload: &HookPayload, ctx: &HookContext) -> HookOutcome {
-    match create_and_lease(payload, ctx) {
-        Ok(path) => HookOutcome::allow_path(format!("{}\n", path.display())),
-        Err(error) => HookOutcome::from_error(&error),
+fn handle_worktree_create(
+    event: &HookEvent,
+    runtime: &HookRuntime,
+    stdout: &mut impl Write,
+) -> Result<()> {
+    let inputs = create_inputs(event)?;
+    let created = manager_for_runtime(runtime)?.create_with_request(inputs.request())?;
+    write_created_path(stdout, &created.path)
+}
+
+struct CreateInputs {
+    repo_root: PathBuf,
+    owner: String,
+    repo_name: String,
+    name: String,
+    start_commit: String,
+}
+
+impl CreateInputs {
+    fn request(&self) -> WorktreeCreateRequest<'_> {
+        WorktreeCreateRequest {
+            repo_root: &self.repo_root,
+            owner: &self.owner,
+            repo: &self.repo_name,
+            job_id: &self.name,
+            branch: &self.name,
+            start_point: &self.start_commit,
+            pr_number: None,
+            source_remote: None,
+            head_repo: None,
+        }
     }
 }
 
-fn create_and_lease(payload: &HookPayload, ctx: &HookContext) -> Result<PathBuf> {
-    let owner = required_identity(payload.owner.as_deref(), "owner")?;
-    let repo = required_identity(payload.repo.as_deref(), "repo")?;
-    let job_id = payload
-        .job_id
+fn create_inputs(event: &HookEvent) -> Result<CreateInputs> {
+    let name = hook_field(
+        event.name.as_deref(),
+        PolicyCode::WorktreeResumeUnproven,
+        "WorktreeCreate hook JSON is missing `name`",
+    )?;
+    let cwd = hook_field(
+        event.cwd.as_deref(),
+        PolicyCode::GitDirUnavailable,
+        "WorktreeCreate hook JSON is missing `cwd`",
+    )?;
+    let source_ref = event
+        .source_ref
         .as_deref()
-        .or(payload.name.as_deref())
-        .ok_or_else(|| Error::HookFailClosed {
-            reason: "WorktreeCreate missing job_id/name".to_owned(),
-        })?;
-    let branch = required_identity(payload.branch.as_deref(), "branch")?;
-    let start_point = payload
-        .start_point
-        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
         .ok_or(Error::StartPointRequired)?;
-    let repo_root = payload
-        .cwd
-        .as_deref()
-        .ok_or_else(|| Error::HookFailClosed {
-            reason: "WorktreeCreate missing cwd".to_owned(),
-        })?;
-    let repo_root = Path::new(repo_root);
-    let derived = derive_worktree_path(&ctx.worktree_base, owner, repo, job_id)?;
-    reject_protected_lease_scope(&derived, ctx)?;
-    let manager = WorktreeManager::with_base(ctx.worktree_base.clone())?;
-    let request = WorktreeCreateRequest {
+    let repo_root = git_toplevel(Path::new(cwd))?;
+    let (owner, repo_name) = origin_owner_repo(&repo_root)?;
+    let start_commit = resolve_start_commit(&repo_root, StartPoint(source_ref))?;
+    Ok(CreateInputs {
         repo_root,
         owner,
-        repo,
-        job_id,
-        branch,
-        start_point,
-    };
-    let worktree = manager.create_with_request(request)?;
-    let stored = path_key(&worktree.path);
-    let store = LeaseStore::open(&ctx.lease_path)?;
-    store.grant(&Lease {
-        worktree_path: stored.clone(),
-        repo: repo.to_owned(),
-        branch: branch.to_owned(),
-        owner: owner.to_owned(),
-        mode: LeaseMode::WriterLocked,
-        ttl: None,
-        heartbeat: None,
-    })?;
-    Ok(PathBuf::from(stored))
+        repo_name,
+        name: name.to_owned(),
+        start_commit,
+    })
 }
 
-fn dispatch_worktree_remove(payload: &HookPayload, ctx: &HookContext) -> HookOutcome {
-    let Some(path) = payload.worktree_path.as_deref() else {
-        return HookOutcome::fail_closed("WorktreeRemove missing worktree_path");
-    };
-    match LeaseStore::open(&ctx.lease_path).and_then(|store| store.release(Path::new(path))) {
-        Ok(()) => HookOutcome::success(),
-        Err(error) => HookOutcome::from_error(&error),
+fn hook_field<'a>(
+    value: Option<&'a str>,
+    code: PolicyCode,
+    message: &'static str,
+) -> Result<&'a str> {
+    value.ok_or_else(|| Error::PolicyViolation {
+        code,
+        message: message.to_owned(),
+    })
+}
+
+fn write_created_path(stdout: &mut impl Write, path: &Path) -> Result<()> {
+    writeln!(stdout, "{}", path.display()).map_err(|e| Error::Io {
+        context: "write WorktreeCreate path",
+        source: e,
+    })
+}
+
+fn handle_worktree_remove(event: &HookEvent, runtime: &HookRuntime) -> Result<()> {
+    let path = hook_field(
+        event.worktree_path.as_deref(),
+        PolicyCode::PathNotAllowed,
+        "WorktreeRemove hook JSON is missing `worktree_path`",
+    )?;
+    let manager = manager_for_runtime(runtime)?;
+    manager.remove(Path::new(path), true)?;
+    Ok(())
+}
+
+fn handle_subagent_start(event: &HookEvent, runtime: &HookRuntime) -> Result<()> {
+    let agent_id = event.agent_id.as_deref().unwrap_or("unknown");
+    let agent_type = event.agent_type.as_deref().unwrap_or("unknown");
+    open_store(runtime)?.upsert_agent(AgentIdentity {
+        agent_id,
+        agent_type,
+        session_id: event.session_id.as_deref(),
+    })
+}
+
+fn handle_subagent_stop(event: &HookEvent, runtime: &HookRuntime) -> Result<()> {
+    let agent_id = event.agent_id.as_deref().unwrap_or("unknown");
+    open_store(runtime)?.retire_agent(agent_id)
+}
+
+fn manager_for_runtime(runtime: &HookRuntime) -> Result<WorktreeManager> {
+    match (&runtime.worktree_base, &runtime.lease_path) {
+        (Some(base), Some(lease)) => {
+            WorktreeManager::with_base_and_leases(base.clone(), LeaseStore::open(lease)?)
+        }
+        (Some(base), None) => WorktreeManager::with_base(base.clone()),
+        (None, Some(lease)) => {
+            let base = crate::paths::worktree_base_path()?;
+            WorktreeManager::with_base_and_leases(base, LeaseStore::open(lease)?)
+        }
+        (None, None) => WorktreeManager::new(),
     }
 }
 
-fn dispatch_subagent_start(payload: &HookPayload, ctx: &HookContext) -> HookOutcome {
-    let Some(agent_id) = payload.agent_id.as_deref() else {
-        return HookOutcome::success();
-    };
-    match LeaseStore::open(&ctx.lease_path).and_then(|store| {
-        store.upsert_agent(
-            agent_id,
-            payload.agent_type.as_deref(),
-            payload.session_id.as_deref(),
-        )
-    }) {
-        Ok(()) => HookOutcome::success(),
-        Err(error) => HookOutcome::from_error(&error),
+fn open_store(runtime: &HookRuntime) -> Result<LeaseStore> {
+    match &runtime.lease_path {
+        Some(path) => LeaseStore::open(path),
+        None => LeaseStore::open(crate::paths::lease_store_path()),
     }
 }
 
-fn dispatch_subagent_stop(payload: &HookPayload, ctx: &HookContext) -> HookOutcome {
-    let Some(agent_id) = payload.agent_id.as_deref() else {
-        return HookOutcome::success();
-    };
-    match LeaseStore::open(&ctx.lease_path).and_then(|store| store.retire_agent(agent_id)) {
-        Ok(()) => HookOutcome::success(),
-        Err(error) => HookOutcome::from_error(&error),
-    }
-}
-
-fn required_identity<'a>(value: Option<&'a str>, field: &str) -> Result<&'a str> {
-    value
-        .filter(|v| !v.is_empty())
-        .ok_or_else(|| Error::HookFailClosed {
-            reason: format!("WorktreeCreate missing {field}"),
-        })
-}
-
-fn reject_protected_lease_scope(worktree_path: &Path, ctx: &HookContext) -> Result<()> {
-    if is_protected_path(worktree_path, ctx) {
+fn git_toplevel(cwd: &Path) -> Result<PathBuf> {
+    let output =
+        crate::git_cmd::git_in(cwd, &["rev-parse", "--show-toplevel"]).map_err(|e| Error::Io {
+            context: "resolve hook repository root",
+            source: e,
+        })?;
+    if !output.status.success() {
         return Err(Error::PolicyViolation {
-            code: PolicyCode::ProtectedPath,
+            code: PolicyCode::GitDirUnavailable,
             message: format!(
-                "lease scope cannot include protected path `{}`",
-                worktree_path.display()
+                "WorktreeCreate cwd is not a git repository: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
             ),
         });
+    }
+    Ok(PathBuf::from(
+        String::from_utf8_lossy(&output.stdout).trim(),
+    ))
+}
+
+fn origin_owner_repo(repo_root: &Path) -> Result<(String, String)> {
+    match crate::git_safe::origin_github_slug(repo_root) {
+        Ok(slug) => {
+            let (owner, repo) = slug.split_once('/').ok_or_else(|| Error::PolicyViolation {
+                code: PolicyCode::GitDirUnavailable,
+                message: format!("origin slug `{slug}` is not owner/repo"),
+            })?;
+            Ok((owner.to_owned(), repo.to_owned()))
+        }
+        Err(_) => {
+            let name = repo_root
+                .file_name()
+                .and_then(|n| n.to_str())
+                .ok_or_else(|| Error::InvalidSegment {
+                    field: "repo",
+                    value: repo_root.display().to_string(),
+                })?;
+            Ok(("local".to_owned(), name.to_owned()))
+        }
+    }
+}
+
+fn admit_bash_command(command: ShellText<'_>) -> Result<()> {
+    let invocations = git_gh_invocations(command).map_err(|unparsed| Error::PolicyViolation {
+        code: PolicyCode::SubcommandNotAllowed,
+        message: format!("unparseable git/gh command: {}", unparsed.0.0),
+    })?;
+    for invocation in invocations {
+        match invocation.tool {
+            GitGhTool::Git => {
+                SafeGitCommand::new(&invocation.args)?;
+            }
+            GitGhTool::Gh => {
+                SafeGhCommand::new(&invocation.args)?;
+            }
+        }
     }
     Ok(())
 }
 
-/// True when `path` is hook configuration or the enforcer binary.
-#[must_use]
-pub fn is_protected_path(path: &Path, ctx: &HookContext) -> bool {
-    let rendered = path.to_string_lossy().replace('\\', "/");
-    if HOOK_CONFIG_SUFFIXES
-        .iter()
-        .any(|suffix| rendered.ends_with(suffix))
-    {
-        return true;
-    }
-    path_eq(path, &ctx.enforcer_path)
-}
-
-fn path_eq(left: &Path, right: &Path) -> bool {
-    match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => left == right,
-    }
-}
-
-fn protected_write_target(words: &[String], ctx: &HookContext) -> Option<PathBuf> {
-    if let Some(path) = first_protected_positional(words, ctx) {
-        return Some(path);
-    }
-    for dest in redirect_destinations(words) {
-        if is_protected_path(Path::new(dest), ctx) {
-            return Some(PathBuf::from(dest));
-        }
-    }
-    None
-}
-
-/// For file-writing commands (tee/cp/mv/install/touch/dd), return the first
-/// positional argument that names a protected path. Flags (`-` prefixed) are
-/// skipped; non-writing programs yield `None`.
-fn first_protected_positional(words: &[String], ctx: &HookContext) -> Option<PathBuf> {
-    let program = normalize_program_name(&words[0]);
-    if !matches!(
-        program.as_str(),
-        "tee" | "cp" | "mv" | "install" | "touch" | "dd"
-    ) {
-        return None;
-    }
-    words[1..]
-        .iter()
-        .filter(|word| !word.starts_with('-'))
-        .find(|word| is_protected_path(Path::new(word), ctx))
-        .map(PathBuf::from)
-}
-
-fn redirect_destinations(words: &[String]) -> Vec<&str> {
-    let mut dests = Vec::new();
-    let mut pending = false;
-    for word in words {
-        if pending {
-            dests.push(word.as_str());
-            pending = false;
-            continue;
-        }
-        if matches!(word.as_str(), ">" | ">>" | "2>" | "2>>") {
-            pending = true;
-            continue;
-        }
-        if let Some(dest) = redirect_dest_from_word(word) {
-            dests.push(dest);
-        }
-    }
-    dests
-}
-
-/// Extract a glued redirect destination (e.g. `>out`, `2>>log`) from a single
-/// word. Returns `None` when the word is not a glued redirect. Prefixes are
-/// checked longest-first so `>>` wins over `>` and `2>>` over `2>`.
-fn redirect_dest_from_word(word: &str) -> Option<&str> {
-    for prefix in [">>", ">", "2>>", "2>"] {
-        if let Some(rest) = word.strip_prefix(prefix)
-            && !rest.is_empty()
-        {
-            return Some(rest);
-        }
-    }
-    None
-}
-
-fn extra_git_or_gh_tokens(words: &[String]) -> bool {
-    words
-        .iter()
-        .skip(1)
-        .any(|word| matches!(normalize_program_name(word).as_str(), "git" | "gh"))
-}
-
-fn looks_like_shell_control(words: &[String]) -> bool {
-    words.iter().any(|word| {
-        matches!(
-            word.as_str(),
-            "&&" | "||" | "|" | ";" | "&" | ">" | ">>" | "<" | ">&" | ">(" | "<("
-        )
-    })
-}
-
-fn strip_env_assignments(words: &[String]) -> &[String] {
-    let mut index = 0;
-    while let Some(word) = words.get(index) {
-        if is_env_assignment(word) {
-            index += 1;
-        } else {
-            break;
-        }
-    }
-    &words[index..]
-}
-
-fn is_env_assignment(word: &str) -> bool {
-    let Some((name, _)) = word.split_once('=') else {
-        return false;
-    };
-    let mut chars = name.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    (first.is_ascii_alphabetic() || first == '_')
-        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
-
-/// Which quote context the tokenizer is currently inside.
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum QuoteState {
-    None,
-    Single,
-    Double,
-}
-
-/// Consume one char while inside a single-quoted literal. Returns the next
-/// quote state. Single quotes take every character verbatim until the close.
-fn handle_single_quote(ch: char, current: &mut String) -> QuoteState {
-    if ch == '\'' {
-        QuoteState::None
-    } else {
-        current.push(ch);
-        QuoteState::Single
-    }
-}
-
-/// Consume one char while inside a double-quoted literal, honouring the
-/// backslash escape of the following character. Returns the next quote state.
-fn handle_double_quote(
-    ch: char,
-    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
-    current: &mut String,
-) -> QuoteState {
-    if ch == '"' {
-        QuoteState::None
-    } else if ch == '\\' {
-        if let Some(next) = chars.next() {
-            current.push(next);
-        }
-        QuoteState::Double
-    } else {
-        current.push(ch);
-        QuoteState::Double
-    }
-}
-
-/// Reject the unquoted separator / substitution characters the classifier
-/// refuses to reason about. Returns `Err` with the exact fail-closed reason
-/// for the offending character, otherwise `Ok(())`.
-fn reject_unquoted_control(
-    ch: char,
-    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
-) -> Result<()> {
-    let reason = match ch {
-        '\n' | '\r' => "unquoted newline is a command separator",
-        ';' => "unquoted semicolon is a command separator",
-        '`' => "backtick substitution is not classified",
-        '$' if matches!(chars.peek(), Some('(' | '{')) => {
-            "command or parameter substitution is not classified"
-        }
-        _ => return Ok(()),
-    };
-    Err(Error::HookFailClosed {
-        reason: reason.to_owned(),
-    })
-}
-
-fn split_shell_words(command: &str) -> Result<Vec<String>> {
-    let mut words = Vec::new();
-    let mut current = String::new();
-    let mut chars = command.chars().peekable();
-    let mut quote = QuoteState::None;
-    while let Some(ch) = chars.next() {
-        match quote {
-            QuoteState::Single => {
-                quote = handle_single_quote(ch, &mut current);
-                continue;
-            }
-            QuoteState::Double => {
-                quote = handle_double_quote(ch, &mut chars, &mut current);
-                continue;
-            }
-            QuoteState::None => {}
-        }
-        reject_unquoted_control(ch, &mut chars)?;
-        match ch {
-            '\'' => quote = QuoteState::Single,
-            '"' => quote = QuoteState::Double,
-            ch if ch.is_whitespace() => {
-                if !current.is_empty() {
-                    words.push(std::mem::take(&mut current));
-                }
-            }
-            _ => current.push(ch),
-        }
-    }
-    if quote != QuoteState::None {
-        return Err(Error::HookFailClosed {
-            reason: "unterminated quote in hook command".to_owned(),
-        });
-    }
-    if !current.is_empty() {
-        words.push(current);
-    }
-    Ok(words)
-}
-
-/// Ordinary developer commands that must not be blocked (false-positive corpus).
-#[must_use]
-pub fn false_positive_corpus() -> &'static [&'static str] {
-    &[
-        "git status",
-        "git log",
-        "git log --oneline -n 5",
-        "git commit -m \"fix typo\"",
-        "git push origin feature/assigned",
-        "git push --force-with-lease origin feature/assigned",
-        "git rebase origin/main",
-        "git status .claude/settings.json 2>/dev/null",
-        "gh pr view 1",
-        "gh pr list",
-    ]
+/// Public validation entry used by tests: policy-check a Bash command string.
+pub fn validate_bash_command(command: &str) -> Result<()> {
+    admit_bash_command(ShellText(command))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use tempfile::tempdir;
 
-    fn ctx(dir: &Path) -> HookContext {
-        HookContext {
-            lease_path: dir.join("leases.sqlite"),
-            worktree_base: dir.join("worktrees"),
-            enforcer_path: dir.join("writ-bin"),
-            expected_branch: None,
-        }
-    }
-
-    /// Dispatch a PreToolUse/Bash payload for `command` in a fresh context.
-    /// Each caller keeps its own explicit exit-code and stderr-substring assertions.
-    fn bash_outcome(ctx: &HookContext, command: &str) -> HookOutcome {
+    fn assert_bash_hook_blocks(command: &str, needle: &str) {
+        let runtime = HookRuntime::default();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
         let payload = serde_json::json!({
             "hook_event_name": "PreToolUse",
             "tool_name": "Bash",
-            "tool_input": {"command": command}
-        });
-        dispatch_hook(payload.to_string().as_bytes(), ctx)
+            "tool_input": { "command": command },
+        })
+        .to_string();
+        let code = dispatch(&payload, &runtime, &mut stdout, &mut stderr);
+        let stderr = String::from_utf8_lossy(&stderr);
+        assert_eq!(code, 2, "{command}: {stderr}");
+        assert!(stderr.contains(needle), "{command}: {stderr}");
     }
 
     #[test]
-    fn malformed_json_fails_closed() {
-        let dir = tempdir().unwrap();
-        let outcome = dispatch_hook(b"{not json", &ctx(dir.path()));
-        assert_eq!(outcome.exit_code, 2);
-        assert!(outcome.stderr.contains("malformed hook JSON"));
+    fn pre_tool_use_blocks_git_and_gh_policy_violations() {
+        assert_bash_hook_blocks("git push --force", "BARE_FORCE_PUSH");
+        assert_bash_hook_blocks("FOO=bar git merge feature", "MERGE_BLOCKED");
+        assert_bash_hook_blocks("gh pr merge 1", "MERGE_BLOCKED");
+        assert_bash_hook_blocks("gh api repos/acme/example", "GH_SUBCOMMAND_NOT_ALLOWED");
     }
 
     #[test]
-    fn empty_payload_fails_closed() {
-        let dir = tempdir().unwrap();
-        let outcome = dispatch_hook(b"   \n", &ctx(dir.path()));
-        assert_eq!(outcome.exit_code, 2);
+    fn pre_tool_use_allows_safe_git_and_ignores_non_git() {
+        validate_bash_command("git status").unwrap();
+        validate_bash_command("git push --force-with-lease origin HEAD").unwrap();
+        validate_bash_command("npm test").unwrap();
+        validate_bash_command("/usr/bin/git status").unwrap();
+        validate_bash_command("git -C /tmp/repo status").unwrap();
+        validate_bash_command("git -- status").unwrap();
+        validate_bash_command("git commit -m 'a > b'").unwrap();
     }
 
     #[test]
-    fn unrecognized_event_exits_zero_without_decision() {
-        let dir = tempdir().unwrap();
-        let outcome = dispatch_hook(br#"{"hook_event_name":"SessionStart"}"#, &ctx(dir.path()));
-        assert_eq!(outcome.exit_code, 0);
-        assert!(outcome.stdout.is_empty());
-        assert!(outcome.stderr.is_empty());
-    }
-
-    #[test]
-    fn pre_tool_use_blocks_merge_with_stderr_reason() {
-        let dir = tempdir().unwrap();
-        let outcome = bash_outcome(&ctx(dir.path()), "git merge feature");
-        assert_eq!(outcome.exit_code, 2);
-        assert!(outcome.stderr.contains("MERGE_BLOCKED"));
-        assert!(outcome.stdout.is_empty());
-    }
-
-    #[test]
-    fn competing_allow_json_does_not_override_exit_2() {
-        let dir = tempdir().unwrap();
-        let blocked = dispatch_hook(
-            serde_json::json!({
-                "hook_event_name": "PreToolUse",
-                "tool_name": "Bash",
-                "tool_input": {"command": "git push --force"}
-            })
-            .to_string()
-            .as_bytes(),
-            &ctx(dir.path()),
-        );
-        let competitor = HookOutcome {
-            exit_code: 0,
-            stdout: r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow"}}"#.into(),
-            stderr: String::new(),
-        };
-        match compose_pre_tool_use(&[blocked, competitor]) {
-            ComposedPreToolUse::Block { reason } => {
-                assert!(reason.contains("BARE_FORCE_PUSH"));
-            }
-            ComposedPreToolUse::Continue => panic!("exit 2 must win over JSON allow"),
-        }
-    }
-
-    #[test]
-    fn false_positive_corpus_is_not_blocked() {
-        let dir = tempdir().unwrap();
-        let context = ctx(dir.path());
-        for command in false_positive_corpus() {
-            let payload = serde_json::json!({
-                "hook_event_name": "PreToolUse",
-                "tool_name": "Bash",
-                "tool_input": {"command": command}
-            });
-            let outcome = dispatch_hook(payload.to_string().as_bytes(), &context);
-            assert_eq!(
-                outcome.exit_code, 0,
-                "false positive on {command}: {}",
-                outcome.stderr
+    fn pre_tool_use_blocks_quoted_force_flags() {
+        for command in [
+            r#"git push --for"ce""#,
+            r#"git push "--force""#,
+            r#"git push -"f""#,
+        ] {
+            let err = validate_bash_command(command).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    Error::PolicyViolation {
+                        code: PolicyCode::BareForcePush,
+                        ..
+                    }
+                ),
+                "{command}: {err:?}"
             );
         }
     }
 
     #[test]
-    fn protected_hook_config_write_is_blocked() {
-        let dir = tempdir().unwrap();
-        let outcome = bash_outcome(&ctx(dir.path()), "tee .claude/settings.json");
-        assert_eq!(outcome.exit_code, 2);
-        assert!(outcome.stderr.contains("PROTECTED_PATH"));
+    fn pre_tool_use_blocks_git_config_overrides() {
+        for command in [
+            "git -c alias.status='!git push --force' status",
+            "git --config-env alias.status=FOO status",
+            "git --config-env=alias.status=FOO status",
+            "git -C /tmp/repo -c core.hooksPath=/tmp/hooks status",
+        ] {
+            let err = validate_bash_command(command).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    Error::PolicyViolation {
+                        code: PolicyCode::SubcommandNotAllowed,
+                        ..
+                    }
+                ),
+                "{command}: {err:?}"
+            );
+        }
     }
 
     #[test]
-    fn newline_separated_merge_fails_closed() {
-        let dir = tempdir().unwrap();
-        let outcome = bash_outcome(&ctx(dir.path()), "git status\ngit merge feature");
-        assert_eq!(outcome.exit_code, 2, "{}", outcome.stderr);
+    fn pre_tool_use_blocks_redirection_and_git_function_def() {
+        let redir = validate_bash_command("git status > /tmp/out").unwrap_err();
+        assert!(matches!(
+            redir,
+            Error::PolicyViolation {
+                code: PolicyCode::SubcommandNotAllowed,
+                ..
+            }
+        ));
+        let shadowed = validate_bash_command("git() { :; }; git status").unwrap_err();
+        assert!(matches!(
+            shadowed,
+            Error::PolicyViolation {
+                code: PolicyCode::SubcommandNotAllowed,
+                ..
+            }
+        ));
+        let expanded = validate_bash_command("g${x-}it push --force").unwrap_err();
+        assert!(matches!(
+            expanded,
+            Error::PolicyViolation {
+                code: PolicyCode::SubcommandNotAllowed,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn compound_command_still_blocks_force_push() {
+        let err = validate_bash_command("npm test && git push --force").unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::BareForcePush,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn worktree_create_requires_explicit_source_ref() {
+        let runtime = HookRuntime::default();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = dispatch(
+            r#"{"hook_event_name":"WorktreeCreate","cwd":"/tmp","name":"job-1"}"#,
+            &runtime,
+            &mut stdout,
+            &mut stderr,
+        );
+        assert_eq!(code, 2);
+        let stderr = String::from_utf8_lossy(&stderr);
+        assert!(stderr.contains("START_POINT_REQUIRED"), "stderr={stderr}");
+        assert!(stdout.is_empty());
+
+        let mut stderr = Vec::new();
+        let code = dispatch(
+            r#"{"hook_event_name":"WorktreeCreate","cwd":"/tmp","name":"job-1","source_ref":"  "}"#,
+            &runtime,
+            &mut stdout,
+            &mut stderr,
+        );
+        assert_eq!(code, 2);
         assert!(
-            outcome.stderr.contains("newline") || outcome.stderr.contains("failed closed"),
-            "{}",
-            outcome.stderr
+            String::from_utf8_lossy(&stderr).contains("START_POINT_REQUIRED"),
+            "stderr={}",
+            String::from_utf8_lossy(&stderr)
         );
     }
 
-    #[test]
-    fn cp_to_hook_config_is_blocked() {
-        let dir = tempdir().unwrap();
-        let outcome = bash_outcome(&ctx(dir.path()), "cp foo .claude/settings.json");
-        assert_eq!(outcome.exit_code, 2);
-        assert!(outcome.stderr.contains("PROTECTED_PATH"));
-    }
-
-    #[test]
-    fn git_status_redirecting_stderr_is_not_a_false_positive() {
-        let dir = tempdir().unwrap();
-        let outcome = bash_outcome(
-            &ctx(dir.path()),
-            "git status .claude/settings.json 2>/dev/null",
+    fn git_stdout(repo: &Path, args: &[&str]) -> String {
+        let output = crate::git_cmd::git_in(repo, args).unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
         );
-        assert_eq!(outcome.exit_code, 0, "{}", outcome.stderr);
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    fn two_commit_repo(repo: &Path) -> (String, String) {
+        git_stdout(repo, &["init", "-b", "main"]);
+        git_stdout(repo, &["config", "user.email", "test@example.com"]);
+        git_stdout(repo, &["config", "user.name", "Test"]);
+        fs::write(repo.join("README"), "one\n").unwrap();
+        git_stdout(repo, &["add", "README"]);
+        git_stdout(repo, &["commit", "-m", "first"]);
+        let first = git_stdout(repo, &["rev-parse", "HEAD"]);
+        fs::write(repo.join("README"), "two\n").unwrap();
+        git_stdout(repo, &["add", "README"]);
+        git_stdout(repo, &["commit", "-m", "second"]);
+        let second = git_stdout(repo, &["rev-parse", "HEAD"]);
+        (first, second)
     }
 
     #[test]
-    fn wrapper_launching_git_is_blocked() {
-        let dir = tempdir().unwrap();
-        let outcome = bash_outcome(&ctx(dir.path()), "sh -c \"git merge feature\"");
-        assert_eq!(outcome.exit_code, 2, "{}", outcome.stderr);
-    }
-
-    #[test]
-    fn non_bash_tool_is_not_asserted() {
-        let dir = tempdir().unwrap();
+    fn worktree_create_uses_source_ref_not_ambient_head() {
+        let temp = tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        fs::create_dir(&repo).unwrap();
+        let (first, second) = two_commit_repo(&repo);
+        assert_ne!(first, second);
+        let runtime = HookRuntime {
+            worktree_base: Some(temp.path().join("worktrees")),
+            lease_path: Some(temp.path().join("leases.db")),
+        };
         let payload = serde_json::json!({
-            "hook_event_name": "PreToolUse",
-            "tool_name": "Edit",
-            "tool_input": {"file_path": "src/lib.rs"}
-        });
-        let outcome = dispatch_hook(payload.to_string().as_bytes(), &ctx(dir.path()));
-        assert_eq!(outcome.exit_code, 0);
+            "hook_event_name": "WorktreeCreate",
+            "cwd": repo,
+            "worktree_name": "job-src",
+            "sourceRef": first,
+        })
+        .to_string();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = dispatch(&payload, &runtime, &mut stdout, &mut stderr);
+        assert_eq!(code, 0, "stderr={}", String::from_utf8_lossy(&stderr));
+        let created = String::from_utf8_lossy(&stdout).trim().to_owned();
+        assert_eq!(
+            git_stdout(Path::new(&created), &["rev-parse", "HEAD"]),
+            first
+        );
+    }
+
+    #[test]
+    fn unknown_hook_event_is_allowed() {
+        let runtime = HookRuntime::default();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = dispatch(
+            r#"{"hook_event_name":"SessionStart"}"#,
+            &runtime,
+            &mut stdout,
+            &mut stderr,
+        );
+        assert_eq!(code, 0);
+        assert!(stdout.is_empty());
+        assert!(stderr.is_empty());
     }
 }
