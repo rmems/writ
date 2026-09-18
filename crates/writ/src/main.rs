@@ -865,18 +865,18 @@ mod tests {
     use std::str;
 
     use clap::{CommandFactory, Parser};
-    use writ_core::status::JobStatus;
+    use writ_core::status::{JobIdentity, JobStatus};
 
     use super::{Cli, run, run_status, run_with_jobs, supervised_exit_code};
 
     fn sample_job() -> JobStatus {
-        let mut job = JobStatus::new(
-            "writ-1",
-            "acme",
-            "example-org",
-            "/tmp/wt/writ-1",
-            "feature/foo",
-        );
+        let mut job = JobStatus::new(JobIdentity {
+            job_id: "writ-1".to_owned(),
+            owner: "acme".to_owned(),
+            repo: "example-org".to_owned(),
+            worktree_path: "/tmp/wt/writ-1".to_owned(),
+            branch: "feature/foo".to_owned(),
+        });
         job.issue_number = Some(29);
         job
     }

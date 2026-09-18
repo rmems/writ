@@ -61,16 +61,16 @@ mod tests {
 
     use super::load_jobs_from;
     use crate::paths::resolve_state_path;
-    use crate::status::JobStatus;
+    use crate::status::{JobIdentity, JobStatus};
 
     fn sample_job() -> JobStatus {
-        let mut job = JobStatus::new(
-            "writ-1",
-            "acme",
-            "example-org",
-            "/tmp/worktrees/acme/example-org/writ-1",
-            "feature/status",
-        );
+        let mut job = JobStatus::new(JobIdentity {
+            job_id: "writ-1".to_owned(),
+            owner: "acme".to_owned(),
+            repo: "example-org".to_owned(),
+            worktree_path: "/tmp/worktrees/acme/example-org/writ-1".to_owned(),
+            branch: "feature/status".to_owned(),
+        });
         job.issue_number = Some(1);
         job
     }

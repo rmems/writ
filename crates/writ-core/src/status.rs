@@ -63,6 +63,21 @@ impl fmt::Display for CiClass {
     }
 }
 
+/// Identity fields required to construct a [`JobStatus`].
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct JobIdentity {
+    /// Unique job identifier (e.g. `writ-347`).
+    pub job_id: String,
+    /// Repository owner.
+    pub owner: String,
+    /// Repository name.
+    pub repo: String,
+    /// Absolute path to the job's isolated worktree.
+    pub worktree_path: String,
+    /// Current branch checked out in the worktree.
+    pub branch: String,
+}
+
 /// Status of a single watched job.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct JobStatus {
@@ -105,21 +120,15 @@ pub struct JobStatus {
 
 impl JobStatus {
     /// Construct a running job with additive timeout residuals unset.
-    pub fn new(
-        job_id: impl Into<String>,
-        owner: impl Into<String>,
-        repo: impl Into<String>,
-        worktree_path: impl Into<String>,
-        branch: impl Into<String>,
-    ) -> Self {
+    pub fn new(identity: JobIdentity) -> Self {
         Self {
-            job_id: job_id.into(),
-            owner: owner.into(),
-            repo: repo.into(),
+            job_id: identity.job_id,
+            owner: identity.owner,
+            repo: identity.repo,
             issue_number: None,
             pr_number: None,
-            worktree_path: worktree_path.into(),
-            branch: branch.into(),
+            worktree_path: identity.worktree_path,
+            branch: identity.branch,
             process_state: ProcessState::Running,
             last_error: None,
             ci_class: CiClass::Pending,
@@ -174,13 +183,13 @@ mod tests {
     use crate::timeout_policy::TimeoutClass;
 
     fn sample_job() -> JobStatus {
-        let mut job = JobStatus::new(
-            "writ-100",
-            "acme",
-            "example-org",
-            "/tmp/worktrees/acme/example-org/writ-100",
-            "feature/status-json-cli",
-        );
+        let mut job = JobStatus::new(JobIdentity {
+            job_id: "writ-100".to_owned(),
+            owner: "acme".to_owned(),
+            repo: "example-org".to_owned(),
+            worktree_path: "/tmp/worktrees/acme/example-org/writ-100".to_owned(),
+            branch: "feature/status-json-cli".to_owned(),
+        });
         job.issue_number = Some(29);
         job.pr_number = Some(42);
         job
