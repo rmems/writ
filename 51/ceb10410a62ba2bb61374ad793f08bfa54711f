@@ -1,0 +1,38 @@
+crates/writ/src/main.rs
+  s_81caa774cffac4::t_0f7b37cb7f04ea 185,191
+  s_81caa774cffac4::t_33f3675775210f 1024-1035,1038-1042,1045-1048,1050-1064,1080,1083-1090,1110-1112,1115,1131-1132,1136,1167,1169-1184,1186,1194,1196-1211
+  s_81caa774cffac4::t_e2c7b18350d841 1081,1141-1162
+  s_81caa774cffac4::t_a57ff14a499544 1185,1188-1193
+  s_81caa774cffac4::t_cbd9048cf6c286 1187
+  s_81caa774cffac4::t_b03585c8f8cf30 505,511-512
+  s_81caa774cffac4::t_3c20cdedf9b11d 193-198
+  s_81caa774cffac4::t_49a692fe8ab6cf 1163-1166
+  s_81caa774cffac4::t_838f140207b6b1 137
+  s_81caa774cffac4::t_f578743a79649b 1065-1079,1082,1092,1096-1107,1109,1113-1114,1118-1130,1133-1135
+  s_81caa774cffac4::t_4ba936a83c9692 349-368
+  s_81caa774cffac4::t_1ccf884eb00aa3 926-929
+  s_81caa774cffac4::t_6ae41d9ec0c5d5 1214-1228
+  s_81caa774cffac4::t_734b1c9a86cb43 342-348
+  s_81caa774cffac4::t_3e0445c8c423f2 496,502-504,506-510,513
+  s_81caa774cffac4::t_3ef149f3f3cdfc 985-1003
+crates/writ-core/src/attribution.rs
+  s_81caa774cffac4::t_ecb3251b25b150 559-567
+  s_81caa774cffac4::t_3247cdcadc0c04 416-422,427-433
+  s_81caa774cffac4::t_600fef4b0509f5 492-500
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "51ceb10410a62ba2bb61374ad793f08bfa54711f",
+  "prompts": {},
+  "sessions": {
+    "s_81caa774cffac4": {
+      "agent_id": {
+        "tool": "cursor",
+        "id": "12226723-e525-41ca-ad4a-8d0ef9881119",
+        "model": "grok-4.6"
+      },
+      "human_author": "Raul Cardenas Montoya <montoyaraul34@gmail.com>"
+    }
+  }
+}
