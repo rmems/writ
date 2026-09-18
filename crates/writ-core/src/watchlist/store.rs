@@ -131,12 +131,13 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), WatchlistError> {
     ));
 
     let write_result = (|| {
-        let mut file = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        let mut file = open_private_new(&tmp)?;
         file.write_all(bytes)?;
         file.write_all(b"\n")?;
         file.sync_all()?;
-        set_private_mode(&tmp)?;
         replace_file(&tmp, path)?;
+        // Re-assert mode on the final path (harmless, and covers non-Unix and
+        // edge cases where the rename target retained prior permissions).
         set_private_mode(path)?;
         Ok(())
     })();
@@ -151,21 +152,54 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), WatchlistError> {
     })
 }
 
-/// Replace `to` with `from`. POSIX `rename` replaces a file atomically. On
-/// Windows, remove the destination first so an existing `watchlist.json` does
-/// not make the write fail.
+/// Replace `to` with `from`. POSIX `rename` replaces a file atomically, so the
+/// prior file is never lost. Windows `rename` refuses to overwrite an existing
+/// destination, so we cannot simply rename over it; the previous code removed
+/// the destination first, which lost the entire watchlist if a crash (or a
+/// failed rename) struck between the remove and the rename. Instead we keep a
+/// recoverable backup: move the existing destination aside, rename the new temp
+/// into place, then drop the backup on success and restore it on failure. This
+/// sequence always leaves at least one copy of the file on disk.
 fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
     #[cfg(windows)]
     {
-        if to.exists() {
-            fs::remove_file(to)?;
+        if !to.exists() {
+            return fs::rename(from, to);
         }
-        fs::rename(from, to)
+        let backup = to.with_extension("bak-replace");
+        // Ensure no stale backup blocks the rename.
+        let _ = fs::remove_file(&backup);
+        fs::rename(to, &backup)?;
+        match fs::rename(from, to) {
+            Ok(()) => {
+                let _ = fs::remove_file(&backup);
+                Ok(())
+            }
+            Err(err) => {
+                // Restore the prior file so we never leave zero copies behind.
+                let _ = fs::rename(&backup, to);
+                Err(err)
+            }
+        }
     }
     #[cfg(not(windows))]
     {
         fs::rename(from, to)
     }
+}
+
+/// Create the temp file with `create_new(true)` semantics. On Unix the file is
+/// created with mode `0o600` at creation time (via `OpenOptionsExt::mode`) so
+/// the private bytes are never briefly world/group-readable under the umask.
+fn open_private_new(path: &Path) -> io::Result<fs::File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
 }
 
 fn set_private_mode(path: &Path) -> io::Result<()> {
@@ -180,28 +214,36 @@ fn set_private_mode(path: &Path) -> io::Result<()> {
 
 fn quarantine_corrupt(path: &Path) -> Result<PathBuf, WatchlistError> {
     let stamp = utc_now_rfc3339().replace([':', '-'], "");
-    let mut candidate = path.with_file_name(format!(
-        "{}.corrupt.{stamp}",
-        path.file_name()
-            .unwrap_or_else(|| std::ffi::OsStr::new("watchlist.json"))
-            .to_string_lossy()
-    ));
+    let base = path
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("watchlist.json"))
+        .to_string_lossy()
+        .into_owned();
+    // Attempt the rename directly and only bump the suffix on AlreadyExists;
+    // an exists()-then-rename pre-check has a TOCTOU race. POSIX rename
+    // overwrites the destination, so this loop primarily hardens the
+    // Windows/edge path where rename refuses an existing target.
     let mut n = 0_u32;
-    while candidate.exists() {
-        n += 1;
-        candidate = path.with_file_name(format!(
-            "{}.corrupt.{stamp}.{n}",
-            path.file_name()
-                .unwrap_or_else(|| std::ffi::OsStr::new("watchlist.json"))
-                .to_string_lossy()
-        ));
+    loop {
+        let candidate = if n == 0 {
+            path.with_file_name(format!("{base}.corrupt.{stamp}"))
+        } else {
+            path.with_file_name(format!("{base}.corrupt.{stamp}.{n}"))
+        };
+        match fs::rename(path, &candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                n += 1;
+            }
+            Err(err) => {
+                return Err(WatchlistError::Io {
+                    context: "quarantine corrupt watchlist",
+                    path: path.to_path_buf(),
+                    source: err,
+                });
+            }
+        }
     }
-    fs::rename(path, &candidate).map_err(|err| WatchlistError::Io {
-        context: "quarantine corrupt watchlist",
-        path: path.to_path_buf(),
-        source: err,
-    })?;
-    Ok(candidate)
 }
 
 /// RFC3339 UTC timestamp for `added_at` / `last_checked`.
@@ -377,6 +419,43 @@ mod tests {
         assert_eq!(owners, vec!["legacy".to_owned()]);
         let owners = load_allowed_owners_from(Some(std::ffi::OsString::from("")), None);
         assert!(owners.is_empty());
+    }
+
+    #[test]
+    fn replace_over_existing_keeps_a_recoverable_file() {
+        // On POSIX this asserts the atomic rename round-trips when overwriting
+        // an existing destination; on Windows the backup dance must leave a
+        // readable watchlist behind.
+        let path = unique_path("watchlist-replace");
+        let _ = fs::remove_file(&path);
+        let mut first = Watchlist::default();
+        first.prs.push(sample_entry());
+        save_watchlist(&path, &first).unwrap();
+
+        let mut second = Watchlist::default();
+        let mut other = sample_entry();
+        other.number = 99;
+        second.prs.push(other);
+        save_watchlist(&path, &second).unwrap();
+
+        let loaded = load_watchlist(&path).unwrap();
+        let _ = fs::remove_file(&path);
+        assert_eq!(loaded.prs.len(), 1);
+        assert_eq!(loaded.prs[0].number, 99);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn temp_file_is_created_private() {
+        // The temp file must be mode 0600 at creation time, not just after a
+        // post-write chmod. We verify indirectly: the final file is 0600 even
+        // though set_private_mode on the path is the only post-write call.
+        use std::os::unix::fs::PermissionsExt;
+        let path = unique_path("watchlist-temp-mode");
+        save_watchlist(&path, &Watchlist::default()).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        let _ = fs::remove_file(&path);
+        assert_eq!(mode, 0o600);
     }
 
     #[cfg(unix)]

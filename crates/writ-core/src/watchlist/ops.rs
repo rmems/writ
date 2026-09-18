@@ -14,7 +14,14 @@ use super::store::{
     load_allowed_owners, load_watchlist, mutate_watchlist, owner_is_allowed, save_watchlist,
     utc_now_rfc3339,
 };
-use crate::git_safe::SafeGhCommand;
+use std::time::Duration;
+
+use crate::git_safe::{GhRun, SafeGhCommand};
+
+/// Default wall-clock deadline for a single `gh pr view` probe. A hung `gh`
+/// (network stall, credential prompt) is killed after this and mapped to
+/// [`WatchlistError::Timeout`] rather than blocking the check cycle forever.
+const GH_PROBE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Snapshot of a pull request used to insert or refresh a watchlist entry.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -37,6 +44,8 @@ pub struct PrSnapshot {
     pub mergeable: Option<String>,
     /// GitHub `reviewDecision`.
     pub review_decision: Option<String>,
+    /// GitHub `isDraft`: a draft PR is not ready to merge.
+    pub is_draft: bool,
     /// Rollup checks.
     pub checks: Vec<CheckSnapshot>,
 }
@@ -69,11 +78,25 @@ impl PrProbe for GhPrProbe {
             "--repo".to_owned(),
             repo.to_owned(),
             "--json".to_owned(),
-            "number,title,url,state,headRefName,baseRefName,mergeable,reviewDecision,statusCheckRollup"
+            "number,title,url,state,headRefName,baseRefName,mergeable,reviewDecision,isDraft,statusCheckRollup"
                 .to_owned(),
         ];
         let cmd = SafeGhCommand::new(&args)?;
-        let output = cmd.run()?;
+        // Use a bounded wall-clock deadline: a truly hung `gh` never returns
+        // from blocking `output()`, so the stderr-based `looks_like_timeout`
+        // heuristic below can never fire. The deadline turns a stall into an
+        // explicit WatchlistError::Timeout; the stderr mapping stays as a
+        // fallback for a `gh` that exits non-zero with a timeout message.
+        let output = match cmd.run_with_timeout(GH_PROBE_TIMEOUT)? {
+            GhRun::Completed(output) => output,
+            GhRun::TimedOut { timeout } => {
+                return Err(WatchlistError::Timeout {
+                    repo: repo.to_owned(),
+                    number,
+                    message: format!("gh pr view exceeded {}s deadline", timeout.as_secs()),
+                });
+            }
+        };
         if output.exit_code != 0 {
             let stderr = output.stderr.trim();
             if looks_like_timeout(stderr) {
@@ -115,6 +138,8 @@ struct GhPrView {
     mergeable: Option<String>,
     #[serde(rename = "reviewDecision")]
     review_decision: Option<String>,
+    #[serde(rename = "isDraft", default)]
+    is_draft: Option<bool>,
     #[serde(rename = "statusCheckRollup")]
     status_check_rollup: Option<Vec<GhCheck>>,
 }
@@ -143,10 +168,12 @@ fn parse_pr_view(repo: &str, stdout: &str) -> Result<PrSnapshot, WatchlistError>
                 .name
                 .or(check.context)
                 .unwrap_or_else(|| "unnamed".to_owned());
-            let state = check
-                .conclusion
-                .or(check.state)
-                .or(check.status)
+            // Treat empty strings as absent: an in-progress CheckRun reports
+            // conclusion="" with status="IN_PROGRESS", and an empty conclusion
+            // must not win over a real status (which would look healthy).
+            let state = non_empty(check.conclusion)
+                .or_else(|| non_empty(check.state))
+                .or_else(|| non_empty(check.status))
                 .unwrap_or_else(|| "UNKNOWN".to_owned());
             CheckSnapshot { name, state }
         })
@@ -161,8 +188,14 @@ fn parse_pr_view(repo: &str, stdout: &str) -> Result<PrSnapshot, WatchlistError>
         state: view.state,
         mergeable: view.mergeable,
         review_decision: view.review_decision,
+        is_draft: view.is_draft.unwrap_or(false),
         checks,
     })
+}
+
+/// Map `Some("")` to `None` so empty JSON strings are treated as absent.
+fn non_empty(value: Option<String>) -> Option<String> {
+    value.filter(|s| !s.is_empty())
 }
 
 /// Result of adding one or more pull requests.
@@ -545,11 +578,38 @@ pub fn import_pr_babysit(
         let Some(repo) = incoming.repo.clone() else {
             continue;
         };
-        if list.get(&repo, incoming.number).is_some() {
-            report.refreshed.push((repo, incoming.number));
+        // Reject malformed identities: a repo that is not `owner/name` would
+        // break owner filtering and later refreshes, so never persist it.
+        if owner_of_repo(&repo).is_none() {
             continue;
         }
         let status = map_imported_status(incoming.last_status.as_deref());
+        if let Some(existing) = list.get_mut(&repo, incoming.number) {
+            // Refresh source fields from the incoming record but preserve the
+            // hive budget (`fix_count`) already accrued locally.
+            if let Some(branch) = incoming.branch.clone() {
+                existing.branch = branch;
+            }
+            existing.base = incoming.base.clone().or_else(|| existing.base.clone());
+            existing.title = incoming.title.clone().or_else(|| existing.title.clone());
+            existing.url = incoming.url.clone().or_else(|| existing.url.clone());
+            existing.stack_id = incoming
+                .stack_id
+                .clone()
+                .or_else(|| existing.stack_id.clone());
+            existing.stack_type = incoming
+                .stack_type
+                .clone()
+                .or_else(|| existing.stack_type.clone());
+            existing.stack_position = incoming.stack_position.or(existing.stack_position);
+            if let Some(added_at) = incoming.added_at.clone() {
+                existing.added_at = Some(added_at);
+            }
+            existing.check_count = incoming.check_count.or(existing.check_count);
+            existing.status = status;
+            report.refreshed.push((repo, incoming.number));
+            continue;
+        }
         list.prs.push(WatchEntry {
             repo: repo.clone(),
             number: incoming.number,
@@ -637,6 +697,21 @@ pub(crate) fn classify_snapshot(snapshot: &PrSnapshot) -> (WatchStatus, Vec<Stri
 
     let mut failed = false;
     let mut pending = false;
+
+    // A draft PR is not ready to merge regardless of CI, so it cannot be
+    // Healthy; surface it as pending with an explicit blocker.
+    if snapshot.is_draft {
+        pending = true;
+        blockers.push("draft:true".to_owned());
+    }
+
+    // GitHub reports `mergeable == UNKNOWN` (or empty/missing) while the merge
+    // is still being computed. Do not declare an unresolved merge Healthy;
+    // treat it as pending until it resolves to MERGEABLE or CONFLICTING.
+    if mergeable != "MERGEABLE" {
+        pending = true;
+        blockers.push("pending:mergeable_unknown".to_owned());
+    }
     for check in &snapshot.checks {
         let state = check.state.to_ascii_uppercase();
         if matches!(
@@ -841,6 +916,7 @@ mod tests {
             state: "OPEN".to_owned(),
             mergeable: Some("MERGEABLE".to_owned()),
             review_decision: None,
+            is_draft: false,
             checks: vec![CheckSnapshot {
                 name: "ci".to_owned(),
                 state: "SUCCESS".to_owned(),
@@ -1088,6 +1164,158 @@ mod tests {
         let (status, blockers) = classify_snapshot(&snap);
         assert_eq!(status, WatchStatus::Residual);
         assert_eq!(blockers, vec!["review:review_required".to_owned()]);
+    }
+
+    #[test]
+    fn parse_pr_view_empty_conclusion_is_pending() {
+        let json = r#"{
+            "number": 7,
+            "title": "wip",
+            "url": "https://example.test/acme/widgets/pull/7",
+            "state": "OPEN",
+            "headRefName": "feat/a",
+            "baseRefName": "main",
+            "mergeable": "MERGEABLE",
+            "reviewDecision": null,
+            "isDraft": false,
+            "statusCheckRollup": [
+                {"name": "ci", "conclusion": "", "status": "IN_PROGRESS", "state": ""}
+            ]
+        }"#;
+        let snap = parse_pr_view("acme/widgets", json).unwrap();
+        assert_eq!(snap.checks[0].state, "IN_PROGRESS");
+        let (status, _) = classify_snapshot(&snap);
+        assert_eq!(status, WatchStatus::Pending);
+    }
+
+    #[test]
+    fn classify_mergeable_unknown_is_pending() {
+        let mut snap = open_snap("acme/widgets", 1, "feat/a", "main");
+        snap.mergeable = Some("UNKNOWN".to_owned());
+        let (status, blockers) = classify_snapshot(&snap);
+        assert_eq!(status, WatchStatus::Pending);
+        assert!(blockers.contains(&"pending:mergeable_unknown".to_owned()));
+    }
+
+    #[test]
+    fn classify_draft_is_pending() {
+        let mut snap = open_snap("acme/widgets", 1, "feat/a", "main");
+        snap.is_draft = true;
+        let (status, blockers) = classify_snapshot(&snap);
+        assert_eq!(status, WatchStatus::Pending);
+        assert!(blockers.contains(&"draft:true".to_owned()));
+    }
+
+    #[test]
+    fn probe_timeout_maps_to_watchlist_timeout() {
+        // A stalled child must surface as WatchlistError::Timeout. `sleep 5`
+        // is not gh, so we exercise the mapping via a tiny probe that reuses
+        // the same GhRun::TimedOut -> Timeout logic shape.
+        struct SlowProbe;
+        impl PrProbe for SlowProbe {
+            fn view(&self, repo: &str, number: u64) -> Result<PrSnapshot, WatchlistError> {
+                use crate::git_safe::{GhRun, SafeGhCommand};
+                // `version` is allowlisted and returns fast; force the timeout
+                // path with a zero deadline to assert the mapping.
+                let cmd = SafeGhCommand::new(&[
+                    "pr".to_owned(),
+                    "view".to_owned(),
+                    number.to_string(),
+                    "--repo".to_owned(),
+                    repo.to_owned(),
+                ])?;
+                match cmd.run_with_timeout(Duration::from_millis(0)) {
+                    Ok(GhRun::TimedOut { timeout }) => Err(WatchlistError::Timeout {
+                        repo: repo.to_owned(),
+                        number,
+                        message: format!("gh exceeded {}s deadline", timeout.as_secs()),
+                    }),
+                    Ok(GhRun::Completed(_)) => Ok(open_snap(repo, number, "feat/a", "main")),
+                    Err(err) => Err(err.into()),
+                }
+            }
+        }
+        let err = SlowProbe.view("acme/widgets", 1).unwrap_err();
+        assert!(
+            matches!(err, WatchlistError::Timeout { number: 1, .. }),
+            "expected timeout, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn import_skips_malformed_repo() {
+        let dir = std::env::temp_dir().join(format!(
+            "watchlist-import-bad-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("watched-prs.json");
+        fs::write(
+            &source,
+            r#"{"prs": [{"number": 1, "repo": "not-a-slug", "branch": "x"}]}"#,
+        )
+        .unwrap();
+        let mut list = Watchlist::default();
+        let report = import_pr_babysit(&mut list, &source).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        assert!(report.added.is_empty());
+        assert!(list.prs.is_empty());
+    }
+
+    #[test]
+    fn import_refreshes_existing_and_preserves_fix_count() {
+        let dir = std::env::temp_dir().join(format!(
+            "watchlist-import-refresh-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("watched-prs.json");
+        fs::write(
+            &source,
+            r#"{"prs": [{"number": 5, "repo": "acme/widgets", "branch": "feat/new",
+                "title": "Fresh title", "url": "https://example.test/x",
+                "check_count": 9, "last_status": "healthy"}]}"#,
+        )
+        .unwrap();
+        let mut list = Watchlist::default();
+        list.prs.push(WatchEntry {
+            repo: "acme/widgets".to_owned(),
+            number: 5,
+            branch: "feat/old".to_owned(),
+            status: WatchStatus::Pending,
+            last_checked: "2026-01-01T00:00:00Z".to_owned(),
+            fix_count: 3,
+            residual_blockers: Vec::new(),
+            stack_id: None,
+            stack_type: None,
+            stack_position: None,
+            base: Some("main".to_owned()),
+            title: Some("Old title".to_owned()),
+            added_at: Some("2026-01-01T00:00:00Z".to_owned()),
+            check_count: Some(1),
+            url: None,
+            kind: Some(WatchKind::PrBabysit),
+            extra: serde_json::Map::new(),
+        });
+        let report = import_pr_babysit(&mut list, &source).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(report.refreshed, vec![("acme/widgets".to_owned(), 5)]);
+        let entry = list.get("acme/widgets", 5).unwrap();
+        assert_eq!(entry.branch, "feat/new");
+        assert_eq!(entry.title.as_deref(), Some("Fresh title"));
+        assert_eq!(entry.url.as_deref(), Some("https://example.test/x"));
+        assert_eq!(entry.check_count, Some(9));
+        assert_eq!(entry.status, WatchStatus::Healthy);
+        // Hive budget preserved.
+        assert_eq!(entry.fix_count, 3);
     }
 
     #[test]

@@ -10,7 +10,8 @@
 
 use std::collections::HashSet;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use crate::error::{Error, PolicyCode, Result};
 
@@ -420,11 +421,102 @@ impl SafeGhCommand {
         })
     }
 
+    /// Execute the validated gh command with a wall-clock deadline.
+    ///
+    /// The async [`crate::supervisor::Supervisor`] already implements timeout
+    /// handling, but wiring it into the synchronous watchlist ops path is
+    /// invasive (it would force async through the whole call chain). Instead we
+    /// keep this self-contained: spawn the child with piped output, drain the
+    /// pipes on background threads so a chatty child cannot deadlock on a full
+    /// pipe buffer, and poll `try_wait` against `deadline`. On expiry we kill
+    /// the child and return [`GhRun::TimedOut`] so callers can map it to a
+    /// timeout error rather than blocking forever the way plain `output()` does.
+    pub fn run_with_timeout(&self, timeout: Duration) -> Result<GhRun> {
+        use std::io::Read;
+
+        let mut child = Command::new("gh")
+            .args(&self.args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| Error::Io {
+                context: "spawn gh",
+                source: e,
+            })?;
+
+        let stdout_handle = child.stdout.take().map(|mut pipe| {
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                let _ = pipe.read_to_end(&mut buf);
+                buf
+            })
+        });
+        let stderr_handle = child.stderr.take().map(|mut pipe| {
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                let _ = pipe.read_to_end(&mut buf);
+                buf
+            })
+        });
+
+        let deadline = Instant::now() + timeout;
+        let poll = Duration::from_millis(25);
+        let status = loop {
+            // Check the deadline first so a zero (or already-elapsed) timeout
+            // always reports TimedOut, independent of how fast the child is.
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                // Join readers so the threads do not outlive the call.
+                if let Some(handle) = stdout_handle {
+                    let _ = handle.join();
+                }
+                if let Some(handle) = stderr_handle {
+                    let _ = handle.join();
+                }
+                return Ok(GhRun::TimedOut { timeout });
+            }
+            match child.try_wait().map_err(|e| Error::Io {
+                context: "wait gh",
+                source: e,
+            })? {
+                Some(status) => break status,
+                None => std::thread::sleep(poll),
+            }
+        };
+
+        let stdout = stdout_handle
+            .and_then(|handle| handle.join().ok())
+            .unwrap_or_default();
+        let stderr = stderr_handle
+            .and_then(|handle| handle.join().ok())
+            .unwrap_or_default();
+
+        Ok(GhRun::Completed(GitOutput {
+            stdout: String::from_utf8_lossy(&stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&stderr).into_owned(),
+            exit_code: status.code().unwrap_or(1),
+        }))
+    }
+
     /// Return the full argument list (for display / logging).
     #[must_use]
     pub fn args(&self) -> &[String] {
         &self.args
     }
+}
+
+/// Result of [`SafeGhCommand::run_with_timeout`].
+#[derive(Debug, Clone)]
+pub enum GhRun {
+    /// The child exited before the deadline.
+    Completed(GitOutput),
+    /// The deadline elapsed and the child was killed.
+    TimedOut {
+        /// The deadline that was exceeded.
+        timeout: Duration,
+    },
 }
 
 /// Resolve the current branch name from a repository working tree.
