@@ -413,17 +413,24 @@ mod tests {
         assert_eq!(sanitize_commit_sha(Some("not a sha")), None);
     }
 
+    struct ReplyCase<'a> {
+        body: &'a str,
+        config: Option<&'a AttributionConfig>,
+        sha: Option<&'a str>,
+        thread: bool,
+    }
+
     /// Render a reply case through both the direct [`ReplyTemplate`] path (when
     /// no config override is given) and [`format_reply`], asserting both match
     /// `expected`. Keeps the reply-template assertions identical across the
     /// focused tests below.
-    fn assert_reply(
-        body: &str,
-        config: Option<&AttributionConfig>,
-        sha: Option<&str>,
-        thread: bool,
-        expected: &str,
-    ) {
+    fn assert_reply(case: ReplyCase<'_>, expected: &str) {
+        let ReplyCase {
+            body,
+            config,
+            sha,
+            thread,
+        } = case;
         let rendered = match config {
             None => ReplyTemplate {
                 body: body.to_owned(),
@@ -482,7 +489,15 @@ mod tests {
                 "worktrees-hives agent: fixed in abc1234\n\n---\nFixed the issue.",
             ),
         ] {
-            assert_reply(body, config, sha, thread, expected);
+            assert_reply(
+                ReplyCase {
+                    body,
+                    config,
+                    sha,
+                    thread,
+                },
+                expected,
+            );
         }
     }
 
@@ -541,7 +556,15 @@ mod tests {
                 "Fixed.\n\n---\nworktrees-hives agent: fixed in abc1234",
             ),
         ] {
-            assert_reply(body, config, sha, thread, expected);
+            assert_reply(
+                ReplyCase {
+                    body,
+                    config,
+                    sha,
+                    thread,
+                },
+                expected,
+            );
         }
     }
 }
