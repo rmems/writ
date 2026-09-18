@@ -1146,22 +1146,7 @@ mod tests {
             source: e,
         })?;
 
-        // A verified `origin` is required now that create binds the requested
-        // owner to the repository origin. Default to the `acme` owner the test
-        // harness allowlists; tests that need a different origin owner override
-        // this remote explicitly.
-        Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .arg("remote")
-            .arg("add")
-            .arg("origin")
-            .arg("https://github.com/acme/test-repo.git")
-            .output()
-            .map_err(|e| Error::Io {
-                context: "git remote add origin",
-                source: e,
-            })?;
+        add_default_acme_origin(dir)?;
 
         // Configure git for testing
         Command::new("git")
@@ -1214,6 +1199,24 @@ mod tests {
             })?;
 
         Ok(dir.to_path_buf())
+    }
+
+    fn add_default_acme_origin(dir: &Path) -> Result<()> {
+        Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/acme/test-repo.git",
+            ])
+            .output()
+            .map_err(|e| Error::Io {
+                context: "git remote add origin",
+                source: e,
+            })?;
+        Ok(())
     }
 
     fn git_output(repo: &Path, args: &[&str]) -> String {
@@ -1447,6 +1450,27 @@ mod tests {
             .is_empty()
         );
         assert!(!harness.job_path("job-origin-mismatch").exists());
+    }
+
+    #[test]
+    fn create_rejects_filesystem_origin_masquerading_as_github_owner() {
+        let harness = Harness::sha1();
+        let local = harness.temp_path().join("acme").join("repo");
+        fs::create_dir_all(&local).unwrap();
+        harness.set_origin(local.to_str().unwrap());
+        let start_commit = harness.head();
+        let result = harness.create("job-path-origin", "feature/path-origin", &start_commit);
+        assert!(
+            matches!(
+                result,
+                Err(Error::PolicyViolation {
+                    code: PolicyCode::OwnerNotAllowed,
+                    ..
+                })
+            ),
+            "expected OwnerNotAllowed for filesystem origin, got {result:?}"
+        );
+        assert!(!harness.job_path("job-path-origin").exists());
     }
 
     #[test]
@@ -1989,7 +2013,11 @@ mod tests {
                 &["init", "--bare", origin.to_str().unwrap()],
             );
             let base_head = harness.head();
-            harness.git(&["remote", "add", "origin", origin.to_str().unwrap()]);
+            harness.git(&[
+                "config",
+                &format!("url.{}.insteadOf", origin.display()),
+                "https://github.com/acme/test-repo.git",
+            ]);
             harness.git(&["push", "origin", "HEAD:refs/heads/main"]);
 
             let fork = harness.temp_path().join("fork");
@@ -2232,7 +2260,9 @@ mod tests {
         fs::create_dir(&repo).unwrap();
         let repo_root = init_test_repo_with_object_format(&repo, None).unwrap();
         let base = temp.path().join("work\ntrees");
-        let manager = WorktreeManager::with_base(base).unwrap();
+        let manager = WorktreeManager::with_base(base)
+            .unwrap()
+            .with_allowlist(OwnerAllowlist::from_owners(["acme"]));
         let start = git_output(&repo_root, &["rev-parse", "HEAD"]);
         let wt = manager
             .create_with_request(WorktreeCreateRequest {

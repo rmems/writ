@@ -521,19 +521,7 @@ fn prepare_git_command(owned_args: Vec<String>, options: &RunOptions) -> Result<
     } else {
         None
     };
-    if let (Some(exp), Some(target)) = (
-        expected.as_deref(),
-        crate::git_safe::checkout_or_switch_target(&owned_args),
-    ) && target != exp
-        && target != "HEAD"
-    {
-        return Err(Error::PolicyViolation {
-            code: PolicyCode::BranchMismatch,
-            message: format!(
-                "git checkout/switch target `{target}` must equal --expected-branch `{exp}`"
-            ),
-        });
-    }
+    reject_supervised_checkout_mismatch(expected.as_deref(), &owned_args)?;
     if let Some(exp) = expected.as_deref() {
         crate::git_safe::reject_push_outside_expected_branch(&owned_args, exp)?;
     }
@@ -562,7 +550,8 @@ fn prepare_gh_command(owned_args: Vec<String>, options: &RunOptions) -> Result<P
         .unwrap_or_else(OwnerAllowlist::from_env);
     let _safe = SafeGhCommand::with_allowlist(&owned_args, &allowlist)?;
     // Always spawn PATH `gh`, never a user-supplied path-qualified binary.
-    let (cwd, branch_check) = if crate::git_safe::gh_requires_branch_check(&owned_args) {
+    let (cwd, branch_check, owned_args) = if crate::git_safe::gh_requires_branch_check(&owned_args)
+    {
         let expected = options
             .expected_branch
             .clone()
@@ -583,21 +572,45 @@ fn prepare_gh_command(owned_args: Vec<String>, options: &RunOptions) -> Result<P
             env_selector.as_deref(),
             &local,
         )?;
+        // Pin the validated slug before any later permit wait so a TOCTOU
+        // origin rewrite cannot retarget `gh`.
+        let owned_args = if env_selector.is_some() {
+            owned_args
+        } else {
+            crate::git_safe::pin_gh_repo_selector(owned_args, &local)
+        };
         (
             Some(repo.clone()),
             Some(BranchCheck {
                 expected_branch: expected,
                 repo,
             }),
+            owned_args,
         )
     } else {
-        (None, None)
+        (None, None, owned_args)
     };
     Ok(PreparedCommand {
         program: "gh".to_owned(),
         args: owned_args,
         cwd,
         branch_check,
+    })
+}
+
+fn reject_supervised_checkout_mismatch(expected: Option<&str>, args: &[String]) -> Result<()> {
+    let (Some(exp), Some(target)) = (expected, crate::git_safe::checkout_or_switch_target(args))
+    else {
+        return Ok(());
+    };
+    if target == exp || target == "HEAD" {
+        return Ok(());
+    }
+    Err(Error::PolicyViolation {
+        code: PolicyCode::BranchMismatch,
+        message: format!(
+            "git checkout/switch target `{target}` must equal --expected-branch `{exp}`"
+        ),
     })
 }
 
