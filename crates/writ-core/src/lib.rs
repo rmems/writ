@@ -4,11 +4,18 @@
 //! implemented by the linked foundation issues.
 
 pub mod attribution;
+mod bash_argv;
 pub mod contract;
 pub mod error;
+mod git_cmd;
 pub mod git_safe;
-mod identity;
+pub mod hook;
+pub mod identity;
+pub mod install;
+pub mod lease;
 pub mod paths;
+pub mod porcelain;
+mod pr_import;
 pub mod state;
 pub mod status;
 pub mod supervisor;

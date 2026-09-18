@@ -24,6 +24,8 @@ All of them, under `--json`:
 | `git-safe` / `gh-safe` | `git.safe` / `gh.safe` |
 | `worktree create\|list\|remove\|prune` | `worktree.create` etc. |
 | `attribution format` | `attribution.format` |
+| `install` | `cli.install` |
+| `hook` | no envelope: PreToolUse is allow/block via exit code; WorktreeCreate prints the worktree path |
 
 **The exception is the policy-violation path**, which prints plain text on stderr
 with exit code 2 instead of an envelope:
