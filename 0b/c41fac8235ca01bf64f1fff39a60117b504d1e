@@ -1,0 +1,41 @@
+crates/writ-core/src/state.rs
+  s_f28c263467f55c::t_5812a1c898880f 64,67-73
+crates/writ/src/main.rs
+  s_f28c263467f55c::t_4ea92b7c4605ea 873-879
+  s_f28c263467f55c::t_fce4b10c8f485e 868
+crates/writ-core/src/supervisor_tests.rs
+  s_f28c263467f55c::t_2170992a17c359 92-98,108-152,155-158,164-176
+  s_f28c263467f55c::t_380726c76b83cd 1-5,14-16,18-38,40-91,99-107,159-163,177-269,272-274,277-282,286-340,343-355,357-419,422-433,435-462,464-485,487-496,500-554
+  s_f28c263467f55c::t_6bbef063d54e38 7-8
+  s_f28c263467f55c::t_cec17cdf6075cb 39
+  s_f28c263467f55c::t_7acd547267216a 6,9-13,17
+  s_f28c263467f55c::t_0dfc382cee43c4 153
+  s_f28c263467f55c::t_b5e84e0fbe2bfa 270-271,275-276,283-285,341-342,356,420-421,434,463,486,497-499
+  s_f28c263467f55c::t_67537862f03cf7 154
+crates/writ-core/src/status.rs
+  s_f28c263467f55c::t_1e99a4e09b3e44 186-192
+  s_f28c263467f55c::t_49931e38944452 66-80
+  s_f28c263467f55c::t_457564a685d448 123,125-127,130-131
+crates/writ-core/src/supervisor.rs
+  s_f28c263467f55c::t_e05514f2c5351f 266-268,270,272
+  s_f28c263467f55c::t_b5e84e0fbe2bfa 1275-1276
+  s_f28c263467f55c::t_a0b0131c8fc5b2 570,586,616
+  s_f28c263467f55c::t_ce3ae4c8d02040 567-569,571-585,587-593,603-604,611,615,617
+  s_f28c263467f55c::t_651f9616993653 410-446
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "0bc41fac8235ca01bf64f1fff39a60117b504d1e",
+  "prompts": {},
+  "sessions": {
+    "s_f28c263467f55c": {
+      "agent_id": {
+        "tool": "cursor",
+        "id": "560bc15e-cf5e-46be-b767-f3cea5d1e08a",
+        "model": "grok-4.6"
+      },
+      "human_author": "Raul Cardenas Montoya <montoyaraul34@gmail.com>"
+    }
+  }
+}
