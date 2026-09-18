@@ -1,0 +1,230 @@
+crates/writ-core/src/paths.rs
+  s_607f75a49ecf30::t_609aa2585830d6 85,130-135,197-213
+qodana/report/results/coverageInformation.json
+  s_607f75a49ecf30::t_609aa2585830d6 1-3
+qodana/log/qodana_inspections_summary.csv
+  s_607f75a49ecf30::t_609aa2585830d6 1-92
+crates/writ-core/src/identity.rs
+  s_607f75a49ecf30::t_609aa2585830d6 9,33-35,38,47-65,165,174-178,180-181,183,197-333,494-658
+qodana/report/results/projectStructure/SDKs.json
+  s_607f75a49ecf30::t_609aa2585830d6 1-8
+crates/writ-core/src/lease.rs
+  s_607f75a49ecf30::t_609aa2585830d6 1-550
+crates/writ/tests/worktree_cli.rs
+  s_607f75a49ecf30::t_609aa2585830d6 66,298-350,393-614
+qodana/results/log/qodana-config.json
+  s_607f75a49ecf30::t_609aa2585830d6 1-6
+qodana/results/log/qodana_inspections_summary.csv
+  s_607f75a49ecf30::t_609aa2585830d6 1-94
+qodana/report/js/QD-main-CcW5ihcQ.js
+  s_607f75a49ecf30::t_609aa2585830d6 1
+qodana/results/projectStructure/SDKs.json
+  s_607f75a49ecf30::t_609aa2585830d6 1-8
+qodana/report/results/projectStructure/ProjectFingerprint.json
+  s_607f75a49ecf30::t_609aa2585830d6 1-10
+crates/writ/Cargo.toml
+  s_607f75a49ecf30::t_609aa2585830d6 12
+qodana/log/indexing-diagnostic/storage-diagnostic-on-shutdown-2026-07-27-21-47-42.127.json
+  s_607f75a49ecf30::t_609aa2585830d6 1-26
+qodana/report/js/QD-QodanaUI-232nrVo_.js
+  s_607f75a49ecf30::t_609aa2585830d6 1-228
+qodana/report/results/qodana.yaml
+  s_607f75a49ecf30::t_609aa2585830d6 1-19
+qodana/report/results/qodana.sarif.json
+  s_607f75a49ecf30::t_609aa2585830d6 1-19726
+qodana/results/log/effective.profile.xml
+  s_607f75a49ecf30::t_609aa2585830d6 1-1917
+qodana/results/log/indexing-diagnostic/python.26e72d08/changed-files-pushing-events.json
+  s_607f75a49ecf30::t_609aa2585830d6 1
+qodana/results/log/qodana_directories_inspection_groups.csv
+  s_607f75a49ecf30::t_609aa2585830d6 1-3
+qodana/log/indexing-diagnostic/project.15375f63/diagnostic-2026-07-27-21-48-01.105.html
+  s_607f75a49ecf30::t_609aa2585830d6 1-760
+qodana/log/indexing-diagnostic/project.15375f63/report.html
+  s_607f75a49ecf30::t_609aa2585830d6 1-704
+qodana/projectStructure/ProjectFingerprint.json
+  s_607f75a49ecf30::t_609aa2585830d6 1-16
+qodana/log/open-telemetry-meters.2026-07-27-21-48-05.json
+  s_607f75a49ecf30::t_609aa2585830d6 1
+qodana/report/js/QD-TaintGraphModal-DdFhfrBa.js
+  s_607f75a49ecf30::t_609aa2585830d6 1-321
+qodana/report/results/projectStructure/Code_Inspection.json
+  s_607f75a49ecf30::t_609aa2585830d6 1-31
+qodana/log/qodana/thread-dump-after-project-configuration.txt
+  s_607f75a49ecf30::t_609aa2585830d6 1-2730
+qodana/report/js/QD-idea-TjfMgUgv.js
+  s_607f75a49ecf30::t_609aa2585830d6 1
+crates/writ/tests/hook_cli.rs
+  s_607f75a49ecf30::t_609aa2585830d6 1-136
+qodana/report/results/result-allProblems.json
+  s_607f75a49ecf30::t_609aa2585830d6 1-7922
+crates/writ-core/src/porcelain.rs
+  s_607f75a49ecf30::t_609aa2585830d6 1-232
+qodana/report/manifest.json
+  s_607f75a49ecf30::t_609aa2585830d6 1-15
+crates/writ-core/src/lib.rs
+  s_607f75a49ecf30::t_609aa2585830d6 6,9,11-14,16-17
+crates/writ-core/src/pr_import.rs
+  s_607f75a49ecf30::t_609aa2585830d6 1-850
+qodana/log/telemetry/open-telemetry-metrics.2026-07-27-21-47-42.csv
+  s_607f75a49ecf30::t_609aa2585830d6 1-235
+SKILL.md
+  s_607f75a49ecf30::t_609aa2585830d6 1-5,8
+docs/adr/0001-rust-only-v1-runtime-and-babysit-pr-boundary.md
+  s_607f75a49ecf30::t_609aa2585830d6 1-147
+qodana/report/js/QD-index-C18D0SRv.js
+  s_607f75a49ecf30::t_609aa2585830d6 1-6
+qodana/results/log/indexing-diagnostic/python.26e72d08/report.html
+  s_607f75a49ecf30::t_609aa2585830d6 1-488
+qodana/results/log/indexing-diagnostic/storage-diagnostic-on-shutdown-2026-08-29-10-16-56.679.json
+  s_607f75a49ecf30::t_609aa2585830d6 1-28
+qodana/results/log/telemetry/open-telemetry-metrics.2026-08-29-10-16-56.csv
+  s_607f75a49ecf30::t_609aa2585830d6 1-236
+qodana/results/log/indexing-diagnostic/python.26e72d08/diagnostic-2026-08-29-10-17-12.109.html
+  s_607f75a49ecf30::t_609aa2585830d6 1-656
+qodana/report/css/QD-QodanaUI-C1oeXZOG.css
+  s_607f75a49ecf30::t_609aa2585830d6 1
+.codacy.yml
+  s_607f75a49ecf30::t_609aa2585830d6 39,48-53,68,77,86
+qodana/results/log/indexing-diagnostic/python.26e72d08/diagnostic-2026-08-29-10-17-12.109.json
+  s_607f75a49ecf30::t_609aa2585830d6 1-596
+qodana/results/log/telemetry/open-telemetry-metrics-plotter.html
+  s_607f75a49ecf30::t_609aa2585830d6 1-1570
+CONTRIBUTING.md
+  s_607f75a49ecf30::t_609aa2585830d6 1-79
+crates/writ-core/src/error.rs
+  s_607f75a49ecf30::t_609aa2585830d6 54-85,107-115,134-139,148-151,159-163,187-188,205,241-254,268-273,277-279,302,307-308,310,359-372
+qodana/projectStructure/Libraries.json
+  s_607f75a49ecf30::t_609aa2585830d6 1-3
+qodana/projectStructure/SDKs.json
+  s_607f75a49ecf30::t_609aa2585830d6 1-7
+qodana/report/idea.html
+  s_607f75a49ecf30::t_609aa2585830d6 1-23
+qodana/report/index.html
+  s_607f75a49ecf30::t_609aa2585830d6 1-23
+qodana/log/sanity.profile.xml
+  s_607f75a49ecf30::t_609aa2585830d6 1-6
+qodana/report/results/projectStructure/Libraries.json
+  s_607f75a49ecf30::t_609aa2585830d6 1-3
+README.md
+  s_607f75a49ecf30::t_a9d08c531038d4 201
+  s_607f75a49ecf30::t_00ba1b4d2403a5 3-5,10-27,43-127,139-169,179-200,202-232,236,244,255,257-258,262,264,266-273,283-355,359,361,363,365-366,368
+qodana/log/indexing-diagnostic/project.15375f63/diagnostic-2026-07-27-21-47-58.160.json
+  s_607f75a49ecf30::t_609aa2585830d6 1-124
+qodana/results/log/sanity.profile.xml
+  s_607f75a49ecf30::t_609aa2585830d6 1-925
+crates/writ-core/src/git_safe.rs
+  s_607f75a49ecf30::t_609aa2585830d6 826,1089-1160,2173-2176
+crates/writ/src/main.rs
+  s_607f75a49ecf30::t_609aa2585830d6 1-2,59-71,92-100,232-279,288,290-301,303,305,310-346,372,375,405-458,467,474-545,589-592,1012-1031
+crates/writ-core/src/hook.rs
+  s_607f75a49ecf30::t_609aa2585830d6 1-532
+qodana/report/results/qodana-config.json
+  s_607f75a49ecf30::t_609aa2585830d6 1-6
+qodana/report/js/QD-initialization-XLQez1l0.js
+  s_607f75a49ecf30::t_609aa2585830d6 1-20
+qodana/results/log/telemetry/open-telemetry-meters.2026-08-29-10-17-18.json
+  s_607f75a49ecf30::t_609aa2585830d6 1
+qodana/results/projectStructure/ProjectFingerprint.json
+  s_607f75a49ecf30::t_609aa2585830d6 1-10
+qodana/results/qodana-short.sarif.json
+  s_607f75a49ecf30::t_609aa2585830d6 1-82
+qodana/report/results/descriptions/Code_Inspection.json
+  s_607f75a49ecf30::t_609aa2585830d6 1-1616
+qodana/results/log/indexing-diagnostic/python.26e72d08/diagnostic-2026-08-29-10-17-11.069.json
+  s_607f75a49ecf30::t_609aa2585830d6 1-124
+qodana/results/log/main.profile.xml
+  s_607f75a49ecf30::t_609aa2585830d6 1-4687
+Cargo.lock
+  ai_agent 6-16,79-88,151-162,169-174,186-203,228-238,312-317,351-364,427-432,540-551,578,589,596-613
+.github/ISSUE_TEMPLATE/chore.yaml
+  s_607f75a49ecf30::t_609aa2585830d6 1-67
+qodana/report/results/promo.json
+  s_607f75a49ecf30::t_609aa2585830d6 1-4
+AGENTS.md
+  s_607f75a49ecf30::t_609aa2585830d6 137-138,244
+crates/writ-core/src/bash_argv/mod.rs
+  s_607f75a49ecf30::t_609aa2585830d6 1-461
+qodana/qodana.sarif.json
+  s_607f75a49ecf30::t_609aa2585830d6 1-26751
+.github/ISSUE_TEMPLATE/bug.yaml
+  s_607f75a49ecf30::t_609aa2585830d6 1-3,5-11,13-20,22-32,34-44,46-59,61-69
+qodana/results/qodana.sarif.json
+  s_607f75a49ecf30::t_609aa2585830d6 1-19726
+qodana/results/log/qodana/thread-dump-after-project-configuration.txt
+  s_607f75a49ecf30::t_609aa2585830d6 1-2141
+qodana/log/indexing-diagnostic/project.15375f63/diagnostic-2026-07-27-21-48-01.105.json
+  s_607f75a49ecf30::t_609aa2585830d6 1-998
+qodana/log/effective.profile.xml
+  s_607f75a49ecf30::t_609aa2585830d6 1-1670
+qodana/qodana-short.sarif.json
+  s_607f75a49ecf30::t_609aa2585830d6 1-74
+qodana/results/log/indexing-diagnostic/python.26e72d08/diagnostic-2026-08-29-10-17-11.069.html
+  s_607f75a49ecf30::t_609aa2585830d6 1-480
+qodana/results/projectStructure/Modules.json
+  s_607f75a49ecf30::t_609aa2585830d6 1-31
+qodana/log/qodana-config.json
+  s_607f75a49ecf30::t_609aa2585830d6 1-6
+docs/examples/README.md
+  s_607f75a49ecf30::t_00ba1b4d2403a5 27-28
+qodana/report/js/QD-Code-C0FEWUn9.js
+  s_607f75a49ecf30::t_609aa2585830d6 1-12
+crates/writ-core/src/git_cmd.rs
+  s_607f75a49ecf30::t_609aa2585830d6 1-8
+crates/writ-core/src/install.rs
+  s_607f75a49ecf30::t_609aa2585830d6 1-399
+qodana/results/log/qodana.yaml
+  s_607f75a49ecf30::t_609aa2585830d6 1-19
+crates/writ-core/Cargo.toml
+  s_607f75a49ecf30::t_609aa2585830d6 12
+qodana/projectStructure/Modules.json
+  s_607f75a49ecf30::t_609aa2585830d6 1-24
+crates/writ-core/src/bash_argv/tests.rs
+  s_607f75a49ecf30::t_609aa2585830d6 1-106
+crates/writ/tests/install_skill.rs
+  s_607f75a49ecf30::t_609aa2585830d6 1-296
+qodana/log/main.profile.xml
+  s_607f75a49ecf30::t_609aa2585830d6 1-4091
+.github/ISSUE_TEMPLATE/feature.yaml
+  s_607f75a49ecf30::t_609aa2585830d6 1-3,8-11,13-14,16-18,23,25-27,32,34-41,43-44,46-56,58-59,61-66
+qodana/log/indexing-diagnostic/project.15375f63/changed-files-pushing-events.json
+  s_607f75a49ecf30::t_609aa2585830d6 1-3
+qodana/log/qodana.yaml
+  s_607f75a49ecf30::t_609aa2585830d6 1-10
+qodana/log/qodana_directories_inspection_groups.csv
+  s_607f75a49ecf30::t_609aa2585830d6 1-19
+qodana/log/telemetry/open-telemetry-metrics-plotter.html
+  s_607f75a49ecf30::t_609aa2585830d6 1-1554
+qodana/report/results/metaInformation.json
+  s_607f75a49ecf30::t_609aa2585830d6 1-22
+qodana/results/projectStructure/Libraries.json
+  s_607f75a49ecf30::t_609aa2585830d6 1-3
+scripts/install-skill.sh
+  s_607f75a49ecf30::t_609aa2585830d6 1-284
+crates/writ-core/src/worktree.rs
+  s_607f75a49ecf30::t_609aa2585830d6 11,13-14,25-30,55-60,64,67,71,74,81-82,84-93,106,118-123,128-130,158-160,174,181-206,228,230,238-242,283,333-355,403,406-457,459-480,483,485-511,515-587,592,595-596,600-614,757,759,768-769,819-824,827-828,831-838,841-866,868-897,901-905,908,935-939,1219-1221,1264-1268,1426-1434,1439-1440,1581-1663,1755-1860,1900-2055
+qodana/report/results/sanity.json
+  s_607f75a49ecf30::t_609aa2585830d6 1-4
+docs/install.md
+  s_607f75a49ecf30::t_609aa2585830d6 1-135
+qodana/log/indexing-diagnostic/project.15375f63/diagnostic-2026-07-27-21-47-58.160.html
+  s_607f75a49ecf30::t_609aa2585830d6 1-480
+.deepsource.toml
+  s_607f75a49ecf30::t_609aa2585830d6 1-9
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "cd93627381c84bcbe0bc38fb581e45ff3015d5ea",
+  "prompts": {},
+  "sessions": {
+    "s_607f75a49ecf30": {
+      "agent_id": {
+        "tool": "cursor",
+        "id": "7f6aba86-65ae-41a6-83e6-aa91eadddbdb",
+        "model": "grok-4.6"
+      },
+      "human_author": "Raul Cardenas Montoya <montoyaraul34@gmail.com>"
+    }
+  }
+}
