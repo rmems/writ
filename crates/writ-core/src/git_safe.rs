@@ -358,60 +358,10 @@ impl SafeGhCommand {
     /// remain the more specific rejection when both would apply, and always
     /// before [`Self::run`].
     pub fn with_allowlist(args: &[String], allowlist: &OwnerAllowlist) -> Result<Self> {
-        if args.is_empty() {
-            return Err(Error::PolicyViolation {
-                code: PolicyCode::GhSubcommandNotAllowed,
-                message: "no gh subcommand provided".to_owned(),
-            });
-        }
-
-        let subcommand = &args[0];
-
-        // Validate subcommand against allowlist.
-        let allowed: HashSet<&str> = ALLOWED_GH_SUBCOMMANDS.iter().copied().collect();
-        if !allowed.contains(subcommand.as_str()) {
-            return Err(Error::PolicyViolation {
-                code: PolicyCode::GhSubcommandNotAllowed,
-                message: format!("gh subcommand `{subcommand}` is not on the allowlist"),
-            });
-        }
-
-        // Block `gh pr merge` / `ready` / `update-branch` even when inherited flags
-        // precede the subcommand, e.g. `gh pr -R owner/repo merge 1`.
-        if subcommand == "pr"
-            && let Some(pr_sub) = first_positional_after(&args[1..])
-        {
-            let blocked: HashSet<&str> = BLOCKED_GH_PR_SUBSUBCOMMANDS.iter().copied().collect();
-            if blocked.contains(pr_sub) {
-                return Err(Error::PolicyViolation {
-                    code: PolicyCode::MergeBlocked,
-                    message: format!("`gh pr {pr_sub}` is not allowed"),
-                });
-            }
-        }
-
-        // `gh repo clone <repo> [<dir>]` can write outside the worktree.
-        if subcommand == "repo"
-            && let Some(repo_sub) = first_positional_after(&args[1..])
-            && repo_sub == "clone"
-        {
-            // Find destination after `clone` token (skip option values).
-            if let Some(dest) = gh_repo_clone_destination(&args[1..]) {
-                reject_external_path(Some(dest), "gh repo clone destination")?;
-            }
-        }
-
-        // Block merge-related flags anywhere in the argument list.
-        let blocked_flags: HashSet<&str> = BLOCKED_GH_FLAGS.iter().copied().collect();
-        for arg in &args[1..] {
-            if blocked_flags.contains(arg.as_str()) {
-                return Err(Error::PolicyViolation {
-                    code: PolicyCode::GhFlagNotAllowed,
-                    message: format!("gh flag `{arg}` is not allowed"),
-                });
-            }
-        }
-
+        let subcommand = gh_subcommand(args)?;
+        gh_reject_blocked_pr_subsubcommand(subcommand, args)?;
+        gh_reject_external_clone_destination(subcommand, args)?;
+        gh_reject_blocked_flags(args)?;
         enforce_gh_repo_targets(args, allowlist, gh_repo_env_selector().as_deref())?;
 
         Ok(Self {
@@ -441,6 +391,68 @@ impl SafeGhCommand {
     pub fn args(&self) -> &[String] {
         &self.args
     }
+}
+
+/// Validate that `args[0]` is a non-empty, allowlisted gh subcommand and return it.
+fn gh_subcommand(args: &[String]) -> Result<&str> {
+    let Some(subcommand) = args.first().map(String::as_str) else {
+        return Err(Error::PolicyViolation {
+            code: PolicyCode::GhSubcommandNotAllowed,
+            message: "no gh subcommand provided".to_owned(),
+        });
+    };
+    let allowed: HashSet<&str> = ALLOWED_GH_SUBCOMMANDS.iter().copied().collect();
+    if !allowed.contains(subcommand) {
+        return Err(Error::PolicyViolation {
+            code: PolicyCode::GhSubcommandNotAllowed,
+            message: format!("gh subcommand `{subcommand}` is not on the allowlist"),
+        });
+    }
+    Ok(subcommand)
+}
+
+/// Block `gh pr merge` / `ready` / `update-branch` even when inherited flags
+/// precede the subcommand, e.g. `gh pr -R owner/repo merge 1`.
+fn gh_reject_blocked_pr_subsubcommand(subcommand: &str, args: &[String]) -> Result<()> {
+    if subcommand == "pr"
+        && let Some(pr_sub) = first_positional_after(&args[1..])
+    {
+        let blocked: HashSet<&str> = BLOCKED_GH_PR_SUBSUBCOMMANDS.iter().copied().collect();
+        if blocked.contains(pr_sub) {
+            return Err(Error::PolicyViolation {
+                code: PolicyCode::MergeBlocked,
+                message: format!("`gh pr {pr_sub}` is not allowed"),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// `gh repo clone <repo> [<dir>]` can write outside the worktree; reject an
+/// external destination.
+fn gh_reject_external_clone_destination(subcommand: &str, args: &[String]) -> Result<()> {
+    if subcommand == "repo"
+        && let Some(repo_sub) = first_positional_after(&args[1..])
+        && repo_sub == "clone"
+        && let Some(dest) = gh_repo_clone_destination(&args[1..])
+    {
+        reject_external_path(Some(dest), "gh repo clone destination")?;
+    }
+    Ok(())
+}
+
+/// Block merge-related flags anywhere in the argument list.
+fn gh_reject_blocked_flags(args: &[String]) -> Result<()> {
+    let blocked_flags: HashSet<&str> = BLOCKED_GH_FLAGS.iter().copied().collect();
+    for arg in &args[1..] {
+        if blocked_flags.contains(arg.as_str()) {
+            return Err(Error::PolicyViolation {
+                code: PolicyCode::GhFlagNotAllowed,
+                message: format!("gh flag `{arg}` is not allowed"),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Resolve the current branch name from a repository working tree.
@@ -541,39 +553,53 @@ fn dashdash_is_option_value(args: &[String], idx: usize) -> bool {
     gh_flag_consumes_next_value(prev, Some("--"))
 }
 
+/// One step of the `first_positional_after` argv scan.
+enum PositionalScan {
+    /// Advance the cursor by `usize` tokens and keep scanning.
+    Skip(usize),
+    /// Stop scanning; the positional (or absence thereof) is decided.
+    Stop(Option<usize>),
+}
+
+/// Classify the token at `args[idx]` for [`first_positional_after`], keeping the
+/// scan loop itself flat. `--` that is a preceding option's value is skipped
+/// (not treated as a terminator); unknown flags fail closed by stopping.
+fn classify_positional_token(args: &[String], idx: usize) -> PositionalScan {
+    let a = args[idx].as_str();
+    if a == "--" {
+        // `--` consumed as a preceding option's value is not a terminator;
+        // keep scanning so a later positional/flag is still seen.
+        if dashdash_is_option_value(args, idx) {
+            return PositionalScan::Skip(1);
+        }
+        return PositionalScan::Stop(idx.checked_add(1).filter(|&n| n < args.len()));
+    }
+    if !a.starts_with('-') {
+        return PositionalScan::Stop(Some(idx));
+    }
+    // Only documented parent flags; anything else fails closed.
+    if a == "--help" || a == "-h" {
+        return PositionalScan::Skip(1);
+    }
+    if let Some((_, consume_next)) = gh_repo_flag(a, args.get(idx + 1).map(String::as_str)) {
+        return PositionalScan::Skip(if consume_next { 2 } else { 1 });
+    }
+    // Value-taking option in separate-token form: skip it and its value so the
+    // value (which may be `--`) is not mistaken for a terminator.
+    if GH_VALUE_TAKING_OPTIONS.contains(&a) {
+        return PositionalScan::Skip(2);
+    }
+    PositionalScan::Stop(None)
+}
+
 /// First non-flag positional argument, skipping common `gh` inherited options that take values.
 fn first_positional_after(args: &[String]) -> Option<&str> {
     let mut i = 0;
     while i < args.len() {
-        let a = args[i].as_str();
-        if a == "--" {
-            // `--` consumed as a preceding option's value is not a terminator;
-            // keep scanning so a later positional/flag is still seen.
-            if dashdash_is_option_value(args, i) {
-                i += 1;
-                continue;
-            }
-            return args.get(i + 1).map(String::as_str);
+        match classify_positional_token(args, i) {
+            PositionalScan::Skip(n) => i += n,
+            PositionalScan::Stop(pos) => return pos.map(|p| args[p].as_str()),
         }
-        if a.starts_with('-') {
-            // Only documented parent flags; anything else fails closed.
-            if a == "--help" || a == "-h" {
-                i += 1;
-                continue;
-            }
-            if let Some((_, consume_next)) = gh_repo_flag(a, args.get(i + 1).map(String::as_str)) {
-                i += if consume_next { 2 } else { 1 };
-                continue;
-            }
-            // Value-taking option in separate-token form: skip it and its value
-            // so the value (which may be `--`) is not mistaken for a terminator.
-            if GH_VALUE_TAKING_OPTIONS.contains(&a) {
-                i += 2;
-                continue;
-            }
-            return None;
-        }
-        return Some(a);
     }
     None
 }
@@ -749,53 +775,57 @@ fn idx_prev_consumes_clone_value(args: &[String], idx: usize) -> bool {
         || matches!(gh_repo_flag(prev, Some("--")), Some((_, true)))
 }
 
-/// Destination directory of `gh repo clone <repository> [<directory>]`, if present.
-fn gh_repo_clone_destination(args: &[String]) -> Option<&str> {
-    // args begin after top-level `repo` (caller passes &args[1..]).
+/// Locate the index just past the `clone` token in `gh repo …` argv (caller
+/// passes `&args[1..]`, i.e. after the top-level `repo`). Returns `None` if no
+/// `clone` token is reached before an unknown flag or unexpected positional
+/// (fail closed for destination detection).
+fn gh_repo_clone_token_end(args: &[String]) -> Option<usize> {
     let mut i = 0;
-    // Find `clone` token (may be preceded by global flags already stripped).
     while i < args.len() {
         let a = args[i].as_str();
         if a == "clone" {
-            i += 1;
-            break;
+            return Some(i + 1);
         }
-        if a.starts_with('-') {
-            if let Some((_, consume_next)) = gh_repo_flag(a, args.get(i + 1).map(String::as_str)) {
-                i += if consume_next { 2 } else { 1 };
-                continue;
-            }
-            if a == "--help" || a == "-h" {
-                i += 1;
-                continue;
-            }
-            // Unknown flag before clone: stop (fail closed for dest detection).
+        if !a.starts_with('-') {
+            // Unexpected positional before clone.
             return None;
         }
-        // Unexpected positional before clone.
+        if let Some((_, consume_next)) = gh_repo_flag(a, args.get(i + 1).map(String::as_str)) {
+            i += if consume_next { 2 } else { 1 };
+            continue;
+        }
+        if a == "--help" || a == "-h" {
+            i += 1;
+            continue;
+        }
+        // Unknown flag before clone: stop (fail closed for dest detection).
         return None;
     }
+    None
+}
+
+/// Collect the positional arguments of `gh repo clone` starting at `start`,
+/// skipping value-taking options and honouring a real `--` terminator (but not a
+/// `--` that is a preceding value-taking option's value).
+fn gh_repo_clone_positionals(args: &[String], start: usize) -> Vec<&str> {
     let mut positionals: Vec<&str> = Vec::new();
+    let mut i = start;
     while i < args.len() {
         let a = args[i].as_str();
-        if a == "--" {
-            // A `--` consumed as the value of a preceding value-taking option is
-            // not the terminator; skip it and keep scanning for the destination.
-            if idx_prev_consumes_clone_value(args, i) {
-                i += 1;
-                continue;
-            }
+        if a == "--" && !idx_prev_consumes_clone_value(args, i) {
             positionals.extend(args[i + 1..].iter().map(String::as_str));
             break;
+        }
+        if a == "--" {
+            // `--` consumed as the value of a preceding value-taking option is
+            // not the terminator; skip it and keep scanning for the destination.
+            i += 1;
+            continue;
         }
         if a.starts_with('-') {
             // Skip known value-taking options for gh repo clone.
             if matches!(a, "-u" | "--upstream-remote-name") {
                 i += 2;
-                continue;
-            }
-            if a.starts_with("--") && a.contains('=') {
-                i += 1;
                 continue;
             }
             i += 1;
@@ -804,12 +834,16 @@ fn gh_repo_clone_destination(args: &[String]) -> Option<&str> {
         positionals.push(a);
         i += 1;
     }
+    positionals
+}
+
+/// Destination directory of `gh repo clone <repository> [<directory>]`, if present.
+fn gh_repo_clone_destination(args: &[String]) -> Option<&str> {
+    // args begin after top-level `repo` (caller passes &args[1..]).
+    let start = gh_repo_clone_token_end(args)?;
+    let positionals = gh_repo_clone_positionals(args, start);
     // positionals: <repository> [<directory>]
-    if positionals.len() >= 2 {
-        Some(positionals[1])
-    } else {
-        None
-    }
+    positionals.get(1).copied()
 }
 
 fn path_is_external(path: &str) -> bool {

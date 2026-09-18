@@ -243,12 +243,72 @@ fn worktree_command_name(cli: &Cli) -> Option<&'static str> {
     }
 }
 
+/// Owned fields of a `worktree create` request, threaded from the CLI action to
+/// [`worktree_create_response`] so the dispatch arm stays small.
+struct WorktreeCreateArgs {
+    repo: PathBuf,
+    owner: String,
+    repo_name: String,
+    job_id: String,
+    branch: String,
+    start_point: Option<String>,
+    schema_version: u8,
+}
+
+/// Build the `worktree.create` response, preserving the exact JSON envelope.
+fn worktree_create_response(
+    allowlist: &writ_core::owners::OwnerAllowlist,
+    args: WorktreeCreateArgs,
+) -> writ_core::error::Result<writ_core::contract::Response<serde_json::Value>> {
+    use writ_core::contract::Response;
+    use writ_core::worktree::{WorktreeCreateRequest, WorktreeManager};
+
+    let WorktreeCreateArgs {
+        repo,
+        owner,
+        repo_name,
+        job_id,
+        branch,
+        start_point,
+        schema_version,
+    } = args;
+
+    if schema_version == writ_core::contract::SCHEMA_VERSION {
+        return Err(writ_core::error::Error::ContractUpgradeRequired {
+            required_schema_version: writ_core::contract::EXACT_BASE_SCHEMA_VERSION,
+        });
+    }
+    let start_point = start_point.ok_or(writ_core::error::Error::StartPointRequired)?;
+    let manager = WorktreeManager::new()?.with_allowlist(allowlist.clone());
+    let wt = manager.create_with_request(WorktreeCreateRequest {
+        repo_root: &repo,
+        owner: &owner,
+        repo: &repo_name,
+        job_id: &job_id,
+        branch: &branch,
+        start_point: &start_point,
+    })?;
+    Ok(Response::success_with_schema(
+        "worktree.create",
+        serde_json::json!({
+            "path": wt.path,
+            "branch": wt.branch,
+            "branch_ref": format!("refs/heads/{}", wt.branch),
+            "repo_root": wt.repo_root,
+            "start_commit": wt.start_commit,
+            "head_commit": wt.head_commit,
+            "worktree_registered": true,
+        }),
+        schema_version,
+    ))
+}
+
 fn worktree_response(
     action: WorktreeAction,
     allowlist: &writ_core::owners::OwnerAllowlist,
 ) -> writ_core::error::Result<writ_core::contract::Response<serde_json::Value>> {
     use writ_core::contract::Response;
-    use writ_core::worktree::{WorktreeCreateRequest, WorktreeManager};
+    use writ_core::worktree::WorktreeManager;
 
     match action {
         WorktreeAction::Create {
@@ -259,36 +319,18 @@ fn worktree_response(
             branch,
             start_point,
             schema_version,
-        } => {
-            if schema_version == writ_core::contract::SCHEMA_VERSION {
-                return Err(writ_core::error::Error::ContractUpgradeRequired {
-                    required_schema_version: writ_core::contract::EXACT_BASE_SCHEMA_VERSION,
-                });
-            }
-            let start_point = start_point.ok_or(writ_core::error::Error::StartPointRequired)?;
-            let manager = WorktreeManager::new()?.with_allowlist(allowlist.clone());
-            let wt = manager.create_with_request(WorktreeCreateRequest {
-                repo_root: &repo,
-                owner: &owner,
-                repo: &repo_name,
-                job_id: &job_id,
-                branch: &branch,
-                start_point: &start_point,
-            })?;
-            Ok(Response::success_with_schema(
-                "worktree.create",
-                serde_json::json!({
-                    "path": wt.path,
-                    "branch": wt.branch,
-                    "branch_ref": format!("refs/heads/{}", wt.branch),
-                    "repo_root": wt.repo_root,
-                    "start_commit": wt.start_commit,
-                    "head_commit": wt.head_commit,
-                    "worktree_registered": true,
-                }),
+        } => worktree_create_response(
+            allowlist,
+            WorktreeCreateArgs {
+                repo,
+                owner,
+                repo_name,
+                job_id,
+                branch,
+                start_point,
                 schema_version,
-            ))
-        }
+            },
+        ),
         WorktreeAction::List => {
             let manager = WorktreeManager::new()?;
             let worktrees = manager.list()?;

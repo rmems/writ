@@ -23,6 +23,29 @@ pub struct OwnerAllowlist {
     owners: BTreeSet<String>,
 }
 
+/// What kind of value an owner-allowlist check is enforcing. Used only to phrase
+/// the "could not be parsed from …" diagnostic; it replaces a stringly-typed
+/// `kind: &str` discriminator so the message wording stays fixed at the call
+/// sites rather than being passed in as free-form text.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum OwnerSpecKind {
+    /// A bare owner name (e.g. the worktree `owner` argument).
+    Owner,
+    /// A `gh -R` / `--repo` repository selector.
+    RepoSelector,
+}
+
+impl OwnerSpecKind {
+    /// The label used in the parse-failure diagnostic. Wording is preserved
+    /// exactly from the previous `&str` discriminator.
+    fn label(self) -> &'static str {
+        match self {
+            OwnerSpecKind::Owner => "owner",
+            OwnerSpecKind::RepoSelector => "repository selector",
+        }
+    }
+}
+
 impl OwnerAllowlist {
     /// Parse a comma-separated owner list (the env-var / `--allowed-owners` form).
     #[must_use]
@@ -88,15 +111,15 @@ impl OwnerAllowlist {
 
     /// Reject `owner` unless it normalizes to an allowlisted owner.
     pub fn enforce_owner(&self, owner: &str) -> Result<()> {
-        self.enforce_spec("owner", owner)
+        self.enforce_spec(OwnerSpecKind::Owner, owner)
     }
 
     /// Reject a `gh -R` / `--repo` selector unless its owner is allowlisted.
     pub fn enforce_repo_selector(&self, selector: &str) -> Result<()> {
-        self.enforce_spec("repository selector", selector)
+        self.enforce_spec(OwnerSpecKind::RepoSelector, selector)
     }
 
-    fn enforce_spec(&self, kind: &str, spec: &str) -> Result<()> {
+    fn enforce_spec(&self, kind: OwnerSpecKind, spec: &str) -> Result<()> {
         if self.owners.is_empty() {
             return Err(Error::PolicyViolation {
                 code: PolicyCode::OwnerNotAllowed,
@@ -106,6 +129,7 @@ impl OwnerAllowlist {
             });
         }
         let Some(normalized) = github_owner_name(spec) else {
+            let kind = kind.label();
             return Err(Error::PolicyViolation {
                 code: PolicyCode::OwnerNotAllowed,
                 message: format!("GitHub owner could not be parsed from {kind} `{spec}`"),

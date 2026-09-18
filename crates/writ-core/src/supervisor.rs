@@ -478,95 +478,8 @@ fn prepare_supervised_command(
     }
 
     match name.as_str() {
-        "git" => {
-            let safe = SafeGitCommand::new(&owned_args)?;
-            let expected = if safe.requires_branch_check() {
-                Some(options.expected_branch.clone().ok_or_else(|| {
-                    Error::PolicyViolation {
-                        code: PolicyCode::BranchMismatch,
-                        message: "mutating git commands require --expected-branch under supervisor"
-                            .to_owned(),
-                    }
-                })?)
-            } else {
-                None
-            };
-            if let (Some(exp), Some(target)) = (
-                expected.as_deref(),
-                crate::git_safe::checkout_or_switch_target(&owned_args),
-            ) && target != exp
-                && target != "HEAD"
-            {
-                return Err(Error::PolicyViolation {
-                    code: PolicyCode::BranchMismatch,
-                    message: format!(
-                        "git checkout/switch target `{target}` must equal --expected-branch `{exp}`"
-                    ),
-                });
-            }
-            if let Some(exp) = expected.as_deref() {
-                crate::git_safe::reject_push_outside_expected_branch(&owned_args, exp)?;
-            }
-            // Always spawn PATH `git`, never a user-supplied path-qualified binary.
-            let repo = resolve_supervised_repo(options.repo.as_deref())?;
-            let branch_check = expected.map(|expected_branch| BranchCheck {
-                expected_branch,
-                repo: repo.clone(),
-            });
-            Ok(PreparedCommand {
-                program: "git".to_owned(),
-                args: owned_args,
-                cwd: Some(repo),
-                branch_check,
-            })
-        }
-        "gh" => {
-            let allowlist = options
-                .allowlist
-                .clone()
-                .unwrap_or_else(OwnerAllowlist::from_env);
-            let _safe = SafeGhCommand::with_allowlist(&owned_args, &allowlist)?;
-            // Always spawn PATH `gh`, never a user-supplied path-qualified binary.
-            let (cwd, branch_check) = if crate::git_safe::gh_requires_branch_check(&owned_args) {
-                let expected =
-                    options
-                        .expected_branch
-                        .clone()
-                        .ok_or_else(|| Error::PolicyViolation {
-                            code: PolicyCode::BranchMismatch,
-                            message:
-                                "mutating gh pr commands require --expected-branch under supervisor"
-                                    .to_owned(),
-                        })?;
-                let repo = resolve_supervised_repo(options.repo.as_deref())?;
-                // Bind the effective repo selector to the verified local checkout
-                // so jobs cannot mutate a different GitHub repository after the
-                // branch gate. An explicit `-R/--repo` wins; otherwise gh reads
-                // the implicit `GH_REPO` environment selector, so bind that too.
-                let env_selector = crate::git_safe::gh_repo_env_target();
-                let local = crate::git_safe::origin_github_slug(&repo)?;
-                crate::git_safe::bind_gh_repo_selector_to_origin(
-                    &owned_args,
-                    env_selector.as_deref(),
-                    &local,
-                )?;
-                (
-                    Some(repo.clone()),
-                    Some(BranchCheck {
-                        expected_branch: expected,
-                        repo,
-                    }),
-                )
-            } else {
-                (None, None)
-            };
-            Ok(PreparedCommand {
-                program: "gh".to_owned(),
-                args: owned_args,
-                cwd,
-                branch_check,
-            })
-        }
+        "git" => prepare_git_command(owned_args, options),
+        "gh" => prepare_gh_command(owned_args, options),
         _ => {
             // Fail closed on path-qualified / relative scripts (./tools/run, tools/run).
             // Basename-only PATH lookups remain for non-sensitive tooling; git/gh above are
@@ -587,6 +500,105 @@ fn prepare_supervised_command(
             })
         }
     }
+}
+
+/// Prepare a supervised `git` command: enforce argv policy, resolve the required
+/// expected-branch for mutating commands, bind checkout/switch and push targets
+/// to that branch, and PATH-force the `git` binary.
+fn prepare_git_command(owned_args: Vec<String>, options: &RunOptions) -> Result<PreparedCommand> {
+    let safe = SafeGitCommand::new(&owned_args)?;
+    let expected = if safe.requires_branch_check() {
+        Some(
+            options
+                .expected_branch
+                .clone()
+                .ok_or_else(|| Error::PolicyViolation {
+                    code: PolicyCode::BranchMismatch,
+                    message: "mutating git commands require --expected-branch under supervisor"
+                        .to_owned(),
+                })?,
+        )
+    } else {
+        None
+    };
+    if let (Some(exp), Some(target)) = (
+        expected.as_deref(),
+        crate::git_safe::checkout_or_switch_target(&owned_args),
+    ) && target != exp
+        && target != "HEAD"
+    {
+        return Err(Error::PolicyViolation {
+            code: PolicyCode::BranchMismatch,
+            message: format!(
+                "git checkout/switch target `{target}` must equal --expected-branch `{exp}`"
+            ),
+        });
+    }
+    if let Some(exp) = expected.as_deref() {
+        crate::git_safe::reject_push_outside_expected_branch(&owned_args, exp)?;
+    }
+    // Always spawn PATH `git`, never a user-supplied path-qualified binary.
+    let repo = resolve_supervised_repo(options.repo.as_deref())?;
+    let branch_check = expected.map(|expected_branch| BranchCheck {
+        expected_branch,
+        repo: repo.clone(),
+    });
+    Ok(PreparedCommand {
+        program: "git".to_owned(),
+        args: owned_args,
+        cwd: Some(repo),
+        branch_check,
+    })
+}
+
+/// Prepare a supervised `gh` command: enforce argv/allowlist policy and, for
+/// mutating `gh pr` commands, require an expected branch and bind the effective
+/// repo selector (explicit `-R` or implicit `GH_REPO`) to the verified local
+/// origin before PATH-forcing the `gh` binary.
+fn prepare_gh_command(owned_args: Vec<String>, options: &RunOptions) -> Result<PreparedCommand> {
+    let allowlist = options
+        .allowlist
+        .clone()
+        .unwrap_or_else(OwnerAllowlist::from_env);
+    let _safe = SafeGhCommand::with_allowlist(&owned_args, &allowlist)?;
+    // Always spawn PATH `gh`, never a user-supplied path-qualified binary.
+    let (cwd, branch_check) = if crate::git_safe::gh_requires_branch_check(&owned_args) {
+        let expected = options
+            .expected_branch
+            .clone()
+            .ok_or_else(|| Error::PolicyViolation {
+                code: PolicyCode::BranchMismatch,
+                message: "mutating gh pr commands require --expected-branch under supervisor"
+                    .to_owned(),
+            })?;
+        let repo = resolve_supervised_repo(options.repo.as_deref())?;
+        // Bind the effective repo selector to the verified local checkout so jobs
+        // cannot mutate a different GitHub repository after the branch gate. An
+        // explicit `-R/--repo` wins; otherwise gh reads the implicit `GH_REPO`
+        // environment selector, so bind that too.
+        let env_selector = crate::git_safe::gh_repo_env_target();
+        let local = crate::git_safe::origin_github_slug(&repo)?;
+        crate::git_safe::bind_gh_repo_selector_to_origin(
+            &owned_args,
+            env_selector.as_deref(),
+            &local,
+        )?;
+        (
+            Some(repo.clone()),
+            Some(BranchCheck {
+                expected_branch: expected,
+                repo,
+            }),
+        )
+    } else {
+        (None, None)
+    };
+    Ok(PreparedCommand {
+        program: "gh".to_owned(),
+        args: owned_args,
+        cwd,
+        branch_check,
+    })
 }
 
 fn program_is_path_qualified(program: &str) -> bool {
