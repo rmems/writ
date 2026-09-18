@@ -146,6 +146,7 @@ impl WorktreeManager {
         validate_worktree_branch(branch)?;
         let base = self.base_path()?;
         validate_repo_root(request.repo_root)?;
+        bind_owner_to_origin(request.repo_root, request.owner)?;
 
         // Resolve the caller-selected start point before any mutation. Appending
         // ^{commit} rejects trees/blobs and peels annotated tags to commits.
@@ -378,6 +379,30 @@ fn validate_repo_root(repo_root: &Path) -> Result<()> {
         args: vec!["worktree".into(), "add".into()],
         stderr: format!("not a git repository: {}", repo_root.display()),
     })
+}
+
+/// Bind the caller-supplied owner to the repository's verified `origin` owner.
+///
+/// `enforce_owner` only proves the *requested* owner is on the allowlist; it does
+/// not prove the local repository at `repo_root` actually belongs to that owner. A
+/// caller could otherwise relabel an out-of-scope local checkout with any
+/// allowlisted owner and have the worktree created under it. Resolving `origin`
+/// and comparing owners closes that gap. Origin resolution failures fail closed
+/// (the error is propagated).
+fn bind_owner_to_origin(repo_root: &Path, requested_owner: &str) -> Result<()> {
+    let origin_slug = crate::git_safe::origin_github_slug(repo_root)?;
+    let origin_owner = crate::git_safe::github_owner_name(&origin_slug);
+    let requested = crate::git_safe::github_owner_name(requested_owner);
+    if origin_owner.is_none() || origin_owner != requested {
+        return Err(Error::PolicyViolation {
+            code: PolicyCode::OwnerNotAllowed,
+            message: format!(
+                "requested owner {:?} does not match repository origin owner (origin `{}`)",
+                requested_owner, origin_slug
+            ),
+        });
+    }
+    Ok(())
 }
 
 fn reject_unproven_resume(
@@ -875,6 +900,23 @@ mod tests {
             source: e,
         })?;
 
+        // A verified `origin` is required now that create binds the requested
+        // owner to the repository origin. Default to the `acme` owner the test
+        // harness allowlists; tests that need a different origin owner override
+        // this remote explicitly.
+        Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .arg("remote")
+            .arg("add")
+            .arg("origin")
+            .arg("https://github.com/acme/test-repo.git")
+            .output()
+            .map_err(|e| Error::Io {
+                context: "git remote add origin",
+                source: e,
+            })?;
+
         // Configure git for testing
         Command::new("git")
             .arg("-C")
@@ -1025,6 +1067,10 @@ mod tests {
             self.git(&["commit", "-m", message]);
             self.head()
         }
+
+        fn set_origin(&self, url: &str) {
+            self.git(&["remote", "set-url", "origin", url]);
+        }
     }
 
     fn assert_create_rejects_start_point_without_mutation(
@@ -1115,6 +1161,52 @@ mod tests {
                 .join("other/test-repo/job-denied")
                 .exists()
         );
+    }
+
+    #[test]
+    fn create_rejects_owner_not_matching_repo_origin_without_mutation() {
+        // `acme` is allowlisted, so enforce_owner passes, but the repository's
+        // verified origin belongs to `other`. Relabeling an out-of-scope local
+        // checkout with an allowlisted owner must be rejected.
+        let harness = Harness::sha1();
+        harness.set_origin("https://github.com/other/test-repo.git");
+        let start_commit = harness.head();
+        let result = harness.create(
+            "job-origin-mismatch",
+            "feature/origin-mismatch",
+            &start_commit,
+        );
+        assert!(
+            matches!(
+                result,
+                Err(Error::PolicyViolation {
+                    code: PolicyCode::OwnerNotAllowed,
+                    ..
+                })
+            ),
+            "expected OwnerNotAllowed for origin owner mismatch, got {result:?}"
+        );
+        assert!(
+            git_output(
+                &harness.repo_root,
+                &["branch", "--list", "feature/origin-mismatch"]
+            )
+            .trim()
+            .is_empty()
+        );
+        assert!(!harness.job_path("job-origin-mismatch").exists());
+    }
+
+    #[test]
+    fn create_accepts_owner_matching_repo_origin() {
+        // Explicit host/owner form on the origin still binds by owner identity.
+        let harness = Harness::sha1();
+        harness.set_origin("git@github.com:Acme/Renamed.git");
+        let start_commit = harness.head();
+        let wt = harness
+            .create("job-origin-match", "feature/origin-match", &start_commit)
+            .unwrap();
+        assert!(wt.path.exists());
     }
 
     #[test]

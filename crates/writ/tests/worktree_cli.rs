@@ -44,6 +44,17 @@ fn init_repo(root: &Path) -> PathBuf {
     git(&repo, &["init", "-b", "trunk"]);
     git(&repo, &["config", "user.email", "test@example.com"]);
     git(&repo, &["config", "user.name", "Test User"]);
+    // create binds the requested owner to the repository origin; the CLI tests
+    // request the `acme` owner, so the origin must belong to `acme`.
+    git(
+        &repo,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/acme/sample.git",
+        ],
+    );
     git(&repo, &["commit", "--allow-empty", "-m", "initial"]);
     repo
 }

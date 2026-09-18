@@ -539,19 +539,17 @@ fn prepare_supervised_command(
                                     .to_owned(),
                         })?;
                 let repo = resolve_supervised_repo(options.repo.as_deref())?;
-                // Bind `-R/--repo` to the verified local checkout so jobs cannot
-                // mutate a different GitHub repository after the branch gate.
-                if let Some(selector) = crate::git_safe::gh_repo_selector(&owned_args) {
-                    let local = crate::git_safe::origin_github_slug(&repo)?;
-                    if !crate::git_safe::github_repo_slugs_match(selector, &local) {
-                        return Err(Error::PolicyViolation {
-                            code: PolicyCode::PathNotAllowed,
-                            message: format!(
-                                "gh -R/--repo `{selector}` does not match verified origin `{local}`"
-                            ),
-                        });
-                    }
-                }
+                // Bind the effective repo selector to the verified local checkout
+                // so jobs cannot mutate a different GitHub repository after the
+                // branch gate. An explicit `-R/--repo` wins; otherwise gh reads
+                // the implicit `GH_REPO` environment selector, so bind that too.
+                let env_selector = crate::git_safe::gh_repo_env_target();
+                let local = crate::git_safe::origin_github_slug(&repo)?;
+                crate::git_safe::bind_gh_repo_selector_to_origin(
+                    &owned_args,
+                    env_selector.as_deref(),
+                    &local,
+                )?;
                 (
                     Some(repo.clone()),
                     Some(BranchCheck {

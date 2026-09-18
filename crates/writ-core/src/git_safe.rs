@@ -474,12 +474,85 @@ fn resolve_current_branch(repo_dir: &Path) -> Result<String> {
     Ok(branch)
 }
 
+/// `gh` options (beyond the repo selector) that consume the following argv token
+/// as their value in the separate-token spelling (`--flag value`).
+///
+/// This is used so the argv scanners can tell when a literal `--` is the *value*
+/// of a preceding value-taking option (e.g. `--template --`) rather than the
+/// end-of-options terminator. gh/pflag consumes that `--` as the option value and
+/// keeps parsing later flags, so a trailing `-R other/repo` would otherwise slip
+/// past a scanner that unconditionally stops at `--`.
+///
+/// Only the separate-token forms matter here: attached forms (`--flag=value`,
+/// `-tvalue`) carry their own value and never pull in the next token. The list is
+/// intentionally conservative; unknown flags are handled by the caller's
+/// fail-closed policy.
+const GH_VALUE_TAKING_OPTIONS: &[&str] = &[
+    "--template",
+    "-t",
+    "--json",
+    "-q",
+    "--jq",
+    "--limit",
+    "-L",
+    "--search",
+    "-S",
+    "--state",
+    "--label",
+    "--assignee",
+    "--author",
+    "--base",
+    "--head",
+    "--milestone",
+    "--project",
+    "--body",
+    "-b",
+    "--body-file",
+    "-F",
+    "--title",
+    "-T",
+    "--comment",
+];
+
+/// Whether `flag` consumes the following argv token as its value in the
+/// separate-token spelling. Repo selectors that expect a value (`-R`, `--repo`,
+/// clustered `-wR`) count too, so `-R --` is treated as `--` being the selector
+/// value rather than the options terminator.
+fn gh_flag_consumes_next_value(flag: &str, next: Option<&str>) -> bool {
+    if GH_VALUE_TAKING_OPTIONS.contains(&flag) {
+        return true;
+    }
+    matches!(gh_repo_flag(flag, next), Some((_, true)))
+}
+
+/// Whether the token at `args[idx]` is a `--` that a preceding value-taking
+/// option consumes as its value (so scanning must continue past it), rather than
+/// the end-of-options terminator.
+fn dashdash_is_option_value(args: &[String], idx: usize) -> bool {
+    if idx == 0 {
+        return false;
+    }
+    let prev = args[idx - 1].as_str();
+    // The previous token must itself be an option in separate-token form (no
+    // attached `=value`), otherwise it does not pull in this `--`.
+    if !prev.starts_with('-') || prev.contains('=') {
+        return false;
+    }
+    gh_flag_consumes_next_value(prev, Some("--"))
+}
+
 /// First non-flag positional argument, skipping common `gh` inherited options that take values.
 fn first_positional_after(args: &[String]) -> Option<&str> {
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
         if a == "--" {
+            // `--` consumed as a preceding option's value is not a terminator;
+            // keep scanning so a later positional/flag is still seen.
+            if dashdash_is_option_value(args, i) {
+                i += 1;
+                continue;
+            }
             return args.get(i + 1).map(String::as_str);
         }
         if a.starts_with('-') {
@@ -490,6 +563,12 @@ fn first_positional_after(args: &[String]) -> Option<&str> {
             }
             if let Some((_, consume_next)) = gh_repo_flag(a, args.get(i + 1).map(String::as_str)) {
                 i += if consume_next { 2 } else { 1 };
+                continue;
+            }
+            // Value-taking option in separate-token form: skip it and its value
+            // so the value (which may be `--`) is not mistaken for a terminator.
+            if GH_VALUE_TAKING_OPTIONS.contains(&a) {
+                i += 2;
                 continue;
             }
             return None;
@@ -652,6 +731,24 @@ fn clone_destination(args: &[String]) -> Option<&str> {
     }
 }
 
+/// `gh repo clone` options (beyond `-R`) that consume the following argv token as
+/// their value in separate-token form.
+const GH_REPO_CLONE_VALUE_OPTIONS: &[&str] = &["-u", "--upstream-remote-name"];
+
+/// Whether the token immediately before `args[idx]` is a `gh repo clone`
+/// value-taking option that consumes this token (here, a `--`) as its value.
+fn idx_prev_consumes_clone_value(args: &[String], idx: usize) -> bool {
+    if idx == 0 {
+        return false;
+    }
+    let prev = args[idx - 1].as_str();
+    if !prev.starts_with('-') || prev.contains('=') {
+        return false;
+    }
+    GH_REPO_CLONE_VALUE_OPTIONS.contains(&prev)
+        || matches!(gh_repo_flag(prev, Some("--")), Some((_, true)))
+}
+
 /// Destination directory of `gh repo clone <repository> [<directory>]`, if present.
 fn gh_repo_clone_destination(args: &[String]) -> Option<&str> {
     // args begin after top-level `repo` (caller passes &args[1..]).
@@ -682,12 +779,18 @@ fn gh_repo_clone_destination(args: &[String]) -> Option<&str> {
     while i < args.len() {
         let a = args[i].as_str();
         if a == "--" {
+            // A `--` consumed as the value of a preceding value-taking option is
+            // not the terminator; skip it and keep scanning for the destination.
+            if idx_prev_consumes_clone_value(args, i) {
+                i += 1;
+                continue;
+            }
             positionals.extend(args[i + 1..].iter().map(String::as_str));
             break;
         }
         if a.starts_with('-') {
             // Skip known value-taking options for gh repo clone.
-            if matches!(a, "-u" | "--upstream-remote-name" | "--") {
+            if matches!(a, "-u" | "--upstream-remote-name") {
                 i += 2;
                 continue;
             }
@@ -990,6 +1093,57 @@ fn reject_command_valued_config_assignment(kv: &str) -> Result<()> {
     Ok(())
 }
 
+/// The `GH_REPO` environment selector, if set to a non-empty value.
+///
+/// `gh` reads `GH_REPO` as an implicit `-R`/`--repo` for commands that operate on
+/// a repository. Exposed so the supervisor can bind it to the verified origin for
+/// mutating `gh pr` commands the same way an explicit `-R` is bound.
+#[must_use]
+pub fn gh_repo_env_target() -> Option<String> {
+    gh_repo_env_selector()
+}
+
+/// The repo selector `gh` will actually resolve for `args`: an explicit
+/// `-R`/`--repo` if present, otherwise the implicit `GH_REPO` selector.
+///
+/// The explicit selector always wins, matching `gh`'s precedence. Returns `None`
+/// when neither is present so the caller falls back to the working directory.
+#[must_use]
+pub fn effective_gh_repo_selector(args: &[String], env_selector: Option<&str>) -> Option<String> {
+    if let Some(explicit) = gh_repo_selector(args) {
+        return Some(explicit.to_owned());
+    }
+    env_selector
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+/// Reject a mutating `gh` command whose effective repo selector (explicit
+/// `-R`/`--repo` or implicit `GH_REPO`) does not match the verified local
+/// `origin` slug.
+///
+/// This is the origin binding the supervisor applies once the branch gate is
+/// satisfied. Extracting it keeps the explicit-`-R` and implicit-`GH_REPO` paths
+/// identical and unit-testable without mutating process environment.
+pub fn bind_gh_repo_selector_to_origin(
+    args: &[String],
+    env_selector: Option<&str>,
+    origin_slug: &str,
+) -> Result<()> {
+    if let Some(selector) = effective_gh_repo_selector(args, env_selector)
+        && !github_repo_slugs_match(&selector, origin_slug)
+    {
+        return Err(Error::PolicyViolation {
+            code: PolicyCode::PathNotAllowed,
+            message: format!(
+                "gh repo selector `{selector}` does not match verified origin `{origin_slug}`"
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Extract the last `-R` / `--repo` selector from a `gh` argv (including `pr` etc.).
 ///
 /// Accepts the pflag spellings `gh` 2.x actually parses: `-R value`, `-R=value`,
@@ -1007,15 +1161,28 @@ fn gh_repo_selectors(args: &[String]) -> Vec<&str> {
     while i < args.len() {
         let a = args[i].as_str();
         if a == "--" {
+            // A `--` that a preceding value-taking option consumes as its value
+            // is not the options terminator; gh keeps parsing, so a later
+            // `-R other/repo` must still be detected. Fail closed by continuing.
+            if dashdash_is_option_value(args, i) {
+                i += 1;
+                continue;
+            }
             break;
         }
-        match gh_repo_flag(a, args.get(i + 1).map(String::as_str)) {
-            Some((selector, consume_next)) => {
-                selectors.push(selector);
-                i += if consume_next { 2 } else { 1 };
-            }
-            None => i += 1,
+        if let Some((selector, consume_next)) = gh_repo_flag(a, args.get(i + 1).map(String::as_str))
+        {
+            selectors.push(selector);
+            i += if consume_next { 2 } else { 1 };
+            continue;
         }
+        // Skip a non-selector value-taking option together with its value so a
+        // `--` value cannot terminate scanning prematurely.
+        if a.starts_with('-') && !a.contains('=') && GH_VALUE_TAKING_OPTIONS.contains(&a) {
+            i += 2;
+            continue;
+        }
+        i += 1;
     }
     selectors
 }
@@ -1072,6 +1239,41 @@ fn gh_repo_env_selector() -> Option<String> {
         .filter(|value| !value.trim().is_empty())
 }
 
+/// Whether a parsed `gh` argv is a command that operates on a repository, so the
+/// `GH_REPO` environment selector applies to it.
+///
+/// Per `gh help environment`, `GH_REPO` only affects commands that otherwise
+/// operate on a local repository. Repository-independent commands such as
+/// `gh auth status`, `gh ssh-key ...`, `gh gist ...`, and global `secret` /
+/// `variable` / `label` forms ignore it. Applying the implicit check to those
+/// wrongly rejects them (e.g. `GH_REPO=other/repo writ gh-safe auth status`).
+///
+/// This is deliberately conservative and fail-closed: `pr`, `issue`, and
+/// non-clone `repo` subcommands are always treated as repository-context, and an
+/// unrecognized subcommand is also treated as repository-context so a new
+/// repo-affecting command is not silently exempted.
+fn gh_command_uses_repo_context(args: &[String]) -> bool {
+    let Some(subcommand) = args.first().map(String::as_str) else {
+        return false;
+    };
+    match subcommand {
+        // Never operate on a local repository; GH_REPO is irrelevant.
+        "auth" | "ssh-key" | "gist" => false,
+        // `repo clone` targets an explicit repository argument, not GH_REPO; the
+        // destination is validated separately. Other `repo` subcommands
+        // (view/edit/...) resolve against the current/selected repository.
+        "repo" => !matches!(first_positional_after(&args[1..]), Some("clone")),
+        // `pr` and `issue` always resolve a repository.
+        "pr" | "issue" => true,
+        // These have both repo-scoped and account/global forms. Fail closed and
+        // treat them as repo-context so GH_REPO is still bound rather than
+        // silently ignored for a repo-scoped invocation.
+        "secret" | "variable" | "label" | "release" | "workflow" | "browse" => true,
+        // Unknown/other allowlisted subcommands: fail closed.
+        _ => true,
+    }
+}
+
 fn enforce_gh_repo_targets(
     args: &[String],
     allowlist: &OwnerAllowlist,
@@ -1079,7 +1281,12 @@ fn enforce_gh_repo_targets(
 ) -> Result<()> {
     let selectors = gh_repo_selectors(args);
     if selectors.is_empty() {
-        if let Some(selector) = implicit_repo.filter(|value| !value.trim().is_empty()) {
+        // The implicit GH_REPO selector only applies to commands that actually
+        // consume repository context. Repository-independent commands like
+        // `gh auth status` must not be rejected just because GH_REPO is set.
+        if gh_command_uses_repo_context(args)
+            && let Some(selector) = implicit_repo.filter(|value| !value.trim().is_empty())
+        {
             allowlist.enforce_repo_selector(selector)?;
         }
         return Ok(());
@@ -2156,6 +2363,142 @@ mod tests {
             Some("github.com/Acme/Repo"),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn gh_repo_env_is_ignored_for_repository_independent_commands() {
+        // GH_REPO only affects commands that operate on a repository. A
+        // repository-independent command such as `gh auth status` must not be
+        // rejected just because GH_REPO points at some other repo.
+        let allowlist = crate::owners::OwnerAllowlist::from_owners(["acme"]);
+        for args in [
+            vec!["auth".to_owned(), "status".to_owned()],
+            vec!["ssh-key".to_owned(), "list".to_owned()],
+            vec!["gist".to_owned(), "list".to_owned()],
+        ] {
+            enforce_gh_repo_targets(&args, &allowlist, Some("other/repo"))
+                .unwrap_or_else(|e| panic!("expected {args:?} to be allowed, got {e:?}"));
+        }
+        // A repository-context command with the same GH_REPO is still enforced.
+        let err = enforce_gh_repo_targets(
+            &["pr".to_owned(), "view".to_owned(), "1".to_owned()],
+            &allowlist,
+            Some("other/repo"),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::OwnerNotAllowed,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn implicit_gh_repo_binds_to_origin_for_mutating_pr() {
+        // Mutating `gh pr` with no explicit -R but GH_REPO pointing at another
+        // repo must be rejected against the verified origin, mirroring -R.
+        let args = vec!["pr".to_owned(), "close".to_owned(), "1".to_owned()];
+        let err =
+            bind_gh_repo_selector_to_origin(&args, Some("other/repo"), "acme/repo").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::PolicyViolation {
+                    code: PolicyCode::PathNotAllowed,
+                    ..
+                }
+            ),
+            "expected PathNotAllowed for implicit GH_REPO mismatch, got {err:?}"
+        );
+        // A matching implicit selector is accepted.
+        bind_gh_repo_selector_to_origin(&args, Some("github.com/Acme/Repo"), "acme/repo").unwrap();
+        // No selector at all falls back to the working directory (accepted).
+        bind_gh_repo_selector_to_origin(&args, None, "acme/repo").unwrap();
+    }
+
+    #[test]
+    fn explicit_r_takes_precedence_over_gh_repo_env_for_binding() {
+        // An explicit -R wins over GH_REPO, and is bound to origin.
+        let args = vec![
+            "pr".to_owned(),
+            "close".to_owned(),
+            "-R".to_owned(),
+            "other/repo".to_owned(),
+            "1".to_owned(),
+        ];
+        assert_eq!(
+            effective_gh_repo_selector(&args, Some("acme/repo")).as_deref(),
+            Some("other/repo")
+        );
+        let err =
+            bind_gh_repo_selector_to_origin(&args, Some("acme/repo"), "acme/repo").unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::PathNotAllowed,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn gh_repo_selector_detects_r_after_dashdash_consumed_as_option_value() {
+        // `--template --` makes gh consume `--` as the template value, so gh
+        // keeps parsing and `-R other/repo` is still an active selector. The
+        // scanner must not treat that `--` as the options terminator.
+        let args = vec![
+            "pr".to_owned(),
+            "view".to_owned(),
+            "--template".to_owned(),
+            "--".to_owned(),
+            "-R".to_owned(),
+            "other/repo".to_owned(),
+        ];
+        assert_eq!(gh_repo_selector(&args), Some("other/repo"));
+
+        // And it must be enforced against the allowlist at the SafeGhCommand
+        // boundary rather than slipping through.
+        let allowlist = crate::owners::OwnerAllowlist::from_owners(["acme"]);
+        let err = SafeGhCommand::with_allowlist(&args, &allowlist).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::PolicyViolation {
+                    code: PolicyCode::OwnerNotAllowed,
+                    ..
+                }
+            ),
+            "expected OwnerNotAllowed for `-R other/repo` after `--template --`, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn gh_repo_selector_still_terminates_on_real_dashdash() {
+        // A bare `--` that is NOT an option value remains an end-of-options
+        // terminator, so a following `-R` is a positional and not a selector.
+        let args = vec![
+            "pr".to_owned(),
+            "view".to_owned(),
+            "--".to_owned(),
+            "-R".to_owned(),
+            "other/repo".to_owned(),
+        ];
+        assert_eq!(gh_repo_selector(&args), None);
+    }
+
+    #[test]
+    fn first_positional_after_skips_dashdash_consumed_as_option_value() {
+        // `-t --` consumes `--` as the `-t`/`--template` value; the real
+        // sub-subcommand `close` still follows and must be found.
+        let args = vec![
+            "-t".to_owned(),
+            "--".to_owned(),
+            "close".to_owned(),
+            "1".to_owned(),
+        ];
+        assert_eq!(first_positional_after(&args), Some("close"));
     }
 
     #[test]
