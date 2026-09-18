@@ -1,0 +1,9 @@
+crates/writ/tests/worktree_cli.rs
+  333cd4b9155a8551 707
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "550fbe925a25321776eb84a9fb2b44a907a29e0d",
+  "prompts": {}
+}
