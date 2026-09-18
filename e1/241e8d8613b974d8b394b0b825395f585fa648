@@ -1,0 +1,24 @@
+crates/writ-core/src/supervisor.rs
+  s_81caa774cffac4::t_8b8a0ed4ba5bd8 686,691
+  s_81caa774cffac4::t_52000f3900cca8 708,710-713
+  s_81caa774cffac4::t_143748ced340d1 741,744,746-750,753
+  s_81caa774cffac4::t_f544e6c774c9cd 762,765-770
+  s_81caa774cffac4::t_f203fadd33b06d 657,662
+  s_81caa774cffac4::t_80c7645a0faad5 602-605,610-615,624-629,639-654,656,658-661,669,675-678,681-683,685,687-690
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "e1241e8d8613b974d8b394b0b825395f585fa648",
+  "prompts": {},
+  "sessions": {
+    "s_81caa774cffac4": {
+      "agent_id": {
+        "tool": "cursor",
+        "id": "12226723-e525-41ca-ad4a-8d0ef9881119",
+        "model": "grok-4.6"
+      },
+      "human_author": "Raul Cardenas Montoya <montoyaraul34@gmail.com>"
+    }
+  }
+}
