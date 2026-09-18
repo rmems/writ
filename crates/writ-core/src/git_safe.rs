@@ -526,20 +526,70 @@ const GH_VALUE_TAKING_OPTIONS: &[&str] = &[
     "--comment",
 ];
 
-/// Whether `flag` consumes the following argv token as its value in the
-/// separate-token spelling. Repo selectors that expect a value (`-R`, `--repo`,
-/// clustered `-wR`) count too, so `-R --` is treated as `--` being the selector
-/// value rather than the options terminator.
-fn gh_flag_consumes_next_value(flag: &str, next: Option<&str>) -> bool {
+/// `gh` boolean (non-value-taking) flags whose separate-token form does NOT
+/// consume the following argv token. When one of these immediately precedes a
+/// literal `--`, that `--` is genuinely the end-of-options terminator.
+///
+/// This list underpins the fail-closed arity decision in
+/// [`separate_token_option_may_consume_dashdash`]: only when the preceding option
+/// is *known* to be boolean can we be certain the `--` terminates options. Any
+/// other separate-token option (recognized value-taking, a repo selector, or an
+/// unrecognized one) is treated conservatively as possibly consuming the `--`, so
+/// a later `-R other/repo` is never skipped. Keeping this list to well-known
+/// flags is safe: an omission here only makes the scanner *more* conservative
+/// (it keeps scanning), never less.
+///
+/// Only unambiguous long-form booleans are listed. Short forms are deliberately
+/// excluded because a single letter is frequently overloaded across subcommands
+/// (e.g. `-c` is `--comment` for `gh pr close` but `--comments` for `gh pr view`,
+/// and `-d` is `--draft` for create but `--delete-branch`/other elsewhere).
+/// Treating any short form as boolean here would risk failing open, so short
+/// forms fall through to the conservative "may consume `--`" branch.
+const GH_KNOWN_BOOLEAN_FLAGS: &[&str] = &[
+    "--help",
+    "--web",
+    "--comments",
+    "--draft",
+    "--fill",
+    "--fill-first",
+    "--fill-verbose",
+    "--no-maintainer-edit",
+    "--delete-branch",
+    "--dry-run",
+    "--merged",
+    "--closed",
+];
+
+/// Whether a separate-token option `flag` may consume the following argv token as
+/// its value (fail-closed). Repo selectors that expect a value (`-R`, `--repo`,
+/// clustered `-wR`) and the known value-taking options consume it; a *known*
+/// boolean flag does not; and any *unrecognized* separate-token option is treated
+/// conservatively as if it might, so `<unknown-opt> -- -R other/repo` never lets
+/// the trailing selector slip past a scanner that stops at `--`.
+fn separate_token_option_may_consume_dashdash(flag: &str) -> bool {
     if GH_VALUE_TAKING_OPTIONS.contains(&flag) {
         return true;
     }
-    matches!(gh_repo_flag(flag, next), Some((_, true)))
+    if matches!(gh_repo_flag(flag, Some("--")), Some((_, true))) {
+        return true;
+    }
+    // Known boolean flag: `--` after it is a real terminator.
+    if GH_KNOWN_BOOLEAN_FLAGS.contains(&flag) {
+        return false;
+    }
+    // Unrecognized separate-token option: fail closed, assume it may take `--` as
+    // its value so the scanner keeps looking for a later repo selector.
+    true
 }
 
-/// Whether the token at `args[idx]` is a `--` that a preceding value-taking
-/// option consumes as its value (so scanning must continue past it), rather than
-/// the end-of-options terminator.
+/// Whether the token at `args[idx]` is a `--` that a preceding option consumes as
+/// its value (so scanning must continue past it), rather than the end-of-options
+/// terminator.
+///
+/// Fails closed: a `--` preceded by any separate-token option that is not a known
+/// boolean flag is treated as that option's value, so a later `-R other/repo` is
+/// still detected and enforced. Only a bare positional or a known boolean flag
+/// immediately before `--` makes it a genuine terminator.
 fn dashdash_is_option_value(args: &[String], idx: usize) -> bool {
     if idx == 0 {
         return false;
@@ -550,7 +600,7 @@ fn dashdash_is_option_value(args: &[String], idx: usize) -> bool {
     if !prev.starts_with('-') || prev.contains('=') {
         return false;
     }
-    gh_flag_consumes_next_value(prev, Some("--"))
+    separate_token_option_may_consume_dashdash(prev)
 }
 
 /// One step of the `first_positional_after` argv scan.
@@ -761,8 +811,14 @@ fn clone_destination(args: &[String]) -> Option<&str> {
 /// their value in separate-token form.
 const GH_REPO_CLONE_VALUE_OPTIONS: &[&str] = &["-u", "--upstream-remote-name"];
 
-/// Whether the token immediately before `args[idx]` is a `gh repo clone`
-/// value-taking option that consumes this token (here, a `--`) as its value.
+/// Whether the token immediately before `args[idx]` is an option that consumes
+/// this token (here, a `--`) as its value for `gh repo clone` scanning.
+///
+/// Fails closed the same way [`dashdash_is_option_value`] does: the `gh repo
+/// clone` value-taking options and repo selectors consume it, a known boolean
+/// flag does not, and any unrecognized separate-token option is treated
+/// conservatively as consuming it so a `--`-hidden destination or later selector
+/// is not skipped.
 fn idx_prev_consumes_clone_value(args: &[String], idx: usize) -> bool {
     if idx == 0 {
         return false;
@@ -771,8 +827,10 @@ fn idx_prev_consumes_clone_value(args: &[String], idx: usize) -> bool {
     if !prev.starts_with('-') || prev.contains('=') {
         return false;
     }
-    GH_REPO_CLONE_VALUE_OPTIONS.contains(&prev)
-        || matches!(gh_repo_flag(prev, Some("--")), Some((_, true)))
+    if GH_REPO_CLONE_VALUE_OPTIONS.contains(&prev) {
+        return true;
+    }
+    separate_token_option_may_consume_dashdash(prev)
 }
 
 /// Locate the index just past the `clone` token in `gh repo …` argv (caller
@@ -2509,12 +2567,65 @@ mod tests {
     }
 
     #[test]
+    fn gh_repo_selector_detects_r_after_dashdash_following_unlisted_value_option() {
+        // Regression for the residual bypass: `-c` is the short form of
+        // `--comment` (`gh pr close`) and is NOT in GH_VALUE_TAKING_OPTIONS, yet
+        // gh consumes the trailing `--` as its value and keeps parsing, so
+        // `-R other/repo` stays an active selector. The fail-closed arity logic
+        // must still detect and enforce it; keying only off the hand-maintained
+        // value-option list (the pre-fix behavior) would miss it entirely.
+        let args = vec![
+            "pr".to_owned(),
+            "close".to_owned(),
+            "1".to_owned(),
+            "-c".to_owned(),
+            "--".to_owned(),
+            "-R".to_owned(),
+            "other/repo".to_owned(),
+        ];
+        assert_eq!(
+            gh_repo_selector(&args),
+            Some("other/repo"),
+            "`-R other/repo` after `-c --` must still be detected"
+        );
+
+        let allowlist = crate::owners::OwnerAllowlist::from_owners(["acme"]);
+        let err = SafeGhCommand::with_allowlist(&args, &allowlist).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::PolicyViolation {
+                    code: PolicyCode::OwnerNotAllowed,
+                    ..
+                }
+            ),
+            "expected OwnerNotAllowed for `-R other/repo` after `-c --`, got {err:?}"
+        );
+    }
+
+    #[test]
     fn gh_repo_selector_still_terminates_on_real_dashdash() {
         // A bare `--` that is NOT an option value remains an end-of-options
         // terminator, so a following `-R` is a positional and not a selector.
         let args = vec![
             "pr".to_owned(),
             "view".to_owned(),
+            "--".to_owned(),
+            "-R".to_owned(),
+            "other/repo".to_owned(),
+        ];
+        assert_eq!(gh_repo_selector(&args), None);
+    }
+
+    #[test]
+    fn gh_repo_selector_terminates_on_dashdash_after_known_boolean_flag() {
+        // `--web` is a known boolean flag, so it does NOT consume the following
+        // `--`; that `--` is a genuine terminator and the trailing `-R` is a
+        // positional operand to gh, not an active selector.
+        let args = vec![
+            "pr".to_owned(),
+            "view".to_owned(),
+            "--web".to_owned(),
             "--".to_owned(),
             "-R".to_owned(),
             "other/repo".to_owned(),
