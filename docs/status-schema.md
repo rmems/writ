@@ -64,6 +64,10 @@ Each entry in the `jobs` array has these fields:
 | `process_state` | `ProcessState` | no | Lifecycle state of the job process. |
 | `last_error` | `string` | yes | Last error message if the job failed. Omitted when absent. |
 | `ci_class` | `CiClass` | no | CI classification for the job's head commit. |
+| `timeout_class` | `TimeoutClass` | yes | Stuck class when `process_state` is `timed_out`. Omitted when absent. Values: `hard`, `idle`, `lost_child`, `redispatch_exhausted`. |
+| `residual_blockers` | `string[]` | yes | Structured leftovers (e.g. `timeout:hard`). Omitted when empty. |
+| `redispatch_count` | `u32` | yes | Completed terminal runs (harness-owned). Supervisor runs always report `0` internally. |
+| `fix_count` | `u32` | yes | Successful fix attempts. Timeout residuals must not increment this. |
 
 ## `ProcessState` enum
 
@@ -76,6 +80,7 @@ Serialized as a lowercase snake_case string.
 | `completed` | Job finished successfully. |
 | `failed` | Job terminated with an error. |
 | `cancelled` | Job was cancelled by the operator. |
+| `timed_out` | Supervisor hang recovery (hard/idle/lost-child). See `timeout_class`. |
 
 ## `CiClass` enum
 

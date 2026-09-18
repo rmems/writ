@@ -88,6 +88,10 @@ SAFETY RULES (non-negotiable):
 
 Worker prompts remain strictly non-merging. Do not forward the primary agent's merge authorization to a worker or subagent.
 
+### Timeouts and hang recovery
+
+Long-running supervised commands use `writ supervisor run` with the named policy in [`docs/timeout-policy.md`](docs/timeout-policy.md). The supervisor kills hung children (hard/idle/lost-child) and never retries, merges, or bare-force-pushes. Harness re-dispatch is capped by `max_redispatch_per_item` (default 1). Timeout residuals do not increment `fix_count`.
+
 ### Enforcement routing
 
 This skill is portable procedure, not a security boundary. Route orchestrated

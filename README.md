@@ -198,7 +198,7 @@ Implemented `writ` surface (`writ --help` is authoritative):
 | `writ status` / `writ jobs` | Implemented (read-only) | Show watched jobs. Empty unless an external process wrote the state file. See [`docs/status-schema.md`](docs/status-schema.md). |
 | `writ git-safe …` | Implemented | Run a git command after the allowlist and, for mutations, expected-branch checks. |
 | `writ gh-safe …` | Implemented | Run a `gh` command after the allowlist. Merge operations are rejected. |
-| `writ supervisor run --timeout <secs> …` | Implemented | Spawn a child with wall-clock timeout. Unix kills the process group; Windows kills only the direct child (grandchildren may survive). |
+| `writ supervisor run --timeout <secs> …` | Implemented | Spawn a child with wall-clock, idle, and grace recovery (`--idle`, `--grace`, `--progress-secs`; see [`docs/timeout-policy.md`](docs/timeout-policy.md)). Unix SIGTERM-then-SIGKILL on the process group; Windows kills only the direct child (grandchildren may survive). |
 | `writ worktree create\|list\|remove\|prune` | Implemented | Isolated worktree lifecycle. `create` requires `--schema-version 2` and `--start-point`. |
 | `writ --json` | Implemented | Version-1 JSON envelopes on stdout; diagnostics on stderr. Fixtures: [`docs/examples/`](docs/examples/). |
 | `writ install` / hook dispatcher | **Planned (M1)** | Register unbypassable hooks. Not a command today. |
@@ -352,7 +352,6 @@ criteria checkboxes, and the Linear footer documented in
 - Planning mirror: [Linear `worktrees-hives` project](https://linear.app/rpd-34/project/worktrees-hives-e3052de4caa3) (this issue: [RM-118](https://linear.app/rpd-34/issue/RM-118/expand-readme-install-commands-architecture))
 
 Milestone groups from the epic: **M1** hook enforcement + minimal lease store; **M2** rename (landed); **M3** cross-repo lease/state + MCP; **M4** path-scoped admission.
->>>>>>> main
 
 ## Project documentation
 
@@ -365,6 +364,7 @@ Milestone groups from the epic: **M1** hook enforcement + minimal lease store; *
 - [`docs/workflows/safe-issue-verified-commit.md`](docs/workflows/safe-issue-verified-commit.md) — issue → verified push
 - [`docs/workflows/safe-verified-commit-to-pr.md`](docs/workflows/safe-verified-commit-to-pr.md) — verified push → PR handoff (never merges)
 - [`docs/status-schema.md`](docs/status-schema.md) — `status` / `jobs` JSON
+- [`docs/timeout-policy.md`](docs/timeout-policy.md) — supervisor hang recovery (hard/idle/lost-child, grace kill, redispatch budget)
 - [`docs/examples/`](docs/examples/) — captured response envelopes
 
 ## License

@@ -23,6 +23,7 @@ All of them, under `--json`:
 | `status` / `jobs` | `cli.status` / `cli.jobs` |
 | `git-safe` / `gh-safe` | `git.safe` / `gh.safe` |
 | `worktree create\|list\|remove\|prune` | `worktree.create` etc. |
+| `supervisor run` | `supervisor.run` (also `--idle`, `--grace`, `--progress-secs`; see [timeout-policy.md](../timeout-policy.md)) |
 | `install` | `cli.install` |
 | `hook` | no envelope: PreToolUse is allow/block via exit code; WorktreeCreate prints the worktree path |
 
