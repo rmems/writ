@@ -1,5 +1,5 @@
-use std::io::{self, Write};
-use std::path::PathBuf;
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -63,6 +63,19 @@ enum Command {
     Watchlist {
         #[command(subcommand)]
         action: WatchlistAction,
+    },
+
+    /// Dispatch a Claude Code hook event from JSON on stdin.
+    Hook,
+
+    /// Idempotently write the writ hook block into Claude Code settings.
+    Install {
+        /// Settings file to update (default: `.claude/settings.json` in the current directory).
+        #[arg(long)]
+        settings: Option<PathBuf>,
+        /// Executable the hook should invoke (default: `WRIT_BIN`, then `writ` on `PATH`).
+        #[arg(long)]
+        writ_bin: Option<PathBuf>,
     },
 }
 
@@ -173,6 +186,15 @@ enum WorktreeAction {
         /// Commit or ref required by v2 for exact-base branch creation.
         #[arg(long)]
         start_point: Option<String>,
+        /// GitHub pull request number whose `refs/pull/<n>/head` is imported from origin.
+        #[arg(long)]
+        pr_number: Option<u64>,
+        /// Named remote bound to the base repository (must be `origin` when set).
+        #[arg(long)]
+        source_remote: Option<String>,
+        /// Fork `owner/repo` identity. Never used as fetch or checkout authority.
+        #[arg(long)]
+        head_repo: Option<String>,
         /// Boundary schema: v1 returns an upgrade error; select v2 to create.
         #[arg(
             long,
@@ -257,6 +279,54 @@ async fn main() -> ExitCode {
     }
 }
 
+struct WorktreeResidual<'a> {
+    path: &'a Path,
+    branch: &'a str,
+    path_exists: bool,
+    branch_commit: &'a Option<String>,
+    head_commit: &'a Option<String>,
+    worktree_registered: bool,
+}
+
+macro_rules! worktree_residual {
+    ($failure:expr) => {
+        WorktreeResidual {
+            path: &$failure.path,
+            branch: &$failure.branch,
+            path_exists: $failure.path_exists,
+            branch_commit: &$failure.branch_commit,
+            head_commit: &$failure.head_commit,
+            worktree_registered: $failure.worktree_registered,
+        }
+    };
+}
+
+fn worktree_residual_json(
+    residual: WorktreeResidual<'_>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut map = serde_json::Map::new();
+    map.insert("path".to_owned(), serde_json::json!(residual.path));
+    map.insert("branch".to_owned(), serde_json::json!(residual.branch));
+    map.insert(
+        "path_exists".to_owned(),
+        serde_json::json!(residual.path_exists),
+    );
+    map.insert(
+        "branch_commit".to_owned(),
+        serde_json::json!(residual.branch_commit),
+    );
+    map.insert(
+        "head_commit".to_owned(),
+        serde_json::json!(residual.head_commit),
+    );
+    map.insert(
+        "worktree_registered".to_owned(),
+        serde_json::json!(residual.worktree_registered),
+    );
+    map.insert("cleanup_performed".to_owned(), serde_json::json!(false));
+    map
+}
+
 fn worktree_error_data(error: &writ_core::error::Error) -> serde_json::Value {
     match error {
         writ_core::error::Error::ContractUpgradeRequired {
@@ -265,51 +335,63 @@ fn worktree_error_data(error: &writ_core::error::Error) -> serde_json::Value {
             "required_schema_version": required_schema_version,
         }),
         writ_core::error::Error::WorktreeCreationFailed(failure) => {
-            let writ_core::error::WorktreeCreationFailure {
-                path,
-                branch,
-                path_exists,
-                branch_commit,
-                head_commit,
-                worktree_registered,
-                ..
-            } = failure.as_ref();
-            serde_json::json!({
-            "path": path,
-            "branch": branch,
-            "path_exists": path_exists,
-            "branch_commit": branch_commit,
-            "head_commit": head_commit,
-            "worktree_registered": worktree_registered,
-            "cleanup_performed": false,
-            })
+            serde_json::Value::Object(worktree_residual_json(worktree_residual!(failure)))
         }
+        writ_core::error::Error::AmbiguousStartPoint {
+            start_point,
+            refs,
+            git_warning,
+        } => serde_json::json!({
+            "start_point": start_point,
+            "refs": refs.iter().map(|colliding| serde_json::json!({
+                "refname": colliding.refname,
+                "commit": colliding.commit,
+            })).collect::<Vec<_>>(),
+            "git_warning": git_warning,
+        }),
         writ_core::error::Error::WorktreePostconditionFailed(failure) => {
-            let writ_core::error::WorktreePostconditionFailure {
-                path,
-                branch,
-                expected_commit,
-                actual_branch,
-                path_exists,
-                branch_commit,
-                head_commit,
-                worktree_registered,
-                ..
-            } = failure.as_ref();
-            serde_json::json!({
-            "path": path,
-            "branch": branch,
-            "expected_commit": expected_commit,
-            "actual_branch": actual_branch,
-            "path_exists": path_exists,
-            "branch_commit": branch_commit,
-            "head_commit": head_commit,
-            "worktree_registered": worktree_registered,
-            "cleanup_performed": false,
-            })
+            postcondition_failure_data(failure)
         }
+        writ_core::error::Error::PrImportFailed(failure) => import_failure_data(failure),
         _ => serde_json::json!({}),
     }
+}
+
+fn postcondition_failure_data(
+    failure: &writ_core::error::WorktreePostconditionFailure,
+) -> serde_json::Value {
+    let mut map = worktree_residual_json(worktree_residual!(failure));
+    map.insert(
+        "expected_commit".to_owned(),
+        serde_json::json!(&failure.expected_commit),
+    );
+    map.insert(
+        "actual_branch".to_owned(),
+        serde_json::json!(&failure.actual_branch),
+    );
+    serde_json::Value::Object(map)
+}
+
+fn import_failure_data(failure: &writ_core::error::PrImportFailure) -> serde_json::Value {
+    let writ_core::error::PrImportFailure {
+        expected_commit,
+        source_remote,
+        source_ref,
+        import_ref,
+        imported_commit,
+        import_ref_exists,
+        cleanup_performed,
+        ..
+    } = failure;
+    serde_json::json!({
+        "expected_commit": expected_commit,
+        "source_remote": source_remote,
+        "source_ref": source_ref,
+        "import_ref": import_ref,
+        "imported_commit": imported_commit,
+        "import_ref_exists": import_ref_exists,
+        "cleanup_performed": cleanup_performed,
+    })
 }
 
 fn worktree_schema_version(cli: &Cli) -> u8 {
@@ -337,47 +419,10 @@ fn worktree_response(
     action: WorktreeAction,
 ) -> writ_core::error::Result<writ_core::contract::Response<serde_json::Value>> {
     use writ_core::contract::Response;
-    use writ_core::worktree::{WorktreeCreateRequest, WorktreeManager};
+    use writ_core::worktree::WorktreeManager;
 
     match action {
-        WorktreeAction::Create {
-            repo,
-            owner,
-            repo_name,
-            job_id,
-            branch,
-            start_point,
-            schema_version,
-        } => {
-            if schema_version == writ_core::contract::SCHEMA_VERSION {
-                return Err(writ_core::error::Error::ContractUpgradeRequired {
-                    required_schema_version: writ_core::contract::EXACT_BASE_SCHEMA_VERSION,
-                });
-            }
-            let start_point = start_point.ok_or(writ_core::error::Error::StartPointRequired)?;
-            let manager = WorktreeManager::new()?;
-            let wt = manager.create_with_request(WorktreeCreateRequest {
-                repo_root: &repo,
-                owner: &owner,
-                repo: &repo_name,
-                job_id: &job_id,
-                branch: &branch,
-                start_point: &start_point,
-            })?;
-            Ok(Response::success_with_schema(
-                "worktree.create",
-                serde_json::json!({
-                    "path": wt.path,
-                    "branch": wt.branch,
-                    "branch_ref": format!("refs/heads/{}", wt.branch),
-                    "repo_root": wt.repo_root,
-                    "start_commit": wt.start_commit,
-                    "head_commit": wt.head_commit,
-                    "worktree_registered": true,
-                }),
-                schema_version,
-            ))
-        }
+        create @ WorktreeAction::Create { .. } => worktree_create_response(create),
         WorktreeAction::List => {
             let manager = WorktreeManager::new()?;
             let worktrees = manager.list()?;
@@ -407,6 +452,60 @@ fn worktree_response(
     }
 }
 
+fn worktree_create_response(
+    action: WorktreeAction,
+) -> writ_core::error::Result<writ_core::contract::Response<serde_json::Value>> {
+    use writ_core::contract::Response;
+    use writ_core::worktree::{WorktreeCreateRequest, WorktreeManager};
+
+    let WorktreeAction::Create {
+        repo,
+        owner,
+        repo_name,
+        job_id,
+        branch,
+        start_point,
+        pr_number,
+        source_remote,
+        head_repo,
+        schema_version,
+    } = action
+    else {
+        unreachable!("worktree_create_response requires Create");
+    };
+    if schema_version == writ_core::contract::SCHEMA_VERSION {
+        return Err(writ_core::error::Error::ContractUpgradeRequired {
+            required_schema_version: writ_core::contract::EXACT_BASE_SCHEMA_VERSION,
+        });
+    }
+    let start_point = start_point.ok_or(writ_core::error::Error::StartPointRequired)?;
+    let manager = WorktreeManager::new()?;
+    let wt = manager.create_with_request(WorktreeCreateRequest {
+        repo_root: &repo,
+        owner: &owner,
+        repo: &repo_name,
+        job_id: &job_id,
+        branch: &branch,
+        start_point: &start_point,
+        pr_number,
+        source_remote: source_remote.as_deref(),
+        head_repo: head_repo.as_deref(),
+    })?;
+    Ok(Response::success_with_schema(
+        "worktree.create",
+        serde_json::json!({
+            "path": wt.path,
+            "branch": wt.branch,
+            "branch_ref": format!("refs/heads/{}", wt.branch),
+            "repo_root": wt.repo_root,
+            "start_commit": wt.start_commit,
+            "head_commit": wt.head_commit,
+            "worktree_registered": true,
+        }),
+        schema_version,
+    ))
+}
+
 fn run_worktree(
     action: WorktreeAction,
     json: bool,
@@ -415,12 +514,83 @@ fn run_worktree(
     let response = worktree_response(action)?;
 
     if json {
-        serde_json::to_writer(&mut *stdout, &response).map_err(io::Error::other)?;
-        stdout.write_all(b"\n")?;
+        write_json_line(stdout, &response)?;
     } else {
         writeln!(stdout, "ok={} command={}", response.ok, response.command)?;
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn run_hook(stdout: &mut impl Write) -> writ_core::error::Result<ExitCode> {
+    let mut input = String::new();
+    io::stdin().read_to_string(&mut input)?;
+    let code = writ_core::hook::dispatch(
+        &input,
+        &writ_core::hook::HookRuntime::default(),
+        stdout,
+        &mut io::stderr(),
+    );
+    Ok(ExitCode::from(code))
+}
+
+fn run_install(
+    settings: Option<PathBuf>,
+    writ_bin: Option<PathBuf>,
+    json: bool,
+    stdout: &mut impl Write,
+) -> writ_core::error::Result<ExitCode> {
+    let settings = settings.unwrap_or_else(|| PathBuf::from(".claude/settings.json"));
+    let command = writ_command(writ_bin);
+    let result =
+        writ_core::install::install_settings(&settings, writ_core::install::WritCommand(&command))?;
+    emit_install_output(json, stdout, &result, &command)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+fn emit_install_output(
+    json: bool,
+    stdout: &mut impl Write,
+    result: &writ_core::install::InstallResult,
+    command: &str,
+) -> io::Result<()> {
+    if json {
+        let response = writ_core::contract::Response::success(
+            "cli.install",
+            serde_json::json!({
+                "path": result.path,
+                "changed": result.changed,
+                "command": command,
+            }),
+        );
+        return write_json_line(stdout, &response);
+    }
+    writeln!(
+        stdout,
+        "install {} settings {}",
+        if result.changed {
+            "updated"
+        } else {
+            "unchanged"
+        },
+        result.path.display()
+    )
+}
+
+fn write_json_line(stdout: &mut impl Write, value: &impl serde::Serialize) -> io::Result<()> {
+    serde_json::to_writer(&mut *stdout, value).map_err(io::Error::other)?;
+    stdout.write_all(b"\n")
+}
+
+fn writ_command(writ_bin: Option<PathBuf>) -> String {
+    if let Some(path) = writ_bin {
+        return path.to_string_lossy().into_owned();
+    }
+    if let Some(path) = std::env::var_os("WRIT_BIN")
+        && !path.is_empty()
+    {
+        return path.to_string_lossy().into_owned();
+    }
+    "writ".to_owned()
 }
 
 /// Entry point for CLI commands (status/jobs, git/gh-safe, supervisor, worktree).
@@ -468,6 +638,10 @@ async fn run(cli: Cli, stdout: &mut impl Write) -> writ_core::error::Result<Exit
         Some(Command::Worktree { action }) => run_worktree(action, cli.json, stdout),
         Some(Command::Watchlist { action }) => {
             watchlist::run(action, cli.json, stdout).map_err(Into::into)
+        }
+        Some(Command::Hook) => run_hook(stdout),
+        Some(Command::Install { settings, writ_bin }) => {
+            run_install(settings, writ_bin, cli.json, stdout)
         }
         None => {
             if cli.json {
@@ -834,6 +1008,45 @@ mod tests {
         };
         assert_eq!(start_point.as_deref(), Some("origin/trunk"));
         assert_eq!(schema_version, 2);
+    }
+
+    #[test]
+    fn worktree_create_parser_accepts_pr_import_identity() {
+        let with_pr = Cli::try_parse_from([
+            "writ",
+            "worktree",
+            "create",
+            "--schema-version",
+            "2",
+            "--repo",
+            ".",
+            "--start-point",
+            "0123456789abcdef0123456789abcdef01234567",
+            "--pr-number",
+            "42",
+            "--head-repo",
+            "acme/fork",
+            "acme",
+            "repo",
+            "job",
+            "branch",
+        ])
+        .unwrap();
+        let Some(super::Command::Worktree {
+            action:
+                super::WorktreeAction::Create {
+                    pr_number,
+                    head_repo,
+                    source_remote,
+                    ..
+                },
+        }) = with_pr.command
+        else {
+            panic!("expected worktree create command with PR identity")
+        };
+        assert_eq!(pr_number, Some(42));
+        assert_eq!(head_repo.as_deref(), Some("acme/fork"));
+        assert_eq!(source_remote.as_deref(), None);
     }
 
     #[tokio::test]

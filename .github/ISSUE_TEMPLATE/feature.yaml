@@ -1,58 +1,66 @@
-name: Feature request or new functionality
-description: Suggest a capability for the Rust enforcement core or the agent skill
-labels: ["platform"]
+name: Feature
+description: New skill, CLI, or enforcement capability
+title: "[Feature]: "
 body:
   - type: markdown
     attributes:
       value: |
-        ## Feature request
+        Use this template for a new `writ` capability. Keep the write-up short
+        enough that a worker can act without a second round trip. Use only the
+        canonical labels in CONTRIBUTING.md. Runtime merge, auto-merge, merge
+        queues, and bare `--force` are forbidden.
 
-        `writ` is the enforcement and admission-control layer for coding-agent
-        fleets. It blocks unsafe git mutations at the boundary, leases worktrees it
-        did not create, and never merges. Keep descriptions concise so a subagent
-        can act on them without a second round trip.
-
-  - type: input
-    id: feature-title
+  - type: textarea
+    id: summary
     attributes:
-      label: Feature name or short title
-      description: One-line summary of the new capability.
-      placeholder: 'e.g. "Reject ambiguous unqualified start-point refs"'
+      label: Summary
+      description: One or two sentences. This is what workers treat as the title-level intent.
+      placeholder: Reject ambiguous unqualified start-point refs during worktree create.
     validations:
       required: true
 
   - type: textarea
-    id: why-needed
+    id: problem-context
     attributes:
-      label: Why is this necessary? What does it solve?
-      description: Use cases, what is blocked without it, and how it improves reliability or safety.
-      placeholder: "Exact-base resolution accepts an ambiguous refname, so a worker can be created from a same-named tag when the caller meant the branch..."
+      label: Problem / context
+      description: What is blocked today, who hits it, and why a new capability is the right fix.
+      placeholder: Exact-base resolution accepts an ambiguous refname, so a worker can start from a same-named tag.
     validations:
       required: true
 
   - type: textarea
-    id: specs-or-refs
+    id: acceptance
     attributes:
-      label: Design notes or linked issue (optional)
-      description: |
-        Constraints and expected behaviour. Link the GitHub issue, or the Linear
-        twin under project `worktrees-hives` — the Linear project keeps its
-        original name; only the GitHub repository was renamed to `writ`.
+      label: Acceptance criteria
+      description: Checkboxes workers parse as the Done bar. Add or delete rows as needed.
+      value: |
+        - [ ]
+        - [ ]
+        - [ ]
+    validations:
+      required: true
 
-  - type: textarea
-    id: test-plan
+  - type: dropdown
+    id: canonical-label
     attributes:
-      label: How would this be verified? (optional for docs-only changes)
-      description: |
-        Name the check that would fail before and pass after. Native gates are
-        canonical: `cargo fmt`, `cargo clippy -D warnings`, `cargo test`.
-        External analyzers are advisory until a finding is reproduced.
-
-  - type: checkboxes
-    id: safety
-    attributes:
-      label: Non-negotiable safety rules
-      description: See AGENTS.md for the authoritative contract.
+      label: Canonical label
+      description: Apply this same GitHub label on the issue. Do not invent a new name.
       options:
-        - label: This does not introduce a merge path, auto-merge, or merge queue, and does not require a bare `--force` push
-          required: true
+        - core
+        - orchestrator
+        - platform
+        - safety
+        - docs
+        - epic
+    validations:
+      required: true
+
+  - type: textarea
+    id: linear
+    attributes:
+      label: Linear
+      description: Planning twin. Keep this footer even when no twin exists yet; replace the placeholders when it does.
+      value: |
+        Linear: <url> (`RM-N`)
+    validations:
+      required: true
