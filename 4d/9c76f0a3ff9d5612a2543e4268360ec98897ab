@@ -1,0 +1,25 @@
+crates/writ/tests/hook_cli.rs
+  s_81caa774cffac4::t_180969a43bf9fb 139,141-161
+README.md
+  s_81caa774cffac4::t_68a5aee4036616 368
+crates/writ-core/src/git_safe.rs
+  s_81caa774cffac4::t_dba0a97e8e44ba 2116-2133
+docs/hook-boundary.md
+  s_81caa774cffac4::t_0e96a218b30cd7 14
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "4d9c76f0a3ff9d5612a2543e4268360ec98897ab",
+  "prompts": {},
+  "sessions": {
+    "s_81caa774cffac4": {
+      "agent_id": {
+        "tool": "cursor",
+        "id": "12226723-e525-41ca-ad4a-8d0ef9881119",
+        "model": "grok-4.6"
+      },
+      "human_author": "Raul Cardenas Montoya <montoyaraul34@gmail.com>"
+    }
+  }
+}
