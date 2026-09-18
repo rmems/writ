@@ -32,6 +32,19 @@ fn writ(args: &[&str], state: &PathBuf) -> std::process::Output {
         .unwrap()
 }
 
+/// Run `writ <args> --state <state>` and parse stdout as a JSON envelope.
+/// Returns `(exit_code, payload)`.
+fn run_json(args: &[&str], state: &PathBuf) -> (Option<i32>, serde_json::Value) {
+    let out = writ(args, state);
+    let payload = serde_json::from_slice(&out.stdout).unwrap();
+    (out.status.code(), payload)
+}
+
+/// Write the shared two-entry sample watchlist to `state`.
+fn write_sample(state: &PathBuf) {
+    fs::write(state, sample_watchlist()).unwrap();
+}
+
 fn sample_watchlist() -> String {
     r#"{
   "version": 1,
@@ -45,6 +58,7 @@ fn sample_watchlist() -> String {
       "fix_count": 1,
       "residual_blockers": ["class_b:review"],
       "stack_id": "s1",
+      "stack_type": "feature",
       "stack_position": 0,
       "base": "main",
       "title": "Add widgets"
@@ -93,19 +107,58 @@ fn list_prints_all_owners_and_json_envelope() {
     let payload: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
     assert_eq!(payload["ok"], true);
     assert_eq!(payload["command"], "watchlist.list");
-    assert_eq!(payload["data"]["prs"].as_array().unwrap().len(), 2);
+    let prs = payload["data"]["prs"].as_array().unwrap();
+    assert_eq!(prs.len(), 2);
+    // stack_type persisted on disk must surface in the list JSON (additive,
+    // v1-compatible field).
+    let stacked = prs
+        .iter()
+        .find(|pr| pr["number"] == 7)
+        .expect("entry 7 present");
+    assert_eq!(stacked["stack_type"], "feature");
+}
+
+#[test]
+fn import_pr_babysit_json_uses_import_command_name() {
+    let dir = TestDir::new();
+    let source = dir.0.join("watched-prs.json");
+    let state = dir.0.join("watchlist.json");
+    fs::write(
+        &source,
+        r#"{
+          "prs": [{
+            "repo": "acme/widgets",
+            "number": 3,
+            "branch": "feat/import",
+            "last_status": "failed",
+            "fix_count": 2
+          }]
+        }"#,
+    )
+    .unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_writ"))
+        .args(["--json", "watchlist", "import-pr-babysit", "--path"])
+        .arg(&source)
+        .arg("--state")
+        .arg(&state)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(payload["ok"], true);
+    assert_eq!(payload["command"], "watchlist.import_pr_babysit");
 }
 
 #[test]
 fn list_filters_by_owner() {
     let dir = TestDir::new();
     let state = dir.0.join("watchlist.json");
-    fs::write(&state, sample_watchlist()).unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_writ"))
-        .args(["watchlist", "list", "--owner", "acme", "--state"])
-        .arg(&state)
-        .output()
-        .unwrap();
+    write_sample(&state);
+    let out = writ(&["watchlist", "list", "--owner", "acme"], &state);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("acme/widgets"));
     assert!(!stdout.contains("example-org/core"));
@@ -215,22 +268,19 @@ fn import_pr_babysit_is_read_only_on_source() {
 fn check_missing_entry_with_repo_is_not_found() {
     let dir = TestDir::new();
     let state = dir.0.join("watchlist.json");
-    fs::write(&state, sample_watchlist()).unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_writ"))
-        .args([
+    write_sample(&state);
+    let (code, payload) = run_json(
+        &[
             "--json",
             "watchlist",
             "check",
             "--repo",
             "acme/widgets",
             "999",
-            "--state",
-        ])
-        .arg(&state)
-        .output()
-        .unwrap();
-    assert_eq!(out.status.code(), Some(1));
-    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        ],
+        &state,
+    );
+    assert_eq!(code, Some(1));
     assert_eq!(payload["ok"], false);
     assert_eq!(payload["error"]["code"], "NOT_FOUND");
 }
@@ -239,22 +289,12 @@ fn check_missing_entry_with_repo_is_not_found() {
 fn check_malformed_repo_is_invalid_input() {
     let dir = TestDir::new();
     let state = dir.0.join("watchlist.json");
-    fs::write(&state, sample_watchlist()).unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_writ"))
-        .args([
-            "--json",
-            "watchlist",
-            "check",
-            "--repo",
-            "not-a-slug",
-            "7",
-            "--state",
-        ])
-        .arg(&state)
-        .output()
-        .unwrap();
-    assert_eq!(out.status.code(), Some(1));
-    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    write_sample(&state);
+    let (code, payload) = run_json(
+        &["--json", "watchlist", "check", "--repo", "not-a-slug", "7"],
+        &state,
+    );
+    assert_eq!(code, Some(1));
     assert_eq!(payload["ok"], false);
     assert_eq!(payload["error"]["code"], "INVALID_INPUT");
 }
@@ -263,12 +303,8 @@ fn check_malformed_repo_is_invalid_input() {
 fn list_repo_filter_ignores_slug_case() {
     let dir = TestDir::new();
     let state = dir.0.join("watchlist.json");
-    fs::write(&state, sample_watchlist()).unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_writ"))
-        .args(["watchlist", "list", "--repo", "ACME/widgets", "--state"])
-        .arg(&state)
-        .output()
-        .unwrap();
+    write_sample(&state);
+    let out = writ(&["watchlist", "list", "--repo", "ACME/widgets"], &state);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("acme/widgets"));
     assert!(!stdout.contains("example-org/core"));

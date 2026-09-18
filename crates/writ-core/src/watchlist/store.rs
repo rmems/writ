@@ -68,23 +68,31 @@ pub fn load_watchlist(path: &Path) -> Result<Watchlist, WatchlistError> {
     };
 
     match serde_json::from_str::<Watchlist>(&data) {
-        Ok(list) => {
-            if list.version > WATCHLIST_VERSION {
-                return Err(WatchlistError::UnsupportedVersion {
-                    path: path.to_path_buf(),
-                    version: list.version,
-                });
-            }
-            Ok(list)
-        }
-        Err(err) => {
-            let quarantine = quarantine_corrupt(path)?;
-            Err(WatchlistError::Corrupt {
-                path: path.to_path_buf(),
-                quarantine,
-                message: err.to_string(),
-            })
-        }
+        Ok(list) => accept_parsed(path, list),
+        Err(err) => Err(quarantine_and_report(path, &err)),
+    }
+}
+
+/// Accept a parsed watchlist, rejecting any version this build cannot read.
+fn accept_parsed(path: &Path, list: Watchlist) -> Result<Watchlist, WatchlistError> {
+    if list.version > WATCHLIST_VERSION {
+        return Err(WatchlistError::UnsupportedVersion {
+            path: path.to_path_buf(),
+            version: list.version,
+        });
+    }
+    Ok(list)
+}
+
+/// Move a corrupt file aside and build the [`WatchlistError::Corrupt`] report.
+fn quarantine_and_report(path: &Path, err: &serde_json::Error) -> WatchlistError {
+    match quarantine_corrupt(path) {
+        Ok(quarantine) => WatchlistError::Corrupt {
+            path: path.to_path_buf(),
+            quarantine,
+            message: err.to_string(),
+        },
+        Err(quarantine_err) => quarantine_err,
     }
 }
 

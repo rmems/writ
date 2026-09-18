@@ -32,13 +32,15 @@ pub(crate) fn run(
             reset,
             kind,
             targets,
-        } => {
-            let path = state_path(state.as_ref());
-            match add_command(&path, repo.as_deref(), reset, kind, &targets) {
-                Ok(report) => write_add(json, &report, stdout).map(|()| ExitCode::SUCCESS),
-                Err(err) => write_error("watchlist.add", json, err, stdout),
-            }
-        }
+        } => run_add(
+            state.as_ref(),
+            repo.as_deref(),
+            reset,
+            kind,
+            &targets,
+            json,
+            stdout,
+        ),
         WatchlistAction::Remove {
             state,
             repo,
@@ -92,10 +94,28 @@ pub(crate) fn run(
             let path = state_path(state.as_ref());
             let source = source.unwrap_or_else(default_pr_babysit_path);
             match import_pr_babysit_at(&path, &source) {
-                Ok(report) => write_add(json, &report, stdout).map(|()| ExitCode::SUCCESS),
+                Ok(report) => write_add("watchlist.import_pr_babysit", json, &report, stdout)
+                    .map(|()| ExitCode::SUCCESS),
                 Err(err) => write_error("watchlist.import_pr_babysit", json, err, stdout),
             }
         }
+    }
+}
+
+/// Handle the `watchlist add` arm: resolve state path, add PRs, render output.
+fn run_add(
+    state: Option<&PathBuf>,
+    repo_flag: Option<&str>,
+    reset: bool,
+    kind: WatchlistKindArg,
+    targets: &[String],
+    json: bool,
+    stdout: &mut impl Write,
+) -> io::Result<ExitCode> {
+    let path = state_path(state);
+    match add_command(&path, repo_flag, reset, kind, targets) {
+        Ok(report) => write_add("watchlist.add", json, &report, stdout).map(|()| ExitCode::SUCCESS),
+        Err(err) => write_error("watchlist.add", json, err, stdout),
     }
 }
 
@@ -221,10 +241,15 @@ fn parse_repo_and_numbers(
     Ok((repo, numbers))
 }
 
-fn write_add(json: bool, report: &AddReport, stdout: &mut impl Write) -> io::Result<()> {
+fn write_add(
+    command: &'static str,
+    json: bool,
+    report: &AddReport,
+    stdout: &mut impl Write,
+) -> io::Result<()> {
     if json {
         return write_envelope(
-            "watchlist.add",
+            command,
             serde_json::json!({
                 "added": identities(&report.added),
                 "refreshed": identities(&report.refreshed),
@@ -236,7 +261,7 @@ fn write_add(json: bool, report: &AddReport, stdout: &mut impl Write) -> io::Res
             stdout,
         );
     }
-    if report.added.is_empty() && report.refreshed.is_empty() && report.skipped.is_empty() {
+    if add_report_is_empty(report) {
         writeln!(stdout, "No pull requests added.")?;
         return Ok(());
     }
@@ -395,6 +420,11 @@ fn write_envelope(
     Ok(())
 }
 
+/// True when an add/import produced no added, refreshed, or skipped entries.
+fn add_report_is_empty(report: &AddReport) -> bool {
+    report.added.is_empty() && report.refreshed.is_empty() && report.skipped.is_empty()
+}
+
 fn identities(items: &[(String, u64)]) -> Vec<serde_json::Value> {
     items
         .iter()
@@ -412,6 +442,7 @@ fn entry_json(entry: &WatchEntry) -> serde_json::Value {
         "fix_count": entry.fix_count,
         "residual_blockers": entry.residual_blockers,
         "stack_id": entry.stack_id,
+        "stack_type": entry.stack_type,
         "stack_position": entry.stack_position,
         "base": entry.base,
         "title": entry.title,

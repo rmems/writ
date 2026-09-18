@@ -195,10 +195,13 @@ impl Watchlist {
 #[must_use]
 pub fn owner_of_repo(repo: &str) -> Option<&str> {
     let (owner, name) = repo.split_once('/')?;
-    if owner.is_empty() || name.is_empty() || name.contains('/') {
-        return None;
-    }
-    Some(owner)
+    is_valid_slug(owner, name).then_some(owner)
+}
+
+/// A well-formed `owner/name` slug has a non-empty owner and a non-empty name
+/// with no further `/` separators.
+fn is_valid_slug(owner: &str, name: &str) -> bool {
+    !owner.is_empty() && !name.is_empty() && !name.contains('/')
 }
 
 /// GitHub `owner/name` slugs are case-insensitive.

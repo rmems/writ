@@ -248,52 +248,85 @@ pub fn add_prs(
         refreshed: Vec::new(),
         skipped: Vec::new(),
     };
+    let ctx = AddContext {
+        repo,
+        kind,
+        reset,
+        now: &now,
+    };
     for &number in numbers {
         let snapshot = probe.view(repo, number)?;
-        let github_state = snapshot.state.to_ascii_uppercase();
-        if github_state == "MERGED" || github_state == "CLOSED" {
-            report
-                .skipped
-                .push((repo.to_owned(), number, snapshot.state.clone()));
-            continue;
-        }
-        if let Some(existing) = list.get_mut(repo, number) {
-            existing.branch = snapshot.branch.clone();
-            existing.base = Some(snapshot.base.clone());
-            existing.title = Some(snapshot.title.clone());
-            existing.url = Some(snapshot.url.clone());
-            if reset {
-                existing.fix_count = 0;
-                existing.check_count = Some(0);
-                existing.residual_blockers.clear();
-                existing.status = WatchStatus::Pending;
-            }
-            report.refreshed.push((repo.to_owned(), number));
-        } else {
-            list.prs.push(WatchEntry {
-                repo: repo.to_owned(),
-                number,
-                branch: snapshot.branch.clone(),
-                status: WatchStatus::Pending,
-                last_checked: now.clone(),
-                fix_count: 0,
-                residual_blockers: Vec::new(),
-                stack_id: None,
-                stack_type: None,
-                stack_position: None,
-                base: Some(snapshot.base.clone()),
-                title: Some(snapshot.title.clone()),
-                added_at: Some(now.clone()),
-                check_count: Some(0),
-                url: Some(snapshot.url.clone()),
-                kind: Some(kind),
-                extra: serde_json::Map::new(),
-            });
-            report.added.push((repo.to_owned(), number));
-        }
+        insert_or_refresh_entry(list, &ctx, &snapshot, &mut report);
     }
     detect_stacks(list);
     Ok(report)
+}
+
+/// Invariant context for one `add` pass. `repo` is the caller-supplied slug
+/// (its case is preserved in the report, unlike the probe's canonical value).
+struct AddContext<'a> {
+    repo: &'a str,
+    kind: WatchKind,
+    reset: bool,
+    now: &'a str,
+}
+
+/// Insert a new entry or refresh an existing one from `snapshot`, recording the
+/// outcome in `report`. MERGED/CLOSED snapshots are skipped, not persisted.
+fn insert_or_refresh_entry(
+    list: &mut Watchlist,
+    ctx: &AddContext,
+    snapshot: &PrSnapshot,
+    report: &mut AddReport,
+) {
+    let AddContext {
+        repo,
+        kind,
+        reset,
+        now,
+    } = *ctx;
+    let number = snapshot.number;
+    let github_state = snapshot.state.to_ascii_uppercase();
+    if github_state == "MERGED" || github_state == "CLOSED" {
+        report
+            .skipped
+            .push((repo.to_owned(), number, snapshot.state.clone()));
+        return;
+    }
+    if let Some(existing) = list.get_mut(repo, number) {
+        existing.branch = snapshot.branch.clone();
+        existing.base = Some(snapshot.base.clone());
+        existing.title = Some(snapshot.title.clone());
+        existing.url = Some(snapshot.url.clone());
+        if reset {
+            existing.fix_count = 0;
+            existing.check_count = Some(0);
+            existing.residual_blockers.clear();
+            existing.status = WatchStatus::Pending;
+        }
+        report.refreshed.push((repo.to_owned(), number));
+    } else {
+        list.prs.push(WatchEntry {
+            repo: repo.to_owned(),
+            number,
+            branch: snapshot.branch.clone(),
+            status: WatchStatus::Pending,
+            last_checked: now.to_owned(),
+            fix_count: 0,
+            residual_blockers: Vec::new(),
+            stack_id: None,
+            stack_type: None,
+            stack_position: None,
+            base: Some(snapshot.base.clone()),
+            title: Some(snapshot.title.clone()),
+            added_at: Some(now.to_owned()),
+            check_count: Some(0),
+            url: Some(snapshot.url.clone()),
+            kind: Some(kind),
+            extra: serde_json::Map::new(),
+        });
+        report.added.push((repo.to_owned(), number));
+    }
 }
 
 /// Remove one entry. Stack-mates remain; empty groups are dropped.
@@ -331,71 +364,103 @@ pub fn check_prs(
     numbers: Option<&[u64]>,
     allowed_owners: &[String],
 ) -> Result<CheckReport, WatchlistError> {
-    let targets = select_check_targets(list, owner, repo, numbers, allowed_owners)?;
+    let scope = CheckScope {
+        owner,
+        repo,
+        numbers,
+    };
+    let targets = select_check_targets(list, &scope, allowed_owners)?;
     refresh_targets(list, probe, &targets)
+}
+
+/// Scope of a check cycle: optional owner/repo/number filters. `unscoped`
+/// means a bare `check-all` that must walk every allowlisted owner.
+struct CheckScope<'a> {
+    owner: Option<&'a str>,
+    repo: Option<&'a str>,
+    numbers: Option<&'a [u64]>,
+}
+
+impl CheckScope<'_> {
+    /// True when no explicit filter was given (bare multi-owner `check-all`).
+    fn unscoped(&self) -> bool {
+        self.repo.is_none() && self.owner.is_none() && self.numbers.is_none()
+    }
+
+    /// True when `(target_repo, number)` passes the owner/repo/number filters.
+    fn matches_filter(&self, target_repo: &str, number: u64) -> bool {
+        self.repo.is_none_or(|want| repos_match(target_repo, want))
+            && self.owner.is_none_or(|want| {
+                owner_of_repo(target_repo).is_some_and(|have| have.eq_ignore_ascii_case(want))
+            })
+            && self.numbers.is_none_or(|want| want.contains(&number))
+    }
 }
 
 fn select_check_targets(
     list: &Watchlist,
-    owner: Option<&str>,
-    repo: Option<&str>,
-    numbers: Option<&[u64]>,
+    scope: &CheckScope,
     allowed_owners: &[String],
 ) -> Result<Vec<(String, u64)>, WatchlistError> {
-    if let Some(repo) = repo {
-        validate_repo(repo)?;
-    }
-    if repo.is_none() && owner.is_none() && numbers.is_none() {
-        if allowed_owners.is_empty() {
-            return Err(WatchlistError::AllowlistRequired);
-        }
-    } else if !allowed_owners.is_empty() {
-        if let Some(repo) = repo
-            && let Some(have) = owner_of_repo(repo)
-            && !owner_is_allowed(have, allowed_owners)
-        {
-            return Err(WatchlistError::OwnerNotAllowed {
-                owner: have.to_owned(),
-            });
-        }
-        if let Some(owner) = owner
-            && !owner_is_allowed(owner, allowed_owners)
-        {
-            return Err(WatchlistError::OwnerNotAllowed {
-                owner: owner.to_owned(),
-            });
-        }
-    }
+    validate_check_scope(scope, allowed_owners)?;
 
     let targets: Vec<(String, u64)> = ordered_identities(list)
         .into_iter()
-        .filter(|(target_repo, number)| {
-            repo.is_none_or(|want| repos_match(target_repo, want))
-                && owner.is_none_or(|want| {
-                    owner_of_repo(target_repo).is_some_and(|have| have.eq_ignore_ascii_case(want))
-                })
-                && numbers.is_none_or(|want| want.contains(number))
-        })
+        .filter(|(target_repo, number)| scope.matches_filter(target_repo, *number))
         .filter(|(target_repo, _)| {
-            if repo.is_none() && owner.is_none() && numbers.is_none() {
-                owner_of_repo(target_repo)
+            // A bare `check-all` walks only allowlisted owners; a scoped call
+            // already validated its explicit owner/repo above.
+            !scope.unscoped()
+                || owner_of_repo(target_repo)
                     .is_some_and(|have| owner_is_allowed(have, allowed_owners))
-            } else {
-                true
-            }
         })
         .collect();
-    if let Some(want) = numbers {
+    if let Some(want) = scope.numbers {
         for &number in want {
             if !targets.iter().any(|(_, have)| *have == number) {
                 return Err(WatchlistError::NotFound {
-                    repo: repo.unwrap_or("<unknown>").to_owned(),
+                    repo: scope.repo.unwrap_or("<unknown>").to_owned(),
                     number,
                 });
             }
         }
     }
     Ok(targets)
+}
+
+/// Enforce repo validity and the owner allowlist for a check scope.
+fn validate_check_scope(
+    scope: &CheckScope,
+    allowed_owners: &[String],
+) -> Result<(), WatchlistError> {
+    if let Some(repo) = scope.repo {
+        validate_repo(repo)?;
+    }
+    if scope.unscoped() {
+        if allowed_owners.is_empty() {
+            return Err(WatchlistError::AllowlistRequired);
+        }
+        return Ok(());
+    }
+    if allowed_owners.is_empty() {
+        return Ok(());
+    }
+    if let Some(repo) = scope.repo
+        && let Some(have) = owner_of_repo(repo)
+        && !owner_is_allowed(have, allowed_owners)
+    {
+        return Err(WatchlistError::OwnerNotAllowed {
+            owner: have.to_owned(),
+        });
+    }
+    if let Some(owner) = scope.owner
+        && !owner_is_allowed(owner, allowed_owners)
+    {
+        return Err(WatchlistError::OwnerNotAllowed {
+            owner: owner.to_owned(),
+        });
+    }
+    Ok(())
 }
 
 fn refresh_targets(
@@ -406,8 +471,8 @@ fn refresh_targets(
     let now = utc_now_rfc3339();
     let mut pruned = Vec::new();
     let mut checked = Vec::new();
-    for (target_repo, number) in targets {
-        match refresh_one(list, probe, target_repo, *number, &now)? {
+    for target in targets {
+        match refresh_one(list, probe, target, &now)? {
             RefreshOutcome::Checked(entry) => checked.push(*entry),
             RefreshOutcome::Pruned {
                 repo,
@@ -432,10 +497,10 @@ enum RefreshOutcome {
 fn refresh_one(
     list: &mut Watchlist,
     probe: &impl PrProbe,
-    target_repo: &str,
-    number: u64,
+    target: &(String, u64),
     now: &str,
 ) -> Result<RefreshOutcome, WatchlistError> {
+    let (target_repo, number) = (target.0.as_str(), target.1);
     match probe.view(target_repo, number) {
         Ok(snapshot) => {
             let github_state = snapshot.state.to_ascii_uppercase();
@@ -527,12 +592,17 @@ pub fn check_prs_at(
         .map(ToOwned::to_owned)
         .unwrap_or_else(load_allowed_owners);
     let mut list = load_watchlist(path)?;
-    let targets = select_check_targets(&list, owner, repo, numbers, &owners)?;
+    let scope = CheckScope {
+        owner,
+        repo,
+        numbers,
+    };
+    let targets = select_check_targets(&list, &scope, &owners)?;
     let now = utc_now_rfc3339();
     let mut pruned = Vec::new();
     let mut checked = Vec::new();
-    for (target_repo, number) in targets {
-        match refresh_one(&mut list, probe, &target_repo, number, &now) {
+    for target in targets {
+        match refresh_one(&mut list, probe, &target, &now) {
             Ok(RefreshOutcome::Checked(entry)) => checked.push(*entry),
             Ok(RefreshOutcome::Pruned {
                 repo,
@@ -684,27 +754,33 @@ fn map_imported_status(last_status: Option<&str>) -> WatchStatus {
 }
 
 pub(crate) fn classify_snapshot(snapshot: &PrSnapshot) -> (WatchStatus, Vec<String>) {
-    let mut blockers = Vec::new();
     let mergeable = snapshot
         .mergeable
         .as_deref()
         .unwrap_or("")
         .to_ascii_uppercase();
     if mergeable == "CONFLICTING" {
-        blockers.push("conflict:mergeable".to_owned());
-        return (WatchStatus::Conflict, blockers);
+        return (WatchStatus::Conflict, vec!["conflict:mergeable".to_owned()]);
     }
 
-    let mut failed = false;
-    let mut pending = false;
+    let mut blockers = Vec::new();
+    let mut pending = classify_readiness(snapshot, &mergeable, &mut blockers);
+    let failed = classify_checks(&snapshot.checks, &mut blockers, &mut pending);
+    classify_review(snapshot.review_decision.as_deref(), &mut blockers);
 
+    resolve_status(snapshot, &blockers, failed, pending)
+}
+
+/// Record draft and unresolved-mergeability blockers; returns whether either
+/// forces a pending status.
+fn classify_readiness(snapshot: &PrSnapshot, mergeable: &str, blockers: &mut Vec<String>) -> bool {
+    let mut pending = false;
     // A draft PR is not ready to merge regardless of CI, so it cannot be
     // Healthy; surface it as pending with an explicit blocker.
     if snapshot.is_draft {
         pending = true;
         blockers.push("draft:true".to_owned());
     }
-
     // GitHub reports `mergeable == UNKNOWN` (or empty/missing) while the merge
     // is still being computed. Do not declare an unresolved merge Healthy;
     // treat it as pending until it resolves to MERGEABLE or CONFLICTING.
@@ -712,7 +788,18 @@ pub(crate) fn classify_snapshot(snapshot: &PrSnapshot) -> (WatchStatus, Vec<Stri
         pending = true;
         blockers.push("pending:mergeable_unknown".to_owned());
     }
-    for check in &snapshot.checks {
+    pending
+}
+
+/// Push class_a/class_b/class_c tokens for CI checks. Returns whether any
+/// check failed hard; sets `pending` when a check is still in flight.
+fn classify_checks(
+    checks: &[CheckSnapshot],
+    blockers: &mut Vec<String>,
+    pending: &mut bool,
+) -> bool {
+    let mut failed = false;
+    for check in checks {
         let state = check.state.to_ascii_uppercase();
         if matches!(
             state.as_str(),
@@ -726,27 +813,40 @@ pub(crate) fn classify_snapshot(snapshot: &PrSnapshot) -> (WatchStatus, Vec<Stri
             state.as_str(),
             "PENDING" | "IN_PROGRESS" | "QUEUED" | "EXPECTED" | "UNKNOWN"
         ) {
-            pending = true;
+            *pending = true;
             blockers.push(format!("class_c:{}", sanitize_token(&check.name)));
         }
     }
+    failed
+}
 
-    if let Some(decision) = snapshot.review_decision.as_deref() {
+/// Push a `review:` blocker when the review decision still gates the merge.
+fn classify_review(review_decision: Option<&str>, blockers: &mut Vec<String>) {
+    if let Some(decision) = review_decision {
         let decision = decision.to_ascii_uppercase();
         if decision == "REVIEW_REQUIRED" || decision == "CHANGES_REQUESTED" {
             blockers.push(format!("review:{}", sanitize_token(&decision)));
         }
     }
+}
 
-    if failed {
-        (WatchStatus::Failed, blockers)
+/// Collapse the failed/pending/blocker signals into a single [`WatchStatus`].
+fn resolve_status(
+    snapshot: &PrSnapshot,
+    blockers: &[String],
+    failed: bool,
+    pending: bool,
+) -> (WatchStatus, Vec<String>) {
+    let status = if failed {
+        WatchStatus::Failed
     } else if pending || (snapshot.checks.is_empty() && blockers.is_empty()) {
-        (WatchStatus::Pending, blockers)
+        WatchStatus::Pending
     } else if !blockers.is_empty() {
-        (WatchStatus::Residual, blockers)
+        WatchStatus::Residual
     } else {
-        (WatchStatus::Healthy, blockers)
-    }
+        WatchStatus::Healthy
+    };
+    (status, blockers.to_vec())
 }
 
 fn sanitize_token(name: &str) -> String {
@@ -808,16 +908,42 @@ fn ordered_identities(list: &Watchlist) -> Vec<(String, u64)> {
 }
 
 fn detect_stacks(list: &mut Watchlist) {
+    let parent = compute_parents(list);
+    assign_positions(list, &parent);
+    rebuild_groups(list);
+}
+
+/// For each entry, find its parent index: another PR in the same repo whose
+/// head branch is this PR's base. When several PRs share the same head branch
+/// we pick the one with the lowest PR number so the inferred parent is
+/// deterministic regardless of add order (ambiguous head-branch collisions are
+/// otherwise unresolvable). Combined with `seen`-guarded root walking this
+/// stays terminating even for cyclic base chains.
+fn compute_parents(list: &Watchlist) -> Vec<Option<usize>> {
     let n = list.prs.len();
     let mut parent: Vec<Option<usize>> = vec![None; n];
     for (i, entry) in list.prs.iter().enumerate() {
         let Some(base) = entry.base.as_deref() else {
             continue;
         };
-        parent[i] = list.prs.iter().enumerate().find_map(|(j, other)| {
-            (j != i && repos_match(&other.repo, &entry.repo) && other.branch == base).then_some(j)
-        });
+        parent[i] = list
+            .prs
+            .iter()
+            .enumerate()
+            .filter(|(j, other)| {
+                *j != i && repos_match(&other.repo, &entry.repo) && other.branch == base
+            })
+            .min_by_key(|(_, other)| other.number)
+            .map(|(j, _)| j);
     }
+    parent
+}
+
+/// Assign `stack_id`/`stack_position` from the parent map. Standalone PRs (no
+/// parent and no child) are cleared. Root discovery walks parents with a
+/// `seen` guard so a cycle terminates rather than looping forever.
+fn assign_positions(list: &mut Watchlist, parent: &[Option<usize>]) {
+    let n = list.prs.len();
     let mut has_child = vec![false; n];
     for parent_idx in parent.iter().flatten() {
         has_child[*parent_idx] = true;
@@ -834,24 +960,30 @@ fn detect_stacks(list: &mut Watchlist) {
             list.prs[i].stack_position = None;
             continue;
         }
-        let mut root = i;
-        let mut pos = 0_u32;
-        let mut seen = vec![false; n];
-        while let Some(next) = parent[root] {
-            if seen[root] {
-                break;
-            }
-            seen[root] = true;
-            root = next;
-            pos = pos.saturating_add(1);
-        }
+        let (root, pos) = walk_to_root(i, parent);
         let stack_id = preserved[root]
             .clone()
             .unwrap_or_else(|| format!("{}#{}", list.prs[root].repo, list.prs[root].number));
         list.prs[i].stack_id = Some(stack_id);
         list.prs[i].stack_position = Some(pos);
     }
-    rebuild_groups(list);
+}
+
+/// Follow parent links from `start` to the stack root, returning
+/// `(root_index, depth)`. Cycle-safe: a repeated node ends the walk.
+fn walk_to_root(start: usize, parent: &[Option<usize>]) -> (usize, u32) {
+    let mut root = start;
+    let mut pos = 0_u32;
+    let mut seen = vec![false; parent.len()];
+    while let Some(next) = parent[root] {
+        if seen[root] {
+            break;
+        }
+        seen[root] = true;
+        root = next;
+        pos = pos.saturating_add(1);
+    }
+    (root, pos)
 }
 
 fn rebuild_groups(list: &mut Watchlist) {
@@ -1356,6 +1488,47 @@ mod tests {
         assert_eq!(top.stack_position, Some(2));
         let group = list.groups.get(bottom.stack_id.as_ref().unwrap()).unwrap();
         assert_eq!(group.numbers, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn stack_parent_selection_prefers_lowest_number_on_branch_collision() {
+        // Two PRs (5 and 9) share the head branch `feat/base`; a child PR 7
+        // bases on `feat/base`. The inferred parent must deterministically be
+        // the lowest number (5), independent of insertion order.
+        let mut probe = MapProbe {
+            snaps: BTreeMap::new(),
+        };
+        probe.snaps.insert(
+            ("acme/widgets".to_owned(), 9),
+            open_snap("acme/widgets", 9, "feat/base", "main"),
+        );
+        probe.snaps.insert(
+            ("acme/widgets".to_owned(), 7),
+            open_snap("acme/widgets", 7, "feat/child", "feat/base"),
+        );
+        probe.snaps.insert(
+            ("acme/widgets".to_owned(), 5),
+            open_snap("acme/widgets", 5, "feat/base", "main"),
+        );
+        let mut list = Watchlist::default();
+        add_prs(
+            &mut list,
+            &probe,
+            "acme/widgets",
+            &[9, 7, 5],
+            WatchKind::PrBabysit,
+            false,
+            &[],
+        )
+        .unwrap();
+        let parent = compute_parents(&list);
+        let child_idx = list
+            .prs
+            .iter()
+            .position(|e| e.number == 7)
+            .expect("child present");
+        let root_idx = parent[child_idx].expect("child has a parent");
+        assert_eq!(list.prs[root_idx].number, 5);
     }
 
     #[test]
