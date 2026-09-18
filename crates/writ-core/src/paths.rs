@@ -261,7 +261,6 @@ fn resolve_lease_path_in(user_data: &Path, writ_lease_path: Option<&OsStr>) -> P
     StateRoot::from_user_data(user_data).leases_db()
 }
 
-
 /// Resolve the configured worktree base path.
 ///
 /// Uses `WRIT_WORKTREE_BASE` when set, otherwise `WH_WORKTREE_BASE` if that is

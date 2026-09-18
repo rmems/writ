@@ -8,15 +8,20 @@
 //! same file. Writes are temp-file + rename; corrupt files are quarantined
 //! rather than silently overwritten.
 
+mod classify;
+mod import;
 mod ops;
+mod probe;
 mod schema;
+mod stack;
 mod store;
 
+pub use import::{default_pr_babysit_path, import_pr_babysit, import_pr_babysit_at};
 pub use ops::{
-    AddReport, CheckReport, CheckSnapshot, GhPrProbe, PrProbe, PrSnapshot, add_prs, add_prs_at,
-    check_prs, check_prs_at, default_pr_babysit_path, import_pr_babysit, import_pr_babysit_at,
-    list_prs_at, remove_pr, remove_pr_at,
+    AddReport, CheckReport, add_prs, add_prs_at, check_prs, check_prs_at, list_prs_at, remove_pr,
+    remove_pr_at,
 };
+pub use probe::{CheckSnapshot, GhPrProbe, PrProbe, PrSnapshot};
 pub use schema::{
     StackGroup, WATCHLIST_VERSION, WatchEntry, WatchKind, WatchStatus, Watchlist, owner_of_repo,
 };
