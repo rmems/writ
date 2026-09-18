@@ -1,0 +1,82 @@
+{
+  "$schema": "https://raw.githubusercontent.com/schemastore/schemastore/master/src/schemas/json/sarif-2.1.0-rtm.5.json",
+  "version": "2.1.0",
+  "runs": [
+    {
+      "tool": {
+        "driver": {
+          "name": "QDPY",
+          "fullName": "Qodana for Python",
+          "version": "262.10074",
+          "rules": [],
+          "taxa": [],
+          "language": "en-US",
+          "contents": [
+            "localizedData",
+            "nonLocalizedData"
+          ],
+          "isComprehensive": false
+        },
+        "extensions": []
+      },
+      "invocations": [
+        {
+          "startTimeUtc": "2026-08-29T10:17:10.311314422Z",
+          "exitCode": 0,
+          "executionSuccessful": true
+        }
+      ],
+      "language": "en-US",
+      "versionControlProvenance": [
+        {
+          "repositoryUri": "ssh://git@github.com/rmems/worktrees-hives.git",
+          "revisionId": "66c48728c3d24c5ba37b9bb505bffe43f511c9f7",
+          "branch": "agent/y6n-fix-windows-aggregate-link-test",
+          "properties": {
+            "repoUrl": "",
+            "lastAuthorName": "Raul Montoya Cardenas",
+            "vcsType": "Git",
+            "lastAuthorEmail": "montoyaraul34@gmail.com"
+          }
+        }
+      ],
+      "originalUriBaseIds": {
+        "PROJECTROOT": {
+          "description": {
+            "text": "The root directory of the repository or workspace (--repository-root qodana CLI parameter)"
+          }
+        },
+        "SRCROOT": {
+          "uri": "python/",
+          "uriBaseId": "PROJECTROOT",
+          "description": {
+            "text": "The subdirectory within the project that was analyzed (--project-dir qodana CLI parameter)"
+          }
+        }
+      },
+      "results": [],
+      "automationDetails": {
+        "id": "python/qodana/2026-08-29",
+        "guid": "3c4b7e22-63d1-475c-b4b9-1ffe1a12c8a1",
+        "properties": {
+          "jobUrl": "",
+          "analysisKind": "regular"
+        }
+      },
+      "newlineSequences": [
+        "\r\n",
+        "\n"
+      ],
+      "properties": {
+        "qodana.coverage.files.provided": false,
+        "configProfile": "recommended",
+        "deviceId": "200820300000000-ee1d-8fb2-91ec-e0b969665e68",
+        "qodanaNewResultSummary": {
+          "moderate": 46,
+          "high": 157,
+          "total": 203
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,67 @@
+name: Chore
+description: Hygiene, packaging, or docs-only work
+title: "[Chore]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this template for repo hygiene, packaging, templates, and
+        docs-only work. Prefer the `docs` label for operator docs and
+        templates; use `platform` for install/packaging. Use only the
+        canonical labels in CONTRIBUTING.md. Runtime merge, auto-merge,
+        merge queues, and bare `--force` are forbidden.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: One or two sentences. This is what workers treat as the title-level intent.
+      placeholder: Document canonical issue labels and add feature/bug/chore templates.
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem-context
+    attributes:
+      label: Problem / context
+      description: Why this hygiene matters now, and what stays out of scope.
+      placeholder: Label meanings are undocumented, so follow-up issues are thin and hard to filter.
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Checkboxes workers parse as the Done bar. Add or delete rows as needed.
+      value: |
+        - [ ]
+        - [ ]
+        - [ ]
+    validations:
+      required: true
+
+  - type: dropdown
+    id: canonical-label
+    attributes:
+      label: Canonical label
+      description: Apply this same GitHub label on the issue. Do not invent a new name.
+      options:
+        - docs
+        - platform
+        - safety
+        - core
+        - orchestrator
+        - epic
+    validations:
+      required: true
+
+  - type: textarea
+    id: linear
+    attributes:
+      label: Linear
+      description: Planning twin. Keep this footer even when no twin exists yet; replace the placeholders when it does.
+      value: |
+        Linear: <url> (`RM-N`)
+    validations:
+      required: true
