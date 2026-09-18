@@ -758,7 +758,11 @@ async fn recover_child(
     if policy.grace > Duration::ZERO {
         terminate_process_group(pid);
         match tokio::time::timeout(policy.grace, child.wait()).await {
-            Ok(Ok(_)) => {}
+            Ok(Ok(_)) => {
+                // Parent exited after SIGTERM; still SIGKILL the group so
+                // grandchildren do not wait for Drop.
+                kill_process_group(pid);
+            }
             Ok(Err(_)) | Err(_) => {
                 let _ = child.kill().await;
                 let _ = tokio::time::timeout(POST_KILL_JOIN_TIMEOUT, child.wait()).await;

@@ -198,7 +198,7 @@ impl TimeoutPolicy {
 /// re-dispatch is allowed and a third run is not.
 #[must_use]
 pub fn can_redispatch(completed_attempts: u32, max_redispatch_per_item: u32) -> bool {
-    completed_attempts < 1 + max_redispatch_per_item
+    completed_attempts < 1u32.saturating_add(max_redispatch_per_item)
 }
 
 #[cfg(test)]
@@ -235,6 +235,11 @@ mod tests {
         assert!(!can_redispatch(1, 0), "max 0 means no retry");
         assert!(can_redispatch(2, 2));
         assert!(!can_redispatch(3, 2));
+        assert!(
+            can_redispatch(1, u32::MAX),
+            "max budget must not overflow in 1 + max_redispatch"
+        );
+        assert!(!can_redispatch(u32::MAX, u32::MAX));
     }
 
     #[test]
