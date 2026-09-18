@@ -207,8 +207,34 @@ pub fn claim(manager: &WorktreeManager, request: ClaimRequest<'_>) -> Result<Cla
             number,
             head_branch,
             head_repo,
-        } => claim_pr(manager, request, number, head_branch, head_repo),
+        } => claim_pr(
+            manager,
+            request,
+            PrClaim {
+                number,
+                head_branch,
+                head_repo,
+            },
+        ),
     }
+}
+
+/// Pull-request identity fields destructured from [`ClaimKind::PullRequest`],
+/// grouped so `claim_pr` stays under the argument-count threshold.
+struct PrClaim<'a> {
+    number: u64,
+    head_branch: &'a str,
+    head_repo: Option<&'a str>,
+}
+
+/// Resource-specific outcome fields threaded into the final [`ClaimResult`],
+/// grouped so `finish_claim` stays under the argument-count threshold.
+struct ClaimOutcome {
+    job_id: String,
+    issue_number: Option<u64>,
+    pr_number: Option<u64>,
+    owns_branch: bool,
+    head_repo: Option<String>,
 }
 
 fn claim_issue(
@@ -229,20 +255,28 @@ fn claim_issue(
         branch: &branch,
         start_point: request.start_point,
     })?;
-    finish_claim(request, worktree, &job_id, Some(number), None, true, None)
+    finish_claim(
+        request,
+        worktree,
+        ClaimOutcome {
+            job_id,
+            issue_number: Some(number),
+            pr_number: None,
+            owns_branch: true,
+            head_repo: None,
+        },
+    )
 }
 
 fn claim_pr(
     manager: &WorktreeManager,
     request: ClaimRequest<'_>,
-    number: u64,
-    head_branch: &str,
-    head_repo: Option<&str>,
+    pr: PrClaim<'_>,
 ) -> Result<ClaimResult> {
-    require_positive("pr_number", number)?;
-    validate_branch_name("head_branch", head_branch)?;
-    let head_repo = validate_head_repo(head_repo)?;
-    let job_id = pr_job_id(number);
+    require_positive("pr_number", pr.number)?;
+    validate_branch_name("head_branch", pr.head_branch)?;
+    let head_repo = validate_head_repo(pr.head_repo)?;
+    let job_id = pr_job_id(pr.number);
     reject_existing_claim(manager, request.owner, request.repo, &job_id)?;
 
     let create_request = WorktreeCreateRequest {
@@ -250,10 +284,10 @@ fn claim_pr(
         owner: request.owner,
         repo: request.repo,
         job_id: &job_id,
-        branch: head_branch,
+        branch: pr.head_branch,
         start_point: request.start_point,
     };
-    let worktree = if branch_exists(request.repo_root, head_branch)? {
+    let worktree = if branch_exists(request.repo_root, pr.head_branch)? {
         manager.attach_with_request(create_request)?
     } else {
         manager.create_with_request(create_request)?
@@ -261,22 +295,20 @@ fn claim_pr(
     finish_claim(
         request,
         worktree,
-        &job_id,
-        None,
-        Some(number),
-        false,
-        head_repo,
+        ClaimOutcome {
+            job_id,
+            issue_number: None,
+            pr_number: Some(pr.number),
+            owns_branch: false,
+            head_repo,
+        },
     )
 }
 
 fn finish_claim(
     request: ClaimRequest<'_>,
     worktree: Worktree,
-    job_id: &str,
-    issue_number: Option<u64>,
-    pr_number: Option<u64>,
-    owns_branch: bool,
-    head_repo: Option<String>,
+    outcome: ClaimOutcome,
 ) -> Result<ClaimResult> {
     let start_commit = worktree
         .start_commit
@@ -289,15 +321,15 @@ fn finish_claim(
     Ok(ClaimResult {
         owner: request.owner.to_owned(),
         repo: request.repo.to_owned(),
-        job_id: job_id.to_owned(),
+        job_id: outcome.job_id,
         branch: worktree.branch,
         worktree_path: worktree.path,
-        issue_number,
-        pr_number,
-        owns_branch,
+        issue_number: outcome.issue_number,
+        pr_number: outcome.pr_number,
+        owns_branch: outcome.owns_branch,
         start_commit,
         head_commit,
-        head_repo,
+        head_repo: outcome.head_repo,
     })
 }
 
@@ -336,6 +368,13 @@ fn assert_owner_allowed(owner: &str, allowed: &[String]) -> Result<()> {
     })
 }
 
+/// The two halves of a `head_repo` slug are well-formed when both are present
+/// and the repository half does not itself contain another separator. Named so
+/// the guard in `validate_head_repo` stays a single, simple condition.
+fn is_valid_owner_repo_halves(owner: &str, repo: &str) -> bool {
+    !owner.is_empty() && !repo.is_empty() && !repo.contains('/')
+}
+
 fn validate_head_repo(head_repo: Option<&str>) -> Result<Option<String>> {
     let Some(slug) = head_repo else {
         return Ok(None);
@@ -343,7 +382,7 @@ fn validate_head_repo(head_repo: Option<&str>) -> Result<Option<String>> {
     let (owner, repo) = slug
         .split_once('/')
         .ok_or_else(|| invalid_claim(format!("head_repo must be owner/repo, got {slug:?}")))?;
-    if owner.is_empty() || repo.is_empty() || repo.contains('/') {
+    if !is_valid_owner_repo_halves(owner, repo) {
         return Err(invalid_claim(format!(
             "head_repo must be owner/repo, got {slug:?}"
         )));
@@ -399,25 +438,30 @@ fn require_positive(field: &str, number: u64) -> Result<()> {
     Ok(())
 }
 
+/// Append one sanitized character to `slug`, collapsing runs of dashes and
+/// dropping a leading dash. `previous_dash` tracks whether the last pushed
+/// character was a collapsing dash. Returns without mutating when the character
+/// should be skipped. Flattening the dash/alphanumeric split into this helper
+/// keeps `sanitize_slug` a single-level loop.
+fn push_sanitized_char(slug: &mut String, previous_dash: &mut bool, ch: char) {
+    if ch.is_ascii_alphanumeric() {
+        *previous_dash = false;
+        slug.push(ch.to_ascii_lowercase());
+        return;
+    }
+    // Non-alphanumeric maps to a dash, but skip leading and repeated dashes.
+    if *previous_dash || slug.is_empty() {
+        return;
+    }
+    *previous_dash = true;
+    slug.push('-');
+}
+
 fn sanitize_slug(raw: &str) -> Result<String> {
     let mut slug = String::new();
     let mut previous_dash = false;
     for ch in raw.chars() {
-        let mapped = if ch.is_ascii_alphanumeric() {
-            ch.to_ascii_lowercase()
-        } else {
-            '-'
-        };
-        if mapped == '-' {
-            if previous_dash || slug.is_empty() {
-                continue;
-            }
-            previous_dash = true;
-            slug.push('-');
-        } else {
-            previous_dash = false;
-            slug.push(mapped);
-        }
+        push_sanitized_char(&mut slug, &mut previous_dash, ch);
         if slug.len() >= MAX_SLUG_CHARS {
             break;
         }
@@ -431,16 +475,32 @@ fn sanitize_slug(raw: &str) -> Result<String> {
     Ok(slug)
 }
 
+/// A ref segment is reserved when it is empty, a dot path component, or
+/// option-looking (leading dash). Extracted so `validate_ref_segment` reads as
+/// a sequence of single-purpose guard clauses.
+fn is_reserved_ref_name(value: &str) -> bool {
+    value.is_empty() || value == "." || value == ".." || value.starts_with('-')
+}
+
+/// A ref segment must be a plain name: it may not embed any path separator.
+fn contains_path_separator(value: &str) -> bool {
+    value
+        .chars()
+        .any(|ch| ch == '/' || ch == '\\' || ch == ':' || std::path::is_separator(ch))
+}
+
+/// A branch path component is invalid when it is empty or a dot component.
+fn is_invalid_path_component(part: &str) -> bool {
+    part.is_empty() || part == "." || part == ".."
+}
+
 fn validate_ref_segment(field: &str, value: &str) -> Result<()> {
-    if value.is_empty() || value == "." || value == ".." || value.starts_with('-') {
+    if is_reserved_ref_name(value) {
         return Err(invalid_claim(format!(
             "invalid {field} segment {value:?}: must be a plain name without separators or a leading dash"
         )));
     }
-    if value
-        .chars()
-        .any(|ch| ch == '/' || ch == '\\' || ch == ':' || std::path::is_separator(ch))
-    {
+    if contains_path_separator(value) {
         return Err(invalid_claim(format!(
             "invalid {field} segment {value:?}: contains a separator"
         )));
@@ -454,10 +514,7 @@ fn validate_branch_name(field: &str, value: &str) -> Result<()> {
             "invalid {field} {value:?}: must be a plain git ref, not empty or option-looking"
         )));
     }
-    if value
-        .split('/')
-        .any(|part| part.is_empty() || part == "." || part == "..")
-    {
+    if value.split('/').any(is_invalid_path_component) {
         return Err(invalid_claim(format!(
             "invalid {field} {value:?}: empty or dot path component"
         )));

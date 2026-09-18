@@ -127,38 +127,16 @@ impl WorktreeManager {
 
     /// Create a worktree from a typed request used by CLI and orchestration adapters.
     pub fn create_with_request(&self, request: WorktreeCreateRequest<'_>) -> Result<Worktree> {
-        let branch = BranchName(request.branch);
-        let start_point = StartPoint(request.start_point);
-        validate_worktree_branch(branch)?;
-        let base = self.base_path()?;
-        validate_repo_root(request.repo_root)?;
-
+        let prepared = self.prepare_worktree(&request)?;
         // Resolve the caller-selected start point before any mutation. Appending
         // ^{commit} rejects trees/blobs and peels annotated tags to commits.
-        let start_commit = resolve_start_commit(request.repo_root, start_point)?;
-        let worktree_path = prepare_worktree_path(
-            base,
-            Owner(request.owner),
-            Repo(request.repo),
-            JobId(request.job_id),
+        reject_unproven_resume(&request, CommitId(&prepared.start_commit))?;
+        add_worktree(
+            &request,
+            &prepared.worktree_path,
+            CommitId(&prepared.start_commit),
         )?;
-        reject_unproven_resume(&request, CommitId(&start_commit))?;
-        add_worktree(&request, &worktree_path, CommitId(&start_commit))?;
-
-        let head_commit = verify_creation_postconditions(CreationPostconditions {
-            repo_root: request.repo_root,
-            worktree_path: &worktree_path,
-            expected_branch: branch,
-            expected_commit: CommitId(&start_commit),
-        })?;
-
-        Ok(Worktree {
-            path: worktree_path,
-            branch: request.branch.to_owned(),
-            repo_root: request.repo_root.to_path_buf(),
-            start_commit: Some(start_commit),
-            head_commit: Some(head_commit),
-        })
+        finish_worktree(&request, prepared)
     }
 
     /// Check out an existing branch in a new worktree without renaming it.
@@ -167,6 +145,19 @@ impl WorktreeManager {
     /// `start_point`, and must not be checked out in another worktree. This is
     /// the PR-babysit path: attach to the published head as-is.
     pub fn attach_with_request(&self, request: WorktreeCreateRequest<'_>) -> Result<Worktree> {
+        let prepared = self.prepare_worktree(&request)?;
+        reject_existing_job_path(&prepared.worktree_path)?;
+        require_existing_branch_at_commit(&request, CommitId(&prepared.start_commit))?;
+        add_existing_worktree(&request, &prepared.worktree_path)?;
+        finish_worktree(&request, prepared)
+    }
+
+    /// Shared prologue for [`Self::create_with_request`] and
+    /// [`Self::attach_with_request`]: validate the branch and repo root, resolve
+    /// the start point to a commit, and derive the sandboxed worktree path. The
+    /// resolution happens before any mutation so trees/blobs are rejected and
+    /// annotated tags are peeled to commits.
+    fn prepare_worktree(&self, request: &WorktreeCreateRequest<'_>) -> Result<PreparedWorktree> {
         let branch = BranchName(request.branch);
         let start_point = StartPoint(request.start_point);
         validate_worktree_branch(branch)?;
@@ -180,23 +171,9 @@ impl WorktreeManager {
             Repo(request.repo),
             JobId(request.job_id),
         )?;
-        reject_existing_job_path(&worktree_path)?;
-        require_existing_branch_at_commit(&request, CommitId(&start_commit))?;
-        add_existing_worktree(&request, &worktree_path)?;
-
-        let head_commit = verify_creation_postconditions(CreationPostconditions {
-            repo_root: request.repo_root,
-            worktree_path: &worktree_path,
-            expected_branch: branch,
-            expected_commit: CommitId(&start_commit),
-        })?;
-
-        Ok(Worktree {
-            path: worktree_path,
-            branch: request.branch.to_owned(),
-            repo_root: request.repo_root.to_path_buf(),
-            start_commit: Some(start_commit),
-            head_commit: Some(head_commit),
+        Ok(PreparedWorktree {
+            worktree_path,
+            start_commit,
         })
     }
 
@@ -358,6 +335,40 @@ impl WorktreeManager {
     }
 }
 
+/// Prologue output shared by create and attach: the sandboxed worktree path and
+/// the resolved start commit, carried into the mutation and epilogue steps.
+struct PreparedWorktree {
+    worktree_path: PathBuf,
+    start_commit: String,
+}
+
+/// Shared epilogue for create and attach: verify the creation postconditions
+/// and build the resulting [`Worktree`]. Kept identical to the two former
+/// inline tails so the returned struct and error shape are unchanged.
+fn finish_worktree(
+    request: &WorktreeCreateRequest<'_>,
+    prepared: PreparedWorktree,
+) -> Result<Worktree> {
+    let PreparedWorktree {
+        worktree_path,
+        start_commit,
+    } = prepared;
+    let head_commit = verify_creation_postconditions(CreationPostconditions {
+        repo_root: request.repo_root,
+        worktree_path: &worktree_path,
+        expected_branch: BranchName(request.branch),
+        expected_commit: CommitId(&start_commit),
+    })?;
+
+    Ok(Worktree {
+        path: worktree_path,
+        branch: request.branch.to_owned(),
+        repo_root: request.repo_root.to_path_buf(),
+        start_commit: Some(start_commit),
+        head_commit: Some(head_commit),
+    })
+}
+
 fn validate_worktree_branch(branch: BranchName<'_>) -> Result<()> {
     match branch.as_str().chars().next() {
         None | Some('-') => Err(Error::GitCommand {
@@ -498,59 +509,68 @@ fn add_worktree(
     let branch = BranchName(request.branch);
     // Create the branch and linked worktree in one operation. If a concurrent
     // actor creates the ref first, Git fails rather than attaching to it.
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(request.repo_root)
-        .arg("worktree")
-        .arg("add")
-        .arg("-b")
-        .arg(branch.as_str())
-        .arg("--")
-        .arg(worktree_path)
-        .arg(start_commit.as_str())
-        .output()
-        .map_err(|e| Error::Io {
-            context: "spawn git worktree add",
-            source: e,
-        })?;
-
-    if output.status.success() {
-        return Ok(());
-    }
-    let residual = inspect_residual_state(request.repo_root, worktree_path, branch);
-    Err(Error::WorktreeCreationFailed(Box::new(
-        WorktreeCreationFailure {
-            path: worktree_path.to_path_buf(),
-            branch: branch.as_str().to_owned(),
-            path_exists: residual.path_exists,
-            branch_commit: residual.branch_commit,
-            head_commit: residual.head_commit,
-            worktree_registered: residual.worktree_registered,
-            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-        },
-    )))
+    run_worktree_add(
+        request.repo_root,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            branch.as_str(),
+            "--",
+            &worktree_path.to_string_lossy(),
+            start_commit.as_str(),
+        ],
+        IoContext("spawn git worktree add"),
+        worktree_path,
+        branch,
+    )
 }
 
 fn add_existing_worktree(request: &WorktreeCreateRequest<'_>, worktree_path: &Path) -> Result<()> {
     let branch = BranchName(request.branch);
+    run_worktree_add(
+        request.repo_root,
+        &[
+            "worktree",
+            "add",
+            "--",
+            &worktree_path.to_string_lossy(),
+            branch.as_str(),
+        ],
+        IoContext("spawn git worktree add for existing branch"),
+        worktree_path,
+        branch,
+    )
+}
+
+/// Shared tail for the two `git worktree add` variants: spawn git with the
+/// caller-provided argument list, return `Ok` on success, otherwise inspect the
+/// residual state and build the identical `Error::WorktreeCreationFailed`.
+///
+/// The two callers differ only in the argument list (`-b branch ... start` vs
+/// `branch`) and the spawn `IoContext`, both passed in, so the subprocess args,
+/// IoContext strings, and error shape are byte-for-byte unchanged.
+fn run_worktree_add(
+    repo_root: &Path,
+    args: &[&str],
+    spawn_context: IoContext,
+    worktree_path: &Path,
+    branch: BranchName<'_>,
+) -> Result<()> {
     let output = Command::new("git")
         .arg("-C")
-        .arg(request.repo_root)
-        .arg("worktree")
-        .arg("add")
-        .arg("--")
-        .arg(worktree_path)
-        .arg(branch.as_str())
+        .arg(repo_root)
+        .args(args)
         .output()
         .map_err(|e| Error::Io {
-            context: "spawn git worktree add for existing branch",
+            context: spawn_context.0,
             source: e,
         })?;
 
     if output.status.success() {
         return Ok(());
     }
-    let residual = inspect_residual_state(request.repo_root, worktree_path, branch);
+    let residual = inspect_residual_state(repo_root, worktree_path, branch);
     Err(Error::WorktreeCreationFailed(Box::new(
         WorktreeCreationFailure {
             path: worktree_path.to_path_buf(),

@@ -413,79 +413,102 @@ fn run_claim(
 fn claim_response(
     action: ClaimAction,
 ) -> writ_core::error::Result<writ_core::contract::Response<serde_json::Value>> {
-    use writ_core::claim::{ClaimKind, ClaimRequest, claim};
     use writ_core::worktree::WorktreeManager;
 
     let allowed = writ_core::claim::allowed_owners_from_env().unwrap_or_default();
     let manager = WorktreeManager::new()?;
     match action {
-        ClaimAction::Issue {
-            repo,
-            start_point,
-            slug,
-            url,
-            owner,
-            repo_name,
-            issue,
-        } => {
-            let target = resolve_claim_target(
-                url.as_deref(),
-                owner,
-                repo_name,
-                issue,
-                writ_core::claim::ClaimResource::Issue,
-            )?;
-            let result = claim(
-                &manager,
-                ClaimRequest {
-                    repo_root: &repo,
-                    owner: &target.owner,
-                    repo: &target.repo,
-                    start_point: &start_point,
-                    kind: ClaimKind::Issue {
-                        number: target.number,
-                        slug: slug.as_deref(),
-                    },
-                    allowed_owners: &allowed,
-                },
-            )?;
-            Ok(claim_success("claim.issue", result, &repo))
-        }
-        ClaimAction::Pr {
-            repo,
-            start_point,
-            head_branch,
-            head_repo,
-            url,
-            owner,
-            repo_name,
-            pr,
-        } => {
-            let target = resolve_claim_target(
-                url.as_deref(),
-                owner,
-                repo_name,
-                pr,
-                writ_core::claim::ClaimResource::PullRequest,
-            )?;
-            let result = claim(
-                &manager,
-                ClaimRequest {
-                    repo_root: &repo,
-                    owner: &target.owner,
-                    repo: &target.repo,
-                    start_point: &start_point,
-                    kind: ClaimKind::PullRequest {
-                        number: target.number,
-                        head_branch: &head_branch,
-                        head_repo: head_repo.as_deref(),
-                    },
-                    allowed_owners: &allowed,
-                },
-            )?;
-            Ok(claim_success("claim.pr", result, &repo))
-        }
+        ClaimAction::Issue { .. } => claim_issue_response(&manager, &allowed, action),
+        ClaimAction::Pr { .. } => claim_pr_response(&manager, &allowed, action),
     }
+}
+
+fn claim_issue_response(
+    manager: &writ_core::worktree::WorktreeManager,
+    allowed: &[String],
+    action: ClaimAction,
+) -> writ_core::error::Result<writ_core::contract::Response<serde_json::Value>> {
+    use writ_core::claim::{ClaimKind, ClaimRequest, claim};
+
+    let ClaimAction::Issue {
+        repo,
+        start_point,
+        slug,
+        url,
+        owner,
+        repo_name,
+        issue,
+    } = action
+    else {
+        unreachable!("claim_issue_response called with a non-issue action");
+    };
+    let target = resolve_claim_target(
+        url.as_deref(),
+        owner,
+        repo_name,
+        issue,
+        writ_core::claim::ClaimResource::Issue,
+    )?;
+    let result = claim(
+        manager,
+        ClaimRequest {
+            repo_root: &repo,
+            owner: &target.owner,
+            repo: &target.repo,
+            start_point: &start_point,
+            kind: ClaimKind::Issue {
+                number: target.number,
+                slug: slug.as_deref(),
+            },
+            allowed_owners: allowed,
+        },
+    )?;
+    Ok(claim_success("claim.issue", result, &repo))
+}
+
+fn claim_pr_response(
+    manager: &writ_core::worktree::WorktreeManager,
+    allowed: &[String],
+    action: ClaimAction,
+) -> writ_core::error::Result<writ_core::contract::Response<serde_json::Value>> {
+    use writ_core::claim::{ClaimKind, ClaimRequest, claim};
+
+    let ClaimAction::Pr {
+        repo,
+        start_point,
+        head_branch,
+        head_repo,
+        url,
+        owner,
+        repo_name,
+        pr,
+    } = action
+    else {
+        unreachable!("claim_pr_response called with a non-pr action");
+    };
+    let target = resolve_claim_target(
+        url.as_deref(),
+        owner,
+        repo_name,
+        pr,
+        writ_core::claim::ClaimResource::PullRequest,
+    )?;
+    let result = claim(
+        manager,
+        ClaimRequest {
+            repo_root: &repo,
+            owner: &target.owner,
+            repo: &target.repo,
+            start_point: &start_point,
+            kind: ClaimKind::PullRequest {
+                number: target.number,
+                head_branch: &head_branch,
+                head_repo: head_repo.as_deref(),
+            },
+            allowed_owners: allowed,
+        },
+    )?;
+    Ok(claim_success("claim.pr", result, &repo))
 }
 
 fn claim_success(
