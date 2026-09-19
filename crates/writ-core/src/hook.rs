@@ -56,7 +56,7 @@ fn dispatch_inner(
         source: std::io::Error::new(std::io::ErrorKind::InvalidData, e),
     })?;
     match event.hook_event_name.as_str() {
-        "PreToolUse" => handle_pre_tool_use(&event),
+        "PreToolUse" => handle_pre_tool_use(&event, runtime),
         "WorktreeCreate" => handle_worktree_create(&event, runtime, stdout),
         "WorktreeRemove" => handle_worktree_remove(&event, runtime),
         "SubagentStart" => handle_subagent_start(&event, runtime),
@@ -100,7 +100,7 @@ struct ToolInput {
     command: Option<String>,
 }
 
-fn handle_pre_tool_use(event: &HookEvent) -> Result<()> {
+fn handle_pre_tool_use(event: &HookEvent, runtime: &HookRuntime) -> Result<()> {
     let tool_name = event.tool_name.as_deref().unwrap_or("");
     if !tool_name.eq_ignore_ascii_case("Bash") {
         return Ok(());
@@ -112,7 +112,14 @@ fn handle_pre_tool_use(event: &HookEvent) -> Result<()> {
     else {
         return Ok(());
     };
-    admit_bash_command(ShellText(command))
+    admit_bash_command(ShellText(command), hook_allowlist(runtime))
+}
+
+fn hook_allowlist(runtime: &HookRuntime) -> OwnerAllowlist {
+    runtime
+        .allowed_owners
+        .clone()
+        .unwrap_or_else(OwnerAllowlist::from_env)
 }
 
 fn handle_worktree_create(
@@ -289,7 +296,7 @@ fn origin_owner_repo(repo_root: &Path) -> Result<(String, String)> {
     }
 }
 
-fn admit_bash_command(command: ShellText<'_>) -> Result<()> {
+fn admit_bash_command(command: ShellText<'_>, allowlist: OwnerAllowlist) -> Result<()> {
     let invocations = git_gh_invocations(command).map_err(|unparsed| Error::PolicyViolation {
         code: PolicyCode::SubcommandNotAllowed,
         message: format!("unparseable git/gh command: {}", unparsed.0.0),
@@ -300,7 +307,7 @@ fn admit_bash_command(command: ShellText<'_>) -> Result<()> {
                 SafeGitCommand::new(&invocation.args)?;
             }
             GitGhTool::Gh => {
-                SafeGhCommand::new(&invocation.args)?;
+                SafeGhCommand::with_allowlist(&invocation.args, &allowlist)?;
             }
         }
     }
@@ -309,7 +316,7 @@ fn admit_bash_command(command: ShellText<'_>) -> Result<()> {
 
 /// Public validation entry used by tests: policy-check a Bash command string.
 pub fn validate_bash_command(command: &str) -> Result<()> {
-    admit_bash_command(ShellText(command))
+    admit_bash_command(ShellText(command), OwnerAllowlist::from_env())
 }
 
 #[cfg(test)]
@@ -529,6 +536,26 @@ mod tests {
             git_stdout(Path::new(&created), &["rev-parse", "HEAD"]),
             first
         );
+    }
+
+    #[test]
+    fn pre_tool_use_blocks_disallowed_gh_repo_with_hook_allowlist() {
+        let runtime = HookRuntime {
+            allowed_owners: Some(OwnerAllowlist::from_owners(["acme"])),
+            ..HookRuntime::default()
+        };
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let payload = serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": { "command": "gh repo delete other/project --yes" },
+        })
+        .to_string();
+        let code = dispatch(&payload, &runtime, &mut stdout, &mut stderr);
+        assert_eq!(code, 2);
+        let stderr = String::from_utf8_lossy(&stderr);
+        assert!(stderr.contains("OWNER_NOT_ALLOWED"), "{stderr}");
     }
 
     #[test]

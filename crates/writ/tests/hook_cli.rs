@@ -23,10 +23,22 @@ impl Drop for TestDir {
     }
 }
 
-fn writ_hook(root: &std::path::Path, payload: &str) -> std::process::Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_writ"))
-        .env("WRIT_WORKTREE_BASE", root.join("worktrees"))
-        .env("WRIT_LEASE_PATH", root.join("leases.db"))
+fn writ_hook(
+    root: &std::path::Path,
+    payload: &str,
+    allowed_owners: Option<&str>,
+) -> std::process::Output {
+    let worktree_base = root.join("worktrees");
+    let lease_path = root.join("leases.db");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_writ"));
+    cmd.env("WRIT_WORKTREE_BASE", &worktree_base)
+        .env("WRIT_LEASE_PATH", &lease_path)
+        .env_remove("WRIT_ALLOWED_OWNERS")
+        .env_remove("WH_ALLOWED_OWNERS");
+    if let Some(owners) = allowed_owners {
+        cmd.args(["--allowed-owners", owners]);
+    }
+    let mut child = cmd
         .args(["hook"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -48,6 +60,7 @@ fn hook_blocks_git_force_push_with_exit_2() {
     let output = writ_hook(
         &root.0,
         r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"git push --force origin main"}}"#,
+        None,
     );
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -60,6 +73,7 @@ fn hook_blocks_quoted_force_push_and_config_injection() {
     let quoted = writ_hook(
         &root.0,
         r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"git push \"--force\""}}"#,
+        None,
     );
     assert_eq!(quoted.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&quoted.stderr);
@@ -68,6 +82,7 @@ fn hook_blocks_quoted_force_push_and_config_injection() {
     let config = writ_hook(
         &root.0,
         r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"git -c alias.status='!git push --force' status"}}"#,
+        None,
     );
     assert_eq!(config.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&config.stderr);
@@ -80,6 +95,7 @@ fn hook_worktree_create_requires_source_ref() {
     let output = writ_hook(
         &root.0,
         r#"{"hook_event_name":"WorktreeCreate","cwd":"/tmp","name":"wt"}"#,
+        None,
     );
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -92,6 +108,7 @@ fn hook_allows_git_status() {
     let output = writ_hook(
         &root.0,
         r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"git status"}}"#,
+        None,
     );
     assert_eq!(output.status.code(), Some(0));
 }
@@ -152,11 +169,24 @@ fn hook_boundary_fail_closed_cases() {
         ),
         (r#"{"hook_event_name":"SessionStart"}"#, 0, ""),
     ] {
-        let output = writ_hook(&root.0, payload);
+        let output = writ_hook(&root.0, payload, None);
         assert_eq!(output.status.code(), Some(exit), "payload={payload}");
         if !needle.is_empty() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             assert!(stderr.contains(needle), "needle={needle} stderr={stderr}");
         }
     }
+}
+
+#[test]
+fn hook_global_allowed_owners_flag_enforces_gh_repo_targets() {
+    let root = TestDir::new();
+    let output = writ_hook(
+        &root.0,
+        r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"gh repo delete other/project --yes"}}"#,
+        Some("acme"),
+    );
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("OWNER_NOT_ALLOWED"), "stderr={stderr}");
 }

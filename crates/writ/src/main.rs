@@ -473,15 +473,17 @@ fn run_worktree(
     Ok(ExitCode::SUCCESS)
 }
 
-fn run_hook(stdout: &mut impl Write) -> writ_core::error::Result<ExitCode> {
+fn run_hook(
+    allowlist: &writ_core::owners::OwnerAllowlist,
+    stdout: &mut impl Write,
+) -> writ_core::error::Result<ExitCode> {
     let mut input = String::new();
     io::stdin().read_to_string(&mut input)?;
-    let code = writ_core::hook::dispatch(
-        &input,
-        &writ_core::hook::HookRuntime::default(),
-        stdout,
-        &mut io::stderr(),
-    );
+    let runtime = writ_core::hook::HookRuntime {
+        allowed_owners: Some(allowlist.clone()),
+        ..writ_core::hook::HookRuntime::default()
+    };
+    let code = writ_core::hook::dispatch(&input, &runtime, stdout, &mut io::stderr());
     Ok(ExitCode::from(code))
 }
 
@@ -593,7 +595,7 @@ async fn run(cli: Cli, stdout: &mut impl Write) -> writ_core::error::Result<Exit
             }
         },
         Some(Command::Worktree { action }) => run_worktree(action, &allowlist, cli.json, stdout),
-        Some(Command::Hook) => run_hook(stdout),
+        Some(Command::Hook) => run_hook(&allowlist, stdout),
         Some(Command::Install { settings, writ_bin }) => {
             run_install(settings, writ_bin, cli.json, stdout)
         }
