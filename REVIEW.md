@@ -59,7 +59,7 @@ Rust owns the hard safety boundary. Reviewers should check:
 - `gh pr merge` and merge-oriented `gh api` requests are impossible through product runtime public interfaces.
 - Branch verification occurs immediately before mutation to reduce time-of-check/time-of-use risk.
 - Canonicalization and component checks prevent `..`, symlink, or prefix-based path escape.
-- State writes use a temporary file and atomic replacement without leaving partial JSON. The PR watchlist writer in `watchlist/` (`watchlist.json`) is the current example: temp + rename, POSIX mode 600, quarantine of corrupt files. The job-status `watched.json` path in `state.rs` remains read-only; the lease store (#124) is still expected to own that job/lease state, not this watchlist.
+- State writes for the hook lease store go through SQLite (`rusqlite` bundled). `watched.json` remains a read-only legacy path; do not add a writer for it. JSON state writes use a temporary file and atomic replacement without leaving partial JSON; the PR watchlist writer in `watchlist/` (`watchlist.json`) is the current example: temp + rename, POSIX mode 600, quarantine of corrupt files.
 - Process timeouts terminate and reap children. This is implemented in `supervisor.rs` (wall-clock timeout inclusive of permit wait, process-group kill on drop on Unix -- Windows kills only the direct child, per the `supervisor.rs` platform notes -- and wrapper/interpreter rejection); changes to it require timeout and reaping tests, not a deferral.
 - Public error codes are stable enough for callers to classify without parsing prose.
 - Unsafe Rust remains forbidden unless a separately reviewed design justifies it.
