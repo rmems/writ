@@ -80,6 +80,8 @@ When monitoring PR checks, classify each row from `gh pr checks --json name,stat
 
 `skipping` is non-blocking. `pending` means continue other work without rerun spam. **Prefer a real fix or `gh run rerun` over noise commits.** Residual codes belong in watchlist notes and the final report.
 
+Requiredness is **not** the Class A/B/C letter and is **not** inferred from a provider name. Pass `isRequired` from GraphQL when available. Count `required_failure` separately from advisory findings, pending results, `ACTION_REQUIRED` external-access/configuration problems, and unknown requiredness. Unknown is a report, not a writ merge gate and not a pass. Do not disable checks, fabricate success, or empty-commit to retrigger a bot.
+
 ### Platform-neutral worker prompt template
 
 When spawning a worker subagent, include these safety instructions in the prompt:

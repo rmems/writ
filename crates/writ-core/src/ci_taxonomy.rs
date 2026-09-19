@@ -37,6 +37,74 @@ impl CheckClass {
     }
 }
 
+/// Whether GitHub (or the check payload) marked this check as required.
+///
+/// Parsed only from `isRequired` / `is_required` / `required`. A provider name
+/// never decides requiredness. Absent fields are [`Requirement::Unknown`], which
+/// is reported and is not a writ merge gate.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Requirement {
+    /// Payload marked this check required (`isRequired: true`).
+    Required,
+    /// Payload marked this check not required (`isRequired: false`).
+    Advisory,
+    /// Requiredness field absent; do not infer pass or fail from the vendor.
+    Unknown,
+}
+
+impl Requirement {
+    /// Stable snake_case token for residual / observation codes.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Required => "required",
+            Self::Advisory => "advisory",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// How this check should be treated in a cycle: a required failure, a reported
+/// finding, a wait, or an external access/configuration problem.
+///
+/// GitHub remains the required-check authority. Observation kinds other than
+/// [`ObservationKind::RequiredFailure`] are not writ merge gates.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservationKind {
+    /// Terminal success (including neutral).
+    Success,
+    /// `skipping` / `SKIPPED` — non-blocking.
+    Skipping,
+    /// Still running; continue other work.
+    Pending,
+    /// [`Requirement::Required`] and a blocking failure the agent may need to fix.
+    RequiredFailure,
+    /// Payload said not required; report the finding, do not treat as a writ gate.
+    AdvisoryFinding,
+    /// Dashboard / login / configuration gate (`ACTION_REQUIRED`), not a source fix.
+    ExternalAccess,
+    /// Blocking outcome with unknown requiredness; report, do not invent a gate.
+    UnknownRequiredness,
+}
+
+impl ObservationKind {
+    /// Stable snake_case token for observation codes.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Skipping => "skipping",
+            Self::Pending => "pending",
+            Self::RequiredFailure => "required_failure",
+            Self::AdvisoryFinding => "advisory_finding",
+            Self::ExternalAccess => "external_access",
+            Self::UnknownRequiredness => "unknown_requiredness",
+        }
+    }
+}
+
 /// Normalized check conclusion, covering `gh` buckets and GraphQL conclusions.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -121,6 +189,8 @@ pub struct CheckEntry {
     pub description: String,
     pub details_url: String,
     pub run_id: Option<u64>,
+    /// From `isRequired` / `required` only. Never inferred from the vendor name.
+    pub requirement: Requirement,
     /// GraphQL `__typename` when present (`CheckRun` / `StatusContext`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub typename: Option<String>,
@@ -137,6 +207,8 @@ pub struct ClassifiedCheck {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub residual_code: Option<String>,
     pub recommended_action: RecommendedAction,
+    /// Required vs advisory vs pending vs external-access vs unknown.
+    pub observation: ObservationKind,
 }
 
 /// Classification of a full PR check rollup.
@@ -182,13 +254,63 @@ impl ClassificationReport {
             .collect()
     }
 
-    /// Failures the agent may fix in source (Class A/B).
+    /// Failures whose recommended action is a source fix (not rerun or residual).
     #[must_use]
     pub fn fixable_failures(&self) -> Vec<&ClassifiedCheck> {
         self.failures()
             .into_iter()
-            .filter(|c| matches!(c.check_class, CheckClass::A | CheckClass::B))
+            .filter(|c| matches!(c.recommended_action, RecommendedAction::FixSource))
             .collect()
+    }
+
+    /// Actual required-check failures. GitHub (via `isRequired`) is the authority.
+    #[must_use]
+    pub fn required_failures(&self) -> Vec<&ClassifiedCheck> {
+        self.with_observation(ObservationKind::RequiredFailure)
+    }
+
+    /// Reported advisory findings; not writ merge gates.
+    #[must_use]
+    pub fn advisory_findings(&self) -> Vec<&ClassifiedCheck> {
+        self.with_observation(ObservationKind::AdvisoryFinding)
+    }
+
+    /// Checks still running.
+    #[must_use]
+    pub fn pending_checks(&self) -> Vec<&ClassifiedCheck> {
+        self.with_observation(ObservationKind::Pending)
+    }
+
+    /// Dashboard / login / configuration problems (`ACTION_REQUIRED`).
+    #[must_use]
+    pub fn external_access(&self) -> Vec<&ClassifiedCheck> {
+        self.with_observation(ObservationKind::ExternalAccess)
+    }
+
+    /// Blocking outcomes whose requiredness was not present on the payload.
+    #[must_use]
+    pub fn unknown_requiredness(&self) -> Vec<&ClassifiedCheck> {
+        self.with_observation(ObservationKind::UnknownRequiredness)
+    }
+
+    fn with_observation(&self, kind: ObservationKind) -> Vec<&ClassifiedCheck> {
+        self.checks
+            .iter()
+            .filter(|c| c.observation == kind)
+            .collect()
+    }
+
+    /// Codes for one observation kind (residual code when present, else a stable label).
+    #[must_use]
+    pub fn observation_codes(&self, kind: ObservationKind) -> Vec<String> {
+        let mut codes: Vec<String> = self
+            .with_observation(kind)
+            .into_iter()
+            .map(observation_code)
+            .collect();
+        codes.sort();
+        codes.dedup();
+        codes
     }
 
     /// Failures that remain residual (Class C, or Class B human gates).
@@ -248,6 +370,7 @@ pub fn parse_check_entry(raw: &Value) -> CheckEntry {
         }
     };
     let run_id = extract_run_id(&details_url).or_else(|| rollup_run_id(raw));
+    let requirement = parse_requirement(raw);
 
     CheckEntry {
         name,
@@ -257,6 +380,7 @@ pub fn parse_check_entry(raw: &Value) -> CheckEntry {
         description,
         details_url,
         run_id,
+        requirement,
         typename,
     }
 }
@@ -269,6 +393,7 @@ pub fn classify_check(entry: CheckEntry) -> ClassifiedCheck {
     let residual_code = residual_code(check_class, &entry);
     let recommended_action =
         recommended_action(check_class, &entry, &policies, residual_code.as_deref());
+    let observation = observation_kind(entry.requirement, entry.conclusion);
     let reason = explain(check_class, &entry);
     ClassifiedCheck {
         entry,
@@ -277,6 +402,7 @@ pub fn classify_check(entry: CheckEntry) -> ClassifiedCheck {
         reason,
         residual_code,
         recommended_action,
+        observation,
     }
 }
 
@@ -301,6 +427,15 @@ pub fn classify_response_data(report: &ClassificationReport) -> Value {
         "all_passed": report.all_passed(),
         "residual_codes": report.residual_codes(),
         "fixable_failure_count": report.fixable_failures().len(),
+        "required_failure_count": report.required_failures().len(),
+        "required_failure_codes": report.observation_codes(ObservationKind::RequiredFailure),
+        "advisory_finding_codes": report.observation_codes(ObservationKind::AdvisoryFinding),
+        "pending_codes": report.observation_codes(ObservationKind::Pending),
+        "external_access_codes": report.observation_codes(ObservationKind::ExternalAccess),
+        "unknown_requiredness_codes": report.observation_codes(ObservationKind::UnknownRequiredness),
+        "github_is_required_check_authority": true,
+        "unknown_requiredness_is_not_a_writ_merge_gate": true,
+        "operator_note": "GitHub is the required-check authority. A provider name does not decide requiredness. Unknown requiredness, advisory findings, pending results, and external access/configuration problems are reported and are not writ merge gates.",
     })
 }
 
@@ -370,6 +505,52 @@ pub fn rerun_command(classified: &ClassifiedCheck) -> Option<Vec<String>> {
         "rerun".to_owned(),
         run_id.to_string(),
     ])
+}
+
+fn parse_requirement(raw: &Value) -> Requirement {
+    for key in ["isRequired", "is_required", "required"] {
+        match raw.get(key) {
+            Some(Value::Bool(true)) => return Requirement::Required,
+            Some(Value::Bool(false)) => return Requirement::Advisory,
+            Some(Value::String(s)) => {
+                let lower = s.trim().to_ascii_lowercase();
+                if lower == "true" || lower == "required" {
+                    return Requirement::Required;
+                }
+                if lower == "false" || lower == "advisory" || lower == "optional" {
+                    return Requirement::Advisory;
+                }
+            }
+            _ => {}
+        }
+    }
+    Requirement::Unknown
+}
+
+fn observation_kind(requirement: Requirement, conclusion: CheckConclusion) -> ObservationKind {
+    match conclusion {
+        CheckConclusion::Success | CheckConclusion::Neutral => ObservationKind::Success,
+        CheckConclusion::Skipped => ObservationKind::Skipping,
+        CheckConclusion::Pending => ObservationKind::Pending,
+        CheckConclusion::ActionRequired => ObservationKind::ExternalAccess,
+        CheckConclusion::Failure
+        | CheckConclusion::Cancelled
+        | CheckConclusion::TimedOut
+        | CheckConclusion::Stale
+        | CheckConclusion::StartupFailure => match requirement {
+            Requirement::Required => ObservationKind::RequiredFailure,
+            Requirement::Advisory => ObservationKind::AdvisoryFinding,
+            Requirement::Unknown => ObservationKind::UnknownRequiredness,
+        },
+    }
+}
+
+fn observation_code(check: &ClassifiedCheck) -> String {
+    if let Some(code) = &check.residual_code {
+        return code.clone();
+    }
+    let name = slug_name(&check.entry.name);
+    format!("{}:{name}", check.observation.as_str())
 }
 
 fn classify_class(entry: &CheckEntry) -> CheckClass {
@@ -522,9 +703,6 @@ fn recommended_action(
     }
     if let Some(rerun) = rerun_action(check_class, entry, policies) {
         return rerun;
-    }
-    if policies.contains(&Policy::FixSource) && residual.is_none() {
-        return RecommendedAction::FixSource;
     }
     if let Some(code) = residual {
         return RecommendedAction::Residual {
@@ -900,6 +1078,7 @@ mod tests {
         assert!(entry.name.is_empty());
         assert_eq!(entry.conclusion, CheckConclusion::Pending);
         assert_eq!(entry.run_id, None);
+        assert_eq!(entry.requirement, Requirement::Unknown);
     }
 
     #[test]
@@ -1114,6 +1293,16 @@ mod tests {
             vec!["class_c:kilo_fail".to_owned()]
         );
         assert_class_counts(&report, (1, 1, 2));
+        assert!(report.required_failures().is_empty());
+        assert_eq!(report.unknown_requiredness().len(), 3);
+        assert_eq!(
+            report.observation_codes(ObservationKind::UnknownRequiredness),
+            vec![
+                "class_c:kilo_fail".to_owned(),
+                "unknown_requiredness:build_test".to_owned(),
+                "unknown_requiredness:codacy_static_code_analysis".to_owned(),
+            ]
+        );
     }
 
     #[test]
@@ -1198,5 +1387,152 @@ mod tests {
         let report = classify_checks(&[raw_check("CI", "CI", "stale", actions_url())]);
         assert_eq!(report.failures().len(), 1);
         assert!(!report.all_passed());
+    }
+
+    #[test]
+    fn requiredness_comes_from_payload_not_provider_name() {
+        let absent = parse_check_entry(&json!({
+            "name": "Codacy Static Code Analysis",
+            "bucket": "fail",
+            "link": "https://app.codacy.com/gh/acme/example-org/pull-requests/12",
+        }));
+        assert_eq!(absent.requirement, Requirement::Unknown);
+        assert_eq!(absent.requirement.as_str(), "unknown");
+
+        let required = parse_check_entry(&json!({
+            "name": "CodeRabbit",
+            "bucket": "fail",
+            "link": "https://coderabbit.ai/review/1",
+            "isRequired": true,
+        }));
+        assert_eq!(required.requirement, Requirement::Required);
+
+        let advisory = parse_check_entry(&json!({
+            "name": "Build & Test",
+            "workflow": "CI",
+            "bucket": "fail",
+            "link": actions_url(),
+            "required": false,
+        }));
+        assert_eq!(advisory.requirement, Requirement::Advisory);
+    }
+
+    #[test]
+    fn observation_kind_splits_required_advisory_unknown_and_external() {
+        let required = classify_check(parse_check_entry(&json!({
+            "name": "Build & Test",
+            "workflow": "CI",
+            "bucket": "fail",
+            "link": actions_url(),
+            "isRequired": true,
+        })));
+        assert_eq!(required.observation, ObservationKind::RequiredFailure);
+        assert_eq!(required.recommended_action, RecommendedAction::FixSource);
+
+        let advisory = classify_check(parse_check_entry(&json!({
+            "name": "qlty check",
+            "bucket": "fail",
+            "link": "https://qlty.sh/gh/acme/example-org/pull/1",
+            "isRequired": false,
+        })));
+        assert_eq!(advisory.observation, ObservationKind::AdvisoryFinding);
+        assert_eq!(advisory.check_class, CheckClass::C);
+
+        let unknown = classify_named("Build & Test", "CI", "fail", actions_url());
+        assert_eq!(unknown.observation, ObservationKind::UnknownRequiredness);
+
+        let external = classify_check(parse_check_entry(&json!({
+            "name": "Codacy Static Code Analysis",
+            "link": "https://app.codacy.com/gh/acme/example-org/pull-requests/12",
+            "conclusion": "ACTION_REQUIRED",
+            "isRequired": true,
+        })));
+        assert_eq!(external.observation, ObservationKind::ExternalAccess);
+        assert_eq!(
+            external.residual_code.as_deref(),
+            Some("class_b:codacy_action_required")
+        );
+
+        let pending = classify_named("Build & Test", "CI", "pending", actions_url());
+        assert_eq!(pending.observation, ObservationKind::Pending);
+    }
+
+    #[test]
+    fn class_c_is_required_only_when_payload_says_so() {
+        let required_bot = classify_check(parse_check_entry(&json!({
+            "name": "Kilo Code Review",
+            "bucket": "fail",
+            "link": "https://app.kilo.ai/review/1",
+            "isRequired": true,
+        })));
+        assert_eq!(required_bot.check_class, CheckClass::C);
+        assert_eq!(required_bot.observation, ObservationKind::RequiredFailure);
+
+        let unnamed = classify_named(
+            "Kilo Code Review",
+            "",
+            "fail",
+            "https://app.kilo.ai/review/1",
+        );
+        assert_eq!(unnamed.observation, ObservationKind::UnknownRequiredness);
+    }
+
+    #[test]
+    fn fixable_failures_are_source_fixes_only() {
+        let report = classify_checks_json(&json!([
+            {
+                "name": "Build & Test",
+                "workflow": "CI",
+                "bucket": "fail",
+                "link": actions_url(),
+                "isRequired": true,
+            },
+            {
+                "name": "Build & Test",
+                "workflow": "CI",
+                "bucket": "timed_out",
+                "link": actions_url(),
+            },
+            {
+                "name": "Codacy Static Code Analysis",
+                "link": "https://app.codacy.com/gh/acme/example-org/pull-requests/12",
+                "conclusion": "ACTION_REQUIRED",
+            },
+            {
+                "name": "Kilo Code Review",
+                "bucket": "fail",
+                "link": "https://app.kilo.ai/review/1",
+            }
+        ]))
+        .unwrap();
+        assert_eq!(report.fixable_failures().len(), 1);
+        assert_eq!(report.fixable_failures()[0].entry.name, "Build & Test");
+        assert_eq!(report.required_failures().len(), 1);
+        assert_eq!(report.external_access().len(), 1);
+        assert_eq!(
+            report.observation_codes(ObservationKind::ExternalAccess),
+            vec!["class_b:codacy_action_required".to_owned()]
+        );
+        assert!(!should_rerun(report.fixable_failures()[0]));
+        assert!(should_rerun(&report.checks[1]));
+    }
+
+    #[test]
+    fn classify_response_data_does_not_treat_unknown_as_a_gate() {
+        let report = classify_checks(&[raw_check("Build & Test", "CI", "fail", actions_url())]);
+        let data = classify_response_data(&report);
+        assert_eq!(data["required_failure_count"], 0);
+        assert_eq!(data["github_is_required_check_authority"], true);
+        assert_eq!(data["unknown_requiredness_is_not_a_writ_merge_gate"], true);
+        assert_eq!(
+            data["unknown_requiredness_codes"],
+            json!(["unknown_requiredness:build_test"])
+        );
+        assert!(
+            data["operator_note"]
+                .as_str()
+                .unwrap()
+                .contains("GitHub is the required-check authority")
+        );
     }
 }

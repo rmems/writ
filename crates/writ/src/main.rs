@@ -935,9 +935,14 @@ fn write_classify_result(
     )?;
     writeln!(
         stdout,
-        "all_passed={} residual_codes={}",
+        "all_passed={} required_failures={} residual_codes={}",
         report.all_passed(),
+        report.required_failures().len(),
         report.residual_codes().join(",")
+    )?;
+    writeln!(
+        stdout,
+        "github is the required-check authority; unknown/advisory/pending/external-access are not writ merge gates"
     )?;
     for check in &report.checks {
         let residual = check.residual_code.as_deref().unwrap_or("-");
@@ -1011,6 +1016,7 @@ mod tests {
         .unwrap();
         let cli = Cli {
             json: true,
+            allowed_owners: None,
             command: Some(super::Command::Ci {
                 action: super::CiAction::Classify {
                     file: Some(path.clone()),
@@ -1038,6 +1044,17 @@ mod tests {
                 .expect("residual_codes")[0],
             "class_c:kilo_pending"
         );
+        assert_eq!(
+            v.pointer("/data/required_failure_count")
+                .and_then(|c| c.as_u64())
+                .expect("required_failure_count"),
+            0
+        );
+        assert_eq!(
+            v.pointer("/data/unknown_requiredness_is_not_a_writ_merge_gate")
+                .expect("unknown_requiredness_is_not_a_writ_merge_gate"),
+            true
+        );
         let _ = std::fs::remove_file(path);
     }
 
@@ -1054,6 +1071,7 @@ mod tests {
         std::fs::write(&path, "not-json").unwrap();
         let cli = Cli {
             json: true,
+            allowed_owners: None,
             command: Some(super::Command::Ci {
                 action: super::CiAction::Classify {
                     file: Some(path.clone()),

@@ -81,7 +81,9 @@ Serialized as a lowercase snake_case string.
 
 Serialized as a lowercase snake_case string. Job-level rollup only — per-check
 Class A (Actions/Azure), Class B (Codacy), and Class C (Kilo/CodeRabbit/Gitar)
-live in [`ci-taxonomy.md`](ci-taxonomy.md) and `writ ci classify`.
+live in [`ci-taxonomy.md`](ci-taxonomy.md) and `writ ci classify`. Per-check
+requiredness (`required_failure` vs advisory / pending / external-access /
+unknown) is also in that classifier; `CiClass` does not infer it from a vendor.
 
 | Variant | Meaning |
 | --- | --- |

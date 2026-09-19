@@ -34,11 +34,12 @@ gh pr checks <n> --json name,state,bucket,workflow,link
 
 | Field | Role |
 | --- | --- |
-| `name` | Display name; vendor matching (Codacy, Kilo, …) |
+| `name` | Display name; vendor matching (Codacy, Kilo, …). **Not** requiredness. |
 | `bucket` | `pass` / `fail` / `pending` / `skipping` / `cancel` — mapped onto conclusions |
 | `state` | GitHub state; `ERROR` is a failure; `EXPECTED` is pending |
 | `workflow` | GitHub Actions workflow name. **Non-empty means Class A** unless a B/C name/link overrides |
 | `link` | Actions run URL (extract run id), `app.codacy.com`, `dev.azure.com`, `kilo.ai`, … |
+| `isRequired` / `required` | Optional. Present on GraphQL rollup; usually absent from `gh pr checks`. |
 
 Legacy aliases (`conclusion`, `workflowName`, `detailsUrl`) are accepted.
 
@@ -53,6 +54,7 @@ Use rollup when `bucket` is not enough (especially `ACTION_REQUIRED`):
 | `detailsUrl` / `targetUrl` | Same URL rules as `link` |
 | `checkSuite.workflowRun.databaseId` | Actions run id when the URL is missing |
 | `context` / `state` | StatusContext name and `SUCCESS` / `PENDING` / `FAILURE` / `ERROR` / `EXPECTED` |
+| `isRequired` / `required` | **Requiredness.** `true` → required, `false` → advisory. Absent → unknown. Never inferred from the vendor name. |
 
 ## Bucket / conclusion interaction
 
@@ -68,6 +70,30 @@ Use rollup when `bucket` is not enough (especially `ACTION_REQUIRED`):
 | `STALE` | stale | Treat as a failure (not success). |
 
 An empty check list is **unknown**, not success.
+
+## Required vs advisory vs unknown
+
+Class A/B/C is **who owns the check**, not whether GitHub requires it. Requiredness
+is parsed only from `isRequired` / `is_required` / `required`. A provider name
+(Codacy, CodeRabbit, CodeScene, …) never decides a writ merge gate.
+
+| Observation | When | Cycle behavior |
+| --- | --- | --- |
+| `required_failure` | `isRequired: true` and a blocking failure | Actual required-check failure. Fix source or official rerun. |
+| `advisory_finding` | `isRequired: false` and a blocking failure | Report the finding. Do not treat it as a writ merge gate. |
+| `pending` | Still running | Continue other work. Do not rerun-spam. |
+| `external_access` | `ACTION_REQUIRED` (dashboard / login / configuration) | Residual human/config gate. Do not empty-push. Unrelated workers continue. |
+| `unknown_requiredness` | Blocking outcome with **no** requiredness field | Report it. **Not** a writ merge gate and **not** a pass. |
+| `success` / `skipping` | Terminal pass or skip | Ignore. |
+
+`required_failure_count` / `required_failure_codes` on `ci.classify` count only
+`required_failure`. GitHub is the required-check authority. This classifier does
+not disable checks, fabricate success, or invent repository protection. If the
+repository has no required contexts configured, that is an operator gap, not a
+reason to treat every bot observation as required.
+
+`fixable_failure_count` counts checks whose recommended action is **fix source**
+only (not flake reruns and not residual `ACTION_REQUIRED` gates).
 
 ## Classification algorithm
 
@@ -114,7 +140,9 @@ does not emit a residual (continue other work). Class C pending **does**.
 
 Record these codes in handoff `notes` and any watchlist blocker list. They do
 not replace `JobStatus.ci_class` (`pass` / `fail` / `pending` / `unknown`), which
-is a job-level rollup, not A/B/C.
+is a job-level rollup, not A/B/C. Watchlist consumers should keep
+`required_failure_codes` distinct from `advisory_finding_codes`,
+`pending_codes`, `external_access_codes`, and `unknown_requiredness_codes`.
 
 ## CLI
 
