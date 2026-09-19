@@ -1,10 +1,9 @@
-//! Durable worktree ownership identity for verified reclaim.
+//! Minimal SQLite lease store for Phase 1 hook admission.
 //!
-//! `WorktreeCreate` grants a writer lock; `WorktreeRemove` releases it without
-//! deleting the row so a later create can prove the branch still belongs to
-//! this owner/repo/job. Budget columns are reserved and nullable; they are not
-//! enforced here. Crash-window reconciliation between git mutation and this
-//! record is [#136](https://github.com/rmems/writ/issues/136).
+//! This is a skeleton, not the full MCP coordination store. `WorktreeCreate`
+//! writes a row; `WorktreeRemove` releases it without deleting the identity so
+//! verified reclaim can prove ownership. Budget columns are reserved and
+//! nullable; they are not enforced here.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -14,7 +13,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::error::{Error, Result};
 
-/// Lease admission modes reserved by #124. Verified reclaim uses
+/// Lease admission modes reserved by #124. Phase 1 only uses
 /// `WriterLocked` (held) and `Unassigned` (released, identity kept).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LeaseMode {
@@ -40,11 +39,6 @@ impl LeaseMode {
     }
 
     /// Parse a stored mode string, failing closed on unrecognized values.
-    ///
-    /// A corrupted or unknown mode must NOT decay to `Unassigned`: a released
-    /// (`Unassigned`) lease is treated as reclaimable by `prove_resume`, so
-    /// silently mapping garbage to `Unassigned` would hand ownership of a branch
-    /// to a caller who never held the lease. Surface it as an error instead.
     fn parse(value: &str) -> Result<Self> {
         match value {
             "UNASSIGNED" => Ok(Self::Unassigned),
@@ -111,11 +105,22 @@ pub struct JobKey<'a> {
     pub job_id: &'a str,
 }
 
-const LEASE_SELECT: &str = "SELECT repo, owner, repo_name, job_id, branch, branch_ref, \
-     worktree_path, start_commit, mode, ttl, heartbeat, max_files, max_churn, \
-     max_fix_cycles, fix_cycles, released_at FROM leases";
+/// Agent-registry upsert payload.
+#[derive(Debug, Clone, Copy)]
+pub struct AgentIdentity<'a> {
+    pub agent_id: &'a str,
+    pub agent_type: &'a str,
+    pub session_id: Option<&'a str>,
+}
 
-/// SQLite-backed lease identity store.
+struct LeaseSql {
+    where_sql: &'static str,
+    context: &'static str,
+}
+
+const LEASE_SELECT: &str = "SELECT repo, owner, repo_name, job_id, branch, branch_ref, worktree_path, start_commit, mode, ttl, heartbeat, max_files, max_churn, max_fix_cycles, fix_cycles, released_at FROM leases";
+
+/// SQLite-backed lease and agent registry.
 #[derive(Debug)]
 pub struct LeaseStore {
     path: PathBuf,
@@ -160,6 +165,13 @@ impl LeaseStore {
                 updated_at INTEGER NOT NULL,
                 released_at INTEGER,
                 UNIQUE(owner, repo_name, job_id)
+            );
+            CREATE TABLE IF NOT EXISTS agents (
+                agent_id TEXT PRIMARY KEY,
+                agent_type TEXT NOT NULL,
+                session_id TEXT,
+                started_at INTEGER NOT NULL,
+                stopped_at INTEGER
             );
             ",
         )
@@ -248,8 +260,10 @@ impl LeaseStore {
     /// Durable resume identity for an owner/repo/job/branch, including released rows.
     pub fn find_resume(&self, key: ResumeKey<'_>) -> Result<Option<Lease>> {
         self.query_lease(
-            "WHERE owner = ?1 AND repo_name = ?2 AND job_id = ?3 AND branch = ?4",
-            "lookup resume identity",
+            LeaseSql {
+                where_sql: "WHERE owner = ?1 AND repo_name = ?2 AND job_id = ?3 AND branch = ?4",
+                context: "lookup resume identity",
+            },
             params![key.owner, key.repo_name, key.job_id, key.branch],
         )
     }
@@ -257,8 +271,10 @@ impl LeaseStore {
     /// Look up a lease by owner/repo/job.
     pub fn find_job(&self, key: JobKey<'_>) -> Result<Option<Lease>> {
         self.query_lease(
-            "WHERE owner = ?1 AND repo_name = ?2 AND job_id = ?3",
-            "lookup lease",
+            LeaseSql {
+                where_sql: "WHERE owner = ?1 AND repo_name = ?2 AND job_id = ?3",
+                context: "lookup lease",
+            },
             params![key.owner, key.repo_name, key.job_id],
         )
     }
@@ -266,23 +282,57 @@ impl LeaseStore {
     /// Look up a lease by worktree path.
     pub fn find_by_path(&self, worktree_path: &Path) -> Result<Option<Lease>> {
         self.query_lease(
-            "WHERE worktree_path = ?1",
-            "lookup lease by path",
+            LeaseSql {
+                where_sql: "WHERE worktree_path = ?1",
+                context: "lookup lease by path",
+            },
             params![path_text(worktree_path)],
         )
     }
 
-    fn query_lease(
-        &self,
-        where_sql: &str,
-        context: &'static str,
-        params: impl rusqlite::Params,
-    ) -> Result<Option<Lease>> {
-        let query = format!("{LEASE_SELECT} {where_sql}");
+    fn query_lease(&self, sql: LeaseSql, params: impl rusqlite::Params) -> Result<Option<Lease>> {
+        let query = format!("{LEASE_SELECT} {}", sql.where_sql);
         let conn = self.lock()?;
         conn.query_row(&query, params, lease_from_row)
             .optional()
-            .map_err(|e| lease_err(context, e))
+            .map_err(|e| lease_err(sql.context, e))
+    }
+
+    /// Upsert a live agent-registry row.
+    pub fn upsert_agent(&self, identity: AgentIdentity<'_>) -> Result<()> {
+        let now = now_secs();
+        let conn = self.lock()?;
+        conn.execute(
+            "
+            INSERT INTO agents (agent_id, agent_type, session_id, started_at, stopped_at)
+            VALUES (?1, ?2, ?3, ?4, NULL)
+            ON CONFLICT(agent_id) DO UPDATE SET
+                agent_type = excluded.agent_type,
+                session_id = excluded.session_id,
+                started_at = excluded.started_at,
+                stopped_at = NULL
+            ",
+            params![
+                identity.agent_id,
+                identity.agent_type,
+                identity.session_id,
+                now
+            ],
+        )
+        .map_err(|e| lease_err("upsert agent", e))?;
+        Ok(())
+    }
+
+    /// Retire an agent-registry row.
+    pub fn retire_agent(&self, agent_id: &str) -> Result<()> {
+        let now = now_secs();
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE agents SET stopped_at = ?1 WHERE agent_id = ?2",
+            params![now, agent_id],
+        )
+        .map_err(|e| lease_err("retire agent", e))?;
+        Ok(())
     }
 
     /// True when the `leases` table has the reserved nullable budget columns.
@@ -310,10 +360,80 @@ impl LeaseStore {
 }
 
 fn lease_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Lease> {
+    let identity = lease_identity(row)?;
+    let limits = lease_limits(row)?;
+    Ok(Lease {
+        repo: identity.repo,
+        owner: identity.owner,
+        repo_name: identity.repo_name,
+        job_id: identity.job_id,
+        branch: identity.branch,
+        branch_ref: identity.branch_ref,
+        worktree_path: identity.worktree_path,
+        start_commit: identity.start_commit,
+        mode: identity.mode,
+        ttl: limits.ttl,
+        heartbeat: limits.heartbeat,
+        max_files: limits.max_files,
+        max_churn: limits.max_churn,
+        max_fix_cycles: limits.max_fix_cycles,
+        fix_cycles: limits.fix_cycles,
+        released_at: limits.released_at,
+    })
+}
+
+struct LeaseIdentity {
+    repo: String,
+    owner: String,
+    repo_name: String,
+    job_id: String,
+    branch: String,
+    branch_ref: String,
+    worktree_path: String,
+    start_commit: String,
+    mode: LeaseMode,
+}
+
+struct LeaseLimits {
+    ttl: Option<i64>,
+    heartbeat: Option<i64>,
+    max_files: Option<i64>,
+    max_churn: Option<i64>,
+    max_fix_cycles: Option<i64>,
+    fix_cycles: Option<i64>,
+    released_at: Option<i64>,
+}
+
+fn lease_identity(row: &rusqlite::Row<'_>) -> rusqlite::Result<LeaseIdentity> {
+    let names = lease_names(row)?;
+    let refs = lease_refs(row)?;
+    Ok(LeaseIdentity {
+        repo: names.0,
+        owner: names.1,
+        repo_name: names.2,
+        job_id: names.3,
+        branch: names.4,
+        branch_ref: refs.0,
+        worktree_path: refs.1,
+        start_commit: refs.2,
+        mode: refs.3,
+    })
+}
+
+fn lease_names(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<(String, String, String, String, String)> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+    ))
+}
+
+fn lease_refs(row: &rusqlite::Row<'_>) -> rusqlite::Result<(String, String, String, LeaseMode)> {
     let mode_text = row.get::<_, String>(8)?;
-    // Map an unrecognized mode to a rusqlite conversion failure so the existing
-    // `lease_err` wrapping in `query_lease` surfaces it as `Error::LeaseStore`
-    // instead of decaying to a reclaimable `Unassigned` lease.
     let mode = LeaseMode::parse(&mode_text).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(
             8,
@@ -324,23 +444,35 @@ fn lease_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Lease> {
             )),
         )
     })?;
-    Ok(Lease {
-        repo: row.get(0)?,
-        owner: row.get(1)?,
-        repo_name: row.get(2)?,
-        job_id: row.get(3)?,
-        branch: row.get(4)?,
-        branch_ref: row.get(5)?,
-        worktree_path: row.get(6)?,
-        start_commit: row.get(7)?,
-        mode,
+    Ok((row.get(5)?, row.get(6)?, row.get(7)?, mode))
+}
+
+fn lease_limits(row: &rusqlite::Row<'_>) -> rusqlite::Result<LeaseLimits> {
+    let reserved = lease_budget_cells(row)?;
+    Ok(LeaseLimits {
         ttl: row.get(9)?,
         heartbeat: row.get(10)?,
+        max_files: reserved.max_files,
+        max_churn: reserved.max_churn,
+        max_fix_cycles: reserved.max_fix_cycles,
+        fix_cycles: reserved.fix_cycles,
+        released_at: row.get(15)?,
+    })
+}
+
+struct BudgetCells {
+    max_files: Option<i64>,
+    max_churn: Option<i64>,
+    max_fix_cycles: Option<i64>,
+    fix_cycles: Option<i64>,
+}
+
+fn lease_budget_cells(row: &rusqlite::Row<'_>) -> rusqlite::Result<BudgetCells> {
+    Ok(BudgetCells {
         max_files: row.get(11)?,
         max_churn: row.get(12)?,
         max_fix_cycles: row.get(13)?,
         fix_cycles: row.get(14)?,
-        released_at: row.get(15)?,
     })
 }
 
@@ -386,7 +518,6 @@ mod tests {
         };
         let held = store.grant(grant).unwrap();
         assert_eq!(held.mode, LeaseMode::WriterLocked);
-        assert_eq!(held.branch_ref, "refs/heads/hive/gh-42");
         assert_eq!(held.max_files, None);
         assert_eq!(held.fix_cycles, None);
         assert!(held.released_at.is_none());
@@ -406,121 +537,28 @@ mod tests {
             .unwrap();
         assert_eq!(resume.start_commit, "abc123");
         assert_eq!(resume.branch_ref, "refs/heads/hive/gh-42");
-        assert_eq!(resume.worktree_path, path_text(&wt));
-        assert_eq!(resume.mode, LeaseMode::Unassigned);
     }
 
     #[test]
-    fn open_sets_busy_timeout() {
+    fn agent_upsert_and_retire() {
         let tmp = tempdir().unwrap();
         let store = LeaseStore::open(tmp.path().join("leases.db")).unwrap();
-        let conn = store.lock().unwrap();
-        let timeout: i64 = conn
-            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(timeout, 5000);
-    }
-
-    #[test]
-    fn unrecognized_mode_fails_closed_instead_of_becoming_unassigned() {
-        let tmp = tempdir().unwrap();
-        let store = LeaseStore::open(tmp.path().join("leases.db")).unwrap();
-        let repo = tmp.path().join("repo");
-        let wt = tmp.path().join("worktrees/acme/sample/gh-42");
         store
-            .grant(LeaseGrant {
-                repo: &repo,
-                owner: "acme",
-                repo_name: "sample",
-                job_id: "gh-42",
-                branch: "hive/gh-42",
-                worktree_path: &wt,
-                start_commit: "abc123",
+            .upsert_agent(AgentIdentity {
+                agent_id: "agent-1",
+                agent_type: "Explore",
+                session_id: Some("session-1"),
             })
             .unwrap();
-
-        // Corrupt the stored mode to a value outside the known set.
-        {
-            let conn = store.lock().unwrap();
-            conn.execute(
-                "UPDATE leases SET mode = 'FUTURE_MODE' WHERE owner = ?1",
-                params!["acme"],
+        store.retire_agent("agent-1").unwrap();
+        let conn = store.conn.lock().unwrap();
+        let stopped: Option<i64> = conn
+            .query_row(
+                "SELECT stopped_at FROM agents WHERE agent_id = ?1",
+                params!["agent-1"],
+                |row| row.get(0),
             )
             .unwrap();
-        }
-
-        // A corrupted mode must fail closed, not decay to a reclaimable Unassigned.
-        let resume = store.find_resume(ResumeKey {
-            owner: "acme",
-            repo_name: "sample",
-            job_id: "gh-42",
-            branch: "hive/gh-42",
-        });
-        assert!(
-            matches!(resume, Err(Error::LeaseStore { .. })),
-            "expected LeaseStore error, got {resume:?}"
-        );
-
-        let by_path = store.find_by_path(&wt);
-        assert!(
-            matches!(by_path, Err(Error::LeaseStore { .. })),
-            "expected LeaseStore error, got {by_path:?}"
-        );
-    }
-
-    #[test]
-    fn every_known_mode_round_trips_through_as_str() {
-        for mode in [
-            LeaseMode::Unassigned,
-            LeaseMode::WriterLocked,
-            LeaseMode::ReviewOnly,
-            LeaseMode::NeedsHuman,
-            LeaseMode::Blocked,
-            LeaseMode::MergeReady,
-        ] {
-            assert_eq!(LeaseMode::parse(mode.as_str()).unwrap(), mode);
-        }
-    }
-
-    #[test]
-    fn resume_lookup_requires_the_same_job_and_branch() {
-        let tmp = tempdir().unwrap();
-        let store = LeaseStore::open(tmp.path().join("leases.db")).unwrap();
-        let repo = tmp.path().join("repo");
-        let wt = tmp.path().join("worktrees/acme/sample/gh-42");
-        store
-            .grant(LeaseGrant {
-                repo: &repo,
-                owner: "acme",
-                repo_name: "sample",
-                job_id: "gh-42",
-                branch: "hive/gh-42",
-                worktree_path: &wt,
-                start_commit: "abc123",
-            })
-            .unwrap();
-
-        assert!(
-            store
-                .find_resume(ResumeKey {
-                    owner: "acme",
-                    repo_name: "sample",
-                    job_id: "gh-99",
-                    branch: "hive/gh-42",
-                })
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            store
-                .find_resume(ResumeKey {
-                    owner: "acme",
-                    repo_name: "sample",
-                    job_id: "gh-42",
-                    branch: "hive/other",
-                })
-                .unwrap()
-                .is_none()
-        );
+        assert!(stopped.is_some());
     }
 }

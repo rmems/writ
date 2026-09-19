@@ -134,10 +134,12 @@ For authorized implementation, complete the cohesive tranche: run focused gates 
 
 ## Architecture
 
+The v1 decision that `writ` is the only authoritative runtime, that `SKILL.md` files are thin clients, and that Codex `babysit-pr` is not replaced by a `writ` skill repo is recorded in [ADR 0001](docs/adr/0001-rust-only-v1-runtime-and-babysit-pr-boundary.md).
+
 `writ` is a **Rust workspace**. One binary owns both layers:
 
 - **Enforcement** — git worktrees, exact-base identity, path sandboxing, process supervision/timeouts, and **hard safety enforcement** (no runtime merge path, force-with-lease only, branch verification).
-- **Coordination state** *(planned, M1)* — agents, leases with path scopes, ownership, and freeze modes, in a single SQLite file derived from `git`/`gh`/disk rather than transcribed. A writer now records durable worktree ownership for verified reclaim; `state.rs` still only *reads* `watched.json`, and path-scoped contention plus hook-time admission remain M1.
+- **Coordination state** *(M1, partial)* — `writ hook` grants and releases SQLite lease rows (`leases` + `agents`). A writer records durable worktree ownership for verified reclaim ([#141](https://github.com/rmems/writ/issues/141)). Path scopes, ownership freeze modes, and the rest of the coordination schema remain later work. `state.rs` still only *reads* `watched.json`; that file is superseded by the lease store, not given a writer.
 - **Agent skill (`SKILL.md`)** — portable prompts describing when and how agents call the CLI on any platform.
 
 ```text
@@ -159,7 +161,7 @@ git / gh / operating system
 | Layer | Responsibilities |
 | --- | --- |
 | Agent skill | Describe when to discover work, spawn subagents, and report results. The installed companion `babysit-pr` skill handles interactive PR monitoring. Prompt content is portable guidance, not a security boundary. |
-| Rust core and CLI | Today: resolve sandboxed paths, supervise child processes, verify branches, and reject unsafe git/GitHub operations. Planned *(M1)*: verify worktrees it did not create, and hold lease state. |
+| Rust core and CLI | Resolve sandboxed paths, supervise child processes, verify branches, reject unsafe git/GitHub operations, dispatch `writ hook`, and hold SQLite lease rows. `writ install` and path-scoped coordination remain later M1 work. |
 | External tools | Runtime `git` and `gh` operations are selected and validated by Rust. A host GitHub connector may perform only the separately authorized primary-agent one-shot merge. The OS supplies filesystem and process primitives. |
 
 **Why enforce at the hook boundary?** A tool that must be *called* to help is advisory: an agent that does not call it is unconstrained. As a `PreToolUse` hook, enforcement applies to the agent's own commands whether or not the agent cooperates, and a blocking exit cannot be overridden by another hook. Hard stops live in Rust, at the binary boundary, so a malformed prompt cannot bypass them.
@@ -173,7 +175,7 @@ Rust code lives in `crates/`:
 - `crates/writ-core/` is the reusable library and source of truth for worktrees, state, process execution, paths, and safety policy.
 - `crates/writ/` is the `writ` command-line adapter. It parses arguments, calls `writ-core`, emits human or JSON output, and maps policy failures to exit code 2.
 
-Keep security boundaries in `writ-core`, not only in the CLI parser. Git must be invoked as a subprocess rather than through libgit2. New mutating commands require branch verification and path-sandbox tests.
+Keep security boundaries in `writ-core`, not only in the CLI parser. Git must be invoked as a subprocess rather than through libgit2. New mutating commands require branch verification and path-sandbox tests. The hook dispatcher (`crates/writ-core/src/hook.rs`) is the production PreToolUse/`WorktreeCreate` boundary.
 
 ### Agent skill
 
@@ -181,14 +183,14 @@ The installable `SKILL.md` will own platform-facing prompts and command guidance
 
 ## Data flow
 
-**Supported today.** Steps 3, 5, and 6 below describe the M1 target; the hook dispatcher does not exist yet. What works now is the same enforcement reached explicitly: `writ worktree create` for exact-base creation, and `writ git-safe` / `writ gh-safe` / `writ supervisor` for validated mutation and supervised execution.
+**Supported today.** Exact-base worktree creation, `writ git-safe` / `writ gh-safe` / `writ supervisor`, and `writ hook` (JSON on stdin) are implemented. Claude Code does not register that hook until `writ install` lands.
 
 1. The operator or agent supplies GitHub or Linear issue/PR context.
 2. The harness (Claude Code agent teams, `/batch`, or an equivalent) assigns work and creates an isolated worktree — or `writ worktree create` does, which is the supported path today.
-3. *(M1)* On `WorktreeCreate`, Rust verifies the exact start point and identity of a worktree it did not create, and records the lease. A non-zero exit aborts creation.
+3. On `WorktreeCreate`, `writ hook` verifies the exact start point, creates or reattaches the worktree, and records a lease row. A non-zero exit aborts creation.
 4. A worker agent changes only that worktree and branch.
-5. *(M1)* On `PreToolUse`, Rust validates each `git`/`gh` mutation and blocks an unsafe one with exit 2, which no other hook can override. Until then, validation happens only when `writ git-safe` / `writ gh-safe` is invoked.
-6. *(M1)* On `WorktreeRemove`, the lease is released.
+5. On `PreToolUse`, `writ hook` validates each `git`/`gh` mutation and blocks an unsafe one with exit 2, which no other hook can override. Until the hook is registered, validation also happens when `writ git-safe` / `writ gh-safe` is invoked.
+6. On `WorktreeRemove`, the lease row is released.
 7. The installed companion `babysit-pr` skill handles interactive monitoring after a PR handoff.
 8. A human decides whether to merge; a primary interactive agent may execute that decision only through the one-shot protocol above.
 
@@ -239,4 +241,5 @@ Use [`REVIEW.md`](REVIEW.md) for the shared checklist. Reviewers should verify b
 - Product epic: GitHub #1
 - Current phase (hook enforcement): GitHub #124
 - Threat model and boundary tests: GitHub #22, #81
+- Architecture decision: [ADR 0001](docs/adr/0001-rust-only-v1-runtime-and-babysit-pr-boundary.md) (Linear [RM-169](https://linear.app/rpd-34/issue/RM-169/v1-record-rust-only-architecture-and-codex-babysit-pr-boundary))
 - Linear project: <https://linear.app/rpd-34/project/worktrees-hives-e3052de4caa3>

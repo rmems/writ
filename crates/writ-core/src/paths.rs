@@ -215,7 +215,17 @@ pub fn lease_store_path() -> PathBuf {
     {
         return base.join("leases.db");
     }
-    StateRoot::default_root().leases_db()
+    resolve_lease_path_in(
+        &user_data_dir(),
+        std::env::var_os(LEASE_PATH_ENV).as_deref(),
+    )
+}
+
+fn resolve_lease_path_in(user_data: &Path, writ_lease_path: Option<&OsStr>) -> PathBuf {
+    if let Some(custom) = writ_lease_path.filter(|v| !v.is_empty()) {
+        return PathBuf::from(custom);
+    }
+    StateRoot::from_user_data(user_data).leases_db()
 }
 
 /// Resolve the configured worktree base path.
