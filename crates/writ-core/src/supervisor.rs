@@ -621,7 +621,7 @@ fn program_is_path_qualified(program: &str) -> bool {
         || (program.len() > 2 && program.as_bytes().get(1) == Some(&b':'))
 }
 
-fn is_forbidden_wrapper(name: &str) -> bool {
+pub(crate) fn is_forbidden_wrapper(name: &str) -> bool {
     if matches!(
         name,
         "sh" | "bash"
@@ -1196,6 +1196,40 @@ mod tests {
         assert!(output.killed);
         assert!(output.exit_code.is_none());
         assert_eq!(output.error_code, Some(SupervisorErrorCode::TimedOut));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_leaves_no_live_untracked_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("child.pid");
+        let script = format!("echo $$ > '{}'; exec sleep 60", pidfile.display());
+        let supervisor = Supervisor::new(1);
+        let output = supervisor
+            .run_unchecked(
+                shell_program(),
+                &[shell_flag(), &script],
+                Some(Duration::from_millis(300)),
+            )
+            .await;
+        assert!(output.timed_out, "stderr={}", output.stderr);
+        assert!(output.killed);
+        let mut pid_text = String::new();
+        for _ in 0..20 {
+            if let Ok(text) = std::fs::read_to_string(&pidfile) {
+                pid_text = text;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let pid = pid_text.trim();
+        assert!(!pid.is_empty(), "child did not record its pid");
+        let proc = std::path::PathBuf::from(format!("/proc/{pid}"));
+        assert!(
+            !proc.exists(),
+            "timed-out child {pid} is still live at {}",
+            proc.display()
+        );
     }
 
     #[cfg(unix)]

@@ -361,6 +361,7 @@ Milestone groups from the epic: **M1** hook enforcement + minimal lease store; *
 - [`docs/workflows/safe-verified-commit-to-pr.md`](docs/workflows/safe-verified-commit-to-pr.md) — verified push → PR handoff (never merges)
 - [`docs/status-schema.md`](docs/status-schema.md) — `status` / `jobs` JSON
 - [`docs/examples/`](docs/examples/) — captured response envelopes
+- [`docs/hook-boundary.md`](docs/hook-boundary.md) — hook-boundary contract tests and two-hook burn-in (#81)
 
 ## License
 

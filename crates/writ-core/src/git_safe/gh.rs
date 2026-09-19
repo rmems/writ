@@ -31,7 +31,14 @@ const BLOCKED_GH_PR_SUBSUBCOMMANDS: &[&str] = &[
 ];
 
 /// `gh pr` flags that are blocked (direct merge-related flags).
-const BLOCKED_GH_FLAGS: &[&str] = &["--merge", "--squash", "--rebase", "--auto", "--admin"];
+const BLOCKED_GH_FLAGS: &[&str] = &[
+    "--merge",
+    "--squash",
+    "--rebase",
+    "--auto",
+    "--admin",
+    "--merge-queue",
+];
 
 /// Pre-validated GitHub CLI command ready for execution.
 #[derive(Debug, Clone)]

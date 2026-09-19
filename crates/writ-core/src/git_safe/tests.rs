@@ -1275,15 +1275,24 @@ fn gh_pr_ready_rejected() {
 
 #[test]
 fn gh_merge_flag_rejected() {
-    let err = SafeGhCommand::new(&["pr".to_owned(), "create".to_owned(), "--merge".to_owned()])
-        .unwrap_err();
-    assert!(matches!(
-        err,
-        Error::PolicyViolation {
-            code: PolicyCode::GhFlagNotAllowed,
-            ..
-        }
-    ));
+    for args in [
+        vec!["pr".to_owned(), "create".to_owned(), "--merge".to_owned()],
+        vec![
+            "pr".to_owned(),
+            "view".to_owned(),
+            "1".to_owned(),
+            "--merge-queue".to_owned(),
+        ],
+    ] {
+        let err = SafeGhCommand::new(&args).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::GhFlagNotAllowed,
+                ..
+            }
+        ));
+    }
 }
 
 #[test]
