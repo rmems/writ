@@ -5,14 +5,13 @@
 //! help and never releases, tombstones, or deletes WIP. Ownership moves only
 //! when a handoff is ACKed at the current `owner_generation`.
 
-use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
 
 use crate::error::{Error, PolicyCode, Result};
-use crate::lease::{AllocationState, JobKey, Lease, LeaseStore};
+use crate::lease::{JobKey, Lease, LeaseStore};
 
 /// Shared coordination event kinds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -978,8 +977,9 @@ fn now_secs() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lease::AllocateRequest;
+    use crate::lease::{AllocateRequest, AllocationState};
     use std::fs;
+    use std::path::Path;
     use std::process::Command;
     use tempfile::tempdir;
 

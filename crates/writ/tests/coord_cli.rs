@@ -175,7 +175,8 @@ fn two_processes_share_store_and_exchange_overlap_help_handoff() {
         &["--json", "coord", "inbox", "acme", "sample", "job-a"],
     );
     assert!(inbox.status.success(), "{:?}", inbox.stderr);
-    let messages = json(&inbox)["data"]["messages"].as_array().unwrap();
+    let inbox_json = json(&inbox);
+    let messages = inbox_json["data"]["messages"].as_array().unwrap();
     assert!(
         messages
             .iter()
