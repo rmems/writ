@@ -1084,6 +1084,7 @@ mod tests {
     fn format_cli(case: FormatCase) -> Cli {
         Cli {
             json: case.json,
+            allowed_owners: None,
             command: Some(super::Command::Attribution {
                 action: super::AttributionAction::Format {
                     body: case.body.to_owned(),
