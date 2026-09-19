@@ -372,17 +372,28 @@ mod tests {
                 .args(args)
                 .output()
                 .unwrap();
-            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
         }
         fs::write(repo.join("README"), "init\n").unwrap();
-        for args in [["add", "README"].as_slice(), ["commit", "-m", "init"].as_slice()] {
+        for args in [
+            ["add", "README"].as_slice(),
+            ["commit", "-m", "init"].as_slice(),
+        ] {
             let out = std::process::Command::new("git")
                 .arg("-C")
                 .arg(repo)
                 .args(args)
                 .output()
                 .unwrap();
-            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
         }
         fs::write(repo.join("wip.txt"), "do-not-lose\n").unwrap();
 
@@ -400,7 +411,10 @@ mod tests {
         let stderr = String::from_utf8_lossy(&stderr);
         assert_eq!(code, 2, "{stderr}");
         assert!(stderr.contains("MERGE_BLOCKED"), "{stderr}");
-        assert_eq!(fs::read_to_string(repo.join("wip.txt")).unwrap(), "do-not-lose\n");
+        assert_eq!(
+            fs::read_to_string(repo.join("wip.txt")).unwrap(),
+            "do-not-lose\n"
+        );
     }
 
     #[test]
@@ -418,17 +432,28 @@ mod tests {
                 .args(args)
                 .output()
                 .unwrap();
-            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
         }
         fs::write(repo.join("README"), "init\n").unwrap();
-        for args in [["add", "README"].as_slice(), ["commit", "-m", "init"].as_slice()] {
+        for args in [
+            ["add", "README"].as_slice(),
+            ["commit", "-m", "init"].as_slice(),
+        ] {
             let out = std::process::Command::new("git")
                 .arg("-C")
                 .arg(repo)
                 .args(args)
                 .output()
                 .unwrap();
-            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
         }
 
         let runtime = HookRuntime::default();
