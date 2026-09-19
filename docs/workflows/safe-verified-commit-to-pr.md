@@ -21,7 +21,7 @@ One issue → one PR unless the issue explicitly groups work.
 
 - No verified push yet — run the commit workflow first.
 - Shared `main`/`master` checkout — work only in the job worktree/branch.
-- Owner outside the configured allowlist unless the operator named this job. **Not enforced in code today** (#146): the allowlist has no reader under `crates/` after the Python removal, so this stop is operator-upheld.
+- Owner outside the configured allowlist unless the operator named this job.
 - Any merge command, merge API, auto-merge, or merge-queue enablement.
 - Bare `git push --force` / `git push -f`.
 - Opening a no-op “kick CI” PR.

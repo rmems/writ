@@ -30,6 +30,7 @@ use tokio::time::Instant;
 
 use crate::error::{Error, PolicyCode, Result};
 use crate::git_safe::{SafeGhCommand, SafeGitCommand};
+use crate::owners::OwnerAllowlist;
 
 /// How long to wait for the child to exit after a timeout kill.
 const POST_KILL_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -103,6 +104,8 @@ pub struct RunOptions {
     pub expected_branch: Option<String>,
     /// Repository working tree for git branch verification and `git -C` (default: `.`).
     pub repo: Option<PathBuf>,
+    /// Explicit owner allowlist. `None` reads `WRIT_ALLOWED_OWNERS` / `WH_ALLOWED_OWNERS`.
+    pub allowlist: Option<OwnerAllowlist>,
 }
 
 /// Configuration for the process supervisor.
@@ -475,93 +478,8 @@ fn prepare_supervised_command(
     }
 
     match name.as_str() {
-        "git" => {
-            let safe = SafeGitCommand::new(&owned_args)?;
-            let expected = if safe.requires_branch_check() {
-                Some(options.expected_branch.clone().ok_or_else(|| {
-                    Error::PolicyViolation {
-                        code: PolicyCode::BranchMismatch,
-                        message: "mutating git commands require --expected-branch under supervisor"
-                            .to_owned(),
-                    }
-                })?)
-            } else {
-                None
-            };
-            if let (Some(exp), Some(target)) = (
-                expected.as_deref(),
-                crate::git_safe::checkout_or_switch_target(&owned_args),
-            ) && target != exp
-                && target != "HEAD"
-            {
-                return Err(Error::PolicyViolation {
-                    code: PolicyCode::BranchMismatch,
-                    message: format!(
-                        "git checkout/switch target `{target}` must equal --expected-branch `{exp}`"
-                    ),
-                });
-            }
-            if let Some(exp) = expected.as_deref() {
-                crate::git_safe::reject_push_outside_expected_branch(&owned_args, exp)?;
-            }
-            // Always spawn PATH `git`, never a user-supplied path-qualified binary.
-            let repo = resolve_supervised_repo(options.repo.as_deref())?;
-            let branch_check = expected.map(|expected_branch| BranchCheck {
-                expected_branch,
-                repo: repo.clone(),
-            });
-            Ok(PreparedCommand {
-                program: "git".to_owned(),
-                args: owned_args,
-                cwd: Some(repo),
-                branch_check,
-            })
-        }
-        "gh" => {
-            let _safe = SafeGhCommand::new(&owned_args)?;
-            // Always spawn PATH `gh`, never a user-supplied path-qualified binary.
-            let (cwd, branch_check) = if crate::git_safe::gh_requires_branch_check(&owned_args) {
-                let expected =
-                    options
-                        .expected_branch
-                        .clone()
-                        .ok_or_else(|| Error::PolicyViolation {
-                            code: PolicyCode::BranchMismatch,
-                            message:
-                                "mutating gh pr commands require --expected-branch under supervisor"
-                                    .to_owned(),
-                        })?;
-                let repo = resolve_supervised_repo(options.repo.as_deref())?;
-                // Bind `-R/--repo` to the verified local checkout so jobs cannot
-                // mutate a different GitHub repository after the branch gate.
-                if let Some(selector) = crate::git_safe::gh_repo_selector(&owned_args) {
-                    let local = crate::git_safe::origin_github_slug(&repo)?;
-                    if !crate::git_safe::github_repo_slugs_match(selector, &local) {
-                        return Err(Error::PolicyViolation {
-                            code: PolicyCode::PathNotAllowed,
-                            message: format!(
-                                "gh -R/--repo `{selector}` does not match verified origin `{local}`"
-                            ),
-                        });
-                    }
-                }
-                (
-                    Some(repo.clone()),
-                    Some(BranchCheck {
-                        expected_branch: expected,
-                        repo,
-                    }),
-                )
-            } else {
-                (None, None)
-            };
-            Ok(PreparedCommand {
-                program: "gh".to_owned(),
-                args: owned_args,
-                cwd,
-                branch_check,
-            })
-        }
+        "git" => prepare_git_command(owned_args, options),
+        "gh" => prepare_gh_command(owned_args, options),
         _ => {
             // Fail closed on path-qualified / relative scripts (./tools/run, tools/run).
             // Basename-only PATH lookups remain for non-sensitive tooling; git/gh above are
@@ -584,6 +502,118 @@ fn prepare_supervised_command(
     }
 }
 
+/// Prepare a supervised `git` command: enforce argv policy, resolve the required
+/// expected-branch for mutating commands, bind checkout/switch and push targets
+/// to that branch, and PATH-force the `git` binary.
+fn prepare_git_command(owned_args: Vec<String>, options: &RunOptions) -> Result<PreparedCommand> {
+    let safe = SafeGitCommand::new(&owned_args)?;
+    let expected = if safe.requires_branch_check() {
+        Some(
+            options
+                .expected_branch
+                .clone()
+                .ok_or_else(|| Error::PolicyViolation {
+                    code: PolicyCode::BranchMismatch,
+                    message: "mutating git commands require --expected-branch under supervisor"
+                        .to_owned(),
+                })?,
+        )
+    } else {
+        None
+    };
+    reject_supervised_checkout_mismatch(expected.as_deref(), &owned_args)?;
+    if let Some(exp) = expected.as_deref() {
+        crate::git_safe::reject_push_outside_expected_branch(&owned_args, exp)?;
+    }
+    // Always spawn PATH `git`, never a user-supplied path-qualified binary.
+    let repo = resolve_supervised_repo(options.repo.as_deref())?;
+    let branch_check = expected.map(|expected_branch| BranchCheck {
+        expected_branch,
+        repo: repo.clone(),
+    });
+    Ok(PreparedCommand {
+        program: "git".to_owned(),
+        args: owned_args,
+        cwd: Some(repo),
+        branch_check,
+    })
+}
+
+/// Prepare a supervised `gh` command: enforce argv/allowlist policy and, for
+/// mutating `gh pr` commands, require an expected branch and bind the effective
+/// repo selector (explicit `-R` or implicit `GH_REPO`) to the verified local
+/// origin before PATH-forcing the `gh` binary.
+fn prepare_gh_command(owned_args: Vec<String>, options: &RunOptions) -> Result<PreparedCommand> {
+    let allowlist = options
+        .allowlist
+        .clone()
+        .unwrap_or_else(OwnerAllowlist::from_env);
+    let _safe = SafeGhCommand::with_allowlist(&owned_args, &allowlist)?;
+    // Always spawn PATH `gh`, never a user-supplied path-qualified binary.
+    let (cwd, branch_check, owned_args) = if crate::git_safe::gh_requires_branch_check(&owned_args)
+    {
+        let expected = options
+            .expected_branch
+            .clone()
+            .ok_or_else(|| Error::PolicyViolation {
+                code: PolicyCode::BranchMismatch,
+                message: "mutating gh pr commands require --expected-branch under supervisor"
+                    .to_owned(),
+            })?;
+        let repo = resolve_supervised_repo(options.repo.as_deref())?;
+        // Bind the effective repo selector to the verified local checkout so jobs
+        // cannot mutate a different GitHub repository after the branch gate. An
+        // explicit `-R/--repo` wins; otherwise gh reads the implicit `GH_REPO`
+        // environment selector, so bind that too.
+        let env_selector = crate::git_safe::gh_repo_env_target();
+        let local = crate::git_safe::origin_github_slug(&repo)?;
+        crate::git_safe::bind_gh_repo_selector_to_origin(
+            &owned_args,
+            env_selector.as_deref(),
+            &local,
+        )?;
+        // Pin the validated slug before any later permit wait so a TOCTOU
+        // origin rewrite cannot retarget `gh`.
+        let owned_args = if env_selector.is_some() {
+            owned_args
+        } else {
+            crate::git_safe::pin_gh_repo_selector(owned_args, &local)
+        };
+        (
+            Some(repo.clone()),
+            Some(BranchCheck {
+                expected_branch: expected,
+                repo,
+            }),
+            owned_args,
+        )
+    } else {
+        (None, None, owned_args)
+    };
+    Ok(PreparedCommand {
+        program: "gh".to_owned(),
+        args: owned_args,
+        cwd,
+        branch_check,
+    })
+}
+
+fn reject_supervised_checkout_mismatch(expected: Option<&str>, args: &[String]) -> Result<()> {
+    let (Some(exp), Some(target)) = (expected, crate::git_safe::checkout_or_switch_target(args))
+    else {
+        return Ok(());
+    };
+    if target == exp || target == "HEAD" {
+        return Ok(());
+    }
+    Err(Error::PolicyViolation {
+        code: PolicyCode::BranchMismatch,
+        message: format!(
+            "git checkout/switch target `{target}` must equal --expected-branch `{exp}`"
+        ),
+    })
+}
+
 fn program_is_path_qualified(program: &str) -> bool {
     program.contains('/')
         || program.contains('\\')
@@ -591,7 +621,7 @@ fn program_is_path_qualified(program: &str) -> bool {
         || (program.len() > 2 && program.as_bytes().get(1) == Some(&b':'))
 }
 
-fn is_forbidden_wrapper(name: &str) -> bool {
+pub(crate) fn is_forbidden_wrapper(name: &str) -> bool {
     if matches!(
         name,
         "sh" | "bash"
@@ -943,6 +973,42 @@ mod tests {
     }
 
     #[test]
+    fn policy_blocks_gh_repo_selector_outside_allowlist() {
+        let err = check_command_policy(
+            "gh",
+            &["pr", "view", "-R", "other/repo", "1"],
+            &RunOptions {
+                allowlist: Some(OwnerAllowlist::from_owners(["acme"])),
+                ..RunOptions::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::OwnerNotAllowed,
+                ..
+            }
+        ));
+        let clustered = check_command_policy(
+            "gh",
+            &["pr", "view", "-R=other/repo", "1"],
+            &RunOptions {
+                allowlist: Some(OwnerAllowlist::from_owners(["acme"])),
+                ..RunOptions::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            clustered,
+            Error::PolicyViolation {
+                code: PolicyCode::OwnerNotAllowed,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn policy_rejects_path_qualified_script() {
         let err = check_command_policy("./tools/run", &[], &RunOptions::default()).unwrap_err();
         assert!(matches!(
@@ -1056,6 +1122,7 @@ mod tests {
             &RunOptions {
                 expected_branch: Some("feature".to_owned()),
                 repo: Some(repo),
+                allowlist: None,
             },
         )
         .unwrap_err();
@@ -1129,6 +1196,40 @@ mod tests {
         assert!(output.killed);
         assert!(output.exit_code.is_none());
         assert_eq!(output.error_code, Some(SupervisorErrorCode::TimedOut));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_leaves_no_live_untracked_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("child.pid");
+        let script = format!("echo $$ > '{}'; exec sleep 60", pidfile.display());
+        let supervisor = Supervisor::new(1);
+        let output = supervisor
+            .run_unchecked(
+                shell_program(),
+                &[shell_flag(), &script],
+                Some(Duration::from_millis(300)),
+            )
+            .await;
+        assert!(output.timed_out, "stderr={}", output.stderr);
+        assert!(output.killed);
+        let mut pid_text = String::new();
+        for _ in 0..20 {
+            if let Ok(text) = std::fs::read_to_string(&pidfile) {
+                pid_text = text;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let pid = pid_text.trim();
+        assert!(!pid.is_empty(), "child did not record its pid");
+        let proc = std::path::PathBuf::from(format!("/proc/{pid}"));
+        assert!(
+            !proc.exists(),
+            "timed-out child {pid} is still live at {}",
+            proc.display()
+        );
     }
 
     #[cfg(unix)]
