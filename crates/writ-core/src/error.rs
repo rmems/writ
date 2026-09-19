@@ -51,6 +51,38 @@ pub struct WorktreePostconditionFailure {
     pub reason: String,
 }
 
+/// Residual state after a failed exact-object PR-head import.
+#[derive(Debug)]
+pub struct PrImportFailure {
+    pub expected_commit: String,
+    pub source_remote: String,
+    pub source_ref: String,
+    pub import_ref: String,
+    pub imported_commit: Option<String>,
+    pub import_ref_exists: bool,
+    pub cleanup_performed: bool,
+    pub reason: String,
+    pub stderr: String,
+}
+
+impl Display for PrImportFailure {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "PR head import failed for `{}` from `{}/{}`: {}; residual_state \
+             import_ref_exists={} imported_commit={} cleanup_performed={}; automatic cleanup \
+             skipped because concurrent adoption cannot be disproven",
+            self.expected_commit,
+            self.source_remote,
+            self.source_ref,
+            self.reason.trim(),
+            self.import_ref_exists,
+            self.imported_commit.as_deref().unwrap_or("<absent>"),
+            self.cleanup_performed
+        )
+    }
+}
+
 impl Display for WorktreePostconditionFailure {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -72,6 +104,15 @@ impl Display for WorktreePostconditionFailure {
     }
 }
 
+/// One fully qualified ref that collided with an unqualified start point.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AmbiguousRef {
+    /// Fully qualified refname, such as `refs/heads/collision`.
+    pub refname: String,
+    /// Canonical commit that ref peels to.
+    pub commit: String,
+}
+
 /// Errors returned by core primitives.
 #[derive(Debug)]
 pub enum Error {
@@ -90,6 +131,12 @@ pub enum Error {
     },
     /// A git subprocess command failed.
     GitCommand { args: Vec<String>, stderr: String },
+    /// An unqualified start point named more than one commit-ish.
+    AmbiguousStartPoint {
+        start_point: String,
+        refs: Vec<AmbiguousRef>,
+        git_warning: Option<String>,
+    },
     /// A worktree create transaction failed and may have left residual state.
     WorktreeCreationFailed(Box<WorktreeCreationFailure>),
     /// Creation completed but its exact branch/ref/HEAD identity was not preserved.
@@ -98,11 +145,20 @@ pub enum Error {
     ContractUpgradeRequired { required_schema_version: u8 },
     /// The exact-base request boundary requires an explicit start point.
     StartPointRequired,
+    /// head_repo or a source remote was supplied without an explicit PR number.
+    PrImportIdentityRequired,
+    /// Exact-object import of a fork PR head failed and left residual refs.
+    PrImportFailed(Box<PrImportFailure>),
     /// A git or gh command was blocked by safety policy.
     PolicyViolation {
         /// Machine-readable policy error code.
         code: PolicyCode,
         /// Human-readable explanation.
+        message: String,
+    },
+    /// The SQLite lease store could not complete an operation.
+    LeaseStore {
+        context: &'static str,
         message: String,
     },
 }
@@ -128,6 +184,10 @@ pub enum PolicyCode {
     PathNotAllowed,
     /// An existing worktree branch lacks a durable identity proving safe resume ownership.
     WorktreeResumeUnproven,
+    /// The owner is missing from the configured allowlist (including an empty list).
+    OwnerNotAllowed,
+    /// The import source is not the configured base-repository remote.
+    UnauthorizedSource,
 }
 
 impl PolicyCode {
@@ -144,6 +204,8 @@ impl PolicyCode {
             Self::GhFlagNotAllowed => "GH_FLAG_NOT_ALLOWED",
             Self::PathNotAllowed => "PATH_NOT_ALLOWED",
             Self::WorktreeResumeUnproven => "WORKTREE_RESUME_UNPROVEN",
+            Self::OwnerNotAllowed => "OWNER_NOT_ALLOWED",
+            Self::UnauthorizedSource => "UNAUTHORIZED_SOURCE",
         }
     }
 }
@@ -179,6 +241,20 @@ impl Display for Error {
                     stderr.trim()
                 )
             }
+            Self::AmbiguousStartPoint {
+                start_point,
+                refs,
+                git_warning,
+            } => {
+                write!(f, "ambiguous start point `{start_point}`")?;
+                for colliding in refs {
+                    write!(f, " {}={}", colliding.refname, colliding.commit)?;
+                }
+                if let Some(warning) = git_warning {
+                    write!(f, "; {warning}")?;
+                }
+                write!(f, "; qualify as refs/heads/<name> or refs/tags/<name>")
+            }
             Self::WorktreeCreationFailed(failure) => Display::fmt(failure.as_ref(), f),
             Self::WorktreePostconditionFailed(failure) => Display::fmt(failure.as_ref(), f),
             Self::ContractUpgradeRequired {
@@ -192,8 +268,17 @@ impl Display for Error {
                 f,
                 "worktree.create schema v2 requires an explicit --start-point"
             ),
+            Self::PrImportIdentityRequired => write!(
+                f,
+                "fork PR import requires --pr-number and a full head object id; \
+                 head_repo is not fetch or checkout authority"
+            ),
+            Self::PrImportFailed(failure) => Display::fmt(failure.as_ref(), f),
             Self::PolicyViolation { code, message } => {
                 write!(f, "policy violation [{code}]: {message}")
+            }
+            Self::LeaseStore { context, message } => {
+                write!(f, "{context}: {message}")
             }
         }
     }
@@ -217,11 +302,15 @@ impl Error {
             Self::SandboxViolation { .. } => "SANDBOX_VIOLATION",
             Self::Io { .. } => "IO_ERROR",
             Self::GitCommand { .. } => "GIT_COMMAND_FAILED",
+            Self::AmbiguousStartPoint { .. } => "AMBIGUOUS_START_POINT",
             Self::WorktreeCreationFailed(_) => "WORKTREE_CREATE_FAILED",
             Self::WorktreePostconditionFailed(_) => "WORKTREE_POSTCONDITION_FAILED",
             Self::ContractUpgradeRequired { .. } => "CONTRACT_UPGRADE_REQUIRED",
             Self::StartPointRequired => "START_POINT_REQUIRED",
+            Self::PrImportIdentityRequired => "PR_IMPORT_IDENTITY_REQUIRED",
+            Self::PrImportFailed(_) => "PR_IMPORT_FAILED",
             Self::PolicyViolation { code, .. } => code.as_str(),
+            Self::LeaseStore { .. } => "LEASE_STORE_FAILED",
         }
     }
 
@@ -270,5 +359,19 @@ mod tests {
 
         assert_eq!(policy.exit_code(), 2);
         assert_eq!(postcondition.exit_code(), 1);
+
+        let ambiguous = Error::AmbiguousStartPoint {
+            start_point: "collision".to_owned(),
+            refs: vec![super::AmbiguousRef {
+                refname: "refs/heads/collision".to_owned(),
+                commit: "0".repeat(40),
+            }],
+            git_warning: None,
+        };
+        assert_eq!(ambiguous.exit_code(), 1);
+        assert_eq!(ambiguous.code(), "AMBIGUOUS_START_POINT");
+        let displayed = ambiguous.to_string();
+        assert!(displayed.contains("collision"), "{displayed}");
+        assert!(displayed.contains("refs/heads/collision"), "{displayed}");
     }
 }
