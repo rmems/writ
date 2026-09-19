@@ -21,6 +21,9 @@
 //! GitHub #124 replaces it, with crash consistency tracked in #136. Do not add a
 //! `watched.json` writer without checking whether the lease store should own the
 //! state instead.
+//!
+//! The multi-owner PR watchlist is a **separate** file (`watchlist.json`) owned
+//! by [`crate::watchlist`]. It must not share this path or schema.
 
 use std::fs;
 use std::path::Path;
