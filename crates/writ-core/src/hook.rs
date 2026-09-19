@@ -16,6 +16,7 @@ use crate::error::{Error, PolicyCode, Result};
 use crate::git_safe::{SafeGhCommand, SafeGitCommand};
 use crate::identity::{StartPoint, resolve_start_commit};
 use crate::lease::{AgentIdentity, LeaseStore};
+use crate::owners::OwnerAllowlist;
 use crate::worktree::{WorktreeCreateRequest, WorktreeManager};
 
 /// Process-local paths for hook dispatch (tests inject temp dirs).
@@ -23,6 +24,8 @@ use crate::worktree::{WorktreeCreateRequest, WorktreeManager};
 pub struct HookRuntime {
     pub worktree_base: Option<PathBuf>,
     pub lease_path: Option<PathBuf>,
+    /// Optional explicit allowlist for tests; production uses `from_env`.
+    pub allowed_owners: Option<OwnerAllowlist>,
 }
 
 /// Dispatch one Claude Code hook event. Returns the process exit code.
@@ -220,17 +223,21 @@ fn handle_subagent_stop(event: &HookEvent, runtime: &HookRuntime) -> Result<()> 
 }
 
 fn manager_for_runtime(runtime: &HookRuntime) -> Result<WorktreeManager> {
-    match (&runtime.worktree_base, &runtime.lease_path) {
+    let manager = match (&runtime.worktree_base, &runtime.lease_path) {
         (Some(base), Some(lease)) => {
-            WorktreeManager::with_base_and_leases(base.clone(), LeaseStore::open(lease)?)
+            WorktreeManager::with_base_and_leases(base.clone(), LeaseStore::open(lease)?)?
         }
-        (Some(base), None) => WorktreeManager::with_base(base.clone()),
+        (Some(base), None) => WorktreeManager::with_base(base.clone())?,
         (None, Some(lease)) => {
             let base = crate::paths::worktree_base_path()?;
-            WorktreeManager::with_base_and_leases(base, LeaseStore::open(lease)?)
+            WorktreeManager::with_base_and_leases(base, LeaseStore::open(lease)?)?
         }
-        (None, None) => WorktreeManager::new(),
-    }
+        (None, None) => WorktreeManager::new()?,
+    };
+    Ok(match &runtime.allowed_owners {
+        Some(allowlist) => manager.with_allowlist(allowlist.clone()),
+        None => manager,
+    })
 }
 
 fn open_store(runtime: &HookRuntime) -> Result<LeaseStore> {
@@ -482,6 +489,15 @@ mod tests {
         git_stdout(repo, &["add", "README"]);
         git_stdout(repo, &["commit", "-m", "second"]);
         let second = git_stdout(repo, &["rev-parse", "HEAD"]);
+        git_stdout(
+            repo,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/acme/test-repo.git",
+            ],
+        );
         (first, second)
     }
 
@@ -495,6 +511,7 @@ mod tests {
         let runtime = HookRuntime {
             worktree_base: Some(temp.path().join("worktrees")),
             lease_path: Some(temp.path().join("leases.db")),
+            allowed_owners: Some(OwnerAllowlist::from_owners(["acme"])),
         };
         let payload = serde_json::json!({
             "hook_event_name": "WorktreeCreate",
