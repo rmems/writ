@@ -513,18 +513,31 @@ impl LeaseStore {
             repo_name: request.repo_name,
             job_id: request.job_id,
         };
-        let claim = require_agent_claim(self, key, request.from_agent_id)?;
-        if let Some(expected) = request.expected_generation
-            && expected != claim.owner_generation
-        {
-            return Err(stale_error(&claim, expected));
-        }
         let to_job = request.to_job_id.unwrap_or(request.job_id);
         let now = now_secs();
         let mut conn = self.lock()?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| coord_err("begin coord handoff", e))?;
+        let claim = load_claim_tx(&tx, key)?
+            .ok_or_else(|| coord_missing("no coordination claim for handoff"))?;
+        if claim.agent_id != request.from_agent_id {
+            return Err(held_error(&claim));
+        }
+        if terminal_allocation(&claim.allocation_state) {
+            return Err(Error::PolicyViolation {
+                code: PolicyCode::CoordClaimMissing,
+                message: format!(
+                    "lease {}/{}/{} is {}; handoff stays on live assignments",
+                    claim.owner, claim.repo_name, claim.job_id, claim.allocation_state
+                ),
+            });
+        }
+        if let Some(expected) = request.expected_generation
+            && expected != claim.owner_generation
+        {
+            return Err(stale_error(&claim, expected));
+        }
         let message = insert_message(
             &tx,
             NewMessage {
@@ -697,6 +710,15 @@ fn transfer_on_handoff_ack(
     };
     let current = load_claim_tx(tx, from_key)?
         .ok_or_else(|| coord_missing("handoff source claim is missing"))?;
+    if terminal_allocation(&current.allocation_state) {
+        return Err(Error::PolicyViolation {
+            code: PolicyCode::CoordClaimMissing,
+            message: format!(
+                "lease {}/{}/{} is {}; refusing to transfer a dead assignment",
+                current.owner, current.repo_name, current.job_id, current.allocation_state
+            ),
+        });
+    }
     if current.owner_generation != handoff.owner_generation {
         return Err(stale_error(&current, handoff.owner_generation));
     }
@@ -931,6 +953,10 @@ fn paths_overlap(left: &str, right: &str) -> bool {
     left == right
         || left.starts_with(&(right.to_owned() + "/"))
         || right.starts_with(&(left.to_owned() + "/"))
+}
+
+fn terminal_allocation(state: &str) -> bool {
+    matches!(state, "RELEASED" | "TOMBSTONED")
 }
 
 fn held_error(claim: &CoordClaim) -> Error {
@@ -1232,6 +1258,58 @@ mod tests {
                 ..
             } => {}
             other => panic!("expected stale generation, got {other:?}"),
+        }
+
+        let peer = LeaseStore::open(&harness.path).unwrap();
+        let first = harness
+            .store
+            .propose_handoff(HandoffRequest {
+                owner: "acme",
+                repo_name: "sample",
+                job_id: "job-a",
+                from_agent_id: "agent-a",
+                to_agent_id: "agent-b",
+                to_job_id: None,
+                expected_generation: Some(1),
+                body: "first gen-1 offer",
+            })
+            .unwrap();
+        let leftover = harness
+            .store
+            .propose_handoff(HandoffRequest {
+                owner: "acme",
+                repo_name: "sample",
+                job_id: "job-a",
+                from_agent_id: "agent-a",
+                to_agent_id: "agent-b",
+                to_job_id: None,
+                expected_generation: Some(1),
+                body: "leftover gen-1 offer",
+            })
+            .unwrap();
+        peer.ack_message(AckRequest {
+            message_id: first.id,
+            owner: "acme",
+            repo_name: "sample",
+            job_id: "job-a",
+            agent_id: "agent-b",
+            session_id: Some("session-b"),
+        })
+        .unwrap();
+        let stale_ack = peer.ack_message(AckRequest {
+            message_id: leftover.id,
+            owner: "acme",
+            repo_name: "sample",
+            job_id: "job-a",
+            agent_id: "agent-b",
+            session_id: Some("session-b"),
+        });
+        match stale_ack {
+            Err(Error::PolicyViolation {
+                code: PolicyCode::CoordStaleGeneration,
+                ..
+            }) => {}
+            other => panic!("expected stale generation on leftover handoff ACK, got {other:?}"),
         }
     }
 }
