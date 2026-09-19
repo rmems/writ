@@ -1130,7 +1130,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn attribution_format_success_cases() {
+    async fn attribution_format_human_omits_sha() {
         let human = format_ok(FormatCase {
             json: false,
             body: "Looks good!",
@@ -1144,7 +1144,10 @@ mod tests {
             str::from_utf8(&human).unwrap(),
             "Looks good!\n\n---\nworktrees-hives agent\n"
         );
+    }
 
+    #[tokio::test]
+    async fn attribution_format_collaboration_message_omits_sha() {
         let collab = parse_stdout_json(
             &format_ok(FormatCase {
                 json: true,
@@ -1168,7 +1171,10 @@ mod tests {
                 true
             )
         );
+    }
 
+    #[tokio::test]
+    async fn attribution_format_json_includes_pushed_sha() {
         let with_sha = parse_stdout_json(
             &format_ok(FormatCase {
                 json: true,
@@ -1190,7 +1196,10 @@ mod tests {
                 false
             )
         );
+    }
 
+    #[tokio::test]
+    async fn attribution_format_pr_comment_omits_blank_sha() {
         let omit_sha = parse_stdout_json(
             &format_ok(FormatCase {
                 json: true,
