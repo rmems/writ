@@ -2401,4 +2401,27 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&repo);
     }
+
+    #[test]
+    fn run_with_timeout_completes_fast_gh_failure_without_hanging() {
+        use std::time::Duration;
+
+        let cmd = SafeGhCommand::new(&[
+            "pr".to_owned(),
+            "view".to_owned(),
+            "1".to_owned(),
+            "--repo".to_owned(),
+            "writ-nonexistent-owner-xyz/nonexistent".to_owned(),
+            "--json".to_owned(),
+            "number".to_owned(),
+        ])
+        .unwrap();
+        let run = cmd
+            .run_with_timeout(Duration::from_secs(30))
+            .expect("spawn/wait should succeed");
+        match run {
+            GhRun::Completed(output) => assert_ne!(output.exit_code, 0),
+            GhRun::TimedOut { .. } => panic!("expected fast gh failure, not timeout"),
+        }
+    }
 }

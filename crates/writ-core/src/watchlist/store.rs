@@ -300,11 +300,11 @@ mod tests {
     use crate::watchlist::schema::{WatchEntry, WatchStatus};
 
     fn unique_path(prefix: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "{prefix}-{}-{}.json",
-            std::process::id(),
-            unix_nanos()
-        ))
+        let id = unix_nanos();
+        std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!("{prefix}-{}-{id}.json", std::process::id()))
     }
 
     fn sample_entry() -> WatchEntry {
@@ -354,11 +354,14 @@ mod tests {
 
     #[test]
     fn save_creates_parent_and_leaves_no_temp() {
-        let dir = std::env::temp_dir().join(format!(
-            "watchlist-nested-{}-{}",
-            std::process::id(),
-            unix_nanos()
-        ));
+        let dir = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!(
+                "watchlist-nested-{}-{}",
+                std::process::id(),
+                unix_nanos()
+            ));
         let path = dir.join("nested").join("watchlist.json");
         save_watchlist(&path, &Watchlist::default()).unwrap();
         assert!(path.exists());

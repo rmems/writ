@@ -25,15 +25,16 @@ pub(crate) fn run(
     json: bool,
     stdout: &mut impl Write,
 ) -> io::Result<ExitCode> {
+    let path = state_path(action.state());
     match action {
         WatchlistAction::Add {
-            state,
             repo,
             reset,
             kind,
             targets,
+            ..
         } => run_add(
-            state.as_ref(),
+            path.as_path(),
             repo.as_deref(),
             reset,
             kind,
@@ -42,69 +43,132 @@ pub(crate) fn run(
             stdout,
         ),
         WatchlistAction::Remove {
-            state,
             repo,
             number,
             targets,
-        } => {
-            let path = state_path(state.as_ref());
-            match remove_command(&path, repo.as_deref(), number, &targets) {
-                Ok(entry) => write_remove(json, &entry, stdout).map(|()| ExitCode::SUCCESS),
-                Err(err) => write_error("watchlist.remove", json, err, stdout),
-            }
-        }
-        WatchlistAction::List { state, repo, owner } => {
-            let path = state_path(state.as_ref());
-            match list_prs_at(&path, owner.as_deref(), repo.as_deref()) {
-                Ok(entries) => write_list(json, &entries, stdout).map(|()| ExitCode::SUCCESS),
-                Err(err) => write_error("watchlist.list", json, err, stdout),
-            }
-        }
-        WatchlistAction::Check {
-            state,
-            repo,
+            ..
+        } => run_remove(
+            path.as_path(),
+            repo.as_deref(),
             number,
-        } => {
-            let path = state_path(state.as_ref());
-            match check_one(&path, repo.as_deref(), number) {
-                Ok(report) => write_check(json, "watchlist.check", &report, stdout)
-                    .map(|()| ExitCode::SUCCESS),
-                Err(err) => write_error("watchlist.check", json, err, stdout),
-            }
+            &targets,
+            json,
+            stdout,
+        ),
+        WatchlistAction::List { repo, owner, .. } => run_list(
+            path.as_path(),
+            owner.as_deref(),
+            repo.as_deref(),
+            json,
+            stdout,
+        ),
+        WatchlistAction::Check { repo, number, .. } => {
+            run_check(path.as_path(), repo.as_deref(), number, json, stdout)
         }
-        WatchlistAction::CheckAll { state, repo, owner } => {
-            let path = state_path(state.as_ref());
-            match check_prs_at(
-                &path,
-                &GhPrProbe,
-                owner.as_deref(),
-                repo.as_deref(),
-                None,
-                None,
-            ) {
-                Ok(report) => write_check(json, "watchlist.check_all", &report, stdout)
-                    .map(|()| ExitCode::SUCCESS),
-                Err(err) => write_error("watchlist.check_all", json, err, stdout),
-            }
+        WatchlistAction::CheckAll { repo, owner, .. } => run_check_all(
+            path.as_path(),
+            owner.as_deref(),
+            repo.as_deref(),
+            json,
+            stdout,
+        ),
+        WatchlistAction::ImportPrBabysit { path: source, .. } => {
+            run_import(path.as_path(), source, json, stdout)
         }
-        WatchlistAction::ImportPrBabysit {
-            state,
-            path: source,
-        } => {
-            let path = state_path(state.as_ref());
-            let source = source.unwrap_or_else(default_pr_babysit_path);
-            match import_pr_babysit_at(&path, &source) {
-                Ok(report) => write_add("watchlist.import_pr_babysit", json, &report, stdout)
-                    .map(|()| ExitCode::SUCCESS),
-                Err(err) => write_error("watchlist.import_pr_babysit", json, err, stdout),
-            }
+    }
+}
+
+trait WatchlistStatePath {
+    fn state(&self) -> Option<&PathBuf>;
+}
+
+impl WatchlistStatePath for WatchlistAction {
+    fn state(&self) -> Option<&PathBuf> {
+        match self {
+            Self::Add { state, .. }
+            | Self::Remove { state, .. }
+            | Self::List { state, .. }
+            | Self::Check { state, .. }
+            | Self::CheckAll { state, .. }
+            | Self::ImportPrBabysit { state, .. } => state.as_ref(),
         }
+    }
+}
+
+fn run_remove(
+    path: &Path,
+    repo: Option<&str>,
+    number: Option<u64>,
+    targets: &[String],
+    json: bool,
+    stdout: &mut impl Write,
+) -> io::Result<ExitCode> {
+    match remove_command(path, repo, number, targets) {
+        Ok(entry) => write_remove(json, &entry, stdout).map(|()| ExitCode::SUCCESS),
+        Err(err) => write_error("watchlist.remove", json, err, stdout),
+    }
+}
+
+fn run_list(
+    path: &Path,
+    owner: Option<&str>,
+    repo: Option<&str>,
+    json: bool,
+    stdout: &mut impl Write,
+) -> io::Result<ExitCode> {
+    match list_prs_at(path, owner, repo) {
+        Ok(entries) => write_list(json, &entries, stdout).map(|()| ExitCode::SUCCESS),
+        Err(err) => write_error("watchlist.list", json, err, stdout),
+    }
+}
+
+fn run_check(
+    path: &Path,
+    repo: Option<&str>,
+    number: u64,
+    json: bool,
+    stdout: &mut impl Write,
+) -> io::Result<ExitCode> {
+    match check_one(path, repo, number) {
+        Ok(report) => {
+            write_check(json, "watchlist.check", &report, stdout).map(|()| ExitCode::SUCCESS)
+        }
+        Err(err) => write_error("watchlist.check", json, err, stdout),
+    }
+}
+
+fn run_check_all(
+    path: &Path,
+    owner: Option<&str>,
+    repo: Option<&str>,
+    json: bool,
+    stdout: &mut impl Write,
+) -> io::Result<ExitCode> {
+    match check_prs_at(path, &GhPrProbe, owner, repo, None, None) {
+        Ok(report) => {
+            write_check(json, "watchlist.check_all", &report, stdout).map(|()| ExitCode::SUCCESS)
+        }
+        Err(err) => write_error("watchlist.check_all", json, err, stdout),
+    }
+}
+
+fn run_import(
+    path: &Path,
+    source: Option<PathBuf>,
+    json: bool,
+    stdout: &mut impl Write,
+) -> io::Result<ExitCode> {
+    let source = source.unwrap_or_else(default_pr_babysit_path);
+    match import_pr_babysit_at(path, &source) {
+        Ok(report) => write_add("watchlist.import_pr_babysit", json, &report, stdout)
+            .map(|()| ExitCode::SUCCESS),
+        Err(err) => write_error("watchlist.import_pr_babysit", json, err, stdout),
     }
 }
 
 /// Handle the `watchlist add` arm: resolve state path, add PRs, render output.
 fn run_add(
-    state: Option<&PathBuf>,
+    path: &Path,
     repo_flag: Option<&str>,
     reset: bool,
     kind: WatchlistKindArg,
@@ -112,8 +176,7 @@ fn run_add(
     json: bool,
     stdout: &mut impl Write,
 ) -> io::Result<ExitCode> {
-    let path = state_path(state);
-    match add_command(&path, repo_flag, reset, kind, targets) {
+    match add_command(path, repo_flag, reset, kind, targets) {
         Ok(report) => write_add("watchlist.add", json, &report, stdout).map(|()| ExitCode::SUCCESS),
         Err(err) => write_error("watchlist.add", json, err, stdout),
     }
@@ -459,5 +522,136 @@ impl WatchlistKindArg {
             Self::PrBabysit => WatchKind::PrBabysit,
             Self::IssueToPr => WatchKind::IssueToPr,
         }
+    }
+}
+
+#[cfg(test)]
+mod cli_unit_tests {
+    use super::{WatchlistAction, WatchlistKindArg, run};
+    use std::fs;
+    use std::io::Cursor;
+    use std::path::PathBuf;
+    use std::process::ExitCode;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new() -> Self {
+            let id = NEXT.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::current_dir()
+                .unwrap()
+                .join("target")
+                .join(format!(
+                    "writ-watchlist-cli-unit-{}-{id}",
+                    std::process::id()
+                ));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn sample_state() -> (Scratch, PathBuf) {
+        let scratch = Scratch::new();
+        let path = scratch.0.join("watchlist.json");
+        fs::write(
+            &path,
+            r#"{
+              "version": 1,
+              "prs": [{
+                "repo": "acme/widgets",
+                "number": 7,
+                "branch": "feat/a",
+                "status": "pending",
+                "last_checked": "2026-01-01T00:00:00Z",
+                "fix_count": 0,
+                "residual_blockers": []
+              }],
+              "groups": {}
+            }"#,
+        )
+        .unwrap();
+        (scratch, path)
+    }
+
+    #[test]
+    fn run_list_human_and_json_use_state_override() {
+        let (_scratch, path) = sample_state();
+        let mut human = Cursor::new(Vec::new());
+        let code = run(
+            WatchlistAction::List {
+                state: Some(path.clone()),
+                repo: None,
+                owner: None,
+            },
+            false,
+            &mut human,
+        )
+        .unwrap();
+        assert_eq!(code, ExitCode::SUCCESS);
+        let text = String::from_utf8(human.into_inner()).unwrap();
+        assert!(text.contains("acme/widgets"));
+
+        let mut json_out = Cursor::new(Vec::new());
+        run(
+            WatchlistAction::List {
+                state: Some(path),
+                repo: None,
+                owner: None,
+            },
+            true,
+            &mut json_out,
+        )
+        .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&json_out.into_inner()).unwrap();
+        assert_eq!(payload["command"], "watchlist.list");
+    }
+
+    #[test]
+    fn run_add_without_repo_is_invalid_input() {
+        let (_scratch, path) = sample_state();
+        let mut out = Cursor::new(Vec::new());
+        let code = run(
+            WatchlistAction::Add {
+                state: Some(path),
+                repo: None,
+                reset: false,
+                kind: WatchlistKindArg::PrBabysit,
+                targets: vec!["7".to_owned()],
+            },
+            true,
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(code, ExitCode::from(1));
+        let payload: serde_json::Value = serde_json::from_slice(&out.into_inner()).unwrap();
+        assert_eq!(payload["error"]["code"], "INVALID_INPUT");
+    }
+
+    #[test]
+    fn run_remove_human_prints_stack_mate_note() {
+        let (_scratch, path) = sample_state();
+        let mut out = Cursor::new(Vec::new());
+        run(
+            WatchlistAction::Remove {
+                state: Some(path),
+                repo: Some("acme/widgets".to_owned()),
+                number: None,
+                targets: vec!["7".to_owned()],
+            },
+            false,
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out.into_inner()).unwrap();
+        assert!(text.contains("stack-mates"));
     }
 }

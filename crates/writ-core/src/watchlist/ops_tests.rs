@@ -328,6 +328,107 @@ fn classify_draft_is_pending() {
 }
 
 #[test]
+fn classify_empty_check_name_sanitizes_to_unnamed() {
+    let mut snap = open_snap("acme/widgets", 1, "feat/a", "main");
+    snap.checks = vec![CheckSnapshot {
+        name: String::new(),
+        state: "FAILURE".to_owned(),
+    }];
+    let (_, blockers) = classify_snapshot(&snap);
+    assert!(blockers.iter().any(|b| b == "class_a:unnamed"));
+}
+
+#[test]
+fn add_reset_clears_fix_count_and_blockers() {
+    let mut probe = MapProbe {
+        snaps: BTreeMap::new(),
+    };
+    probe.snaps.insert(
+        ("acme/widgets".to_owned(), 1),
+        open_snap("acme/widgets", 1, "feat/a", "main"),
+    );
+    let mut list = Watchlist::default();
+    add_prs(
+        &mut list,
+        &probe,
+        "acme/widgets",
+        &[1],
+        WatchKind::PrBabysit,
+        false,
+        &[],
+    )
+    .unwrap();
+    list.get_mut("acme/widgets", 1).unwrap().fix_count = 4;
+    list.get_mut("acme/widgets", 1)
+        .unwrap()
+        .residual_blockers
+        .push("class_b:x".to_owned());
+    add_prs(
+        &mut list,
+        &probe,
+        "acme/widgets",
+        &[1],
+        WatchKind::PrBabysit,
+        true,
+        &[],
+    )
+    .unwrap();
+    let entry = list.get("acme/widgets", 1).unwrap();
+    assert_eq!(entry.fix_count, 0);
+    assert!(entry.residual_blockers.is_empty());
+}
+
+struct TimeoutProbe;
+
+impl PrProbe for TimeoutProbe {
+    fn view(&self, repo: &str, number: u64) -> Result<PrSnapshot, WatchlistError> {
+        Err(WatchlistError::Timeout {
+            repo: repo.to_owned(),
+            number,
+            message: "stall".to_owned(),
+        })
+    }
+}
+
+#[test]
+fn check_maps_probe_timeout_to_entry_status() {
+    let mut list = Watchlist::default();
+    list.prs.push(WatchEntry {
+        repo: "acme/widgets".to_owned(),
+        number: 1,
+        branch: "feat/a".to_owned(),
+        status: WatchStatus::Pending,
+        last_checked: "2026-01-01T00:00:00Z".to_owned(),
+        fix_count: 0,
+        residual_blockers: Vec::new(),
+        stack_id: None,
+        stack_type: None,
+        stack_position: None,
+        base: None,
+        title: None,
+        added_at: None,
+        check_count: Some(0),
+        url: None,
+        kind: None,
+        extra: serde_json::Map::new(),
+    });
+    let report = check_prs(
+        &mut list,
+        &TimeoutProbe,
+        None,
+        Some("acme/widgets"),
+        Some(&[1]),
+        &[],
+    )
+    .unwrap();
+    assert_eq!(report.checked[0].status, WatchStatus::Timeout);
+    assert_eq!(
+        report.checked[0].residual_blockers,
+        vec!["timeout:gh".to_owned()]
+    );
+}
+
+#[test]
 fn probe_timeout_maps_to_watchlist_timeout() {
     // A stalled child must surface as WatchlistError::Timeout. `sleep 5`
     // is not gh, so we exercise the mapping via a tiny probe that reuses
@@ -694,14 +795,17 @@ impl PrProbe for FailSecondProbe {
 
 #[test]
 fn check_persists_completed_entries_before_gh_failure() {
-    let dir = std::env::temp_dir().join(format!(
-        "watchlist-partial-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let dir = std::env::current_dir()
+        .unwrap()
+        .join("target")
+        .join(format!(
+            "watchlist-partial-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
     fs::create_dir_all(&dir).unwrap();
     let path = dir.join("watchlist.json");
     let mut list = Watchlist::default();

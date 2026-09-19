@@ -220,3 +220,68 @@ impl WatchlistError {
         }
     }
 }
+
+#[cfg(test)]
+mod error_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn display_and_codes_cover_variants() {
+        let io_err = WatchlistError::Io {
+            context: "read watchlist",
+            path: PathBuf::from("/tmp/x.json"),
+            source: io::Error::from(io::ErrorKind::NotFound),
+        };
+        assert!(io_err.to_string().contains("read watchlist"));
+        assert_eq!(io_err.code(), "IO_ERROR");
+        assert_eq!(io_err.exit_code(), 1);
+
+        let corrupt = WatchlistError::Corrupt {
+            path: PathBuf::from("/tmp/x.json"),
+            quarantine: PathBuf::from("/tmp/x.corrupt"),
+            message: "bad".to_owned(),
+        };
+        assert!(corrupt.to_string().contains("quarantined"));
+        assert_eq!(corrupt.code(), "CORRUPT_STATE");
+
+        let version = WatchlistError::UnsupportedVersion {
+            path: PathBuf::from("/tmp/x.json"),
+            version: 99,
+        };
+        assert!(version.to_string().contains("unsupported"));
+
+        let not_found = WatchlistError::NotFound {
+            repo: "acme/r".to_owned(),
+            number: 1,
+        };
+        assert!(not_found.to_string().contains("acme/r#1"));
+
+        let allow = WatchlistError::AllowlistRequired;
+        assert_eq!(allow.exit_code(), 2);
+        assert_eq!(allow.code(), "OWNER_ALLOWLIST_REQUIRED");
+
+        let timeout = WatchlistError::Timeout {
+            repo: "acme/r".to_owned(),
+            number: 2,
+            message: "slow".to_owned(),
+        };
+        assert!(timeout.to_string().contains("timed out"));
+
+        let policy = WatchlistError::Policy {
+            code: PolicyCode::GhSubcommandNotAllowed,
+            message: "nope".to_owned(),
+        };
+        assert!(policy.to_string().contains("policy violation"));
+        assert_eq!(policy.exit_code(), 2);
+    }
+
+    #[test]
+    fn from_core_policy_maps_to_watchlist_policy() {
+        let err = WatchlistError::from(crate::error::Error::PolicyViolation {
+            code: PolicyCode::MergeBlocked,
+            message: "blocked".to_owned(),
+        });
+        assert!(matches!(err, WatchlistError::Policy { .. }));
+    }
+}

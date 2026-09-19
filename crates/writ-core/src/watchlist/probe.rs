@@ -186,3 +186,35 @@ pub(crate) fn parse_pr_view(repo: &str, stdout: &str) -> Result<PrSnapshot, Watc
 fn non_empty(value: Option<String>) -> Option<String> {
     value.filter(|s| !s.is_empty())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_uses_context_when_name_missing() {
+        let json = r#"{
+          "number": 1,
+          "title": "t",
+          "url": "https://example.test",
+          "state": "OPEN",
+          "headRefName": "head",
+          "baseRefName": "main",
+          "mergeable": "MERGEABLE",
+          "statusCheckRollup": [{
+            "context": "ci/build",
+            "conclusion": "",
+            "status": "IN_PROGRESS"
+          }]
+        }"#;
+        let snap = parse_pr_view("acme/widgets", json).unwrap();
+        assert_eq!(snap.checks[0].name, "ci/build");
+        assert_eq!(snap.checks[0].state, "IN_PROGRESS");
+    }
+
+    #[test]
+    fn parse_invalid_json_is_gh_error() {
+        let err = parse_pr_view("acme/widgets", "{").unwrap_err();
+        assert!(matches!(err, WatchlistError::Gh { .. }));
+    }
+}
