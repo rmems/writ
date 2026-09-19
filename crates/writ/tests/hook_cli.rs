@@ -141,7 +141,7 @@ fn hook_boundary_fail_closed_cases() {
     for (payload, exit, needle) in [
         ("{", 2, "IO_ERROR"),
         (
-            r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"git merge origin/main"}}"#,
+            r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"gh pr merge 1"}}"#,
             2,
             "MERGE_BLOCKED",
         ),

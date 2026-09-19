@@ -1471,14 +1471,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn git_safe_blocks_merge() {
+    async fn git_safe_blocks_mergetool() {
         let cli = Cli {
             json: false,
             allowed_owners: None,
             command: Some(super::Command::GitSafe {
                 expected_branch: None,
                 repo: None,
-                args: vec!["merge".to_owned(), "feature".to_owned()],
+                args: vec!["mergetool".to_owned()],
             }),
         };
         let mut stdout = Vec::new();

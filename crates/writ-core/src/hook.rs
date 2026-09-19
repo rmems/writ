@@ -112,7 +112,7 @@ fn handle_pre_tool_use(event: &HookEvent) -> Result<()> {
     else {
         return Ok(());
     };
-    admit_bash_command(ShellText(command))
+    admit_bash_command(ShellText(command), event.cwd.as_deref().map(Path::new))
 }
 
 fn handle_worktree_create(
@@ -289,7 +289,7 @@ fn origin_owner_repo(repo_root: &Path) -> Result<(String, String)> {
     }
 }
 
-fn admit_bash_command(command: ShellText<'_>) -> Result<()> {
+fn admit_bash_command(command: ShellText<'_>, cwd: Option<&Path>) -> Result<()> {
     let invocations = git_gh_invocations(command).map_err(|unparsed| Error::PolicyViolation {
         code: PolicyCode::SubcommandNotAllowed,
         message: format!("unparseable git/gh command: {}", unparsed.0.0),
@@ -297,7 +297,10 @@ fn admit_bash_command(command: ShellText<'_>) -> Result<()> {
     for invocation in invocations {
         match invocation.tool {
             GitGhTool::Git => {
-                SafeGitCommand::new(&invocation.args)?;
+                let cmd = SafeGitCommand::new(&invocation.args)?;
+                if let Some(cwd) = cwd {
+                    cmd.admit_local_merge(cwd)?;
+                }
             }
             GitGhTool::Gh => {
                 SafeGhCommand::new(&invocation.args)?;
@@ -309,7 +312,7 @@ fn admit_bash_command(command: ShellText<'_>) -> Result<()> {
 
 /// Public validation entry used by tests: policy-check a Bash command string.
 pub fn validate_bash_command(command: &str) -> Result<()> {
-    admit_bash_command(ShellText(command))
+    admit_bash_command(ShellText(command), None)
 }
 
 #[cfg(test)]
@@ -337,7 +340,7 @@ mod tests {
     #[test]
     fn pre_tool_use_blocks_git_and_gh_policy_violations() {
         assert_bash_hook_blocks("git push --force", "BARE_FORCE_PUSH");
-        assert_bash_hook_blocks("FOO=bar git merge feature", "MERGE_BLOCKED");
+        assert_bash_hook_blocks("FOO=bar git mergetool", "MERGE_BLOCKED");
         assert_bash_hook_blocks("gh pr merge 1", "MERGE_BLOCKED");
         assert_bash_hook_blocks("gh api repos/acme/example", "GH_SUBCOMMAND_NOT_ALLOWED");
     }
@@ -346,11 +349,101 @@ mod tests {
     fn pre_tool_use_allows_safe_git_and_ignores_non_git() {
         validate_bash_command("git status").unwrap();
         validate_bash_command("git push --force-with-lease origin HEAD").unwrap();
+        validate_bash_command("git merge feature").unwrap();
         validate_bash_command("npm test").unwrap();
         validate_bash_command("/usr/bin/git status").unwrap();
         validate_bash_command("git -C /tmp/repo status").unwrap();
         validate_bash_command("git -- status").unwrap();
         validate_bash_command("git commit -m 'a > b'").unwrap();
+    }
+
+    #[test]
+    fn pre_tool_use_refuses_merge_that_would_lose_wip_when_cwd_is_set() {
+        let temp = tempdir().unwrap();
+        let repo = temp.path();
+        for args in [
+            ["init", "-b", "worker-a"].as_slice(),
+            ["config", "user.email", "test@example.com"].as_slice(),
+            ["config", "user.name", "hook-test"].as_slice(),
+        ] {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        }
+        fs::write(repo.join("README"), "init\n").unwrap();
+        for args in [["add", "README"].as_slice(), ["commit", "-m", "init"].as_slice()] {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        }
+        fs::write(repo.join("wip.txt"), "do-not-lose\n").unwrap();
+
+        let runtime = HookRuntime::default();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let payload = serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "cwd": repo,
+            "tool_name": "Bash",
+            "tool_input": { "command": "git merge worker-b" },
+        })
+        .to_string();
+        let code = dispatch(&payload, &runtime, &mut stdout, &mut stderr);
+        let stderr = String::from_utf8_lossy(&stderr);
+        assert_eq!(code, 2, "{stderr}");
+        assert!(stderr.contains("MERGE_BLOCKED"), "{stderr}");
+        assert_eq!(fs::read_to_string(repo.join("wip.txt")).unwrap(), "do-not-lose\n");
+    }
+
+    #[test]
+    fn pre_tool_use_allows_feature_branch_merge_when_cwd_is_clean() {
+        let temp = tempdir().unwrap();
+        let repo = temp.path();
+        for args in [
+            ["init", "-b", "worker-a"].as_slice(),
+            ["config", "user.email", "test@example.com"].as_slice(),
+            ["config", "user.name", "hook-test"].as_slice(),
+        ] {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        }
+        fs::write(repo.join("README"), "init\n").unwrap();
+        for args in [["add", "README"].as_slice(), ["commit", "-m", "init"].as_slice()] {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        }
+
+        let runtime = HookRuntime::default();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let payload = serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "cwd": repo,
+            "tool_name": "Bash",
+            "tool_input": { "command": "git merge worker-b" },
+        })
+        .to_string();
+        let code = dispatch(&payload, &runtime, &mut stdout, &mut stderr);
+        let stderr = String::from_utf8_lossy(&stderr);
+        assert_eq!(code, 0, "{stderr}");
     }
 
     #[test]

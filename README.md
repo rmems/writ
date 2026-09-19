@@ -1,8 +1,8 @@
 # writ
 
-A Rust safety core for coding-agent fleets: isolated git worktrees, `git`/`gh` mutation allowlists, path sandboxing, process containment, and **no runtime merge path at all**.
+A Rust safety core for coding-agent fleets: isolated git worktrees, `git`/`gh` mutation allowlists, path sandboxing, process containment, and **no GitHub PR merge path**. Local feature-branch integration is allowlisted.
 
-Workers run in one worktree each. The portable [`SKILL.md`](SKILL.md) tells an agent host how to spawn them. The installed companion `babysit-pr` skill can watch a pull request until it is merge-ready. **A human still merges** — `writ` exposes no merge path, auto-merge, or merge queue.
+Workers run in one worktree each. The portable [`SKILL.md`](SKILL.md) tells an agent host how to spawn them. The installed companion `babysit-pr` skill can watch a pull request until it is merge-ready. **A human still merges the pull request on GitHub** — `writ` exposes no `gh pr merge` path, auto-merge, or merge queue.
 
 > [!IMPORTANT]
 > **This repository is mid-pivot.** It is becoming **`writ`** — the enforcement and admission-control layer for agent fleets. See [#1](https://github.com/rmems/writ/issues/1) for the product epic and [#124](https://github.com/rmems/writ/issues/124) for the current phase. The crate rename and the GitHub repository rename have both landed under milestone M2.
@@ -11,7 +11,7 @@ Workers run in one worktree each. The portable [`SKILL.md`](SKILL.md) tells an a
 
 > [!NOTE]
 > **The enforcement core is real; the hook layer is not built yet.**
-> Shipping today are the `git`/`gh` allowlists, exact-base worktree verification, path sandboxing, process supervision, and the absence of any merge path — reachable through the `writ` CLI, including `writ worktree create`, which remains supported.
+> Shipping today are the `git`/`gh` allowlists, exact-base worktree verification, path sandboxing, process supervision, local feature-branch merge admission, and a hard block on GitHub PR merges — reachable through the `writ` CLI, including `writ worktree create`, which remains supported.
 > Not yet built: the `PreToolUse`/`WorktreeCreate` hook dispatcher, `writ install`, and the SQLite lease store. Those are milestone **M1** ([#124](https://github.com/rmems/writ/issues/124)). Until they land, enforcement applies only to commands routed through `writ` deliberately — it is **opt-in, not unbypassable**.
 
 | Area | Today | Later |
@@ -100,7 +100,7 @@ Skill directories are not standardized. Common roots include `~/.agents/skills`,
 
 ## Quick start
 
-Until M1 hooks land, git and GitHub commands that `writ` can admit must go through `writ` on purpose. Merge is not among them: the runtime has no merge path. A primary agent may perform one human-authorized merge only through the host connector, after the [protocol in `AGENTS.md`](AGENTS.md#human-authorized-one-shot-merge-protocol).
+Until M1 hooks land, git and GitHub commands that `writ` can admit must go through `writ` on purpose. Local `git merge` on an assigned feature branch is allowlisted; `gh pr merge`, auto-merge, and merge queues are not. GitHub owns remote PR merges ([`AGENTS.md`](AGENTS.md#remote-github-merges)).
 
 1. Install the binary and skill as above.
 2. Isolate a job worktree from a known start point (never from a dirty ambient `HEAD`). `acme` / `example-org` are sandbox path segments; they must match the GitHub slug you pass to `gh-safe`, not this repository's clone path:
@@ -124,7 +124,7 @@ Until M1 hooks land, git and GitHub commands that `writ` can admit must go throu
    writ --json status
    ```
 
-Do not expect a `discover` → `add` → `check-all` → `list` hive loop. Those were scaffold-era skill stubs and were removed with the Python orchestrator. Current operator flow is: isolate a worktree, implement in that tree, open a PR, optionally hand it to `babysit-pr`, and leave the merge to a human — or to an explicitly authorized one-shot merge through the host connector.
+Do not expect a `discover` → `add` → `check-all` → `list` hive loop. Those were scaffold-era skill stubs and were removed with the Python orchestrator. Current operator flow is: isolate a worktree, integrate compatible peer work locally when needed, implement in that tree, open a PR, optionally hand it to `babysit-pr`, and leave the GitHub PR merge to a human.
 
 ## Architecture
 
@@ -132,7 +132,7 @@ Two layers, one binary.
 
 | Layer | Owns | Does not own |
 | --- | --- | --- |
-| **Enforcement** (per-repo) | Exact base, branch/path identity, path sandbox, git/gh allowlists, no merge path, force-with-lease only, process containment | Which agent does what |
+| **Enforcement** (per-repo) | Exact base, branch/path identity, path sandbox, git/gh allowlists, local feature-branch merge, no GitHub PR merge path, force-with-lease only, process containment | Which agent does what |
 | **Coordination state** (cross-repo) *(planned, M1)* | Agents, leases with path scopes, ownership, blockers, freeze modes. SQLite, single file, derived from `git`/`gh`/disk. Not implemented yet | Task decomposition or scheduling |
 | `git`, `gh`, OS | Version-control, GitHub, and process primitives, invoked through allowlists | Policy |
 
@@ -183,7 +183,7 @@ Register with `writ install`. Matcher scope starts at `Bash(git *)` and `Bash(gh
 | Term | Meaning |
 | --- | --- |
 | **Orchestrator** | The host agent session that loads [`SKILL.md`](SKILL.md), calls `writ`, and spawns workers. It is not a `writ` subcommand. |
-| **Worker** | A subagent bound to one assigned worktree and branch. Workers never merge. |
+| **Worker** | A subagent bound to one assigned worktree and branch. Workers may integrate peer work locally; they never merge a GitHub pull request. |
 | **Worktree** | An isolated git checkout under the sandboxed worktree root (`{worktree_root}/{owner}/{repo}/{job_id}`). |
 | **Watchlist / hive** | Durable list of jobs. Today: optional `watched.json` *read* by `writ status` / `writ jobs`. Writer and SQLite leases are not in this tree (M1). |
 | **Merge-ready** | CI green, conflict-free, required checks successful, review threads resolved. Report it; do not merge. |
@@ -197,7 +197,7 @@ Implemented `writ` surface (`writ --help` is authoritative):
 | --- | --- | --- |
 | `writ status` / `writ jobs` | Implemented (read-only) | Show watched jobs. Empty unless an external process wrote the state file. See [`docs/status-schema.md`](docs/status-schema.md). |
 | `writ git-safe …` | Implemented | Run a git command after the allowlist and, for mutations, expected-branch checks. |
-| `writ gh-safe …` | Implemented | Run a `gh` command after the allowlist. Merge operations are rejected. |
+| `writ gh-safe …` | Implemented | Run a `gh` command after the allowlist. GitHub PR merge operations are rejected. |
 | `writ supervisor run --timeout <secs> …` | Implemented | Spawn a child with wall-clock timeout. Unix kills the process group; Windows kills only the direct child (grandchildren may survive). |
 | `writ worktree create\|list\|remove\|prune` | Implemented | Isolated worktree lifecycle. `create` requires `--schema-version 2` and `--start-point`. |
 | `writ --json` | Implemented | Version-1 JSON envelopes on stdout; diagnostics on stderr. Fixtures: [`docs/examples/`](docs/examples/). |
@@ -235,7 +235,7 @@ Milestone A skill stubs used these names. They are **not** commands in `writ` or
 
 These apply to every agent, platform, and command path. [`SKILL.md`](SKILL.md) restates them as procedure; [`AGENTS.md`](AGENTS.md) is the contract.
 
-- **Never merge autonomously.** The runtime exposes no merge path. A primary interactive agent may perform one immediate merge only after a human unambiguously identifies and requests that exact PR, under the [authorization protocol](AGENTS.md#human-authorized-one-shot-merge-protocol).
+- **Never merge a GitHub pull request through `writ`.** Local feature-branch `git merge` is allowlisted; `gh pr merge`, auto-merge, and merge queues are not. GitHub repository protection owns remote PR merges ([`AGENTS.md`](AGENTS.md#remote-github-merges)).
 - Auto-merge, merge queues, scheduled merges, and admin bypasses are always forbidden.
 - Force pushes may use only `--force-with-lease`; bare `--force` and `-f` are forbidden.
 - Each job edits only its assigned branch and isolated worktree.
@@ -261,10 +261,10 @@ Linear may mirror planning for an operator's own team; that team id is operator-
 
 | Skill | Role |
 | --- | --- |
-| **`writ`** ([`SKILL.md`](SKILL.md)) | Fleet procedure: isolate worktrees, spawn workers, issue → PR, never merge. |
+| **`writ`** ([`SKILL.md`](SKILL.md)) | Fleet procedure: isolate worktrees, spawn workers, local integration, issue → PR. Does not merge GitHub pull requests. |
 | **`babysit-pr`** (installed companion) | Single-PR interactive monitoring in the current checkout: CI, reviews, threads, merge-ready report. Not a hive orchestrator and not a merge button. |
 
-`writ` admits writes across jobs. `babysit-pr` watches one PR. Neither merges.
+`writ` admits writes across jobs, including local feature-branch integration. `babysit-pr` watches one PR. Neither merges a GitHub pull request.
 
 ## Build and gates
 
@@ -310,7 +310,7 @@ If the new `writ` data root is absent and a pre-rename `worktrees-hives` root st
 | Agent does not see the `writ` skill | `ls "$HOME/.agents/skills/writ/SKILL.md"`; confirm the host's actual skill root; recreate the symlink. |
 | `writ: command not found` | `cargo install --path crates/writ` from the clone, or set `WRIT_BIN`. |
 | `writ status` / `writ jobs` is always empty | Expected. Nothing in this workspace writes `watched.json`. See [`docs/status-schema.md`](docs/status-schema.md). |
-| `policy violation [BARE_FORCE_PUSH]` or `[MERGE_BLOCKED]` | Exit 2 is the safety boundary working. Use `--force-with-lease` only when allowed; never merge through `writ`. |
+| `policy violation [BARE_FORCE_PUSH]` or `[MERGE_BLOCKED]` | Exit 2 is the safety boundary working. Use `--force-with-lease` only when allowed. `MERGE_BLOCKED` covers `gh pr merge`, `git mergetool`, default-branch local merge, and dirty-WIP merge — not routine feature-branch integration. |
 | Owner allowlist did not block another org | Confirm `WRIT_ALLOWED_OWNERS` / `--allowed-owners` is set. Empty lists deny. The gate covers worktree create and `gh` repo selectors, not host MCP calls. |
 | `writ install` is missing | Planned M1. Do not invent a second installer. Track [#18](https://github.com/rmems/writ/issues/18) and [#124](https://github.com/rmems/writ/issues/124). |
 
@@ -358,7 +358,7 @@ Milestone groups from the epic: **M1** hook enforcement + minimal lease store; *
 - [`REVIEW.md`](REVIEW.md) — pull-request lifecycle and review checklist
 - [`docs/adr/0001-rust-only-v1-runtime-and-babysit-pr-boundary.md`](docs/adr/0001-rust-only-v1-runtime-and-babysit-pr-boundary.md) — v1 Rust-only runtime and Codex `babysit-pr` boundary
 - [`docs/workflows/safe-issue-verified-commit.md`](docs/workflows/safe-issue-verified-commit.md) — issue → verified push
-- [`docs/workflows/safe-verified-commit-to-pr.md`](docs/workflows/safe-verified-commit-to-pr.md) — verified push → PR handoff (never merges)
+- [`docs/workflows/safe-verified-commit-to-pr.md`](docs/workflows/safe-verified-commit-to-pr.md) — verified push → PR handoff (does not merge the pull request)
 - [`docs/status-schema.md`](docs/status-schema.md) — `status` / `jobs` JSON
 - [`docs/examples/`](docs/examples/) — captured response envelopes
 - [`docs/hook-boundary.md`](docs/hook-boundary.md) — hook-boundary contract tests and two-hook burn-in (#81)

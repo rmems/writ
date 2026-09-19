@@ -11,9 +11,10 @@ Use these `AGENTS.md` sections as the single source of truth:
 - [Beads Issue Tracker](AGENTS.md#beads-issue-tracker)
 - [Session Completion](AGENTS.md#session-completion)
 - [Attribution semantics](AGENTS.md#attribution-semantics)
-- [Human-authorized one-shot merge protocol](AGENTS.md#human-authorized-one-shot-merge-protocol)
+- [Local collaboration](AGENTS.md#local-collaboration-allowed)
+- [Remote GitHub merges](AGENTS.md#remote-github-merges)
 
-Interactive PR monitoring belongs to the installed companion `babysit-pr` skill. That skill is portable operator guidance, not a security boundary. Rust `writ-core` remains the hard code-enforced boundary for worktree, branch, path, process, push, runtime no-merge, auto-merge, and merge-queue controls.
+Interactive PR monitoring belongs to the installed companion `babysit-pr` skill. That skill is portable operator guidance, not a security boundary. Rust `writ-core` remains the hard code-enforced boundary for worktree, branch, path, process, push, GitHub PR merge, auto-merge, merge-queue, and default-branch controls. Local feature-branch integration is allowlisted.
 
 ## Claude-specific delegation
 
