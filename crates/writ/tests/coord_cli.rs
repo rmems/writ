@@ -100,56 +100,44 @@ fn two_processes_share_store_and_exchange_overlap_help_handoff() {
     let wip = path_a.join("wip.txt");
     fs::write(&wip, "do not delete").unwrap();
 
-    let announce_a = thread::spawn({
-        let root = root.0.clone();
-        move || {
-            writ(
-                &root,
-                &[
-                    "--json",
-                    "coord",
-                    "announce",
-                    "acme",
-                    "sample",
-                    "job-a",
-                    "--agent",
-                    "agent-a",
-                    "--session",
-                    "sess-a",
-                    "--intent",
-                    "own coord.rs",
-                    "--path",
-                    "crates/writ-core/src/coord.rs",
-                ],
-            )
-        }
-    });
-    let announce_b = thread::spawn({
-        let root = root.0.clone();
-        move || {
-            writ(
-                &root,
-                &[
-                    "--json",
-                    "coord",
-                    "announce",
-                    "acme",
-                    "sample",
-                    "job-b",
-                    "--agent",
-                    "agent-b",
-                    "--session",
-                    "sess-b",
-                    "--intent",
-                    "own coord module",
-                    "--path",
-                    "crates/writ-core/src",
-                ],
-            )
-        }
-    });
-    let first = announce_a.join().unwrap();
-    let second = announce_b.join().unwrap();
+    let first = writ(
+        &root.0,
+        &[
+            "--json",
+            "coord",
+            "announce",
+            "acme",
+            "sample",
+            "job-a",
+            "--agent",
+            "agent-a",
+            "--session",
+            "sess-a",
+            "--intent",
+            "own coord.rs",
+            "--path",
+            "crates/writ-core/src/coord.rs",
+        ],
+    );
+    let second = writ(
+        &root.0,
+        &[
+            "--json",
+            "coord",
+            "announce",
+            "acme",
+            "sample",
+            "job-b",
+            "--agent",
+            "agent-b",
+            "--session",
+            "sess-b",
+            "--intent",
+            "own coord module",
+            "--path",
+            "crates/writ-core/src",
+        ],
+    );
     assert!(first.status.success(), "{:?}", first.stderr);
     assert!(second.status.success(), "{:?}", second.stderr);
     let overlaps = json(&first)["data"]["overlaps"]
@@ -170,10 +158,23 @@ fn two_processes_share_store_and_exchange_overlap_help_handoff() {
         "expected advisory overlap, got {overlaps:?}"
     );
 
-    let inbox = writ(
-        &root.0,
-        &["--json", "coord", "inbox", "acme", "sample", "job-a"],
-    );
+    let listed = thread::spawn({
+        let root = root.0.clone();
+        move || writ(&root, &["--json", "coord", "list"])
+    });
+    let inbox_job = thread::spawn({
+        let root = root.0.clone();
+        move || {
+            writ(
+                &root,
+                &["--json", "coord", "inbox", "acme", "sample", "job-a"],
+            )
+        }
+    });
+    let listed = listed.join().unwrap();
+    let inbox = inbox_job.join().unwrap();
+    assert!(listed.status.success(), "{:?}", listed.stderr);
+    assert_eq!(json(&listed)["data"]["claims"].as_array().unwrap().len(), 2);
     assert!(inbox.status.success(), "{:?}", inbox.stderr);
     let inbox_json = json(&inbox);
     let messages = inbox_json["data"]["messages"].as_array().unwrap();
