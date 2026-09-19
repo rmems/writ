@@ -134,3 +134,29 @@ fn install_is_idempotent() {
         "Bash(git *)"
     );
 }
+
+#[test]
+fn hook_boundary_fail_closed_cases() {
+    let root = TestDir::new();
+    for (payload, exit, needle) in [
+        ("{", 2, "IO_ERROR"),
+        (
+            r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"git merge origin/main"}}"#,
+            2,
+            "MERGE_BLOCKED",
+        ),
+        (
+            r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"git push --force-with-lease origin HEAD"}}"#,
+            0,
+            "",
+        ),
+        (r#"{"hook_event_name":"SessionStart"}"#, 0, ""),
+    ] {
+        let output = writ_hook(&root.0, payload);
+        assert_eq!(output.status.code(), Some(exit), "payload={payload}");
+        if !needle.is_empty() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains(needle), "needle={needle} stderr={stderr}");
+        }
+    }
+}
