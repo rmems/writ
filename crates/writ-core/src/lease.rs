@@ -94,7 +94,7 @@ impl AllocationState {
         }
     }
 
-    fn is_terminal(self) -> bool {
+    pub(crate) fn is_terminal(self) -> bool {
         matches!(self, Self::Released | Self::Tombstoned)
     }
 
@@ -360,6 +360,7 @@ impl LeaseStore {
         )
         .map_err(|e| lease_err("initialize lease schema", e))?;
         ensure_crash_consistency_columns(&conn)?;
+        crate::coord::ensure_schema(&conn)?;
         Ok(Self {
             path,
             conn: Mutex::new(conn),
@@ -1086,7 +1087,7 @@ impl LeaseStore {
         .map_err(|e| lease_err("lookup operation phase", e))
     }
 
-    fn lock(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
+    pub(crate) fn lock(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
         self.conn.lock().map_err(|_| Error::LeaseStore {
             context: "lease store",
             message: "lease store mutex poisoned".to_owned(),
