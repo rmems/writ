@@ -21,7 +21,7 @@ For stacked pull requests, review and fix the bottom PR before its children. Re-
 - [ ] The PR links its GitHub issue and, when present, the matching Linear `RM-*` issue.
 - [ ] Changes satisfy the linked acceptance criteria without unrelated refactors.
 - [ ] Session work is reflected accurately in Beads.
-- [ ] Generated replies identify the agent and, after a fix, include the pushed commit SHA.
+- [ ] Generated replies identify the agent. Review-fix replies include the pushed commit SHA. Coordination messages and no-code-change replies do not invent a SHA.
 - [ ] Attribution is audited only on commits reachable from the submitted PR head and not its base, excluding synthetic review-merge/checkout and test-fixture commits. The Git author is the primary author, `Co-authored-by` credits an additional contributor, and `Agent` identifies the coding agent; the presence of one does not prove another.
 - [ ] Every Codex-authored commit in that submitted range contains exact `Agent: Codex` and `Co-authored-by: Codex <noreply@openai.com>` trailers without rewriting Cursor-attributed history.
 - [ ] After the first tested implementation and before final publication, one independent review matched to the change's risk was completed. Extra review was requested only for a named high-risk boundary or a reproduced finding that warranted follow-up.
@@ -75,7 +75,7 @@ cargo test --workspace
 
 ## Review replies
 
-Post a fix reply only after its commit is pushed. Include attribution on every automated thread reply and optional PR comment. After a code fix, include the pushed SHA; when no code changed, include attribution without inventing a SHA.
+Post a review-fix reply only after its commit is pushed. Include attribution on every automated thread reply, optional PR comment, and peer coordination message. After a code fix, include the pushed SHA; for intent/dependency/overlap/help/handoff messages and when no code changed, include attribution without inventing a SHA. Peers may talk before any push exists.
 
 Render with `writ attribution format` so platforms set `agent_id` (`WRIT_AGENT_ID`) without forking reply logic. Canonical templates live in [`SKILL.md`](SKILL.md#reply-attribution). Thread reply after a successful push:
 

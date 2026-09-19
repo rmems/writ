@@ -146,7 +146,8 @@ enum AttributionAction {
         /// Identity line. Overrides `WRIT_AGENT_ID` / `WRIT_ATTRIBUTION`.
         #[arg(long)]
         agent_id: Option<String>,
-        /// Pushed commit SHA after a successful fix. Omit when no code changed.
+        /// Actual commit SHA when discussing committed work. Omit for
+        /// coordination messages and when no code changed. Never invent a SHA.
         #[arg(long)]
         commit_sha: Option<String>,
         /// `footer` (default) or `header`.
@@ -1141,6 +1142,30 @@ mod tests {
         assert_eq!(
             str::from_utf8(&human).unwrap(),
             "Looks good!\n\n---\nworktrees-hives agent\n"
+        );
+
+        let collab = parse_stdout_json(
+            &format_ok(FormatCase {
+                json: true,
+                body: "Overlap: I own SKILL.md Reply attribution; RM-145 owns the rest.",
+                agent_id: Some("worktrees-hives agent"),
+                commit_sha: None,
+                placement: None,
+                pr_comment: false,
+            })
+            .await,
+        );
+        assert!(format_envelope_ok(&collab), "{collab}");
+        assert_eq!(
+            format_data(&collab),
+            (
+                Some(
+                    "Overlap: I own SKILL.md Reply attribution; RM-145 owns the rest.\n\n---\nworktrees-hives agent"
+                ),
+                None,
+                Some(true),
+                true
+            )
         );
 
         let with_sha = parse_stdout_json(

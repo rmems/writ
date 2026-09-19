@@ -1,9 +1,11 @@
-//! Configurable reply attribution for automated PR comments and thread replies.
+//! Configurable reply attribution for automated PR comments, thread replies,
+//! and peer coordination messages.
 //!
 //! Restores GitHub [#14](https://github.com/rmems/writ/issues/14) / Linear RM-128
 //! after the Python orchestrator was removed. Platforms override `agent_id`
 //! without forking reply templates. This is transparency for posted comments,
-//! not Git commit identity and not a merge path.
+//! not Git commit identity and not a merge path. Coordination messages may omit
+//! a SHA; never invent one.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -187,7 +189,8 @@ pub struct ReplyTemplate {
     pub body: String,
     /// Attribution configuration.
     pub attribution_config: AttributionConfig,
-    /// Commit SHA after a successful push; `None` when no code change landed.
+    /// Real commit SHA when discussing committed or pushed work; `None` for
+    /// coordination messages and when no code change landed. Never invent a SHA.
     pub commit_sha: Option<String>,
     /// Thread replies use a `---` separator; PR comments use a blank line.
     pub is_thread_reply: bool,

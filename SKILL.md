@@ -15,7 +15,7 @@ Use this skill when:
 - Discovering work from GitHub or Linear issues
 - Spawning worker subagents for code changes
 - Running [Safe Issue → Verified Commit](docs/workflows/safe-issue-verified-commit.md) then [Safe Verified Commit → PR](docs/workflows/safe-verified-commit-to-pr.md)
-- Formatting attributed PR review replies (`writ attribution format`; [Reply attribution](#reply-attribution))
+- Formatting attributed PR review replies and peer coordination messages (`writ attribution format`; [Reply attribution](#reply-attribution))
 - Handing a pull request to the installed companion `babysit-pr` skill when interactive monitoring is needed
 - Executing a human-requested one-shot merge after the automated workflows end
 - Reporting results back to the operator
@@ -71,9 +71,9 @@ A worker or companion-skill monitoring agent MUST NOT claim it merged the PR. A 
 
 ### Reply attribution
 
-Automated review-thread replies and optional PR-level summary comments must identify **which automation stack** responded. When a code fix landed, they must also identify **which commit** landed the fix. Attribution is transparency, not GitHub App impersonation and not a change to Git `user.name` / `user.email`.
+Automated review-thread replies, optional PR-level summary comments, and peer coordination messages must identify **which automation stack** responded. When discussing committed or pushed work, they must also identify **which commit** with an actual SHA. Attribution is transparency, not GitHub App impersonation and not a change to Git `user.name` / `user.email`.
 
-Do not merge, approve, or auto-resolve a thread as a side effect of posting a reply. Post a reply only after a successful push when the reply reports a code fix. A local HEAD SHA after a failed or rejected push is not a completion SHA.
+Do not merge, approve, or auto-resolve a thread as a side effect of posting a reply. Intent, dependency, overlap/help, and handoff messages may be posted before any code or pushed SHA exists. Post a review-fix reply only after a successful push, and include that pushed SHA. A local HEAD SHA after a failed or rejected push is not a completion SHA. Never fabricate a SHA.
 
 #### Configuration
 
@@ -82,7 +82,7 @@ Platforms set identity without forking these templates. Empty values fall back t
 | Key | Env | Type | Default | Purpose |
 | --- | --- | --- | --- | --- |
 | `agent_id` / `attribution` | `WRIT_AGENT_ID`, else `WRIT_ATTRIBUTION` | string | `worktrees-hives agent` | Identity line on replies |
-| `include_sha_on_fix` | `WRIT_INCLUDE_SHA_ON_FIX` | bool | `true` | Callers intend to attach a SHA after code fixes. Review replies after a successful push still include the SHA. |
+| `include_sha_on_fix` | `WRIT_INCLUDE_SHA_ON_FIX` | bool | `true` | Callers intend to attach a SHA after code fixes. Review-fix replies after a successful push still include that SHA. Coordination messages omit it. |
 | `attribution_placement` | `WRIT_ATTRIBUTION_PLACEMENT` | `footer` \| `header` | `footer` | Where the line goes |
 
 Override `agent_id` with `WRIT_AGENT_ID` (or `writ attribution format --agent-id ...`). Do not copy this skill to change the label.
@@ -126,6 +126,19 @@ No code change: the check already covers this path.
 worktrees-hives agent
 ```
 
+Peer coordination (intent, dependency, overlap/help, handoff) — omit `--commit-sha`; do not wait for a push:
+
+```bash
+writ attribution format --body "Overlap: I own SKILL.md Reply attribution templates; RM-145 owns the rest of SKILL.md. Next: collab-message docs without a fabricated SHA."
+```
+
+```text
+Overlap: I own SKILL.md Reply attribution templates; RM-145 owns the rest of SKILL.md. Next: collab-message docs without a fabricated SHA.
+
+---
+worktrees-hives agent
+```
+
 Optional PR-level summary comment (`--pr-comment` uses a blank line instead of `---`):
 
 ```bash
@@ -140,7 +153,7 @@ worktrees-hives agent: fixed in abc1234
 
 `--placement header` puts the identity line above the body. `--agent-id` overrides the env default for one reply.
 
-Ordering: **push success → then reply with the pushed SHA**. Review replies that report a code fix must include that SHA (`--commit-sha`); do not omit it after a successful push. When no code change landed, omit `--commit-sha` so a SHA is not invented. If a SHA is passed to the formatter, it is always rendered so a real fix cannot be dropped.
+SHA policy: include `--commit-sha` only when referring to committed or pushed work, and only with a real object id. Review replies that report a code fix must use the SHA from a successful push; do not omit it after that push, and do not invent one. Coordination messages and replies with no code change omit `--commit-sha`. If a SHA is passed to the formatter, it is always rendered so a real fix cannot be dropped. Peers do not need a push before they can talk.
 
 ### Platform-neutral worker prompt template
 
@@ -157,7 +170,7 @@ SAFETY RULES (non-negotiable):
 - Before editing, verify: worktree path, branch name, clean assigned state, and remote alignment; exact remote-base equality applies only to a newly created unpublished branch, while a published branch must match its expected upstream relationship
 - Repair a clean bootstrap source or unpublished verified-base alignment; abort on unsafe identity or path mismatch
 - After the first tested implementation and before publication, obtain one independent risk-matched review; add review only for a named high-risk boundary or an actual finding
-- After pushing, reply with SHA and agent attribution using the SKILL.md reply templates (`writ attribution format`)
+- Use `writ attribution format` for automated replies. Intent/dependency/overlap/help/handoff messages need identity and must not invent a SHA. After a successful push, review-fix replies include that real SHA.
 ```
 
 Worker prompts remain strictly non-merging. Do not forward the primary agent's merge authorization to a worker or subagent.
