@@ -20,7 +20,7 @@ Workers run in one worktree each. The portable [`SKILL.md`](SKILL.md) tells an a
 | `writ` CLI (`git-safe`, `gh-safe`, `worktree`, `supervisor`, `status`) | Implemented | Envelope-compatible additions only |
 | Claude Code hook dispatcher / `writ install` | Not built | M1 ([#124](https://github.com/rmems/writ/issues/124), install narrative [#18](https://github.com/rmems/writ/issues/18)) |
 | SQLite lease store, path scopes, budgets | Not built | M1 then M3/M4 ([#1](https://github.com/rmems/writ/issues/1), [#167](https://github.com/rmems/writ/issues/167)) |
-| Owner-allowlist enforcement | Policy text only | [#146](https://github.com/rmems/writ/issues/146) |
+| Owner-allowlist enforcement | Enforced in `writ-core` | [#146](https://github.com/rmems/writ/issues/146) |
 | Hive verbs `discover` / `add` / `check` / `check-all` | **Removed** | Do not expect them; see [Commands](#commands) |
 
 Canonical command names live in [`SKILL.md`](SKILL.md) and `writ --help`. This README summarizes them.
@@ -245,17 +245,13 @@ These apply to every agent, platform, and command path. [`SKILL.md`](SKILL.md) r
 
 Soft prompt text is not runtime enforcement. Hard stops live in Rust, at the binary boundary, where a malformed prompt cannot bypass them.
 
-## Owner allowlist — not currently enforced
+## Owner allowlist
 
-> [!WARNING]
-> **`WRIT_ALLOWED_OWNERS` has no reader anywhere under `crates/`.** It was enforced in the Python layer this repository just removed, so owner scoping is presently a stated requirement with no code behind it. Do not rely on it as an access control. Tracked in [#146](https://github.com/rmems/writ/issues/146).
+Repository access is controlled by a configured owner allowlist, not a built-in org list.
 
-The intended contract, for when enforcement lands:
-
-- Repository access is controlled by a configured owner allowlist, not a built-in org list. There is no default owner baked into `writ`.
-- Set `WRIT_ALLOWED_OWNERS=acme,example-org` (comma-separated), or pass explicit owners at the API boundary.
-- An empty allowlist denies multi-owner discovery/scheduling rather than permitting it. A single repository the operator named explicitly is still in scope for that job.
-- Other orgs and arbitrary public repos stay out of scope unless the operator overrides.
+- Set `WRIT_ALLOWED_OWNERS=acme,example-org` (comma-separated), or pass `--allowed-owners` / explicit owners at the API boundary.
+- An empty allowlist denies owner-taking operations (`writ worktree create` and `gh` commands that select a repository via `-R` / `--repo` in any pflag spelling, or via `GH_REPO`) rather than permitting them.
+- Comparison uses the same host/case normalization as `github_repo_slugs_match`, so `Acme/Repo` and `github.com/acme/repo` cannot diverge.
 
 Examples use generic owners such as `acme` and `example-org`.
 
@@ -315,7 +311,7 @@ If the new `writ` data root is absent and a pre-rename `worktrees-hives` root st
 | `writ: command not found` | `cargo install --path crates/writ` from the clone, or set `WRIT_BIN`. |
 | `writ status` / `writ jobs` is always empty | Expected. Nothing in this workspace writes `watched.json`. See [`docs/status-schema.md`](docs/status-schema.md). |
 | `policy violation [BARE_FORCE_PUSH]` or `[MERGE_BLOCKED]` | Exit 2 is the safety boundary working. Use `--force-with-lease` only when allowed; never merge through `writ`. |
-| Owner allowlist did not block another org | Not enforced in code yet ([#146](https://github.com/rmems/writ/issues/146)). Treat it as an operator policy. |
+| Owner allowlist did not block another org | Confirm `WRIT_ALLOWED_OWNERS` / `--allowed-owners` is set. Empty lists deny. The gate covers worktree create and `gh` repo selectors, not host MCP calls. |
 | `writ install` is missing | Planned M1. Do not invent a second installer. Track [#18](https://github.com/rmems/writ/issues/18) and [#124](https://github.com/rmems/writ/issues/124). |
 
 ## Issue labels and templates
