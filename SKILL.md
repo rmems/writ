@@ -35,7 +35,7 @@ This skill never grants an exception to those rules. Worker, orchestrator, sched
 
 Before making any code change, the agent MUST verify:
 
-1. **Worktree isolation:** `pwd` is inside the assigned worktree path (`{worktree_root}/{owner}/{repo}/{job_id}`).
+1. **Worktree isolation:** `pwd` is inside the assigned checkout path (created by the harness or `git worktree add`, then joined via `writ worktree register`).
 2. **Branch correctness:** `git branch --show-current` matches the assigned feature branch.
 3. **Clean state:** `git status` shows no uncommitted changes from other work. A dirty or stale primary checkout is preserved and is not a reason to abort isolated work.
 4. **Remote alignment:** For a newly created, unpublished assigned branch, fetch the intended remote base and prove that the branch equals that exact remote-base commit before edits; it may lack an upstream only for this creation proof. For a published assigned branch, fetch and verify its expected upstream and the expected local/remote relationship instead of comparing the branch with the base. Stop on an unexpected upstream, unexpected remote commit, behind state, or divergence.

@@ -1,10 +1,9 @@
 //! Claude Code hook dispatcher.
 //!
 //! Reads hook JSON on stdin. Exit 0 allows; exit 2 blocks and writes a reason
-//! on stderr that Claude Code shows to the model. `WorktreeCreate` also prints
-//! the admitted worktree path as the last stdout line. Exact-base create
-//! requires a hook-supplied start ref (`source_ref` and aliases); there is no
-//! ambient `HEAD` fallback.
+//! on stderr that Claude Code shows to the model. The harness owns worktree
+//! creation and removal: `WorktreeCreate`/`WorktreeRemove` here only update
+//! coordination records and never create, move, or delete a checkout.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -12,12 +11,11 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use crate::bash_argv::{GitGhTool, ShellText, git_gh_invocations};
+use crate::checkout::CheckoutRegistry;
 use crate::error::{Error, PolicyCode, Result};
 use crate::git_safe::{SafeGhCommand, SafeGitCommand};
-use crate::identity::{StartPoint, resolve_start_commit};
 use crate::lease::{AgentIdentity, LeaseStore};
 use crate::owners::OwnerAllowlist;
-use crate::worktree::{WorktreeCreateRequest, WorktreeManager};
 
 /// Process-local paths for hook dispatch (tests inject temp dirs).
 #[derive(Debug, Clone, Default)]
@@ -69,8 +67,6 @@ fn dispatch_inner(
 struct HookEvent {
     hook_event_name: String,
     #[serde(default)]
-    cwd: Option<String>,
-    #[serde(default)]
     tool_name: Option<String>,
     #[serde(default)]
     tool_input: Option<ToolInput>,
@@ -84,14 +80,6 @@ struct HookEvent {
     agent_type: Option<String>,
     #[serde(default)]
     session_id: Option<String>,
-    #[serde(
-        default,
-        alias = "sourceRef",
-        alias = "start_point",
-        alias = "base_ref",
-        alias = "baseRef"
-    )]
-    source_ref: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -115,95 +103,71 @@ fn handle_pre_tool_use(event: &HookEvent) -> Result<()> {
     admit_bash_command(ShellText(command))
 }
 
+/// Coordination-only `WorktreeCreate`: the harness performs the actual
+/// creation. When the event names an already-existing checkout, register it
+/// and echo the canonical path on stdout; otherwise allow native creation to
+/// proceed untouched (exit 0, no claimed path).
 fn handle_worktree_create(
     event: &HookEvent,
     runtime: &HookRuntime,
     stdout: &mut impl Write,
 ) -> Result<()> {
-    let inputs = create_inputs(event)?;
-    let created = manager_for_runtime(runtime)?.create_with_request(inputs.request())?;
-    write_created_path(stdout, &created.path)
-}
-
-struct CreateInputs {
-    repo_root: PathBuf,
-    owner: String,
-    repo_name: String,
-    name: String,
-    start_commit: String,
-}
-
-impl CreateInputs {
-    fn request(&self) -> WorktreeCreateRequest<'_> {
-        WorktreeCreateRequest {
-            repo_root: &self.repo_root,
-            owner: &self.owner,
-            repo: &self.repo_name,
-            job_id: &self.name,
-            branch: &self.name,
-            start_point: &self.start_commit,
-            pr_number: None,
-            source_remote: None,
-            head_repo: None,
-        }
-    }
-}
-
-fn create_inputs(event: &HookEvent) -> Result<CreateInputs> {
-    let name = hook_field(
-        event.name.as_deref(),
-        PolicyCode::WorktreeResumeUnproven,
-        "WorktreeCreate hook JSON is missing `name`",
-    )?;
-    let cwd = hook_field(
-        event.cwd.as_deref(),
-        PolicyCode::GitDirUnavailable,
-        "WorktreeCreate hook JSON is missing `cwd`",
-    )?;
-    let source_ref = event
-        .source_ref
+    let Some(path) = event
+        .worktree_path
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .ok_or(Error::StartPointRequired)?;
-    let repo_root = git_toplevel(Path::new(cwd))?;
-    let (owner, repo_name) = origin_owner_repo(&repo_root)?;
-    let start_commit = resolve_start_commit(&repo_root, StartPoint(source_ref))?;
-    Ok(CreateInputs {
-        repo_root,
-        owner,
-        repo_name,
-        name: name.to_owned(),
-        start_commit,
-    })
+        .map(Path::new)
+    else {
+        return Ok(());
+    };
+    if !path.exists() {
+        return Ok(());
+    }
+    let job_id = event
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| "checkout".to_owned());
+    match open_registry(runtime)?.register(path, &job_id) {
+        Ok(info) => writeln!(stdout, "{}", info.path.display()).map_err(|e| Error::Io {
+            context: "write WorktreeCreate path",
+            source: e,
+        }),
+        // A path that exists but is not a git checkout is not ours to judge;
+        // let the harness continue without a registered record.
+        Err(
+            err @ Error::PolicyViolation {
+                code: PolicyCode::GitDirUnavailable,
+                ..
+            },
+        ) => {
+            let _ = err;
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
 }
 
-fn hook_field<'a>(
-    value: Option<&'a str>,
-    code: PolicyCode,
-    message: &'static str,
-) -> Result<&'a str> {
-    value.ok_or_else(|| Error::PolicyViolation {
-        code,
-        message: message.to_owned(),
-    })
-}
-
-fn write_created_path(stdout: &mut impl Write, path: &Path) -> Result<()> {
-    writeln!(stdout, "{}", path.display()).map_err(|e| Error::Io {
-        context: "write WorktreeCreate path",
-        source: e,
-    })
-}
-
+/// Coordination-only `WorktreeRemove`: release the lease row for the path,
+/// never delete the checkout or its branch. A missing `worktree_path` is a
+/// no-op rather than a block.
 fn handle_worktree_remove(event: &HookEvent, runtime: &HookRuntime) -> Result<()> {
-    let path = hook_field(
-        event.worktree_path.as_deref(),
-        PolicyCode::PathNotAllowed,
-        "WorktreeRemove hook JSON is missing `worktree_path`",
-    )?;
-    let manager = manager_for_runtime(runtime)?;
-    manager.remove(Path::new(path), true)?;
+    let Some(path) = event
+        .worktree_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(());
+    };
+    open_store(runtime)?.release_by_path(Path::new(path))?;
     Ok(())
 }
 
@@ -222,70 +186,14 @@ fn handle_subagent_stop(event: &HookEvent, runtime: &HookRuntime) -> Result<()> 
     open_store(runtime)?.retire_agent(agent_id)
 }
 
-fn manager_for_runtime(runtime: &HookRuntime) -> Result<WorktreeManager> {
-    let manager = match (&runtime.worktree_base, &runtime.lease_path) {
-        (Some(base), Some(lease)) => {
-            WorktreeManager::with_base_and_leases(base.clone(), LeaseStore::open(lease)?)?
-        }
-        (Some(base), None) => WorktreeManager::with_base(base.clone())?,
-        (None, Some(lease)) => {
-            let base = crate::paths::worktree_base_path()?;
-            WorktreeManager::with_base_and_leases(base, LeaseStore::open(lease)?)?
-        }
-        (None, None) => WorktreeManager::new()?,
-    };
-    Ok(match &runtime.allowed_owners {
-        Some(allowlist) => manager.with_allowlist(allowlist.clone()),
-        None => manager,
-    })
+fn open_registry(runtime: &HookRuntime) -> Result<CheckoutRegistry> {
+    CheckoutRegistry::with_store(open_store(runtime)?)
 }
 
 fn open_store(runtime: &HookRuntime) -> Result<LeaseStore> {
     match &runtime.lease_path {
         Some(path) => LeaseStore::open(path),
         None => LeaseStore::open(crate::paths::lease_store_path()),
-    }
-}
-
-fn git_toplevel(cwd: &Path) -> Result<PathBuf> {
-    let output =
-        crate::git_cmd::git_in(cwd, &["rev-parse", "--show-toplevel"]).map_err(|e| Error::Io {
-            context: "resolve hook repository root",
-            source: e,
-        })?;
-    if !output.status.success() {
-        return Err(Error::PolicyViolation {
-            code: PolicyCode::GitDirUnavailable,
-            message: format!(
-                "WorktreeCreate cwd is not a git repository: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ),
-        });
-    }
-    Ok(PathBuf::from(
-        String::from_utf8_lossy(&output.stdout).trim(),
-    ))
-}
-
-fn origin_owner_repo(repo_root: &Path) -> Result<(String, String)> {
-    match crate::git_safe::origin_github_slug(repo_root) {
-        Ok(slug) => {
-            let (owner, repo) = slug.split_once('/').ok_or_else(|| Error::PolicyViolation {
-                code: PolicyCode::GitDirUnavailable,
-                message: format!("origin slug `{slug}` is not owner/repo"),
-            })?;
-            Ok((owner.to_owned(), repo.to_owned()))
-        }
-        Err(_) => {
-            let name = repo_root
-                .file_name()
-                .and_then(|n| n.to_str())
-                .ok_or_else(|| Error::InvalidSegment {
-                    field: "repo",
-                    value: repo_root.display().to_string(),
-                })?;
-            Ok(("local".to_owned(), name.to_owned()))
-        }
     }
 }
 
@@ -437,7 +345,7 @@ mod tests {
     }
 
     #[test]
-    fn worktree_create_requires_explicit_source_ref() {
+    fn worktree_create_without_existing_checkout_is_a_noop_allow() {
         let runtime = HookRuntime::default();
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
@@ -447,24 +355,18 @@ mod tests {
             &mut stdout,
             &mut stderr,
         );
-        assert_eq!(code, 2);
-        let stderr = String::from_utf8_lossy(&stderr);
-        assert!(stderr.contains("START_POINT_REQUIRED"), "stderr={stderr}");
-        assert!(stdout.is_empty());
+        assert_eq!(code, 0);
+        assert!(stdout.is_empty(), "no checkout may be claimed or created");
 
         let mut stderr = Vec::new();
         let code = dispatch(
-            r#"{"hook_event_name":"WorktreeCreate","cwd":"/tmp","name":"job-1","source_ref":"  "}"#,
+            r#"{"hook_event_name":"WorktreeCreate","worktree_path":"/nonexistent/job-1","name":"job-1"}"#,
             &runtime,
             &mut stdout,
             &mut stderr,
         );
-        assert_eq!(code, 2);
-        assert!(
-            String::from_utf8_lossy(&stderr).contains("START_POINT_REQUIRED"),
-            "stderr={}",
-            String::from_utf8_lossy(&stderr)
-        );
+        assert_eq!(code, 0);
+        assert!(stdout.is_empty());
     }
 
     fn git_stdout(repo: &Path, args: &[&str]) -> String {
@@ -502,32 +404,95 @@ mod tests {
     }
 
     #[test]
-    fn worktree_create_uses_source_ref_not_ambient_head() {
+    fn worktree_create_registers_existing_checkout_without_mutating_it() {
         let temp = tempdir().unwrap();
         let repo = temp.path().join("repo");
         fs::create_dir(&repo).unwrap();
         let (first, second) = two_commit_repo(&repo);
         assert_ne!(first, second);
+        let checkout = temp.path().join("harness-checkout");
+        fs::create_dir(&checkout).unwrap();
+        git_stdout(&checkout, &["clone", repo.to_str().unwrap(), "."]);
+        fs::write(checkout.join("wip.txt"), "keep\n").unwrap();
+        let head_before = git_stdout(&checkout, &["rev-parse", "HEAD"]);
+
+        let lease_path = temp.path().join("leases.db");
         let runtime = HookRuntime {
-            worktree_base: Some(temp.path().join("worktrees")),
-            lease_path: Some(temp.path().join("leases.db")),
-            allowed_owners: Some(OwnerAllowlist::from_owners(["acme"])),
+            worktree_base: None,
+            lease_path: Some(lease_path.clone()),
+            allowed_owners: None,
         };
         let payload = serde_json::json!({
             "hook_event_name": "WorktreeCreate",
-            "cwd": repo,
+            "worktree_path": checkout,
             "worktree_name": "job-src",
-            "sourceRef": first,
         })
         .to_string();
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let code = dispatch(&payload, &runtime, &mut stdout, &mut stderr);
         assert_eq!(code, 0, "stderr={}", String::from_utf8_lossy(&stderr));
-        let created = String::from_utf8_lossy(&stdout).trim().to_owned();
         assert_eq!(
-            git_stdout(Path::new(&created), &["rev-parse", "HEAD"]),
-            first
+            String::from_utf8_lossy(&stdout).trim(),
+            crate::paths::canonicalize_for_tools(&checkout)
+                .unwrap()
+                .display()
+                .to_string()
+        );
+        assert_eq!(git_stdout(&checkout, &["rev-parse", "HEAD"]), head_before);
+        assert!(checkout.join("wip.txt").exists());
+
+        let store = LeaseStore::open(&lease_path).unwrap();
+        assert_eq!(store.list_active().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn worktree_remove_releases_lease_without_deleting_checkout() {
+        let temp = tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        fs::create_dir(&repo).unwrap();
+        let _ = two_commit_repo(&repo);
+        let checkout = temp.path().join("harness-checkout");
+        fs::create_dir(&checkout).unwrap();
+        git_stdout(&checkout, &["clone", repo.to_str().unwrap(), "."]);
+
+        let lease_path = temp.path().join("leases.db");
+        let runtime = HookRuntime {
+            worktree_base: None,
+            lease_path: Some(lease_path.clone()),
+            allowed_owners: None,
+        };
+        let canonical = crate::paths::canonicalize_for_tools(&checkout).unwrap();
+        open_store(&runtime)
+            .unwrap()
+            .grant(crate::lease::LeaseGrant {
+                repo: &repo,
+                owner: "acme",
+                repo_name: "test-repo",
+                job_id: "job-rm",
+                branch: "job/rm",
+                worktree_path: &canonical,
+                start_commit: "abc",
+            })
+            .unwrap();
+
+        let payload = serde_json::json!({
+            "hook_event_name": "WorktreeRemove",
+            "worktree_path": canonical,
+        })
+        .to_string();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = dispatch(&payload, &runtime, &mut stdout, &mut stderr);
+        assert_eq!(code, 0, "stderr={}", String::from_utf8_lossy(&stderr));
+        assert!(checkout.join(".git").exists(), "checkout must survive");
+        assert!(
+            open_store(&runtime)
+                .unwrap()
+                .list_active()
+                .unwrap()
+                .is_empty(),
+            "lease released"
         );
     }
 

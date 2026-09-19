@@ -11,8 +11,8 @@ Workers run in one worktree each. The portable [`SKILL.md`](SKILL.md) tells an a
 
 > [!NOTE]
 > **The enforcement core is real; the hook layer is not built yet.**
-> Shipping today are the `git`/`gh` allowlists, exact-base worktree verification, path sandboxing, process supervision, and the absence of any merge path — reachable through the `writ` CLI, including `writ worktree create`, which remains supported.
-> Not yet built: the `PreToolUse`/`WorktreeCreate` hook dispatcher, `writ install`, and the SQLite lease store. Those are milestone **M1** ([#124](https://github.com/rmems/writ/issues/124)). Until they land, enforcement applies only to commands routed through `writ` deliberately — it is **opt-in, not unbypassable**.
+> Shipping today are the `git`/`gh` allowlists, path sandboxing, process supervision, checkout registration (`writ worktree register`), and the absence of any merge path — reachable through the `writ` CLI. The managed lifecycle (`worktree create`/`remove`/`prune`) is deprecated: the agent harness or plain `git` owns checkout creation and physical cleanup.
+> Enforcement still applies only to commands routed through `writ` deliberately — it is **opt-in, not unbypassable** — until the remaining **M1** burn-in lands ([#124](https://github.com/rmems/writ/issues/124)).
 
 | Area | Today | Later |
 | --- | --- | --- |
@@ -40,7 +40,7 @@ Claude Code agent teams have real coordination and [documented zero isolation](h
 `writ` fills that gap. It does not assign work. It **admits writes**.
 
 > [!NOTE]
-> **Status: Phase 1 hook dispatcher is in this tree.** `writ hook` admits `PreToolUse` (Bash `git`/`gh` only), `WorktreeCreate`, and `WorktreeRemove`, and `writ install` writes the hook block. The SQLite lease store is a skeleton: grant/release plus reserved budget columns, not MCP or budget enforcement. Live Claude Code end-to-end burn-in is still outstanding on [#124](https://github.com/rmems/writ/issues/124).
+> **Status: Phase 1 hook dispatcher is in this tree.** `writ hook` admits `PreToolUse` (Bash `git`/`gh` only) and answers `SubagentStart`/`SubagentStop` plus `WorktreeCreate`/`WorktreeRemove` as coordination-only events — it never creates or deletes a checkout. `writ install` writes the hook block (PreToolUse + subagent registry only). The SQLite lease store is a skeleton: grant/release plus reserved budget columns, not MCP or budget enforcement. Live Claude Code end-to-end burn-in is still outstanding on [#124](https://github.com/rmems/writ/issues/124).
 
 ## Install
 
@@ -103,13 +103,20 @@ Skill directories are not standardized. Common roots include `~/.agents/skills`,
 Until M1 hooks land, git and GitHub commands that `writ` can admit must go through `writ` on purpose. Merge is not among them: the runtime has no merge path. A primary agent may perform one human-authorized merge only through the host connector, after the [protocol in `AGENTS.md`](AGENTS.md#human-authorized-one-shot-merge-protocol).
 
 1. Install the binary and skill as above.
-2. Isolate a job worktree from a known start point (never from a dirty ambient `HEAD`). `acme` / `example-org` are sandbox path segments; they must match the GitHub slug you pass to `gh-safe`, not this repository's clone path:
+2. The harness creates the isolated checkout (native worktree support, or plain git):
 
    ```bash
-   writ --json worktree create --schema-version 2 \
-     --repo /path/to/repo --start-point origin/main \
-     acme example-org job-42 hive/issue-42-example
+   git -C /path/to/repo fetch origin
+   git -C /path/to/repo worktree add /path/to/job-42 -b hive/issue-42-example origin/main
    ```
+
+   Then register it for coordination — any path works, including a standalone clone:
+
+   ```bash
+   writ --json worktree register /path/to/job-42 --job job-42
+   ```
+
+   Registration is coordination-state only: no creation, relocation, rename, fetch, or reset. A branch ahead of its base registers as-is.
 
 3. Route git and GitHub mutations through the allowlists:
 
@@ -124,7 +131,7 @@ Until M1 hooks land, git and GitHub commands that `writ` can admit must go throu
    writ --json status
    ```
 
-Do not expect a `discover` → `add` → `check-all` → `list` hive loop. Those were scaffold-era skill stubs and were removed with the Python orchestrator. Current operator flow is: isolate a worktree, implement in that tree, open a PR, optionally hand it to `babysit-pr`, and leave the merge to a human — or to an explicitly authorized one-shot merge through the host connector.
+Do not expect a `discover` → `add` → `check-all` → `list` hive loop. Those were scaffold-era skill stubs and were removed with the Python orchestrator. Current operator flow is: the harness isolates a worktree, `writ worktree register` joins it to the coordination store, the worker implements in that tree, opens a PR, optionally hands it to `babysit-pr`, and leaves the merge to a human — or to an explicitly authorized one-shot merge through the host connector.
 
 ## Architecture
 
@@ -173,8 +180,9 @@ Call-outs:
 Enforcement is designed to run as [Claude Code hooks](https://code.claude.com/docs/en/hooks). None of the hooks below are registered yet: `.claude/settings.json` currently registers only `SessionStart` and `PreCompact`. This section states the target design and the contract it relies on, not current behavior.
 
 - **`PreToolUse`** — "Exit 2 means a blocking error… exit 2 blocks whether or not you print JSON: even a JSON `permissionDecision` of `allow` can't override it."
-- **`WorktreeCreate`** — "Any non-zero exit code aborts worktree creation." This is the lease-admission seam.
-- **`WorktreeRemove`**, **`SubagentStart`/`SubagentStop`** — lease release and agent registry.
+- **`SubagentStart`/`SubagentStop`** — agent registry.
+
+`WorktreeCreate`/`WorktreeRemove` are deliberately **not** installed: worktree lifecycle is harness-owned. If an older settings file still routes them to `writ hook`, the dispatcher treats them as coordination-only (register/release records, never filesystem mutation).
 
 Register with `writ install`. Matcher scope starts at `Bash(git *)` and `Bash(gh *)` only.
 
@@ -184,7 +192,7 @@ Register with `writ install`. Matcher scope starts at `Bash(git *)` and `Bash(gh
 | --- | --- |
 | **Orchestrator** | The host agent session that loads [`SKILL.md`](SKILL.md), calls `writ`, and spawns workers. It is not a `writ` subcommand. |
 | **Worker** | A subagent bound to one assigned worktree and branch. Workers never merge. |
-| **Worktree** | An isolated git checkout under the sandboxed worktree root (`{worktree_root}/{owner}/{repo}/{job_id}`). |
+| **Worktree** | An isolated git checkout created by the harness (or plain `git worktree add`), registered with `writ worktree register`. Any path; no writ-specific root required. |
 | **Watchlist / hive** | Durable list of jobs. Today: optional `watched.json` *read* by `writ status` / `writ jobs`. Writer and SQLite leases are not in this tree (M1). |
 | **Merge-ready** | CI green, conflict-free, required checks successful, review threads resolved. Report it; do not merge. |
 | **Lease** | Planned M1 record that admits a writer to a path scope. Not implemented. |
@@ -199,7 +207,8 @@ Implemented `writ` surface (`writ --help` is authoritative):
 | `writ git-safe …` | Implemented | Run a git command after the allowlist and, for mutations, expected-branch checks. |
 | `writ gh-safe …` | Implemented | Run a `gh` command after the allowlist. Merge operations are rejected. |
 | `writ supervisor run --timeout <secs> …` | Implemented | Spawn a child with wall-clock timeout. Unix kills the process group; Windows kills only the direct child (grandchildren may survive). |
-| `writ worktree create\|list\|remove\|prune` | Implemented | Isolated worktree lifecycle. `create` requires `--schema-version 2` and `--start-point`. |
+| `writ worktree register\|unregister\|inspect\|list` | Implemented | Coordination records for harness-owned checkouts. Register/unregister never touch files or branches. |
+| `writ worktree create\|remove\|prune` | Deprecated | Managed lifecycle kept for caller compatibility during the transition. `create` requires `--schema-version 2` and `--start-point`. |
 | `writ --json` | Implemented | Version-1 JSON envelopes on stdout; diagnostics on stderr. Fixtures: [`docs/examples/`](docs/examples/). |
 | `writ install` / hook dispatcher | **Planned (M1)** | Register unbypassable hooks. Not a command today. |
 
@@ -226,7 +235,7 @@ Milestone A skill stubs used these names. They are **not** commands in `writ` or
 | Old verb | Was supposed to mean | Use instead |
 | --- | --- | --- |
 | `discover` | Show candidate issues/PRs under allowlisted owners | Host GitHub/Linear tools; operator-configured owners only ([#146](https://github.com/rmems/writ/issues/146)) |
-| `add` | Enqueue issues/PRs into the hive | Create an isolated worktree with `writ worktree create` |
+| `add` | Enqueue issues/PRs into the hive | Harness creates the checkout; `writ worktree register` joins it to coordination |
 | `check` | One maintenance/fix cycle in the current context | Worker flow in [`SKILL.md`](SKILL.md) + `writ git-safe` / `writ gh-safe` |
 | `check-all` | Orchestrated cycles across the hive | Host orchestrator; no hive runtime in this repo |
 | `list` | Show hive items / workers | `writ status` / `writ jobs` / `writ worktree list` |

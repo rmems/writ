@@ -271,6 +271,20 @@ impl LeaseStore {
         )
     }
 
+    /// All currently held (unreleased) leases, in insertion order.
+    pub fn list_active(&self) -> Result<Vec<Lease>> {
+        let query = format!("{LEASE_SELECT} WHERE released_at IS NULL ORDER BY id");
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare(&query)
+            .map_err(|e| lease_err("list active leases", e))?;
+        let rows = stmt
+            .query_map([], lease_from_row)
+            .map_err(|e| lease_err("list active leases", e))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| lease_err("list active leases", e))
+    }
+
     /// Look up a lease by worktree path.
     pub fn find_by_path(&self, worktree_path: &Path) -> Result<Option<Lease>> {
         self.query_lease(
@@ -511,6 +525,9 @@ mod tests {
         let released = store.release_by_path(&wt).unwrap().unwrap();
         assert_eq!(released.mode, LeaseMode::Unassigned);
         assert!(released.released_at.is_some());
+
+        let active = store.list_active().unwrap();
+        assert!(active.is_empty(), "released lease must not list as active");
 
         let resume = store
             .find_resume(ResumeKey {

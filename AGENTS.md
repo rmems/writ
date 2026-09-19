@@ -76,7 +76,7 @@ Audit attribution only on commits actually introduced by the submitted pull-requ
 An explicit user request to implement scoped work authorizes the assigned worker to create the scoped branch/worktree, edit code, commit, make the first push, and create the PR without repeated confirmation. That authority never authorizes a merge, auto-merge, merge queue, destructive action, or work outside the assigned scope; Rust remains the hard enforcement boundary.
 
 - **Beads:** Use Beads as lightweight canonical state: one task per cohesive tranche and claim it before coding. Complete acceptance prose, Linear sync, GitHub child issues, project metadata, and audit reports may follow implementation, but must be complete by PR handoff rather than blocking the first edit.
-- **Isolation and identity:** A dirty or stale primary checkout is not a blocker. Preserve it, bootstrap a clean source/clone, and use `writ` for the assigned worktree. Prefer reclaim and clear identity over aborting a recoverable setup. A newly created, unpublished assigned branch must equal the verified remote-base commit before edits. A published branch contains job history and is not compared for equality with the base; fetch its expected upstream and verify the configured upstream plus the expected local/remote relationship instead. Stop on an unexpected remote commit, behind state, or divergence until it is reconciled safely.
+- **Isolation and identity:** A dirty or stale primary checkout is not a blocker. Preserve it, bootstrap a clean source/clone, and register the assigned checkout with `writ worktree register`. Registration records the observed state; it never resets a checkout that is ahead of its base. Prefer reclaim and clear identity over aborting a recoverable setup. A newly created, unpublished assigned branch must equal the verified remote-base commit before edits. A published branch contains job history and is not compared for equality with the base; fetch its expected upstream and verify the configured upstream plus the expected local/remote relationship instead. Stop on an unexpected remote commit, behind state, or divergence until it is reconciled safely.
 - **Parallel work:** One writable worker owns one assigned worktree and branch. The manager coordinates separate workers through explicit assignments, status, dependencies, and handoffs. Never allow multiple writers to share one worktree, even for declared disjoint paths. One controller retains commit and push authority for each assignment.
 - **Review and validation:** After the first tested implementation, require one independent review matched to the risk before final publication. Add review only for a named high-risk boundary or an actual finding that warrants follow-up. Run focused gates during work. Immediately before publication, align or rebase an unpublished branch onto the verified base, or reconcile a published branch with its expected upstream, then run exactly one complete native gate suite on the exact would-be-pushed head; any later tree change invalidates that run. An issue may add focused checks; it must not replace or reduce that final suite. Do not require serial policy audits or duplicate full-suite runs from every subagent.
 - **Routine remediation:** Automatically fix safe mechanical findings within scope. Stop for a genuine ownership collision, a destructive or out-of-scope action, an unresolved Critical/Important correctness issue, a material user design decision, or an explicit fail-closed condition in a portable worker contract. A required gate failure or timeout blocks commit/push handoff until it is repaired or the user explicitly changes scope; an in-scope repair does not require another confirmation.
@@ -147,7 +147,8 @@ Agent / SKILL.md
        |
        | intent and operator context
        v
-Claude Code hooks (PreToolUse, WorktreeCreate, WorktreeRemove, SubagentStart/Stop)
+Claude Code hooks (PreToolUse, SubagentStart/Stop; WorktreeCreate/WorktreeRemove are
+  coordination-only and no longer installed by `writ install`)
        |
        | hook JSON on stdin; exit 2 blocks, and cannot be overridden
        v
@@ -175,7 +176,7 @@ Rust code lives in `crates/`:
 - `crates/writ-core/` is the reusable library and source of truth for worktrees, state, process execution, paths, and safety policy.
 - `crates/writ/` is the `writ` command-line adapter. It parses arguments, calls `writ-core`, emits human or JSON output, and maps policy failures to exit code 2.
 
-Keep security boundaries in `writ-core`, not only in the CLI parser. Git must be invoked as a subprocess rather than through libgit2. New mutating commands require branch verification and path-sandbox tests. The hook dispatcher (`crates/writ-core/src/hook.rs`) is the production PreToolUse/`WorktreeCreate` boundary.
+Keep security boundaries in `writ-core`, not only in the CLI parser. Git must be invoked as a subprocess rather than through libgit2. New mutating commands require branch verification and path-sandbox tests. The hook dispatcher (`crates/writ-core/src/hook.rs`) is the production PreToolUse boundary; worktree lifecycle events routed to it are coordination-only, never filesystem mutations.
 
 ### Agent skill
 
@@ -183,14 +184,14 @@ The installable `SKILL.md` will own platform-facing prompts and command guidance
 
 ## Data flow
 
-**Supported today.** Exact-base worktree creation, `writ git-safe` / `writ gh-safe` / `writ supervisor`, and `writ hook` (JSON on stdin) are implemented. Claude Code does not register that hook until `writ install` lands.
+**Supported today.** Checkout registration (`writ worktree register`/`unregister`/`inspect`/`list`), `writ git-safe` / `writ gh-safe` / `writ supervisor`, and `writ hook` (JSON on stdin) are implemented. The managed lifecycle commands (`worktree create`/`remove`/`prune`) are deprecated. Claude Code does not register that hook until `writ install` lands.
 
 1. The operator or agent supplies GitHub or Linear issue/PR context.
-2. The harness (Claude Code agent teams, `/batch`, or an equivalent) assigns work and creates an isolated worktree — or `writ worktree create` does, which is the supported path today.
-3. On `WorktreeCreate`, `writ hook` verifies the exact start point, creates or reattaches the worktree, and records a lease row. A non-zero exit aborts creation.
-4. A worker agent changes only that worktree and branch.
+2. The harness (Claude Code agent teams, `/batch`, Cursor, plain `git worktree add`, or an equivalent) assigns work and creates the isolated checkout wherever it wants.
+3. `writ worktree register <path>` (or a coordination-only `WorktreeCreate` hook event, where still wired) records a lease row for the existing checkout. Registration never creates, moves, fetches, resets, or deletes anything; a standalone clone and a dirty or detached checkout register fine.
+4. A worker agent changes only that checkout and its branch.
 5. On `PreToolUse`, `writ hook` validates each `git`/`gh` mutation and blocks an unsafe one with exit 2, which no other hook can override. Until the hook is registered, validation also happens when `writ git-safe` / `writ gh-safe` is invoked.
-6. On `WorktreeRemove`, the lease row is released.
+6. `writ worktree unregister` (or a `WorktreeRemove` hook event) releases the lease row. The checkout itself is the harness's to delete — writ never removes it, and expiring a claim never erases WIP.
 7. The installed companion `babysit-pr` skill handles interactive monitoring after a PR handoff.
 8. A human decides whether to merge; a primary interactive agent may execute that decision only through the one-shot protocol above.
 
@@ -200,8 +201,8 @@ GitHub is the product issue source. Linear may mirror product planning for the o
 
 | Purpose | Default | Override |
 | --- | --- | --- |
-| Worktree root | `~/.local/share/writ/worktrees` | `WRIT_WORKTREE_BASE`, else `WH_WORKTREE_BASE` |
-| Job worktree | `{worktree root}/{owner}/{repo}/{job_id}` | Derived only; must remain sandboxed |
+| Worktree root (deprecated managed lifecycle) | `~/.local/share/writ/worktrees` | `WRIT_WORKTREE_BASE`, else `WH_WORKTREE_BASE` |
+| Registered checkout | Any path the harness chose | None — registration requires no writ-specific root |
 | Watched state | `~/.local/share/writ/watched.json` | `WRIT_STATE_PATH`, else `WH_STATE_PATH` |
 | Rust binary resolution | `writ` from `PATH` | `WRIT_BIN` |
 
