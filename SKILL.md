@@ -96,3 +96,25 @@ defined in [`AGENTS.md`](AGENTS.md#enforcement-layers). The separate interactive
 host merge path is available only to the primary agent after it completes the
 linked one-shot authorization protocol; never forward that authority to a
 worker.
+
+## Watchlist (persistent multi-owner PR state)
+
+Use `writ watchlist` to persist a sticky subset of PRs across check cycles.
+Canonical docs: [`docs/watchlist-schema.md`](docs/watchlist-schema.md).
+
+- **File:** `{user_data}/writ/watchlist.json` (legacy `{user_data}/worktrees-hives/watchlist.json` if that root still exists). Override with `WRIT_WATCHLIST_PATH`. This is **not** `watched.json` (`writ status`) and **not** `pr-babysit/`.
+- **Identity:** `(repo, number)`. Owners from different orgs coexist in one file.
+- **Commands:** `add`, `remove`, `list`, `check`, `check-all`, optional `import-pr-babysit`.
+- **`list`** shows every owner by default (`--owner` / `--repo` filter).
+- **`add [--repo owner/name] <number>…`** calls `gh pr view`, skips MERGED/CLOSED, dedupes, infers stack fields when `base` matches another watched branch. Stack-mates stay on `remove`.
+- **`check-all`** walks in stack order, refreshes status / residuals / `last_checked`, prunes MERGED/CLOSED. It does not spawn babysit workers and does not increment `fix_count`. Multi-owner `check-all` requires `WRIT_ALLOWED_OWNERS`.
+- **Status:** `healthy`, `pending`, `failed`, `residual`, `conflict`, `timeout`.
+- **Concurrency:** one writer; do not run two `check-all` processes on the same file. Writes are temp + rename; corrupt files are quarantined.
+
+Example:
+
+```bash
+writ watchlist add --repo acme/widgets 41 36
+writ watchlist list
+WRIT_ALLOWED_OWNERS=acme,example-org writ watchlist check-all
+```

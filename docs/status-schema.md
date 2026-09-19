@@ -10,7 +10,7 @@
 >
 > The populated shapes below are still reachable, so consumers must handle them: `load_jobs_from` returns an empty vec only when the file is missing, and parses and returns any file that *is* present -- placed there externally, or pointed at via `WRIT_STATE_PATH`. What is missing is the writer, not the read path.
 >
-> The store is superseded rather than unfinished: the SQLite lease store in [#124](https://github.com/rmems/writ/issues/124) replaces it, with crash consistency in [#136](https://github.com/rmems/writ/issues/136).
+> The store is superseded rather than unfinished: the SQLite lease store in [#124](https://github.com/rmems/writ/issues/124) replaces it, with crash consistency in [#136](https://github.com/rmems/writ/issues/136). The multi-owner PR watchlist is a different file (`watchlist.json`); see [watchlist-schema.md](watchlist-schema.md).
 
 This document defines the JSON schema emitted by `writ status --json` and `writ jobs --json`.
 

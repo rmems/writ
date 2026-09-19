@@ -245,10 +245,10 @@ These apply to every agent, platform, and command path. [`SKILL.md`](SKILL.md) r
 
 Soft prompt text is not runtime enforcement. Hard stops live in Rust, at the binary boundary, where a malformed prompt cannot bypass them.
 
-## Owner allowlist — not currently enforced
+## Owner allowlist — partial enforcement
 
 > [!WARNING]
-> **`WRIT_ALLOWED_OWNERS` has no reader anywhere under `crates/`.** It was enforced in the Python layer this repository just removed, so owner scoping is presently a stated requirement with no code behind it. Do not rely on it as an access control. Tracked in [#146](https://github.com/rmems/writ/issues/146).
+> **`WRIT_ALLOWED_OWNERS` is read by `writ watchlist check-all` (and `WH_ALLOWED_OWNERS` as a legacy alias).** An empty allowlist denies that multi-owner walk. Other multi-owner discovery/scheduling still has no reader under `crates/` after the Python layer was removed, so do not treat the env var as a general access-control gate. Broader enforcement is tracked in [#146](https://github.com/rmems/writ/issues/146).
 
 The intended contract, for when enforcement lands:
 
@@ -303,6 +303,7 @@ This is not `writ install`. Hook registration into `.claude/settings.json` is mi
 | Worktree root | platform user-data `writ/worktrees` | `WRIT_WORKTREE_BASE`, else `WH_WORKTREE_BASE` |
 | Job worktree | `{worktree root}/{owner}/{repo}/{job_id}` | Derived only; must remain sandboxed |
 | Watched state | platform user-data `writ/watched.json` | `WRIT_STATE_PATH`, else `WH_STATE_PATH` |
+| PR watchlist | platform user-data `writ/watchlist.json` | `WRIT_WATCHLIST_PATH`, else `WH_WATCHLIST_PATH` |
 | Rust binary | `writ` on `PATH` | `WRIT_BIN` |
 
 If the new `writ` data root is absent and a pre-rename `worktrees-hives` root still exists, the path resolver keeps using the legacy root so an upgrade does not hide existing state. That is a read/fallback, not an automatic directory move.
@@ -360,6 +361,7 @@ Milestone groups from the epic: **M1** hook enforcement + minimal lease store; *
 - [`SKILL.md`](SKILL.md) — portable agent procedure (guidance, not a security boundary)
 - [`docs/install.md`](docs/install.md) — clone + symlink skill install, cross-agent roots, uninstall
 - [`REVIEW.md`](REVIEW.md) — pull-request lifecycle and review checklist
+- [`docs/watchlist-schema.md`](docs/watchlist-schema.md) — `writ watchlist` persistence
 - [`docs/adr/0001-rust-only-v1-runtime-and-babysit-pr-boundary.md`](docs/adr/0001-rust-only-v1-runtime-and-babysit-pr-boundary.md) — v1 Rust-only runtime and Codex `babysit-pr` boundary
 - [`docs/workflows/safe-issue-verified-commit.md`](docs/workflows/safe-issue-verified-commit.md) — issue → verified push
 - [`docs/workflows/safe-verified-commit-to-pr.md`](docs/workflows/safe-verified-commit-to-pr.md) — verified push → PR handoff (never merges)
