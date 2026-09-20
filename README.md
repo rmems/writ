@@ -10,7 +10,7 @@ Workers run in one worktree each. The portable [`SKILL.md`](SKILL.md) tells an a
 ## Status
 
 > [!NOTE]
-> **The enforcement core is real; the hook layer is not built yet.**
+> **The enforcement core and the Phase 1 hook dispatcher are real; live burn-in is outstanding.**
 > Shipping today are the `git`/`gh` allowlists, path sandboxing, process supervision, checkout registration (`writ worktree register`), and the absence of any merge path — reachable through the `writ` CLI. The managed lifecycle (`worktree create`/`remove`/`prune`) is deprecated: the agent harness or plain `git` owns checkout creation and physical cleanup.
 > Enforcement still applies only to commands routed through `writ` deliberately — it is **opt-in, not unbypassable** — until the remaining **M1** burn-in lands ([#124](https://github.com/rmems/writ/issues/124)).
 
@@ -18,8 +18,8 @@ Workers run in one worktree each. The portable [`SKILL.md`](SKILL.md) tells an a
 | --- | --- | --- |
 | Repo, license, [`SKILL.md`](SKILL.md), this README | Done | Living docs; update as milestones close |
 | `writ` CLI (`git-safe`, `gh-safe`, `worktree`, `supervisor`, `status`) | Implemented | Envelope-compatible additions only |
-| Claude Code hook dispatcher / `writ install` | Not built | M1 ([#124](https://github.com/rmems/writ/issues/124), install narrative [#18](https://github.com/rmems/writ/issues/18)) |
-| SQLite lease store, path scopes, budgets | Not built | M1 then M3/M4 ([#1](https://github.com/rmems/writ/issues/1), [#167](https://github.com/rmems/writ/issues/167)) |
+| Claude Code hook dispatcher / `writ install` | Implemented | Live burn-in outstanding ([#124](https://github.com/rmems/writ/issues/124), install narrative [#18](https://github.com/rmems/writ/issues/18)) |
+| SQLite lease store, path scopes, budgets | Skeleton (grant/release + registration) | M1 then M3/M4 ([#1](https://github.com/rmems/writ/issues/1), [#167](https://github.com/rmems/writ/issues/167)) |
 | Owner-allowlist enforcement | Enforced in `writ-core` | [#146](https://github.com/rmems/writ/issues/146) |
 | Hive verbs `discover` / `add` / `check` / `check-all` | **Removed** | Do not expect them; see [Commands](#commands) |
 
@@ -175,9 +175,9 @@ Call-outs:
 - **Stacks:** handle from the bottom of the stack upward. Do not run parallel writers on one stack.
 - **State location:** default watched-state path is platform user-data (`writ/watched.json`), overridable with `WRIT_STATE_PATH` (legacy `WH_STATE_PATH` if unset). Do not treat that file as a writer API; this repo only *reads* it. The planned store is SQLite leases, not a new JSON path.
 
-### Why hooks (planned — M1)
+### Why hooks
 
-Enforcement is designed to run as [Claude Code hooks](https://code.claude.com/docs/en/hooks). None of the hooks below are registered yet: `.claude/settings.json` currently registers only `SessionStart` and `PreCompact`. This section states the target design and the contract it relies on, not current behavior.
+Enforcement runs as [Claude Code hooks](https://code.claude.com/docs/en/hooks): `writ install` writes the hook block into `.claude/settings.json`, and `writ hook` dispatches the JSON payloads. This repo's own `.claude/settings.json` still registers only `SessionStart` and `PreCompact` — hooks are opt-in until the [#124](https://github.com/rmems/writ/issues/124) burn-in completes.
 
 - **`PreToolUse`** — "Exit 2 means a blocking error… exit 2 blocks whether or not you print JSON: even a JSON `permissionDecision` of `allow` can't override it."
 - **`SubagentStart`/`SubagentStop`** — agent registry.
@@ -299,14 +299,14 @@ test -f "$HOME/.agents/skills/writ/SKILL.md" && echo OK
 
 Full root table, uninstall, verification, and WSL notes: [`docs/install.md`](docs/install.md).
 
-This is not `writ install`. Hook registration into `.claude/settings.json` is milestone M1 and is not built yet ([#124](https://github.com/rmems/writ/issues/124)).
+This is not `writ install`, which writes the `writ` hook block into `.claude/settings.json` (implemented; do not run it against a shared settings file until the [#124](https://github.com/rmems/writ/issues/124) burn-in completes).
 
 ## Runtime paths
 
 | Purpose | Default | Override |
 | --- | --- | --- |
 | Worktree root | platform user-data `writ/worktrees` | `WRIT_WORKTREE_BASE`, else `WH_WORKTREE_BASE` |
-| Job worktree | `{worktree root}/{owner}/{repo}/{job_id}` | Derived only; must remain sandboxed |
+| Job worktree | `{worktree root}/{owner}/{repo}/{job_id}` | Deprecated managed lifecycle only; `register` accepts any path |
 | Watched state | platform user-data `writ/watched.json` | `WRIT_STATE_PATH`, else `WH_STATE_PATH` |
 | Rust binary | `writ` on `PATH` | `WRIT_BIN` |
 

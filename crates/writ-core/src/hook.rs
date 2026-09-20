@@ -130,11 +130,7 @@ fn handle_worktree_create(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
-        .or_else(|| {
-            path.file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-        })
-        .unwrap_or_else(|| "checkout".to_owned());
+        .unwrap_or_else(|| crate::checkout::default_job_id(path));
     match open_registry(runtime)?.register(path, &job_id) {
         Ok(info) => writeln!(stdout, "{}", info.path.display()).map_err(|e| Error::Io {
             context: "write WorktreeCreate path",
@@ -167,7 +163,9 @@ fn handle_worktree_remove(event: &HookEvent, runtime: &HookRuntime) -> Result<()
     else {
         return Ok(());
     };
-    open_store(runtime)?.release_by_path(Path::new(path))?;
+    // unregister normalizes the path without requiring the checkout to still
+    // exist: WorktreeRemove fires after the harness has already deleted it.
+    open_registry(runtime)?.unregister(Path::new(path))?;
     Ok(())
 }
 

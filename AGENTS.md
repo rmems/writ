@@ -184,7 +184,7 @@ The installable `SKILL.md` will own platform-facing prompts and command guidance
 
 ## Data flow
 
-**Supported today.** Checkout registration (`writ worktree register`/`unregister`/`inspect`/`list`), `writ git-safe` / `writ gh-safe` / `writ supervisor`, and `writ hook` (JSON on stdin) are implemented. The managed lifecycle commands (`worktree create`/`remove`/`prune`) are deprecated. Claude Code does not register that hook until `writ install` lands.
+**Supported today.** Checkout registration (`writ worktree register`/`unregister`/`inspect`/`list`), `writ git-safe` / `writ gh-safe` / `writ supervisor`, and `writ hook` (JSON on stdin) are implemented. The managed lifecycle commands (`worktree create`/`remove`/`prune`) are deprecated. Claude Code does not register that hook until the operator runs `writ install` (implemented; held back from shared settings pending the [#124](https://github.com/rmems/writ/issues/124) burn-in).
 
 1. The operator or agent supplies GitHub or Linear issue/PR context.
 2. The harness (Claude Code agent teams, `/batch`, Cursor, plain `git worktree add`, or an equivalent) assigns work and creates the isolated checkout wherever it wants.

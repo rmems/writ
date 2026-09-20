@@ -445,11 +445,7 @@ fn worktree_register_response(
     use writ_core::contract::Response;
 
     let registry = CheckoutRegistry::new()?;
-    let job_id = job.unwrap_or_else(|| {
-        path.file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "checkout".to_owned())
-    });
+    let job_id = job.unwrap_or_else(|| writ_core::checkout::default_job_id(&path));
     let info = registry.register(&path, &job_id)?;
     let mut data = checkout_json(&info);
     data["job_id"] = serde_json::Value::String(job_id);

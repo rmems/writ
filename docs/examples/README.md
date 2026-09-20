@@ -25,7 +25,7 @@ All of them, under `--json`:
 | `worktree register\|unregister\|inspect\|list` | `worktree.register` etc. |
 | `worktree create\|remove\|prune` | `worktree.create` etc. (deprecated) |
 | `install` | `cli.install` |
-| `hook` | no envelope: PreToolUse is allow/block via exit code; a WorktreeCreate event prints the registered checkout path |
+| `hook` | no envelope even under `--json`: PreToolUse is allow/block via exit code; a WorktreeCreate event prints the registered checkout path only when the path is an existing git checkout — missing, nonexistent, or non-git paths produce no stdout |
 
 **The exception is the policy-violation path**, which prints plain text on stderr
 with exit code 2 instead of an envelope:

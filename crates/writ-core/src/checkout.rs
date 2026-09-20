@@ -41,7 +41,9 @@ pub struct CheckoutInfo {
     pub origin_slug: Option<String>,
     /// Owner segment derived from `origin_slug`, else `local`.
     pub owner: String,
-    /// Repo segment derived from `origin_slug`, else the directory name.
+    /// Repo segment derived from `origin_slug`, else the name of the directory
+    /// containing the git common dir — so linked worktrees of one repository
+    /// share an identity while standalone clones stay distinct.
     pub repo_name: String,
     /// True when `git status --porcelain` reports any change (including
     /// untracked files).
@@ -97,8 +99,7 @@ impl CheckoutRegistry {
     /// Only a row whose recorded `worktree_path` matches `path` is released, so
     /// stale state for a different path cannot steal a live registration.
     pub fn unregister(&self, path: &Path) -> Result<Option<Lease>> {
-        let canonical = canonicalize(path)?;
-        self.leases.release_by_path(&canonical)
+        self.leases.release_by_path(&checkout_path_key(path)?)
     }
 
     /// Currently held (unreleased) registrations.
@@ -147,12 +148,7 @@ pub fn inspect_checkout(path: &Path) -> Result<CheckoutInfo> {
     let origin_slug = crate::git_safe::origin_github_slug(&path).ok();
     let (owner, repo_name) = match origin_slug.as_deref().and_then(|s| s.split_once('/')) {
         Some((owner, repo)) => (owner.to_owned(), repo.to_owned()),
-        None => (
-            "local".to_owned(),
-            path.file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "checkout".to_owned()),
-        ),
+        None => ("local".to_owned(), local_repo_name(&common_dir)),
     };
 
     Ok(CheckoutInfo {
@@ -166,6 +162,65 @@ pub fn inspect_checkout(path: &Path) -> Result<CheckoutInfo> {
         repo_name,
         dirty,
     })
+}
+
+/// Normalize a checkout path for lease lookups without requiring it to exist.
+///
+/// Registration stores the canonical top-level, but `WorktreeRemove` and
+/// `unregister` may run after the harness has already deleted the checkout, so
+/// canonicalization is not always possible. Falls back to lexical
+/// normalization: absolutize against the current directory and collapse `.` and
+/// `..` without touching the filesystem.
+pub fn checkout_path_key(path: &Path) -> Result<PathBuf> {
+    if let Ok(canonical) = canonicalize(path) {
+        return Ok(canonical);
+    }
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| Error::Io {
+                context: "resolve current directory",
+                source: e,
+            })?
+            .join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    Ok(normalized)
+}
+
+/// Display name for a checkout path suitable as a default job id: the file name
+/// of the normalized path (`writ worktree register .` yields the directory's
+/// real name, not "checkout").
+#[must_use]
+pub fn default_job_id(path: &Path) -> String {
+    checkout_path_key(path)
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "checkout".to_owned())
+}
+
+/// Repo name for an origin-less checkout: the directory containing its git
+/// common dir (strip a trailing `/.git`), so linked worktrees of one repository
+/// share an identity while standalone clones stay distinct.
+fn local_repo_name(common_dir: &Path) -> String {
+    let base = if common_dir.file_name().is_some_and(|n| n == ".git") {
+        common_dir.parent().unwrap_or(common_dir)
+    } else {
+        common_dir
+    };
+    base.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| common_dir.to_string_lossy().into_owned())
 }
 
 fn canonicalize(path: &Path) -> Result<PathBuf> {
@@ -450,5 +505,118 @@ mod tests {
         let store = LeaseStore::open(tmp.path().join("leases.db")).unwrap();
         let registry = CheckoutRegistry::with_store(store).unwrap();
         assert!(registry.register(tmp.path(), "x").is_err());
+    }
+
+    #[test]
+    fn linked_worktrees_share_repo_identity_for_coordination() {
+        let (_tmp, repo) = init_repo();
+        let wt = _tmp.path().join("elsewhere/wt-b");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "job/b",
+                wt.to_str().unwrap(),
+            ],
+        );
+        let primary = inspect_checkout(&repo).unwrap();
+        let linked = inspect_checkout(&wt).unwrap();
+        assert_eq!(
+            linked.repo_name, primary.repo_name,
+            "linked worktrees must share the repo segment of the lease identity"
+        );
+        assert_eq!(linked.owner, primary.owner);
+    }
+
+    #[test]
+    fn register_second_active_path_for_same_job_fails() {
+        let (tmp, repo) = init_repo();
+        let wt1 = tmp.path().join("wts/one");
+        let wt2 = tmp.path().join("wts/two");
+        for (wt, branch) in [(&wt1, "job/one"), (&wt2, "job/two")] {
+            git(
+                &repo,
+                &[
+                    "worktree",
+                    "add",
+                    "--quiet",
+                    "-b",
+                    branch,
+                    wt.to_str().unwrap(),
+                ],
+            );
+        }
+
+        let store = LeaseStore::open(tmp.path().join("leases.db")).unwrap();
+        let registry = CheckoutRegistry::with_store(store).unwrap();
+        registry.register(&wt1, "shared-job").unwrap();
+
+        // Same job id, different live path: conflict, never a seize.
+        let err = registry.register(&wt2, "shared-job").unwrap_err();
+        assert!(matches!(
+            err,
+            crate::error::Error::PolicyViolation {
+                code: crate::error::PolicyCode::LeaseConflict,
+                ..
+            }
+        ));
+
+        // Re-registering the same path under the same job refreshes.
+        registry.register(&wt1, "shared-job").unwrap();
+
+        // After release, the job id can move to the other path.
+        registry.unregister(&wt1).unwrap();
+        registry.register(&wt2, "shared-job").unwrap();
+    }
+
+    #[test]
+    fn unregister_releases_lease_after_checkout_deleted() {
+        let (tmp, repo) = init_repo();
+        let wt = tmp.path().join("wts/gone");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "job/gone",
+                wt.to_str().unwrap(),
+            ],
+        );
+        let store = LeaseStore::open(tmp.path().join("leases.db")).unwrap();
+        let registry = CheckoutRegistry::with_store(store).unwrap();
+        registry.register(&wt, "gone-job").unwrap();
+        assert_eq!(registry.registered().unwrap().len(), 1);
+
+        // Harness deleted the checkout before unregister/WorktreeRemove ran.
+        std::fs::remove_dir_all(&wt).unwrap();
+        let lease = registry
+            .unregister(&wt)
+            .unwrap()
+            .expect("deleted checkout must still release its lease");
+        assert_eq!(lease.job_id, "gone-job");
+        assert!(registry.registered().unwrap().is_empty());
+    }
+
+    #[test]
+    fn default_job_id_uses_directory_name_of_normalized_path() {
+        assert_eq!(default_job_id(Path::new(".")), env_dir_name());
+        assert_eq!(
+            default_job_id(Path::new("some/dir/../checkout")),
+            "checkout"
+        );
+    }
+
+    fn env_dir_name() -> String {
+        std::env::current_dir()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
     }
 }
