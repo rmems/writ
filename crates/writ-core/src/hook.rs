@@ -357,15 +357,11 @@ mod tests {
         validate_bash_command("git commit -m 'a > b'").unwrap();
     }
 
-    #[test]
-    fn pre_tool_use_refuses_merge_that_would_lose_wip_when_cwd_is_set() {
+    /// Repo on feature branch `worker-a` with one committed file.
+    fn merge_hook_test_repo() -> tempfile::TempDir {
         let temp = tempdir().unwrap();
         let repo = temp.path();
-        for args in [
-            ["init", "-b", "worker-a"].as_slice(),
-            ["config", "user.email", "test@example.com"].as_slice(),
-            ["config", "user.name", "hook-test"].as_slice(),
-        ] {
+        let git = |args: &[&str]| {
             let out = std::process::Command::new("git")
                 .arg("-C")
                 .arg(repo)
@@ -377,26 +373,19 @@ mod tests {
                 "{}",
                 String::from_utf8_lossy(&out.stderr)
             );
-        }
+        };
+        git(&["init", "-b", "worker-a"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "hook-test"]);
+        git(&["config", "core.autocrlf", "false"]);
         fs::write(repo.join("README"), "init\n").unwrap();
-        for args in [
-            ["add", "README"].as_slice(),
-            ["commit", "-m", "init"].as_slice(),
-        ] {
-            let out = std::process::Command::new("git")
-                .arg("-C")
-                .arg(repo)
-                .args(args)
-                .output()
-                .unwrap();
-            assert!(
-                out.status.success(),
-                "{}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-        }
-        fs::write(repo.join("wip.txt"), "do-not-lose\n").unwrap();
+        git(&["add", "README"]);
+        git(&["commit", "-m", "init"]);
+        temp
+    }
 
+    /// Dispatch a PreToolUse Bash hook for `command` with `cwd` set to `repo`.
+    fn dispatch_bash_hook(repo: &Path, command: &str) -> (u8, String) {
         let runtime = HookRuntime::default();
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
@@ -404,11 +393,20 @@ mod tests {
             "hook_event_name": "PreToolUse",
             "cwd": repo,
             "tool_name": "Bash",
-            "tool_input": { "command": "git merge worker-b" },
+            "tool_input": { "command": command },
         })
         .to_string();
         let code = dispatch(&payload, &runtime, &mut stdout, &mut stderr);
-        let stderr = String::from_utf8_lossy(&stderr);
+        (code, String::from_utf8_lossy(&stderr).into_owned())
+    }
+
+    #[test]
+    fn pre_tool_use_refuses_merge_that_would_lose_wip_when_cwd_is_set() {
+        let temp = merge_hook_test_repo();
+        let repo = temp.path();
+        fs::write(repo.join("wip.txt"), "do-not-lose\n").unwrap();
+
+        let (code, stderr) = dispatch_bash_hook(repo, "git merge worker-b");
         assert_eq!(code, 2, "{stderr}");
         assert!(stderr.contains("MERGE_BLOCKED"), "{stderr}");
         assert_eq!(
@@ -419,55 +417,8 @@ mod tests {
 
     #[test]
     fn pre_tool_use_allows_feature_branch_merge_when_cwd_is_clean() {
-        let temp = tempdir().unwrap();
-        let repo = temp.path();
-        for args in [
-            ["init", "-b", "worker-a"].as_slice(),
-            ["config", "user.email", "test@example.com"].as_slice(),
-            ["config", "user.name", "hook-test"].as_slice(),
-        ] {
-            let out = std::process::Command::new("git")
-                .arg("-C")
-                .arg(repo)
-                .args(args)
-                .output()
-                .unwrap();
-            assert!(
-                out.status.success(),
-                "{}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-        }
-        fs::write(repo.join("README"), "init\n").unwrap();
-        for args in [
-            ["add", "README"].as_slice(),
-            ["commit", "-m", "init"].as_slice(),
-        ] {
-            let out = std::process::Command::new("git")
-                .arg("-C")
-                .arg(repo)
-                .args(args)
-                .output()
-                .unwrap();
-            assert!(
-                out.status.success(),
-                "{}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-        }
-
-        let runtime = HookRuntime::default();
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
-        let payload = serde_json::json!({
-            "hook_event_name": "PreToolUse",
-            "cwd": repo,
-            "tool_name": "Bash",
-            "tool_input": { "command": "git merge worker-b" },
-        })
-        .to_string();
-        let code = dispatch(&payload, &runtime, &mut stdout, &mut stderr);
-        let stderr = String::from_utf8_lossy(&stderr);
+        let temp = merge_hook_test_repo();
+        let (code, stderr) = dispatch_bash_hook(temp.path(), "git merge worker-b");
         assert_eq!(code, 0, "{stderr}");
     }
 

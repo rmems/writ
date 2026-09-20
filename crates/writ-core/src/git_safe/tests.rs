@@ -1405,6 +1405,8 @@ fn temp_repo_with_branch(branch: &str) -> std::path::PathBuf {
     git(&["checkout", "-b", branch]);
     git(&["config", "user.email", "test@example.com"]);
     git(&["config", "user.name", "writ-core-test"]);
+    // Keep blob contents byte-identical on Windows runners (autocrlf rewrites \n).
+    git(&["config", "core.autocrlf", "false"]);
     std::fs::write(
         dir.join("README"),
         "init
@@ -1525,6 +1527,33 @@ fn two_assigned_worktrees() -> (std::path::PathBuf, std::path::PathBuf, std::pat
     (repo, worker_a, worker_b)
 }
 
+fn remove_all(repo: &std::path::Path, worker_a: &std::path::Path, worker_b: &std::path::Path) {
+    let _ = std::fs::remove_dir_all(worker_a);
+    let _ = std::fs::remove_dir_all(worker_b);
+    let _ = std::fs::remove_dir_all(repo);
+}
+
+/// `cmd` must be refused with MERGE_BLOCKED whose message contains `needle`.
+fn expect_merge_blocked(
+    cmd: &SafeGitCommand,
+    dir: &std::path::Path,
+    expected_branch: Option<&str>,
+    needle: &str,
+) {
+    let err = cmd.run(dir, expected_branch).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::MergeBlocked,
+                ..
+            }
+        ),
+        "{err}"
+    );
+    assert!(format!("{err}").contains(needle), "{err}");
+}
+
 #[test]
 fn two_worktree_local_merge_integrates_peer_branch() {
     let (repo, worker_a, worker_b) = two_assigned_worktrees();
@@ -1546,30 +1575,15 @@ fn two_worktree_local_merge_integrates_peer_branch() {
         std::fs::read_to_string(worker_b.join("b.txt")).unwrap(),
         "from-b\n"
     );
-    let _ = std::fs::remove_dir_all(&worker_a);
-    let _ = std::fs::remove_dir_all(&worker_b);
-    let _ = std::fs::remove_dir_all(&repo);
+    remove_all(&repo, &worker_a, &worker_b);
 }
 
 #[test]
 fn merge_on_default_branch_is_blocked() {
     let (repo, worker_a, worker_b) = two_assigned_worktrees();
     let cmd = SafeGitCommand::new(&["merge".to_owned(), "worker-a".to_owned()]).unwrap();
-    let err = cmd.run(&repo, None).unwrap_err();
-    assert!(
-        matches!(
-            err,
-            Error::PolicyViolation {
-                code: PolicyCode::MergeBlocked,
-                ..
-            }
-        ),
-        "{err}"
-    );
-    assert!(format!("{err}").contains("default branch"), "{err}");
-    let _ = std::fs::remove_dir_all(&worker_a);
-    let _ = std::fs::remove_dir_all(&worker_b);
-    let _ = std::fs::remove_dir_all(&repo);
+    expect_merge_blocked(&cmd, &repo, None, "default branch");
+    remove_all(&repo, &worker_a, &worker_b);
 }
 
 #[test]
@@ -1577,18 +1591,7 @@ fn merge_refuses_to_lose_uncommitted_wip() {
     let (repo, worker_a, worker_b) = two_assigned_worktrees();
     std::fs::write(worker_b.join("wip.txt"), "keep-me\n").unwrap();
     let cmd = SafeGitCommand::new(&["merge".to_owned(), "worker-a".to_owned()]).unwrap();
-    let err = cmd.run(&worker_b, Some("worker-b")).unwrap_err();
-    assert!(
-        matches!(
-            err,
-            Error::PolicyViolation {
-                code: PolicyCode::MergeBlocked,
-                ..
-            }
-        ),
-        "{err}"
-    );
-    assert!(format!("{err}").contains("uncommitted work"), "{err}");
+    expect_merge_blocked(&cmd, &worker_b, Some("worker-b"), "uncommitted work");
     assert_eq!(
         std::fs::read_to_string(worker_b.join("wip.txt")).unwrap(),
         "keep-me\n"
@@ -1597,9 +1600,7 @@ fn merge_refuses_to_lose_uncommitted_wip() {
         !worker_b.join("a.txt").exists(),
         "peer file must not appear after refused merge"
     );
-    let _ = std::fs::remove_dir_all(&worker_a);
-    let _ = std::fs::remove_dir_all(&worker_b);
-    let _ = std::fs::remove_dir_all(&repo);
+    remove_all(&repo, &worker_a, &worker_b);
 }
 
 #[test]
@@ -1633,19 +1634,6 @@ fn pull_on_default_branch_is_blocked() {
         "main".to_owned(),
     ])
     .unwrap();
-    let err = cmd.run(&repo, None).unwrap_err();
-    assert!(
-        matches!(
-            err,
-            Error::PolicyViolation {
-                code: PolicyCode::MergeBlocked,
-                ..
-            }
-        ),
-        "{err}"
-    );
-    assert!(format!("{err}").contains("default branch"), "{err}");
-    let _ = std::fs::remove_dir_all(&worker_a);
-    let _ = std::fs::remove_dir_all(&worker_b);
-    let _ = std::fs::remove_dir_all(&repo);
+    expect_merge_blocked(&cmd, &repo, None, "default branch");
+    remove_all(&repo, &worker_a, &worker_b);
 }
