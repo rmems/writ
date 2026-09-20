@@ -296,45 +296,51 @@ fn admit_bash_command(command: ShellText<'_>, cwd: Option<&Path>) -> Result<()> 
     })?;
     for invocation in invocations {
         match invocation.tool {
-            GitGhTool::Git => {
-                let cmd = SafeGitCommand::new(&invocation.args)?;
-                if !matches!(cmd.subcommand(), "merge" | "pull") {
-                    continue;
-                }
-                if invocation.other_location_global {
-                    return Err(Error::PolicyViolation {
-                        code: PolicyCode::MergeBlocked,
-                        message:
-                            "cannot verify merge target: --git-dir/--work-tree/--namespace override"
-                                .to_owned(),
-                    });
-                }
-                let dir = invocation.git_dir.as_deref().map(|d| {
-                    if d.is_absolute() {
-                        d.to_path_buf()
-                    } else {
-                        cwd.map(|c| c.join(d)).unwrap_or_else(|| d.to_path_buf())
-                    }
-                });
-                match dir.as_deref().or(cwd) {
-                    Some(dir) => cmd.admit_local_merge(dir)?,
-                    // No event cwd and no -C: the merge target is unknown, so
-                    // admission fails closed rather than skipping the guards.
-                    None => {
-                        return Err(Error::PolicyViolation {
-                            code: PolicyCode::MergeBlocked,
-                            message: "cannot verify merge target: hook event has no cwd and the git command sets no -C"
-                                .to_owned(),
-                        });
-                    }
-                }
-            }
+            GitGhTool::Git => admit_git_invocation(&invocation, cwd)?,
             GitGhTool::Gh => {
                 SafeGhCommand::new(&invocation.args)?;
             }
         }
     }
     Ok(())
+}
+
+/// Policy-check one git invocation; merge/pull additionally verify the
+/// directory they will actually run in.
+fn admit_git_invocation(
+    invocation: &crate::bash_argv::GitGhInvocation,
+    cwd: Option<&Path>,
+) -> Result<()> {
+    let cmd = SafeGitCommand::new(&invocation.args)?;
+    if !matches!(cmd.subcommand(), "merge" | "pull") {
+        return Ok(());
+    }
+    if invocation.other_location_global {
+        return Err(Error::PolicyViolation {
+            code: PolicyCode::MergeBlocked,
+            message: "cannot verify merge target: --git-dir/--work-tree/--namespace override"
+                .to_owned(),
+        });
+    }
+    let dir = invocation
+        .git_dir
+        .as_deref()
+        .map(|d| match (d.is_absolute(), cwd) {
+            (true, _) => d.to_path_buf(),
+            (false, Some(base)) => base.join(d),
+            (false, None) => d.to_path_buf(),
+        });
+    match dir.as_deref().or(cwd) {
+        Some(dir) => cmd.admit_local_merge(dir),
+        // No event cwd and no -C: the merge target is unknown, so admission
+        // fails closed rather than skipping the guards.
+        None => Err(Error::PolicyViolation {
+            code: PolicyCode::MergeBlocked,
+            message:
+                "cannot verify merge target: hook event has no cwd and the git command sets no -C"
+                    .to_owned(),
+        }),
+    }
 }
 
 /// Public validation entry used by tests: policy-check a Bash command string.

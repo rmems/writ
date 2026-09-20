@@ -427,19 +427,7 @@ fn skip_git_globals(
             GitPrefix::Operand => return rest.to_vec(),
             GitPrefix::EndOfOptions => return rest.get(1..).unwrap_or(&[]).to_vec(),
             GitPrefix::TakesValue => {
-                if first == "-C" {
-                    // Git resolves successive -C operands relative to the
-                    // previous one; fold them into one effective path.
-                    if let Some(dir) = rest.get(1) {
-                        let next = std::path::PathBuf::from(dir);
-                        *git_dir = Some(match git_dir.take() {
-                            Some(base) if !next.is_absolute() => base.join(next),
-                            _ => next,
-                        });
-                    }
-                } else {
-                    *other_location_global = true;
-                }
+                record_location_global(first, rest.get(1), git_dir, other_location_global);
                 rest = rest.get(2..).unwrap_or(&[])
             }
             GitPrefix::EqualsForm => {
@@ -448,6 +436,27 @@ fn skip_git_globals(
             }
         }
     }
+}
+
+/// Track the repository a location global points at. `-C` operands fold into
+/// the effective directory (git resolves each relative to the previous);
+/// other location globals mark the target as not fully known.
+fn record_location_global(
+    flag: &str,
+    value: Option<&String>,
+    git_dir: &mut Option<std::path::PathBuf>,
+    other_location_global: &mut bool,
+) {
+    if flag != "-C" {
+        *other_location_global = true;
+        return;
+    }
+    let Some(dir) = value else { return };
+    let next = std::path::PathBuf::from(dir);
+    *git_dir = Some(match git_dir.take() {
+        Some(base) if !next.is_absolute() => base.join(next),
+        _ => next,
+    });
 }
 
 #[derive(Clone, Copy)]
