@@ -176,17 +176,25 @@ pub fn checkout_path_key(path: &Path) -> Result<PathBuf> {
     if let Ok(canonical) = canonicalize(path) {
         return Ok(canonical);
     }
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .map_err(|e| Error::Io {
-                context: "resolve current directory",
-                source: e,
-            })?
-            .join(path)
-    };
-    let mut parts: Vec<std::ffi::OsString> = Vec::new();
+    let parts = lexical_components(&absolutize_cwd(path)?);
+    Ok(resolve_surviving_prefix(&parts).unwrap_or_else(|| parts.iter().collect()))
+}
+
+fn absolutize_cwd(path: &Path) -> Result<PathBuf> {
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    std::env::current_dir()
+        .map(|cwd| cwd.join(path))
+        .map_err(|e| Error::Io {
+            context: "resolve current directory",
+            source: e,
+        })
+}
+
+/// Collapse `.`/`..` lexically, without touching the filesystem.
+fn lexical_components(absolute: &Path) -> Vec<std::ffi::OsString> {
+    let mut parts = Vec::new();
     for component in absolute.components() {
         match component {
             std::path::Component::CurDir => {}
@@ -196,17 +204,20 @@ pub fn checkout_path_key(path: &Path) -> Result<PathBuf> {
             other => parts.push(other.as_os_str().to_os_string()),
         }
     }
-    for i in (1..=parts.len()).rev() {
+    parts
+}
+
+/// Canonicalize the longest path prefix that still exists and append the
+/// remaining components verbatim.
+fn resolve_surviving_prefix(parts: &[std::ffi::OsString]) -> Option<PathBuf> {
+    (1..=parts.len()).rev().find_map(|i| {
         let prefix: PathBuf = parts[..i].iter().collect();
-        if let Ok(base) = std::fs::canonicalize(&prefix) {
-            let mut resolved = base;
-            for part in &parts[i..] {
-                resolved.push(part);
-            }
-            return Ok(resolved);
-        }
-    }
-    Ok(parts.iter().collect())
+        let base = std::fs::canonicalize(prefix).ok()?;
+        Some(parts[i..].iter().fold(base, |mut acc, part| {
+            acc.push(part);
+            acc
+        }))
+    })
 }
 
 /// Display name for a checkout path suitable as a default job id: the file name
