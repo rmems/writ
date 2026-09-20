@@ -168,9 +168,10 @@ pub fn inspect_checkout(path: &Path) -> Result<CheckoutInfo> {
 ///
 /// Registration stores the canonical top-level, but `WorktreeRemove` and
 /// `unregister` may run after the harness has already deleted the checkout, so
-/// canonicalization is not always possible. Falls back to lexical
-/// normalization: absolutize against the current directory and collapse `.` and
-/// `..` without touching the filesystem.
+/// canonicalization is not always possible. Falls back to absolutizing and
+/// collapsing `.`/`..` lexically, then canonicalizing the longest ancestor
+/// that still exists — so a deleted leaf under a symlinked parent (e.g.
+/// `/var` → `/private/var` on macOS) still matches the stored canonical path.
 pub fn checkout_path_key(path: &Path) -> Result<PathBuf> {
     if let Ok(canonical) = canonicalize(path) {
         return Ok(canonical);
@@ -185,17 +186,27 @@ pub fn checkout_path_key(path: &Path) -> Result<PathBuf> {
             })?
             .join(path)
     };
-    let mut normalized = PathBuf::new();
+    let mut parts: Vec<std::ffi::OsString> = Vec::new();
     for component in absolute.components() {
         match component {
             std::path::Component::CurDir => {}
             std::path::Component::ParentDir => {
-                normalized.pop();
+                parts.pop();
             }
-            other => normalized.push(other.as_os_str()),
+            other => parts.push(other.as_os_str().to_os_string()),
         }
     }
-    Ok(normalized)
+    for i in (1..=parts.len()).rev() {
+        let prefix: PathBuf = parts[..i].iter().collect();
+        if let Ok(base) = std::fs::canonicalize(&prefix) {
+            let mut resolved = base;
+            for part in &parts[i..] {
+                resolved.push(part);
+            }
+            return Ok(resolved);
+        }
+    }
+    Ok(parts.iter().collect())
 }
 
 /// Display name for a checkout path suitable as a default job id: the file name
