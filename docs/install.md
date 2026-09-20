@@ -2,7 +2,7 @@
 
 This is the **clone + symlink** install for the portable skill in [`SKILL.md`](../SKILL.md). One clone, many skill-root symlinks. It does not require Graphite; plain `git` is enough. `gh` is optional and unused by the installer.
 
-This is **not** `writ install`. That CLI command will write Claude Code hooks into `.claude/settings.json` and is **not built yet** ([#124](https://github.com/rmems/writ/issues/124)). Until it lands, enforcement stays opt-in through `writ git-safe` / `writ gh-safe` / `writ worktree` as described in the [README](../README.md).
+This is **not** `writ install`, the CLI command that writes the `writ` hook block into `.claude/settings.json` (implemented; held back from shared settings pending the [#124](https://github.com/rmems/writ/issues/124) burn-in). Until hooks are registered, enforcement stays opt-in through `writ git-safe` / `writ gh-safe` / `writ worktree` as described in the [README](../README.md).
 
 Second-platform smoke testing that consumes these paths was tracked in [#17](https://github.com/rmems/writ/issues/17) and closed as not planned. The paths below remain the source of truth for a human or later checklist.
 
@@ -132,4 +132,4 @@ Linux and macOS are the supported install surfaces. On WSL, use the Linux `$HOME
 | --- | --- | --- |
 | `writ` binary | `cargo install --path crates/writ` (see README Build), or a GitHub Release artifact | Shipping |
 | Agent skill | this document / `scripts/install-skill.sh` | Shipping |
-| Claude Code hooks | future `writ install` writing `.claude/settings.json` | Not built ([#124](https://github.com/rmems/writ/issues/124)) |
+| Claude Code hooks | `writ install` writing `.claude/settings.json` | Implemented; burn-in outstanding ([#124](https://github.com/rmems/writ/issues/124)) |
