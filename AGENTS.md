@@ -102,7 +102,7 @@ Stop and report an unsafe identity or path mismatch, a genuine ownership collisi
 These guardrails are enforced at multiple layers:
 
 1. **Agent skill (`SKILL.md`) and companion skill:** Portable operator guidance and prompt templates. Neither is a security boundary.
-2. **Rust core (`writ-core`):** Hard enforcement. Rejects unsafe git/GitHub operations — including `gh pr merge`, auto-merge, merge-queue, default-branch local merge, dirty-WIP merge, and bare force-push — at the process boundary. Local feature-branch `git merge` is allowlisted. Authoritative safety layer for the product runtime.
+2. **Rust core (`writ-core`):** Hard enforcement. Rejects unsafe git/GitHub operations — including `gh pr merge`, auto-merge, merge-queue, default-branch local merge, dirty-WIP merge, and bare force-push — at the process boundary. Local feature-branch `git merge` is allowlisted; the hook verifies merge/pull against the event `cwd` (or an explicit `-C` target) and fails closed when neither is known. Authoritative safety layer for the product runtime.
 3. **GitHub repository protection:** Intended authority for merging a pull request into a protected branch. `writ` does not implement a merge-permission protocol. If protection is missing, report the operator gap; do not rebuild a writ merge engine.
 
 Rust must enforce safety-sensitive runtime mutation rules. Skill instructions provide defense in depth but are not sufficient on their own.

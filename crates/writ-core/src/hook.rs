@@ -298,8 +298,35 @@ fn admit_bash_command(command: ShellText<'_>, cwd: Option<&Path>) -> Result<()> 
         match invocation.tool {
             GitGhTool::Git => {
                 let cmd = SafeGitCommand::new(&invocation.args)?;
-                if let Some(cwd) = cwd {
-                    cmd.admit_local_merge(cwd)?;
+                if !matches!(cmd.subcommand(), "merge" | "pull") {
+                    continue;
+                }
+                if invocation.other_location_global {
+                    return Err(Error::PolicyViolation {
+                        code: PolicyCode::MergeBlocked,
+                        message:
+                            "cannot verify merge target: --git-dir/--work-tree/--namespace override"
+                                .to_owned(),
+                    });
+                }
+                let dir = invocation.git_dir.as_deref().map(|d| {
+                    if d.is_absolute() {
+                        d.to_path_buf()
+                    } else {
+                        cwd.map(|c| c.join(d)).unwrap_or_else(|| d.to_path_buf())
+                    }
+                });
+                match dir.as_deref().or(cwd) {
+                    Some(dir) => cmd.admit_local_merge(dir)?,
+                    // No event cwd and no -C: the merge target is unknown, so
+                    // admission fails closed rather than skipping the guards.
+                    None => {
+                        return Err(Error::PolicyViolation {
+                            code: PolicyCode::MergeBlocked,
+                            message: "cannot verify merge target: hook event has no cwd and the git command sets no -C"
+                                .to_owned(),
+                        });
+                    }
                 }
             }
             GitGhTool::Gh => {
@@ -349,7 +376,8 @@ mod tests {
     fn pre_tool_use_allows_safe_git_and_ignores_non_git() {
         validate_bash_command("git status").unwrap();
         validate_bash_command("git push --force-with-lease origin HEAD").unwrap();
-        validate_bash_command("git merge feature").unwrap();
+        // No cwd to verify against: merge/pull fail closed in the hook.
+        validate_bash_command("git merge feature").unwrap_err();
         validate_bash_command("npm test").unwrap();
         validate_bash_command("/usr/bin/git status").unwrap();
         validate_bash_command("git -C /tmp/repo status").unwrap();

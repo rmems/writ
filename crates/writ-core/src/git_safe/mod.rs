@@ -305,25 +305,11 @@ impl SafeGitCommand {
     /// Default-branch (`main`/`master`) integration and dirty-tree merges that would
     /// clobber uncommitted work are refused.
     pub fn admit_local_merge(&self, repo_dir: &Path) -> Result<()> {
-        match self.subcommand() {
-            "merge" => {}
-            "pull" => {
-                if merge_is_recovery(&self.args) {
-                    return Ok(());
-                }
-                let current = resolve_current_branch(repo_dir)?;
-                if is_default_integration_branch(&current) {
-                    return Err(Error::PolicyViolation {
-                        code: PolicyCode::MergeBlocked,
-                        message: format!(
-                            "local pull on default branch `{current}` is not allowed; GitHub owns protected-branch integration"
-                        ),
-                    });
-                }
-                return Ok(());
-            }
+        let verb = match self.subcommand() {
+            "merge" => "merge",
+            "pull" => "pull",
             _ => return Ok(()),
-        }
+        };
         if merge_is_recovery(&self.args) {
             return Ok(());
         }
@@ -332,16 +318,16 @@ impl SafeGitCommand {
             return Err(Error::PolicyViolation {
                 code: PolicyCode::MergeBlocked,
                 message: format!(
-                    "local merge on default branch `{current}` is not allowed; GitHub owns protected-branch integration"
+                    "local {verb} on default branch `{current}` is not allowed; GitHub owns protected-branch integration"
                 ),
             });
         }
         if working_tree_is_dirty(repo_dir)? {
             return Err(Error::PolicyViolation {
                 code: PolicyCode::MergeBlocked,
-                message:
-                    "refusing git merge with uncommitted work; commit, stash, or abort to preserve WIP"
-                        .to_owned(),
+                message: format!(
+                    "refusing git {verb} with uncommitted work; commit, stash, or abort to preserve WIP"
+                ),
             });
         }
         Ok(())
