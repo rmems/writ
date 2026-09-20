@@ -425,62 +425,90 @@ fn worktree_create_response(
     ))
 }
 
+fn checkout_json(info: &writ_core::checkout::CheckoutInfo) -> serde_json::Value {
+    serde_json::json!({
+        "path": info.path,
+        "branch": info.branch,
+        "head_commit": info.head_commit,
+        "common_dir": info.common_dir,
+        "linked_worktree": info.linked_worktree,
+        "origin_slug": info.origin_slug,
+        "dirty": info.dirty,
+    })
+}
+
+fn worktree_register_response(
+    path: PathBuf,
+    job: Option<String>,
+) -> writ_core::error::Result<writ_core::contract::Response<serde_json::Value>> {
+    use writ_core::checkout::CheckoutRegistry;
+    use writ_core::contract::Response;
+
+    let registry = CheckoutRegistry::new()?;
+    let job_id = job.unwrap_or_else(|| {
+        path.file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "checkout".to_owned())
+    });
+    let info = registry.register(&path, &job_id)?;
+    let mut data = checkout_json(&info);
+    data["job_id"] = serde_json::Value::String(job_id);
+    Ok(Response::success("worktree.register", data))
+}
+
+fn worktree_unregister_response(
+    path: PathBuf,
+) -> writ_core::error::Result<writ_core::contract::Response<serde_json::Value>> {
+    use writ_core::checkout::CheckoutRegistry;
+    use writ_core::contract::Response;
+
+    let released = CheckoutRegistry::new()?.unregister(&path)?;
+    Ok(Response::success(
+        "worktree.unregister",
+        serde_json::json!({ "released": released.is_some() }),
+    ))
+}
+
+fn worktree_inspect_response(
+    path: PathBuf,
+) -> writ_core::error::Result<writ_core::contract::Response<serde_json::Value>> {
+    use writ_core::contract::Response;
+
+    let info = writ_core::checkout::inspect_checkout(&path)?;
+    Ok(Response::success("worktree.inspect", checkout_json(&info)))
+}
+
+fn worktree_list_response()
+-> writ_core::error::Result<writ_core::contract::Response<serde_json::Value>> {
+    use writ_core::checkout::CheckoutRegistry;
+    use writ_core::contract::Response;
+
+    let worktrees = CheckoutRegistry::new()?.registered()?;
+    Ok(Response::success(
+        "worktree.list",
+        serde_json::json!({
+            "worktrees": worktrees.iter().map(|lease| serde_json::json!({
+                "path": lease.worktree_path,
+                "branch": lease.branch,
+                "job_id": lease.job_id,
+                "mode": lease.mode.as_str(),
+            })).collect::<Vec<_>>(),
+        }),
+    ))
+}
+
 fn worktree_response(
     action: WorktreeAction,
     allowlist: &writ_core::owners::OwnerAllowlist,
 ) -> writ_core::error::Result<writ_core::contract::Response<serde_json::Value>> {
-    use writ_core::checkout::CheckoutRegistry;
     use writ_core::contract::Response;
     use writ_core::worktree::WorktreeManager;
 
     match action {
-        WorktreeAction::Register { path, job } => {
-            let registry = CheckoutRegistry::new()?;
-            let job_id = job.unwrap_or_else(|| {
-                path.file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "checkout".to_owned())
-            });
-            let info = registry.register(&path, &job_id)?;
-            Ok(Response::success(
-                "worktree.register",
-                serde_json::json!({
-                    "path": info.path,
-                    "branch": info.branch,
-                    "head_commit": info.head_commit,
-                    "common_dir": info.common_dir,
-                    "linked_worktree": info.linked_worktree,
-                    "origin_slug": info.origin_slug,
-                    "job_id": job_id,
-                    "dirty": info.dirty,
-                }),
-            ))
-        }
-        WorktreeAction::Unregister { path } => {
-            let registry = CheckoutRegistry::new()?;
-            let released = registry.unregister(&path)?;
-            Ok(Response::success(
-                "worktree.unregister",
-                serde_json::json!({
-                    "released": released.is_some(),
-                }),
-            ))
-        }
-        WorktreeAction::Inspect { path } => {
-            let info = writ_core::checkout::inspect_checkout(&path)?;
-            Ok(Response::success(
-                "worktree.inspect",
-                serde_json::json!({
-                    "path": info.path,
-                    "branch": info.branch,
-                    "head_commit": info.head_commit,
-                    "common_dir": info.common_dir,
-                    "linked_worktree": info.linked_worktree,
-                    "origin_slug": info.origin_slug,
-                    "dirty": info.dirty,
-                }),
-            ))
-        }
+        WorktreeAction::Register { path, job } => worktree_register_response(path, job),
+        WorktreeAction::Unregister { path } => worktree_unregister_response(path),
+        WorktreeAction::Inspect { path } => worktree_inspect_response(path),
+        WorktreeAction::List => worktree_list_response(),
         WorktreeAction::Create {
             repo,
             owner,
@@ -507,21 +535,6 @@ fn worktree_response(
                 schema_version,
             },
         ),
-        WorktreeAction::List => {
-            let registry = CheckoutRegistry::new()?;
-            let worktrees = registry.registered()?;
-            Ok(Response::success(
-                "worktree.list",
-                serde_json::json!({
-                    "worktrees": worktrees.iter().map(|lease| serde_json::json!({
-                        "path": lease.worktree_path,
-                        "branch": lease.branch,
-                        "job_id": lease.job_id,
-                        "mode": lease.mode.as_str(),
-                    })).collect::<Vec<_>>(),
-                }),
-            ))
-        }
         WorktreeAction::Remove { path, force } => {
             let manager = WorktreeManager::new()?;
             manager.remove(&path, force)?;
