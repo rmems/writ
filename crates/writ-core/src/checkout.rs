@@ -212,7 +212,9 @@ fn lexical_components(absolute: &Path) -> Vec<std::ffi::OsString> {
 fn resolve_surviving_prefix(parts: &[std::ffi::OsString]) -> Option<PathBuf> {
     (1..=parts.len()).rev().find_map(|i| {
         let prefix: PathBuf = parts[..i].iter().collect();
-        let base = std::fs::canonicalize(prefix).ok()?;
+        // Same normalization as registration: resolves symlinks, short names,
+        // and strips Windows verbatim prefixes.
+        let base = crate::paths::canonicalize_for_tools(&prefix).ok()?;
         Some(parts[i..].iter().fold(base, |mut acc, part| {
             acc.push(part);
             acc
