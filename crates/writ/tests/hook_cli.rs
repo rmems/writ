@@ -75,15 +75,63 @@ fn hook_blocks_quoted_force_push_and_config_injection() {
 }
 
 #[test]
-fn hook_worktree_create_requires_source_ref() {
+fn hook_worktree_create_is_coordination_only() {
     let root = TestDir::new();
+    // No existing checkout named: allow native creation untouched.
     let output = writ_hook(
         &root.0,
-        r#"{"hook_event_name":"WorktreeCreate","cwd":"/tmp","name":"wt"}"#,
+        r#"{"hook_event_name":"WorktreeCreate","worktree_path":"/nonexistent/wt","name":"wt"}"#,
     );
-    assert_eq!(output.status.code(), Some(2));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("START_POINT_REQUIRED"), "stderr={stderr}");
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stdout.is_empty(), "no path may be claimed");
+}
+
+#[test]
+fn hook_worktree_events_register_and_release_without_deleting() {
+    let root = TestDir::new();
+    let repo = root.0.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    let git = |dir: &PathBuf, args: &[&str]| {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?}");
+    };
+    git(&repo, &["init", "--quiet", "-b", "main"]);
+    git(&repo, &["config", "user.email", "t@e.com"]);
+    git(&repo, &["config", "user.name", "t"]);
+    fs::write(repo.join("f"), "x\n").unwrap();
+    git(&repo, &["add", "f"]);
+    git(&repo, &["commit", "--quiet", "-m", "init"]);
+
+    let create = writ_hook(
+        &root.0,
+        &serde_json::json!({
+            "hook_event_name": "WorktreeCreate",
+            "worktree_path": repo,
+            "worktree_name": "job-1",
+        })
+        .to_string(),
+    );
+    assert_eq!(create.status.code(), Some(0));
+    assert!(!create.stdout.is_empty(), "existing checkout registered");
+
+    let remove = writ_hook(
+        &root.0,
+        &serde_json::json!({
+            "hook_event_name": "WorktreeRemove",
+            "worktree_path": repo,
+        })
+        .to_string(),
+    );
+    assert_eq!(remove.status.code(), Some(0));
+    assert!(
+        repo.join(".git").exists(),
+        "WorktreeRemove must never delete a harness-owned checkout"
+    );
 }
 
 #[test]
