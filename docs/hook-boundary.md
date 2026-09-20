@@ -46,7 +46,7 @@ In a throwaway git repo, not a live multi-repo settings file:
 }
 ```
 
-3. Ask Claude Code to run `git push --force`, `git merge`, `gh pr merge`, and `gh api`. Each must be blocked with the policy reason visible.
+3. Ask Claude Code to run `git push --force`, `git mergetool`, `gh pr merge`, and `gh api`. Each must be blocked with the policy reason visible. A `git merge <feature>` on an assigned feature branch with a clean tree must be admitted.
 4. Add a second PreToolUse hook that prints `{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow"}}` and exits 0. The force-push and merge commands must still be blocked.
 5. Confirm a normal session (`git status`, `git log`, `git commit`, `git push` to the assigned branch, `git rebase` onto the base, `gh pr view`, `gh pr list`) is not blocked.
 
@@ -72,4 +72,4 @@ Do not run `writ install` against a shared `~/.claude/settings.json` until that 
 | Unrecognized `hook_event_name` | exit 0, no decision |
 | False-positive corpus | listed ordinary commands must pass |
 
-Prompt-only merge and force-push rules in `AGENTS.md` / `SKILL.md` remain as defense in depth until `writ install` and burn-in land. The Rust hook is now the testable boundary; it is not yet registered by default.
+Prompt-only GitHub PR merge and force-push rules in `AGENTS.md` / `SKILL.md` remain as defense in depth until `writ install` and burn-in land. Local feature-branch merge is allowlisted. The Rust hook is now the testable boundary; it is not yet registered by default.

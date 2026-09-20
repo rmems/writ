@@ -43,10 +43,11 @@ Claude Code hooks (`PreToolUse`, `WorktreeCreate`, `WorktreeRemove`, `SubagentSt
 - exact-base worktree identity and path sandboxing
 - `git`/`gh` mutation allowlists (`git-safe`, `gh-safe`)
 - process supervision and timeouts
-- runtime rejection of merge, auto-merge, merge-queue, and bare force-push
+- runtime rejection of GitHub PR merge, auto-merge, merge-queue, default-branch local merge, dirty-WIP merge, and bare force-push
+- local feature-branch `git merge` admission (assigned worktree only)
 - job/watched state, once a writer exists (M1)
 
-This ADR does not add a merge command to `writ`. A primary interactive agent may perform a human-authorized one-shot merge only through the host connector protocol in `AGENTS.md`. That path is unavailable to the runtime, workers, orchestrators, and companion monitoring skills.
+This ADR does not add a GitHub PR merge command to `writ`. Local assigned-branch integration is allowlisted. GitHub repository protection owns remote PR merges; `writ` must not grow a merge-permission protocol.
 
 ### 2. `SKILL.md` files are thin, platform-facing clients
 
@@ -85,9 +86,7 @@ For production and fleet use, every mutating `git` or `gh` invocation goes throu
 
 Reads are not mutations. GitHub MCP is preferred for PR/issue/check/review reads; shell `gh` reads are a fallback when MCP is unavailable. Identity-adjacent local `git` (`fetch`, `rev-parse`, `status`, `branch --show-current`) is not a second control plane; the production path still prefers `writ git-safe` for those calls (`fetch` is already allowlisted and non-mutating).
 
-The host-connector one-shot merge is the sole documented merge exception, and only after the complete human-authorization protocol. It is not a `writ` command and is not available to babysitting flows.
-
-GitHub MCP may perform GitHub writes that `writ gh-safe` cannot (`gh run` and `gh api` are outside the allowlist). That is still not a raw `gh`/`git` production path, and it remains subject to the merge prohibition.
+GitHub MCP may perform GitHub writes that `writ gh-safe` cannot (`gh run` and `gh api` are outside the allowlist). That is still not a raw `gh`/`git` production path, and it remains subject to the GitHub PR merge prohibition. Local feature-branch `git merge` is allowlisted through `writ git-safe`.
 
 **Honest current enforcement.** Until M1 hooks land, policy applies only to commands that actually enter `writ`. This ADR states the required production path. It does not claim that raw `git`/`gh` is currently impossible on the operator's machine.
 
@@ -120,8 +119,8 @@ That skill owns the **monitoring loop**: poll PR/CI/review state, classify branc
 | `git push` / `--force-with-lease` | `writ git-safe` on the assigned branch. Bare `--force`/`-f` remain forbidden. |
 | Allowlisted `gh` writes (for example `gh pr comment`) | `writ gh-safe`. Merge, auto-merge, merge-queue, `gh pr merge` / `ready` / `update-branch` / `checkout` remain blocked. |
 | Check reruns, Actions job logs, review-thread resolve | GitHub MCP, or a future `writ` primitive. Today `gh run` and `gh api` are outside `gh-safe`; do not send them through it, and do not use raw `gh api` in production. |
-| “Until merged or closed” | Observational stop condition. The skill must not merge. |
-| Ready-to-merge report | Handoff signal only. Human merge, or the separately authorized primary-agent one-shot protocol. |
+| “Until merged or closed” | Observational stop condition. The skill must not merge the pull request. |
+| Ready-to-merge report | Handoff signal only. A human merges on GitHub. |
 
 Compatibility rules:
 

@@ -70,6 +70,8 @@ struct HookEvent {
     tool_name: Option<String>,
     #[serde(default)]
     tool_input: Option<ToolInput>,
+    #[serde(default)]
+    cwd: Option<String>,
     #[serde(default, alias = "worktree_name")]
     name: Option<String>,
     #[serde(default)]
@@ -100,7 +102,7 @@ fn handle_pre_tool_use(event: &HookEvent) -> Result<()> {
     else {
         return Ok(());
     };
-    admit_bash_command(ShellText(command))
+    admit_bash_command(ShellText(command), event.cwd.as_deref().map(Path::new))
 }
 
 /// Coordination-only `WorktreeCreate`: the harness performs the actual
@@ -195,16 +197,14 @@ fn open_store(runtime: &HookRuntime) -> Result<LeaseStore> {
     }
 }
 
-fn admit_bash_command(command: ShellText<'_>) -> Result<()> {
+fn admit_bash_command(command: ShellText<'_>, cwd: Option<&Path>) -> Result<()> {
     let invocations = git_gh_invocations(command).map_err(|unparsed| Error::PolicyViolation {
         code: PolicyCode::SubcommandNotAllowed,
         message: format!("unparseable git/gh command: {}", unparsed.0.0),
     })?;
     for invocation in invocations {
         match invocation.tool {
-            GitGhTool::Git => {
-                SafeGitCommand::new(&invocation.args)?;
-            }
+            GitGhTool::Git => admit_git_invocation(&invocation, cwd)?,
             GitGhTool::Gh => {
                 SafeGhCommand::new(&invocation.args)?;
             }
@@ -213,9 +213,47 @@ fn admit_bash_command(command: ShellText<'_>) -> Result<()> {
     Ok(())
 }
 
+/// Policy-check one git invocation; merge/pull additionally verify the
+/// directory they will actually run in.
+fn admit_git_invocation(
+    invocation: &crate::bash_argv::GitGhInvocation,
+    cwd: Option<&Path>,
+) -> Result<()> {
+    let cmd = SafeGitCommand::new(&invocation.args)?;
+    if !matches!(cmd.subcommand(), "merge" | "pull") {
+        return Ok(());
+    }
+    if invocation.other_location_global {
+        return Err(Error::PolicyViolation {
+            code: PolicyCode::MergeBlocked,
+            message: "cannot verify merge target: --git-dir/--work-tree/--namespace override"
+                .to_owned(),
+        });
+    }
+    let dir = invocation
+        .git_dir
+        .as_deref()
+        .map(|d| match (d.is_absolute(), cwd) {
+            (true, _) => d.to_path_buf(),
+            (false, Some(base)) => base.join(d),
+            (false, None) => d.to_path_buf(),
+        });
+    match dir.as_deref().or(cwd) {
+        Some(dir) => cmd.admit_local_merge(dir),
+        // No event cwd and no -C: the merge target is unknown, so admission
+        // fails closed rather than skipping the guards.
+        None => Err(Error::PolicyViolation {
+            code: PolicyCode::MergeBlocked,
+            message:
+                "cannot verify merge target: hook event has no cwd and the git command sets no -C"
+                    .to_owned(),
+        }),
+    }
+}
+
 /// Public validation entry used by tests: policy-check a Bash command string.
 pub fn validate_bash_command(command: &str) -> Result<()> {
-    admit_bash_command(ShellText(command))
+    admit_bash_command(ShellText(command), None)
 }
 
 #[cfg(test)]
@@ -243,7 +281,7 @@ mod tests {
     #[test]
     fn pre_tool_use_blocks_git_and_gh_policy_violations() {
         assert_bash_hook_blocks("git push --force", "BARE_FORCE_PUSH");
-        assert_bash_hook_blocks("FOO=bar git merge feature", "MERGE_BLOCKED");
+        assert_bash_hook_blocks("FOO=bar git mergetool", "MERGE_BLOCKED");
         assert_bash_hook_blocks("gh pr merge 1", "MERGE_BLOCKED");
         assert_bash_hook_blocks("gh api repos/acme/example", "GH_SUBCOMMAND_NOT_ALLOWED");
     }
@@ -252,11 +290,78 @@ mod tests {
     fn pre_tool_use_allows_safe_git_and_ignores_non_git() {
         validate_bash_command("git status").unwrap();
         validate_bash_command("git push --force-with-lease origin HEAD").unwrap();
+        // No cwd to verify against: merge/pull fail closed in the hook.
+        validate_bash_command("git merge feature").unwrap_err();
         validate_bash_command("npm test").unwrap();
         validate_bash_command("/usr/bin/git status").unwrap();
         validate_bash_command("git -C /tmp/repo status").unwrap();
         validate_bash_command("git -- status").unwrap();
         validate_bash_command("git commit -m 'a > b'").unwrap();
+    }
+
+    /// Repo on feature branch `worker-a` with one committed file.
+    fn merge_hook_test_repo() -> tempfile::TempDir {
+        let temp = tempdir().unwrap();
+        let repo = temp.path();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-b", "worker-a"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "hook-test"]);
+        git(&["config", "core.autocrlf", "false"]);
+        fs::write(repo.join("README"), "init\n").unwrap();
+        git(&["add", "README"]);
+        git(&["commit", "-m", "init"]);
+        temp
+    }
+
+    /// Dispatch a PreToolUse Bash hook for `command` with `cwd` set to `repo`.
+    fn dispatch_bash_hook(repo: &Path, command: &str) -> (u8, String) {
+        let runtime = HookRuntime::default();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let payload = serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "cwd": repo,
+            "tool_name": "Bash",
+            "tool_input": { "command": command },
+        })
+        .to_string();
+        let code = dispatch(&payload, &runtime, &mut stdout, &mut stderr);
+        (code, String::from_utf8_lossy(&stderr).into_owned())
+    }
+
+    #[test]
+    fn pre_tool_use_refuses_merge_that_would_lose_wip_when_cwd_is_set() {
+        let temp = merge_hook_test_repo();
+        let repo = temp.path();
+        fs::write(repo.join("wip.txt"), "do-not-lose\n").unwrap();
+
+        let (code, stderr) = dispatch_bash_hook(repo, "git merge worker-b");
+        assert_eq!(code, 2, "{stderr}");
+        assert!(stderr.contains("MERGE_BLOCKED"), "{stderr}");
+        assert_eq!(
+            fs::read_to_string(repo.join("wip.txt")).unwrap(),
+            "do-not-lose\n"
+        );
+    }
+
+    #[test]
+    fn pre_tool_use_allows_feature_branch_merge_when_cwd_is_clean() {
+        let temp = merge_hook_test_repo();
+        let (code, stderr) = dispatch_bash_hook(temp.path(), "git merge worker-b");
+        assert_eq!(code, 0, "{stderr}");
     }
 
     #[test]
