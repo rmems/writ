@@ -1,14 +1,25 @@
-//! Status and job-query JSON types for Python and agent consumption.
+//! Status and job-query JSON types for agents and humans.
+//!
+//! The authority is the SQLite lease store (`leases` + `agents`). Unknown
+//! collaboration fields stay `null` rather than being inferred. GitHub CI/PR
+//! merge state is not mixed into this snapshot.
 
 use std::fmt;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::checkout::{CheckoutInfo, DETACHED_BRANCH, inspect_checkout_for_status};
 use crate::contract::Response;
+use crate::lease::{AgentRecord, Lease, LeaseMode, LeaseStore};
+use crate::paths::lease_store_path;
 use crate::timeout_policy::{RecoveryStage, TimeoutClass};
 
 /// Lifecycle state of a watched job process.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+///
+/// Lease-backed status reports [`Unknown`]: process lifecycle is not stored
+/// in the coordination database.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProcessState {
     /// Job has been created but not yet started.
@@ -23,10 +34,37 @@ pub enum ProcessState {
     Cancelled,
     /// Job hit a supervisor timeout / hang residual (see `timeout_class`).
     TimedOut,
+    /// Process lifecycle is not recorded in the current store.
+    #[default]
+    Unknown,
+}
+
+/// Local collaboration state derived only from a recorded lease mode.
+///
+/// Released / paused / conflicted / ready-for-integration are local
+/// coordination values. They are never treated as GitHub merged/completed.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CollaborationState {
+    /// Held writer lock (`WRITER_LOCKED`).
+    Running,
+    /// Recorded as needing a human (`NEEDS_HUMAN`).
+    Waiting,
+    /// Review-only / paused writer (`REVIEW_ONLY`).
+    Paused,
+    /// Recorded blocked / conflicted (`BLOCKED`).
+    Conflicted,
+    /// Locally marked ready for integration (`MERGE_READY`).
+    ReadyForIntegration,
+    /// Identity kept after release (`UNASSIGNED`). Not GitHub-completed.
+    Unassigned,
+    /// Mode is missing or not mapped.
+    #[default]
+    Unknown,
 }
 
 /// CI check-run classification for a job's head commit.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CiClass {
     /// All required CI checks passed.
@@ -36,50 +74,54 @@ pub enum CiClass {
     /// Checks are queued or in progress.
     Pending,
     /// CI status could not be determined.
+    #[default]
     Unknown,
 }
 
-impl fmt::Display for ProcessState {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Pending => "pending",
-            Self::Running => "running",
-            Self::Completed => "completed",
-            Self::Failed => "failed",
-            Self::Cancelled => "cancelled",
-            Self::TimedOut => "timed_out",
-        })
-    }
+macro_rules! impl_snake_case_display {
+    ($ty:ty, $($variant:ident => $text:literal),+ $(,)?) => {
+        impl fmt::Display for $ty {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(match self {
+                    $(Self::$variant => $text,)+
+                })
+            }
+        }
+    };
 }
 
-impl fmt::Display for CiClass {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Pass => "pass",
-            Self::Fail => "fail",
-            Self::Pending => "pending",
-            Self::Unknown => "unknown",
-        })
-    }
+impl_snake_case_display! {
+    ProcessState,
+    Pending => "pending",
+    Running => "running",
+    Completed => "completed",
+    Failed => "failed",
+    Cancelled => "cancelled",
+    TimedOut => "timed_out",
+    Unknown => "unknown",
 }
 
-/// Identity fields required to construct a [`JobStatus`].
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct JobIdentity {
-    /// Unique job identifier (e.g. `writ-347`).
-    pub job_id: String,
-    /// Repository owner.
-    pub owner: String,
-    /// Repository name.
-    pub repo: String,
-    /// Absolute path to the job's isolated worktree.
-    pub worktree_path: String,
-    /// Current branch checked out in the worktree.
-    pub branch: String,
+impl_snake_case_display! {
+    CollaborationState,
+    Running => "running",
+    Waiting => "waiting",
+    Paused => "paused",
+    Conflicted => "conflicted",
+    ReadyForIntegration => "ready_for_integration",
+    Unassigned => "unassigned",
+    Unknown => "unknown",
 }
 
-/// Status of a single watched job.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+impl_snake_case_display! {
+    CiClass,
+    Pass => "pass",
+    Fail => "fail",
+    Pending => "pending",
+    Unknown => "unknown",
+}
+
+/// Status of a single registered checkout / lease identity.
+#[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct JobStatus {
     /// Unique job identifier (e.g. `writ-347`).
     pub job_id: String,
@@ -93,18 +135,20 @@ pub struct JobStatus {
     /// Linked pull-request number, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pr_number: Option<u64>,
-    /// Absolute path to the job's isolated worktree.
+    /// Absolute path to the registered checkout.
     pub worktree_path: String,
-    /// Current branch checked out in the worktree.
+    /// Branch recorded on the lease (coordination identity).
     pub branch: String,
-    /// Lifecycle state of the job process.
+    /// Process lifecycle. Lease-backed rows are `unknown`.
+    #[serde(default)]
     pub process_state: ProcessState,
-    /// Last error message, if the job is in `Failed` state.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Last error message when one is recorded.
+    #[serde(default)]
     pub last_error: Option<String>,
-    /// CI classification for the job's head commit.
+    /// CI classification. Lease-backed rows are `unknown`.
+    #[serde(default)]
     pub ci_class: CiClass,
-    /// Stuck class when `process_state` is `timed_out` (additive v1).
+    /// Stuck class when `process_state` is `timed_out` (additive).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_class: Option<TimeoutClass>,
     /// Structured leftovers (`timeout:hard`, CI codes, …). Empty omitted.
@@ -125,62 +169,295 @@ pub struct JobStatus {
     /// Host redispatch cap recorded on the residual. Supervisor never consumes it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_redispatch_per_item: Option<u32>,
+    /// Local collaboration state mapped from lease mode only.
+    #[serde(default)]
+    pub collaboration_state: CollaborationState,
+    /// Raw lease mode string (`WRITER_LOCKED`, `UNASSIGNED`, …).
+    #[serde(default)]
+    pub lease_mode: Option<String>,
+    /// HEAD commit when known.
+    #[serde(default)]
+    pub head: Option<String>,
+    /// `checkout` when live inspect succeeded, otherwise `lease`.
+    #[serde(default)]
+    pub head_source: Option<String>,
+    /// SQLite lease row id.
+    #[serde(default)]
+    pub lease_row_id: Option<i64>,
+    /// Lease `updated_at` unix seconds.
+    #[serde(default)]
+    pub updated_at: Option<i64>,
+    /// Ownership generation. Not stored today; always `null`.
+    #[serde(default)]
+    pub ownership_generation: Option<i64>,
+    /// Agent id joined to this job. Not stored on the lease; always `null`.
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    /// Session id joined to this job. Not stored on the lease; always `null`.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Declared path scopes. Not stored today; always `null`.
+    #[serde(default)]
+    pub declared_paths: Option<Vec<String>>,
+    /// Latest blocker. Not stored today; always `null`.
+    #[serde(default)]
+    pub blocker: Option<String>,
+    /// Latest handoff. Not stored today; always `null`.
+    #[serde(default)]
+    pub handoff: Option<String>,
+    /// `true` when an active lease cannot inspect its checkout.
+    #[serde(default)]
+    pub recovery_needed: Option<bool>,
 }
 
-impl JobStatus {
-    /// Construct a running job with additive timeout residuals unset.
-    pub fn new(identity: JobIdentity) -> Self {
-        Self {
-            job_id: identity.job_id,
-            owner: identity.owner,
-            repo: identity.repo,
-            issue_number: None,
-            pr_number: None,
-            worktree_path: identity.worktree_path,
-            branch: identity.branch,
-            process_state: ProcessState::Running,
-            last_error: None,
-            ci_class: CiClass::Pending,
-            timeout_class: None,
-            residual_blockers: Vec::new(),
-            redispatch_count: None,
-            fix_count: None,
-            recovery_stage: None,
-            last_output_ms: None,
-            max_redispatch_per_item: None,
-        }
-    }
+/// One agent-registry row from the same lease store.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AgentStatus {
+    pub agent_id: String,
+    pub agent_type: String,
+    pub session_id: Option<String>,
+    pub started_at: i64,
+    pub stopped_at: Option<i64>,
 }
 
 /// Payload for `writ status` and `writ jobs` v1 envelope responses.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct JobsData {
-    /// List of job statuses (may be empty when no jobs are watched).
+    /// Store this snapshot was built from.
+    pub source: String,
+    /// Lease identities (active and released).
     pub jobs: Vec<JobStatus>,
+    /// Agent registry rows (live and stopped).
+    pub agents: Vec<AgentStatus>,
+}
+
+impl JobsData {
+    /// Empty successful snapshot of the lease store.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            source: SOURCE_LEASE_STORE.to_owned(),
+            jobs: Vec::new(),
+            agents: Vec::new(),
+        }
+    }
 }
 
 /// Named envelope type for `writ status --json` / `writ jobs --json` responses.
 pub type StatusReport = Response<JobsData>;
 
-/// Build a successful v1 envelope response for the given command and job list.
-///
-/// The returned value serializes as `{ ok, schema_version, command, data: { jobs }, error }`,
-/// matching the shared envelope contract defined in [`crate::contract::Response`].
+const SOURCE_LEASE_STORE: &str = "lease_store";
+/// Lease-backed status/jobs envelope. Bumped because `process_state` and
+/// `ci_class` emit `unknown`, which strict v1 ProcessState decoders reject.
+pub const STATUS_SCHEMA_VERSION: u8 = 2;
+
+/// Map a recorded lease mode onto local collaboration state. No GitHub merge
+/// outcome is inferred.
 #[must_use]
-pub fn status_response(command: &'static str, jobs: Vec<JobStatus>) -> StatusReport {
-    Response::success(command, JobsData { jobs })
+pub fn collaboration_state_from_mode(mode: LeaseMode) -> CollaborationState {
+    match mode {
+        LeaseMode::WriterLocked => CollaborationState::Running,
+        LeaseMode::NeedsHuman => CollaborationState::Waiting,
+        LeaseMode::ReviewOnly => CollaborationState::Paused,
+        LeaseMode::Blocked => CollaborationState::Conflicted,
+        LeaseMode::MergeReady => CollaborationState::ReadyForIntegration,
+        LeaseMode::Unassigned => CollaborationState::Unassigned,
+        LeaseMode::Unknown => CollaborationState::Unknown,
+    }
 }
 
-/// Build a failure v1 envelope when watched state cannot be loaded.
+/// Load collaboration status from the default lease-store path.
+pub fn load() -> Result<JobsData, String> {
+    load_from_path(&lease_store_path())
+}
+
+/// Load collaboration status from an explicit SQLite path.
 ///
-/// Serializes as `{ ok: false, schema_version, command, data: { jobs: [] }, error: { code, message } }`.
+/// Only a genuinely absent file yields an empty snapshot; an unreadable store
+/// (permission denied, directory, corrupt file) is an error, not empty state.
+pub fn load_from_path(path: &Path) -> Result<JobsData, String> {
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.is_file() => {}
+        Ok(_) => {
+            return Err(format!(
+                "lease store path is not a regular file: {}",
+                path.display()
+            ));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(JobsData::empty());
+        }
+        Err(e) => {
+            return Err(format!("stat lease store {}: {e}", path.display()));
+        }
+    }
+    let store = LeaseStore::open_read_only(path).map_err(|e| e.to_string())?;
+    load_from_store(&store)
+}
+
+/// Load collaboration status from an already-open store.
+pub fn load_from_store(store: &LeaseStore) -> Result<JobsData, String> {
+    let (leases, agents) = store.snapshot().map_err(|e| e.to_string())?;
+    Ok(JobsData {
+        source: SOURCE_LEASE_STORE.to_owned(),
+        jobs: leases.iter().map(job_from_lease).collect(),
+        agents: agents.into_iter().map(agent_status).collect(),
+    })
+}
+
+fn job_from_lease(lease: &Lease) -> JobStatus {
+    let (head, head_source, recovery_needed) = resolve_head(lease);
+    JobStatus {
+        job_id: lease.job_id.clone(),
+        owner: lease.owner.clone(),
+        repo: lease.repo_name.clone(),
+        issue_number: None,
+        pr_number: None,
+        worktree_path: lease.worktree_path.clone(),
+        branch: lease.branch.clone(),
+        process_state: ProcessState::Unknown,
+        last_error: None,
+        ci_class: CiClass::Unknown,
+        timeout_class: None,
+        residual_blockers: Vec::new(),
+        redispatch_count: None,
+        fix_count: None,
+        recovery_stage: None,
+        last_output_ms: None,
+        max_redispatch_per_item: None,
+        collaboration_state: collaboration_state_from_mode(lease.mode),
+        lease_mode: Some(lease.mode_raw.clone()),
+        head,
+        head_source,
+        lease_row_id: Some(lease.row_id),
+        updated_at: Some(lease.updated_at),
+        ownership_generation: None,
+        agent_id: None,
+        session_id: None,
+        declared_paths: None,
+        blocker: None,
+        handoff: None,
+        recovery_needed,
+    }
+}
+
+fn resolve_head(lease: &Lease) -> (Option<String>, Option<String>, Option<bool>) {
+    match inspect_checkout_for_status(Path::new(&lease.worktree_path)) {
+        Ok(info) if checkout_matches_lease(&info, lease) => {
+            (info.head_commit, Some("checkout".to_owned()), Some(false))
+        }
+        Ok(_) | Err(_) => (
+            nonempty_head(&lease.start_commit),
+            Some("lease".to_owned()),
+            Some(lease.released_at.is_none()),
+        ),
+    }
+}
+
+/// The inspected checkout only supplies a live head when its recorded
+/// identity still matches the lease: same repository and same branch.
+fn checkout_matches_lease(info: &CheckoutInfo, lease: &Lease) -> bool {
+    let branch = info.branch.as_deref().unwrap_or(DETACHED_BRANCH);
+    if branch != lease.branch {
+        return false;
+    }
+    if info.owner != lease.owner {
+        return false;
+    }
+    if info.repo_name != lease.repo_name {
+        return false;
+    }
+    info.common_dir == recorded_common_dir(lease)
+}
+
+fn recorded_common_dir(lease: &Lease) -> PathBuf {
+    crate::paths::canonicalize_for_tools(Path::new(&lease.repo))
+        .unwrap_or_else(|_| PathBuf::from(&lease.repo))
+}
+
+fn nonempty_head(start_commit: &str) -> Option<String> {
+    let trimmed = start_commit.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_owned())
+    }
+}
+
+fn agent_status(record: AgentRecord) -> AgentStatus {
+    AgentStatus {
+        agent_id: record.agent_id,
+        agent_type: record.agent_type,
+        session_id: record.session_id,
+        started_at: record.started_at,
+        stopped_at: record.stopped_at,
+    }
+}
+
+/// Human summary derived from the same snapshot as JSON.
+#[must_use]
+pub fn format_human(data: &JobsData) -> String {
+    if data.jobs.is_empty() && data.agents.is_empty() {
+        return "No collaboration participants.\n".to_owned();
+    }
+    let mut out = format!("source={}\n", data.source);
+    for job in &data.jobs {
+        out.push_str(&format_job_line(job));
+        out.push('\n');
+    }
+    if !data.agents.is_empty() {
+        out.push_str("agents:\n");
+        for agent in &data.agents {
+            out.push_str(&format_agent_line(agent));
+            out.push('\n');
+        }
+    }
+    out
+}
+
+fn format_job_line(job: &JobStatus) -> String {
+    let head = job.head.as_deref().unwrap_or("unknown");
+    let mode = job.lease_mode.as_deref().unwrap_or("unknown");
+    format!(
+        "{} [{}] {}/{} path={} branch={} head={} lease={}",
+        job.job_id,
+        job.collaboration_state,
+        job.owner,
+        job.repo,
+        job.worktree_path,
+        job.branch,
+        head,
+        mode
+    )
+}
+
+fn format_agent_line(agent: &AgentStatus) -> String {
+    let session = agent.session_id.as_deref().unwrap_or("unknown");
+    let liveness = if agent.stopped_at.is_some() {
+        "stopped"
+    } else {
+        "live"
+    };
+    format!(
+        "  {} type={} session={} {}",
+        agent.agent_id, agent.agent_type, session, liveness
+    )
+}
+
+/// Build a successful status envelope for the given command and snapshot.
+#[must_use]
+pub fn status_response(command: &'static str, data: JobsData) -> StatusReport {
+    Response::success_with_schema(command, data, STATUS_SCHEMA_VERSION)
+}
+
+/// Build a failure envelope when coordination state cannot be loaded.
 #[must_use]
 pub fn status_error(command: &'static str, message: String) -> StatusReport {
     Response {
         ok: false,
-        schema_version: crate::contract::SCHEMA_VERSION,
+        schema_version: STATUS_SCHEMA_VERSION,
         command,
-        data: JobsData { jobs: Vec::new() },
+        data: JobsData::empty(),
         error: Some(crate::contract::ErrorData {
             code: "STATE_LOAD_FAILED".to_owned(),
             message,
@@ -191,51 +468,101 @@ pub fn status_error(command: &'static str, message: String) -> StatusReport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contract::SCHEMA_VERSION;
+    use crate::checkout::CheckoutRegistry;
+    use crate::lease::{AgentIdentity, LeaseGrant};
     use crate::timeout_policy::TimeoutClass;
+    use tempfile::tempdir;
 
     fn sample_job() -> JobStatus {
-        let mut job = JobStatus::new(JobIdentity {
+        JobStatus {
             job_id: "writ-100".to_owned(),
             owner: "acme".to_owned(),
             repo: "example-org".to_owned(),
             worktree_path: "/tmp/worktrees/acme/example-org/writ-100".to_owned(),
             branch: "feature/status-json-cli".to_owned(),
-        });
-        job.issue_number = Some(29);
-        job.pr_number = Some(42);
-        job
+            issue_number: Some(29),
+            pr_number: Some(42),
+            process_state: ProcessState::Unknown,
+            last_error: None,
+            ci_class: CiClass::Unknown,
+            collaboration_state: CollaborationState::Running,
+            lease_mode: Some("WRITER_LOCKED".to_owned()),
+            head: Some("abc123".to_owned()),
+            head_source: Some("lease".to_owned()),
+            lease_row_id: Some(1),
+            updated_at: Some(1),
+            ..JobStatus::default()
+        }
+    }
+
+    fn grant<'a>(repo: &'a Path, wt: &'a Path, job_id: &'a str, branch: &'a str) -> LeaseGrant<'a> {
+        LeaseGrant {
+            repo,
+            owner: "acme",
+            repo_name: "sample",
+            job_id,
+            branch,
+            worktree_path: wt,
+            start_commit: "abc123",
+        }
+    }
+
+    fn json_value(job: &JobStatus) -> serde_json::Value {
+        serde_json::from_str(&serde_json::to_string(job).unwrap()).unwrap()
+    }
+
+    fn assert_str(v: &serde_json::Value, key: &str, expected: &str) {
+        assert_eq!(
+            v.get(key).unwrap_or_else(|| panic!("missing {key}")),
+            expected
+        );
+    }
+
+    fn assert_null(v: &serde_json::Value, key: &str) {
+        assert!(
+            v.get(key)
+                .unwrap_or_else(|| panic!("missing {key}"))
+                .is_null(),
+            "{key} must be null"
+        );
     }
 
     #[test]
-    fn job_status_serializes_with_optional_fields_present() {
-        let job = JobStatus {
-            last_error: Some("task failed: permission denied".to_owned()),
-            ..sample_job()
-        };
-        let json = serde_json::to_string(&job).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(v.get("job_id").expect("missing job_id"), "writ-100");
-        assert_eq!(
-            v.get("process_state").expect("missing process_state"),
-            "running"
-        );
-        assert_eq!(v.get("ci_class").expect("missing ci_class"), "pending");
-        assert_eq!(v.get("issue_number").expect("missing issue_number"), 29);
-        assert_eq!(v.get("pr_number").expect("missing pr_number"), 42);
-        assert_eq!(
-            v.get("last_error").expect("missing last_error"),
-            "task failed: permission denied"
-        );
+    fn job_status_serializes_core_fields() {
+        let v = json_value(&sample_job());
+        assert_str(&v, "job_id", "writ-100");
+        assert_str(&v, "collaboration_state", "running");
+        assert_str(&v, "process_state", "unknown");
     }
 
     #[test]
-    fn job_status_omits_none_fields() {
+    fn job_status_serializes_unknown_fields_as_null() {
+        let v = json_value(&sample_job());
+        assert_str(&v, "ci_class", "unknown");
+        assert_null(&v, "last_error");
+        assert_null(&v, "ownership_generation");
+    }
+
+    #[test]
+    fn job_status_serializes_unrecorded_handoff_as_null() {
+        let v = json_value(&sample_job());
+        assert_null(&v, "declared_paths");
+        assert_null(&v, "blocker");
+        assert_null(&v, "handoff");
+    }
+
+    #[test]
+    fn job_status_serializes_unjoined_agent_as_null() {
+        let v = json_value(&sample_job());
+        assert_null(&v, "agent_id");
+        assert_null(&v, "session_id");
+    }
+
+    #[test]
+    fn job_status_omits_legacy_none_issue_fields() {
         let job = JobStatus {
             issue_number: None,
             pr_number: None,
-            last_error: None,
             ..sample_job()
         };
         let json = serde_json::to_string(&job).unwrap();
@@ -243,83 +570,113 @@ mod tests {
 
         assert!(v.get("issue_number").is_none());
         assert!(v.get("pr_number").is_none());
-        assert!(v.get("last_error").is_none());
     }
 
     #[test]
-    fn status_response_uses_v1_envelope() {
-        let response = status_response("cli.status", vec![sample_job()]);
-        let json = serde_json::to_string(&response).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-
-        // Verify envelope keys exist (not Null from missing keys).
+    fn status_response_uses_status_schema() {
+        let mut data = JobsData::empty();
+        data.jobs.push(sample_job());
+        let v: serde_json::Value = serde_json::from_str(
+            &serde_json::to_string(&status_response("cli.status", data)).unwrap(),
+        )
+        .unwrap();
         assert_eq!(
             v.get("schema_version").expect("missing schema_version"),
-            SCHEMA_VERSION
+            STATUS_SCHEMA_VERSION
         );
         assert_eq!(v.get("command").expect("missing command"), "cli.status");
         assert!(v.get("ok").expect("missing ok").as_bool().unwrap());
+    }
+
+    #[test]
+    fn status_response_nests_jobs_under_data() {
+        let mut data = JobsData::empty();
+        data.jobs.push(sample_job());
+        let v: serde_json::Value = serde_json::from_str(
+            &serde_json::to_string(&status_response("cli.status", data)).unwrap(),
+        )
+        .unwrap();
         assert!(
             v.get("error").expect("missing error").is_null(),
             "error must be explicitly null, not absent"
         );
-        // Verify jobs live under data, not at top level.
         assert!(v.get("jobs").is_none(), "jobs must not be at top level");
+        assert_eq!(
+            v.get("data")
+                .expect("missing data")
+                .get("source")
+                .expect("missing source"),
+            "lease_store"
+        );
+    }
+
+    #[test]
+    fn status_response_includes_jobs_and_agents_arrays() {
+        let mut data = JobsData::empty();
+        data.jobs.push(sample_job());
+        let v: serde_json::Value = serde_json::from_str(
+            &serde_json::to_string(&status_response("cli.status", data)).unwrap(),
+        )
+        .unwrap();
         let data = v.get("data").expect("missing data");
-        let jobs = data
-            .get("jobs")
-            .expect("missing data.jobs")
-            .as_array()
-            .expect("data.jobs must be an array");
-        assert_eq!(jobs.len(), 1);
+        assert_eq!(
+            data.get("jobs")
+                .expect("missing data.jobs")
+                .as_array()
+                .expect("data.jobs must be an array")
+                .len(),
+            1
+        );
+        assert!(
+            data.get("agents")
+                .expect("missing data.agents")
+                .as_array()
+                .expect("data.agents must be an array")
+                .is_empty()
+        );
     }
 
     #[test]
     fn empty_response_has_zero_jobs() {
-        let response = status_response("cli.jobs", Vec::new());
+        let response = status_response("cli.jobs", JobsData::empty());
         assert!(response.data.jobs.is_empty());
         assert!(response.ok);
+        assert_eq!(response.data.source, "lease_store");
     }
 
     #[test]
     fn status_error_sets_ok_false_and_error_payload() {
-        let response = status_error("cli.status", "parse failed".to_owned());
-        let json = serde_json::to_string(&response).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-
+        let v: serde_json::Value = serde_json::from_str(
+            &serde_json::to_string(&status_error("cli.status", "parse failed".to_owned())).unwrap(),
+        )
+        .unwrap();
         assert_eq!(v.get("ok").expect("missing ok"), false);
         assert_eq!(v.get("command").expect("missing command"), "cli.status");
         let err = v.get("error").expect("missing error");
         assert_eq!(err.get("code").expect("missing code"), "STATE_LOAD_FAILED");
-        assert_eq!(err.get("message").expect("missing message"), "parse failed");
-        let jobs = v
-            .get("data")
-            .expect("missing data")
-            .get("jobs")
-            .expect("missing data.jobs")
-            .as_array()
-            .expect("data.jobs must be array");
-        assert!(jobs.is_empty());
     }
 
     #[test]
-    fn roundtrip_through_json() {
-        let response = status_response("cli.status", vec![sample_job()]);
-        let json = serde_json::to_string(&response).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(v.get("command").expect("missing command"), "cli.status");
-        let data = v.get("data").expect("missing data");
-        let jobs = data
-            .get("jobs")
-            .expect("missing data.jobs")
-            .as_array()
-            .expect("data.jobs must be an array");
-        assert_eq!(jobs.len(), 1);
-        assert_eq!(jobs[0].get("job_id").expect("missing job_id"), "writ-100");
+    fn status_error_keeps_empty_jobs() {
+        let v: serde_json::Value = serde_json::from_str(
+            &serde_json::to_string(&status_error("cli.status", "parse failed".to_owned())).unwrap(),
+        )
+        .unwrap();
         assert_eq!(
-            jobs[0].get("branch").expect("missing branch"),
-            "feature/status-json-cli"
+            v.get("error")
+                .expect("missing error")
+                .get("message")
+                .expect("missing message"),
+            "parse failed"
+        );
+        assert!(
+            v.get("data")
+                .expect("missing data")
+                .get("jobs")
+                .expect("missing data.jobs")
+                .as_array()
+                .expect("data.jobs must be array")
+                .is_empty()
         );
     }
 
@@ -344,7 +701,6 @@ mod tests {
         assert_eq!(v.get("fix_count").unwrap(), 0);
         assert!(v.get("sha").is_none());
         assert!(v.get("commit").is_none());
-        assert!(v.get("head").is_none());
         assert!(
             !TimeoutClass::Idle.counts_toward_fix_cap(),
             "timeout residual must not be treated as a fix"
@@ -360,10 +716,82 @@ mod tests {
             (ProcessState::Failed, "\"failed\""),
             (ProcessState::Cancelled, "\"cancelled\""),
             (ProcessState::TimedOut, "\"timed_out\""),
+            (ProcessState::Unknown, "\"unknown\""),
         ];
         for (state, expected) in cases {
             assert_eq!(serde_json::to_string(&state).unwrap(), expected);
         }
+    }
+
+    fn assert_mode_maps(mode: LeaseMode, state: CollaborationState, json: &str) {
+        assert_eq!(collaboration_state_from_mode(mode), state);
+        assert_eq!(
+            serde_json::to_string(&state).unwrap(),
+            format!("\"{json}\"")
+        );
+        assert_ne!(state, CollaborationState::Unknown);
+    }
+
+    #[test]
+    fn collaboration_state_maps_active_and_waiting_modes() {
+        assert_mode_maps(
+            LeaseMode::WriterLocked,
+            CollaborationState::Running,
+            "running",
+        );
+        assert_mode_maps(
+            LeaseMode::NeedsHuman,
+            CollaborationState::Waiting,
+            "waiting",
+        );
+        assert_mode_maps(LeaseMode::ReviewOnly, CollaborationState::Paused, "paused");
+    }
+
+    #[test]
+    fn collaboration_state_maps_blocked_and_ready_without_github_completion() {
+        assert_mode_maps(
+            LeaseMode::Blocked,
+            CollaborationState::Conflicted,
+            "conflicted",
+        );
+        assert_mode_maps(
+            LeaseMode::MergeReady,
+            CollaborationState::ReadyForIntegration,
+            "ready_for_integration",
+        );
+        assert_ne!(
+            collaboration_state_from_mode(LeaseMode::MergeReady).to_string(),
+            "completed"
+        );
+    }
+
+    #[test]
+    fn unassigned_is_not_completed() {
+        assert_mode_maps(
+            LeaseMode::Unassigned,
+            CollaborationState::Unassigned,
+            "unassigned",
+        );
+        assert_ne!(
+            collaboration_state_from_mode(LeaseMode::Unassigned).to_string(),
+            "completed"
+        );
+    }
+
+    #[test]
+    fn unknown_mode_is_not_reported_as_unassigned() {
+        assert_eq!(
+            collaboration_state_from_mode(LeaseMode::Unknown),
+            CollaborationState::Unknown
+        );
+        assert_eq!(
+            serde_json::to_string(&CollaborationState::Unknown).unwrap(),
+            "\"unknown\""
+        );
+        assert_ne!(
+            collaboration_state_from_mode(LeaseMode::Unknown).to_string(),
+            "unassigned"
+        );
     }
 
     #[test]
@@ -377,5 +805,197 @@ mod tests {
         for (class, expected) in cases {
             assert_eq!(serde_json::to_string(&class).unwrap(), expected);
         }
+    }
+
+    fn seeded_store() -> (tempfile::TempDir, LeaseStore) {
+        let tmp = tempdir().unwrap();
+        let store = LeaseStore::open(tmp.path().join("leases.db")).unwrap();
+        let repo = tmp.path().join("repo");
+        let wt_a = tmp.path().join("checkouts/a");
+        let wt_b = tmp.path().join("checkouts/b");
+        store.grant(grant(&repo, &wt_a, "job-a", "hive/a")).unwrap();
+        store.grant(grant(&repo, &wt_b, "job-b", "hive/b")).unwrap();
+        store
+            .upsert_agent(AgentIdentity {
+                agent_id: "agent-a",
+                agent_type: "Worker",
+                session_id: Some("session-a"),
+            })
+            .unwrap();
+        store
+            .upsert_agent(AgentIdentity {
+                agent_id: "agent-b",
+                agent_type: "Worker",
+                session_id: Some("session-b"),
+            })
+            .unwrap();
+        (tmp, store)
+    }
+
+    #[test]
+    fn two_leases_render_as_distinct_participants() {
+        let (_tmp, store) = seeded_store();
+        let data = load_from_store(&store).unwrap();
+        assert_eq!(data.jobs.len(), 2);
+        assert_eq!(data.jobs[0].job_id, "job-a");
+        assert_eq!(data.jobs[1].job_id, "job-b");
+    }
+
+    #[test]
+    fn lease_backed_job_does_not_invent_process_or_ci() {
+        let (_tmp, store) = seeded_store();
+        let job = &load_from_store(&store).unwrap().jobs[0];
+        assert_eq!(job.collaboration_state, CollaborationState::Running);
+        assert_eq!(job.process_state, ProcessState::Unknown);
+        assert_eq!(job.ci_class, CiClass::Unknown);
+    }
+
+    #[test]
+    fn missing_checkout_uses_lease_head_and_marks_recovery() {
+        let (_tmp, store) = seeded_store();
+        let job = &load_from_store(&store).unwrap().jobs[0];
+        assert_eq!(job.head.as_deref(), Some("abc123"));
+        assert_eq!(job.head_source.as_deref(), Some("lease"));
+        assert_eq!(job.recovery_needed, Some(true));
+    }
+
+    #[test]
+    fn human_status_lists_both_agents() {
+        let (_tmp, store) = seeded_store();
+        let human = format_human(&load_from_store(&store).unwrap());
+        assert!(human.contains("job-a") && human.contains("job-b"));
+        assert!(human.contains("agent-a") && human.contains("agent-b"));
+        assert!(!human.contains("completed"));
+    }
+
+    #[test]
+    fn released_lease_is_unassigned_not_completed() {
+        let tmp = tempdir().unwrap();
+        let store = LeaseStore::open(tmp.path().join("leases.db")).unwrap();
+        let repo = tmp.path().join("repo");
+        let wt = tmp.path().join("checkouts/a");
+        store.grant(grant(&repo, &wt, "job-a", "hive/a")).unwrap();
+        store.release_by_path(&wt).unwrap();
+        let job = &load_from_store(&store).unwrap().jobs[0];
+        assert_eq!(job.collaboration_state, CollaborationState::Unassigned);
+        assert_eq!(job.lease_mode.as_deref(), Some("UNASSIGNED"));
+        assert_ne!(job.collaboration_state.to_string(), "completed");
+    }
+
+    #[test]
+    fn human_empty_snapshot_is_not_a_watchlist_message() {
+        let text = format_human(&JobsData::empty());
+        assert_eq!(text, "No collaboration participants.\n");
+        assert!(!text.contains("watched"));
+    }
+
+    #[test]
+    fn missing_lease_store_is_empty_without_creating_a_file() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("missing").join("leases.db");
+        let data = load_from_path(&path).unwrap();
+        assert!(data.jobs.is_empty());
+        assert!(data.agents.is_empty());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn load_from_path_reads_existing_store_without_write() {
+        let (_tmp, store) = seeded_store();
+        let data = load_from_path(store.path()).unwrap();
+        assert_eq!(data.jobs.len(), 2);
+        assert_eq!(data.agents.len(), 2);
+    }
+
+    #[test]
+    fn directory_lease_store_path_is_an_error_not_empty() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path().join("leases.db");
+        std::fs::create_dir(&dir).unwrap();
+        let err = load_from_path(&dir).unwrap_err();
+        assert!(err.contains("not a regular file"), "{err}");
+    }
+
+    #[test]
+    fn corrupt_lease_store_is_an_error_not_empty() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("leases.db");
+        std::fs::write(&path, b"not a sqlite database").unwrap();
+        assert!(load_from_path(&path).is_err());
+    }
+
+    #[test]
+    fn unrecognized_stored_mode_survives_verbatim_in_lease_mode() {
+        let (tmp, store) = seeded_store();
+        let conn = rusqlite::Connection::open(tmp.path().join("leases.db")).unwrap();
+        conn.execute("UPDATE leases SET mode = 'SUSPENDED'", [])
+            .unwrap();
+        let job = &load_from_store(&store).unwrap().jobs[0];
+        assert_eq!(job.lease_mode.as_deref(), Some("SUSPENDED"));
+        assert_eq!(job.collaboration_state, CollaborationState::Unknown);
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    fn init_checkout(dir: &Path, branch: &str) -> String {
+        std::fs::create_dir_all(dir).unwrap();
+        git(dir, &["init", "--quiet", "-b", branch]);
+        git(dir, &["config", "user.email", "test@example.com"]);
+        git(dir, &["config", "user.name", "test"]);
+        std::fs::write(dir.join("file.txt"), "base\n").unwrap();
+        git(dir, &["add", "file.txt"]);
+        git(dir, &["commit", "--quiet", "-m", "base"]);
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    }
+
+    #[test]
+    fn live_checkout_matching_lease_reports_checkout_head() {
+        let tmp = tempdir().unwrap();
+        let db = tmp.path().join("leases.db");
+        let wt = tmp.path().join("wt-live");
+        let head = init_checkout(&wt, "hive/a");
+        CheckoutRegistry::with_store(LeaseStore::open(&db).unwrap())
+            .unwrap()
+            .register(&wt, "job-a")
+            .unwrap();
+        let job = &load_from_store(&LeaseStore::open(&db).unwrap())
+            .unwrap()
+            .jobs[0];
+        assert_eq!(job.head.as_deref(), Some(head.as_str()));
+        assert_eq!(job.head_source.as_deref(), Some("checkout"));
+        assert_eq!(job.recovery_needed, Some(false));
+    }
+
+    #[test]
+    fn branch_switched_checkout_falls_back_to_lease_head() {
+        let tmp = tempdir().unwrap();
+        let db = tmp.path().join("leases.db");
+        let wt = tmp.path().join("wt-moved");
+        let head = init_checkout(&wt, "hive/a");
+        CheckoutRegistry::with_store(LeaseStore::open(&db).unwrap())
+            .unwrap()
+            .register(&wt, "job-a")
+            .unwrap();
+        git(&wt, &["checkout", "--quiet", "-b", "other"]);
+        let job = &load_from_store(&LeaseStore::open(&db).unwrap())
+            .unwrap()
+            .jobs[0];
+        assert_eq!(job.head.as_deref(), Some(head.as_str()));
+        assert_eq!(job.head_source.as_deref(), Some("lease"));
+        assert_eq!(job.recovery_needed, Some(true));
     }
 }

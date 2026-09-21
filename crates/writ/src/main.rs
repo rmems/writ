@@ -26,9 +26,9 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Show status of all watched jobs.
+    /// Show collaboration status from the shared lease store.
     Status,
-    /// List all watched jobs (alias for status).
+    /// List collaboration participants (alias for status).
     Jobs,
     /// Validate and run a git command under safety policy.
     GitSafe {
@@ -890,16 +890,11 @@ async fn run(cli: Cli, stdout: &mut impl Write) -> writ_core::error::Result<Exit
         writ_core::owners::OwnerAllowlist::from_cli_or_env(cli.allowed_owners.as_deref());
     match cli.command {
         Some(Command::Status) => {
-            run_status(
-                cli.json,
-                "cli.status",
-                writ_core::state::load_jobs(),
-                stdout,
-            )?;
+            run_status(cli.json, "cli.status", writ_core::status::load(), stdout)?;
             Ok(ExitCode::SUCCESS)
         }
         Some(Command::Jobs) => {
-            run_status(cli.json, "cli.jobs", writ_core::state::load_jobs(), stdout)?;
+            run_status(cli.json, "cli.jobs", writ_core::status::load(), stdout)?;
             Ok(ExitCode::SUCCESS)
         }
         Some(Command::GitSafe {
@@ -1076,15 +1071,15 @@ fn supervised_exit_code(output: &writ_core::supervisor::SupervisedOutput) -> Exi
     }
 }
 
-/// Render status/jobs from a preloaded `load_jobs` result (testable without env mutation).
+/// Render status/jobs from a preloaded snapshot (testable without env mutation).
 fn run_status(
     json: bool,
     command_name: &'static str,
-    jobs_result: Result<Vec<writ_core::status::JobStatus>, String>,
+    jobs_result: Result<writ_core::status::JobsData, String>,
     stdout: &mut impl Write,
 ) -> io::Result<()> {
     match jobs_result {
-        Ok(jobs) => run_with_jobs(json, command_name, jobs, stdout),
+        Ok(data) => run_with_jobs(json, command_name, data, stdout),
         Err(e) => {
             if json {
                 // JSON path: write ok:false envelope, then exit non-zero.
@@ -1103,23 +1098,15 @@ fn run_status(
 fn run_with_jobs(
     json: bool,
     command_name: &'static str,
-    jobs: Vec<writ_core::status::JobStatus>,
+    data: writ_core::status::JobsData,
     stdout: &mut impl Write,
 ) -> io::Result<()> {
     if json {
-        let response = writ_core::status::status_response(command_name, jobs);
+        let response = writ_core::status::status_response(command_name, data);
         serde_json::to_writer(&mut *stdout, &response).map_err(io::Error::other)?;
         stdout.write_all(b"\n")?;
-    } else if jobs.is_empty() {
-        stdout.write_all(b"No watched jobs.\n")?;
     } else {
-        for job in &jobs {
-            writeln!(
-                stdout,
-                "{} [{}] {}/{} branch={} ci={}",
-                job.job_id, job.process_state, job.owner, job.repo, job.branch, job.ci_class
-            )?;
-        }
+        stdout.write_all(writ_core::status::format_human(&data).as_bytes())?;
     }
     Ok(())
 }
@@ -1208,7 +1195,7 @@ mod tests {
     use std::str;
 
     use clap::{CommandFactory, Parser};
-    use writ_core::status::{JobIdentity, JobStatus};
+    use writ_core::status::{CiClass, CollaborationState, JobStatus, JobsData, ProcessState};
 
     use super::{
         Cli, json_error_command, run, run_status, run_with_jobs, supervised_exit_code,
@@ -1216,15 +1203,25 @@ mod tests {
     };
 
     fn sample_job() -> JobStatus {
-        let mut job = JobStatus::new(JobIdentity {
+        JobStatus {
             job_id: "writ-1".to_owned(),
             owner: "acme".to_owned(),
             repo: "example-org".to_owned(),
+            issue_number: Some(29),
+            pr_number: None,
             worktree_path: "/tmp/wt/writ-1".to_owned(),
             branch: "feature/foo".to_owned(),
-        });
-        job.issue_number = Some(29);
-        job
+            process_state: ProcessState::Unknown,
+            last_error: None,
+            ci_class: CiClass::Unknown,
+            collaboration_state: CollaborationState::Running,
+            lease_mode: Some("WRITER_LOCKED".to_owned()),
+            head: Some("abc123".to_owned()),
+            head_source: Some("lease".to_owned()),
+            lease_row_id: Some(1),
+            updated_at: Some(1),
+            ..JobStatus::default()
+        }
     }
 
     /// Timeout knobs with every second-valued budget disabled, matching the
@@ -1239,6 +1236,29 @@ mod tests {
             progress_secs: 0,
             max_redispatch: 1,
         }
+    }
+
+    fn sample_data() -> JobsData {
+        JobsData {
+            source: "lease_store".to_owned(),
+            jobs: vec![sample_job()],
+            agents: Vec::new(),
+        }
+    }
+
+    /// Assert the shared success envelope shape and return `data` for further
+    /// per-command checks.
+    fn ok_envelope<'v>(v: &'v serde_json::Value, command: &str) -> &'v serde_json::Value {
+        assert_eq!(v.get("ok").and_then(serde_json::Value::as_bool), Some(true));
+        assert_eq!(
+            v.get("command").and_then(serde_json::Value::as_str),
+            Some(command)
+        );
+        assert!(
+            v.get("error").expect("missing error").is_null(),
+            "error must be explicitly null, not absent"
+        );
+        v.get("data").expect("missing data")
     }
 
     #[test]
@@ -1834,25 +1854,25 @@ mod tests {
     fn status_json_emits_v1_envelope_with_jobs_in_data() {
         let mut stdout = Vec::new();
 
-        run_with_jobs(true, "cli.status", vec![], &mut stdout).unwrap();
+        run_with_jobs(true, "cli.status", JobsData::empty(), &mut stdout).unwrap();
 
         let output = str::from_utf8(&stdout).unwrap();
         let v: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
 
-        assert_eq!(v.get("schema_version").expect("missing schema_version"), 1);
-        assert_eq!(v.get("command").expect("missing command"), "cli.status");
-        assert!(v.get("ok").expect("missing ok").as_bool().unwrap());
-        assert!(
-            v.get("error").expect("missing error").is_null(),
-            "error must be explicitly null, not absent"
+        let data = ok_envelope(&v, "cli.status");
+        assert_eq!(
+            (
+                v.get("schema_version").expect("missing schema_version"),
+                data.get("source").expect("missing source")
+            ),
+            (&serde_json::json!(2), &serde_json::json!("lease_store"))
         );
-        let data = v.get("data").expect("missing data");
-        let jobs = data
-            .get("jobs")
-            .expect("missing data.jobs")
-            .as_array()
-            .expect("data.jobs must be an array");
-        assert!(jobs.is_empty());
+        assert_eq!(
+            data.get("jobs")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(0)
+        );
         assert!(v.get("jobs").is_none(), "jobs must be nested under data");
     }
 
@@ -1860,22 +1880,30 @@ mod tests {
     fn status_json_includes_injected_jobs() {
         let mut stdout = Vec::new();
 
-        run_with_jobs(true, "cli.status", vec![sample_job()], &mut stdout).unwrap();
+        run_with_jobs(true, "cli.status", sample_data(), &mut stdout).unwrap();
 
         let output = str::from_utf8(&stdout).unwrap();
         let v: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
 
-        let data = v.get("data").expect("missing data");
+        let data = ok_envelope(&v, "cli.status");
         let jobs = data
             .get("jobs")
-            .expect("missing data.jobs")
-            .as_array()
+            .and_then(serde_json::Value::as_array)
             .expect("data.jobs must be an array");
         assert_eq!(jobs.len(), 1);
-        assert_eq!(jobs[0].get("job_id").expect("missing job_id"), "writ-1");
         assert_eq!(
-            jobs[0].get("process_state").expect("missing process_state"),
-            "running"
+            (
+                jobs[0].get("job_id").expect("missing job_id"),
+                jobs[0]
+                    .get("collaboration_state")
+                    .expect("missing collaboration_state"),
+                jobs[0].get("process_state").expect("missing process_state")
+            ),
+            (
+                &serde_json::json!("writ-1"),
+                &serde_json::json!("running"),
+                &serde_json::json!("unknown")
+            )
         );
     }
 
@@ -1883,25 +1911,19 @@ mod tests {
     fn jobs_json_emits_v1_envelope_with_jobs_in_data() {
         let mut stdout = Vec::new();
 
-        run_with_jobs(true, "cli.jobs", vec![], &mut stdout).unwrap();
+        run_with_jobs(true, "cli.jobs", JobsData::empty(), &mut stdout).unwrap();
 
         let output = str::from_utf8(&stdout).unwrap();
         let v: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
 
-        assert_eq!(v.get("schema_version").expect("missing schema_version"), 1);
-        assert_eq!(v.get("command").expect("missing command"), "cli.jobs");
-        assert!(v.get("ok").expect("missing ok").as_bool().unwrap());
-        assert!(
-            v.get("error").expect("missing error").is_null(),
-            "error must be explicitly null, not absent"
+        let data = ok_envelope(&v, "cli.jobs");
+        assert_eq!(v.get("schema_version").expect("missing schema_version"), 2);
+        assert_eq!(
+            data.get("jobs")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(0)
         );
-        let data = v.get("data").expect("missing data");
-        let jobs = data
-            .get("jobs")
-            .expect("missing data.jobs")
-            .as_array()
-            .expect("data.jobs must be an array");
-        assert!(jobs.is_empty());
         assert!(v.get("jobs").is_none(), "jobs must be nested under data");
     }
 
@@ -1909,25 +1931,31 @@ mod tests {
     fn status_without_json_prints_human_readable() {
         let mut stdout = Vec::new();
 
-        run_with_jobs(false, "cli.status", vec![], &mut stdout).unwrap();
+        run_with_jobs(false, "cli.status", JobsData::empty(), &mut stdout).unwrap();
 
-        assert_eq!(str::from_utf8(&stdout).unwrap(), "No watched jobs.\n");
+        assert_eq!(
+            str::from_utf8(&stdout).unwrap(),
+            "No collaboration participants.\n"
+        );
     }
 
     #[test]
     fn jobs_without_json_prints_human_readable() {
         let mut stdout = Vec::new();
 
-        run_with_jobs(false, "cli.jobs", vec![], &mut stdout).unwrap();
+        run_with_jobs(false, "cli.jobs", JobsData::empty(), &mut stdout).unwrap();
 
-        assert_eq!(str::from_utf8(&stdout).unwrap(), "No watched jobs.\n");
+        assert_eq!(
+            str::from_utf8(&stdout).unwrap(),
+            "No collaboration participants.\n"
+        );
     }
 
     #[test]
     fn status_without_json_lists_jobs_when_present() {
         let mut stdout = Vec::new();
 
-        run_with_jobs(false, "cli.status", vec![sample_job()], &mut stdout).unwrap();
+        run_with_jobs(false, "cli.status", sample_data(), &mut stdout).unwrap();
 
         let output = str::from_utf8(&stdout).unwrap();
         assert!(output.contains("writ-1"));
@@ -1941,30 +1969,29 @@ mod tests {
         let err = run_status(
             true,
             "cli.status",
-            Err("failed to parse watched.json: expected value".to_owned()),
+            Err("failed to open lease store".to_owned()),
             &mut stdout,
         )
         .unwrap_err();
-        assert!(err.to_string().contains("failed to parse"));
+        assert!(err.to_string().contains("failed to open lease store"));
 
         let output = str::from_utf8(&stdout).unwrap();
         let v: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
-        assert_eq!(v.get("ok").expect("missing ok"), false);
         assert_eq!(
-            v.get("error")
-                .expect("missing error")
-                .get("code")
-                .expect("missing code"),
-            "STATE_LOAD_FAILED"
+            (
+                v.get("ok").expect("missing ok"),
+                v.pointer("/error/code").expect("missing error.code")
+            ),
+            (
+                &serde_json::json!(false),
+                &serde_json::json!("STATE_LOAD_FAILED")
+            )
         );
-        assert!(
-            v.get("data")
-                .expect("missing data")
-                .get("jobs")
-                .expect("missing jobs")
-                .as_array()
-                .expect("jobs array")
-                .is_empty()
+        assert_eq!(
+            v.pointer("/data/jobs")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(0)
         );
     }
 
@@ -1974,14 +2001,16 @@ mod tests {
         let err = run_status(
             false,
             "cli.status",
-            Err("failed to read watched.json: permission denied".to_owned()),
+            Err("failed to query leases: permission denied".to_owned()),
             &mut stdout,
         )
         .unwrap_err();
         assert!(err.to_string().contains("permission denied"));
         // Must not look like a healthy empty watch list.
         assert!(
-            !str::from_utf8(&stdout).unwrap().contains("No watched jobs"),
+            !str::from_utf8(&stdout)
+                .unwrap()
+                .contains("No collaboration participants"),
             "human load error must not print healthy empty summary"
         );
         assert!(
