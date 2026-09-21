@@ -887,4 +887,106 @@ mod tests {
         assert_eq!(data.jobs.len(), 2);
         assert_eq!(data.agents.len(), 2);
     }
+
+    #[test]
+    fn directory_lease_store_path_is_an_error_not_empty() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path().join("leases.db");
+        std::fs::create_dir(&dir).unwrap();
+        let err = load_from_path(&dir).unwrap_err();
+        assert!(err.contains("not a regular file"), "{err}");
+    }
+
+    #[test]
+    fn corrupt_lease_store_is_an_error_not_empty() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("leases.db");
+        std::fs::write(&path, b"not a sqlite database").unwrap();
+        assert!(load_from_path(&path).is_err());
+    }
+
+    #[test]
+    fn unrecognized_stored_mode_survives_verbatim_in_lease_mode() {
+        let (tmp, store) = seeded_store();
+        let conn = rusqlite::Connection::open(tmp.path().join("leases.db")).unwrap();
+        conn.execute("UPDATE leases SET mode = 'SUSPENDED'", [])
+            .unwrap();
+        let job = &load_from_store(&store).unwrap().jobs[0];
+        assert_eq!(job.lease_mode.as_deref(), Some("SUSPENDED"));
+        assert_eq!(job.collaboration_state, CollaborationState::Unknown);
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    fn init_checkout(dir: &Path, branch: &str) -> String {
+        std::fs::create_dir_all(dir).unwrap();
+        git(dir, &["init", "--quiet", "-b", branch]);
+        git(dir, &["config", "user.email", "test@example.com"]);
+        git(dir, &["config", "user.name", "test"]);
+        std::fs::write(dir.join("file.txt"), "base\n").unwrap();
+        git(dir, &["add", "file.txt"]);
+        git(dir, &["commit", "--quiet", "-m", "base"]);
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    }
+
+    #[test]
+    fn live_checkout_matching_lease_reports_checkout_head() {
+        let tmp = tempdir().unwrap();
+        let store = LeaseStore::open(tmp.path().join("leases.db")).unwrap();
+        let wt = tmp.path().join("wt-live");
+        let head = init_checkout(&wt, "hive/a");
+        store
+            .grant(LeaseGrant {
+                repo: &wt,
+                owner: "local",
+                repo_name: "wt-live",
+                job_id: "job-a",
+                branch: "hive/a",
+                worktree_path: &wt,
+                start_commit: &head,
+            })
+            .unwrap();
+        let job = &load_from_store(&store).unwrap().jobs[0];
+        assert_eq!(job.head.as_deref(), Some(head.as_str()));
+        assert_eq!(job.head_source.as_deref(), Some("checkout"));
+        assert_eq!(job.recovery_needed, Some(false));
+    }
+
+    #[test]
+    fn branch_switched_checkout_falls_back_to_lease_head() {
+        let tmp = tempdir().unwrap();
+        let store = LeaseStore::open(tmp.path().join("leases.db")).unwrap();
+        let wt = tmp.path().join("wt-moved");
+        let head = init_checkout(&wt, "hive/a");
+        store
+            .grant(LeaseGrant {
+                repo: &wt,
+                owner: "local",
+                repo_name: "wt-moved",
+                job_id: "job-a",
+                branch: "hive/a",
+                worktree_path: &wt,
+                start_commit: &head,
+            })
+            .unwrap();
+        git(&wt, &["checkout", "--quiet", "-b", "other"]);
+        let job = &load_from_store(&store).unwrap().jobs[0];
+        assert_eq!(job.head.as_deref(), Some(head.as_str()));
+        assert_eq!(job.head_source.as_deref(), Some("lease"));
+        assert_eq!(job.recovery_needed, Some(true));
+    }
 }
