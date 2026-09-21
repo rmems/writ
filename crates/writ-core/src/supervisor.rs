@@ -48,8 +48,96 @@ use crate::timeout_policy::{
     ProgressCallback, ProgressSnapshot, RecoveryStage, SupervisorStep, TimeoutClass, TimeoutPolicy,
     TimeoutResidual,
 };
-pub use cmd::{check_command_policy, normalize_program_name};
-use cmd::{prepare_supervised_command, verify_repo_branch};
+pub use cmd::check_command_policy;
+use cmd::{CommandRequest, prepare_supervised_command, verify_repo_branch};
+
+/// Normalize an executable path to a basename without platform extensions.
+#[must_use]
+pub fn normalize_program_name(program: &str) -> String {
+    // Accept both Unix and Windows separators even when running on Linux (tests / cross config).
+    let base = program
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(program);
+    let lower = base.to_ascii_lowercase();
+    lower
+        .strip_suffix(".exe")
+        .or_else(|| lower.strip_suffix(".cmd"))
+        .or_else(|| lower.strip_suffix(".bat"))
+        .unwrap_or(&lower)
+        .to_owned()
+}
+
+const FORBIDDEN_WRAPPERS: &[&str] = &[
+    "bash",
+    "bun",
+    "chroot",
+    "cmd",
+    "curl",
+    "dash",
+    "deno",
+    "doas",
+    "env",
+    "fish",
+    "http",
+    "httpie",
+    "ipython",
+    "ipython3",
+    "lua",
+    "nc",
+    "ncat",
+    "netcat",
+    "nice",
+    "node",
+    "nodejs",
+    "nohup",
+    "nsenter",
+    "open",
+    "perl",
+    "php",
+    "powershell",
+    "pwsh",
+    "py",
+    "python",
+    "python2",
+    "python3",
+    "rscript",
+    "ruby",
+    "script",
+    "setsid",
+    "sh",
+    "socat",
+    "stdbuf",
+    "su",
+    "sudo",
+    "time",
+    "timeout",
+    "unshare",
+    "wget",
+    "xargs",
+    "xdg-open",
+    "zsh",
+];
+
+const VERSIONED_WRAPPER_PREFIXES: &[&str] = &[
+    "python", "python2", "python3", "perl", "ruby", "node", "nodejs", "php", "lua", "ipython",
+];
+
+pub(super) fn is_forbidden_wrapper(name: &str) -> bool {
+    FORBIDDEN_WRAPPERS.contains(&name) || versioned_wrapper_name(name)
+}
+
+fn versioned_wrapper_name(name: &str) -> bool {
+    VERSIONED_WRAPPER_PREFIXES.iter().any(|prefix| {
+        let Some(rest) = name.strip_prefix(prefix) else {
+            return false;
+        };
+        rest.is_empty()
+            || rest.starts_with('.')
+            || rest.chars().next().is_some_and(|c| c.is_ascii_digit())
+    })
+}
 
 /// How long to wait for the child to exit after a timeout kill.
 const POST_KILL_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -314,7 +402,11 @@ impl Supervisor {
         options: &RunOptions,
     ) -> Result<SupervisedOutput> {
         // Allowlist / structural validation only (no branch TOCTOU window before queue).
-        let prepared = prepare_supervised_command(program, args, options)?;
+        let prepared = prepare_supervised_command(&CommandRequest {
+            program,
+            args,
+            options,
+        })?;
         let started = Instant::now();
         let _permit = match acquire_run_permit(self, policy, options, started).await {
             Ok(permit) => permit,

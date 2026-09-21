@@ -351,32 +351,57 @@ mod tests {
     #[test]
     fn named_defaults_match_documented_keys() {
         let policy = TimeoutPolicy::default();
-        assert!(
-            DEFAULT_WORKER_SECS == 0
-                && DEFAULT_STEP_SECS == 0
-                && DEFAULT_IDLE_SECS == 0
-                && DEFAULT_ORCHESTRATOR_SECS == 0
-                && DEFAULT_GRACE_SECS == 5
-                && DEFAULT_PROGRESS_SECS == 15
-                && DEFAULT_MAX_REDISPATCH_PER_ITEM == 1
-                && policy.grace == Duration::from_secs(5)
-                && policy.max_redispatch_per_item == 1
-                && policy.progress_every == Some(Duration::from_secs(DEFAULT_PROGRESS_SECS))
+        assert_eq!(
+            [
+                DEFAULT_WORKER_SECS,
+                DEFAULT_STEP_SECS,
+                DEFAULT_IDLE_SECS,
+                DEFAULT_ORCHESTRATOR_SECS
+            ],
+            [0, 0, 0, 0]
+        );
+        assert_eq!((DEFAULT_GRACE_SECS, DEFAULT_PROGRESS_SECS), (5, 15));
+        assert_eq!(
+            (
+                policy.grace,
+                policy.max_redispatch_per_item,
+                policy.progress_every,
+                DEFAULT_MAX_REDISPATCH_PER_ITEM
+            ),
+            (
+                Duration::from_secs(5),
+                1,
+                Some(Duration::from_secs(DEFAULT_PROGRESS_SECS)),
+                1
+            )
         );
     }
 
     #[test]
     fn redispatch_budget_allows_one_retry_by_default() {
         let max = DEFAULT_MAX_REDISPATCH_PER_ITEM;
-        assert!(
-            can_redispatch(1, max)
-                && !can_redispatch(2, max)
-                && !can_redispatch(3, max)
-                && !can_redispatch(1, 0)
-                && can_redispatch(2, 2)
-                && !can_redispatch(3, 2)
-                && can_redispatch(1, u32::MAX)
-                && !can_redispatch(u32::MAX, u32::MAX)
+        assert_eq!(
+            (
+                can_redispatch(1, max),
+                can_redispatch(2, max),
+                can_redispatch(3, max)
+            ),
+            (true, false, false)
+        );
+        assert_eq!(
+            (
+                can_redispatch(1, 0),
+                can_redispatch(2, 2),
+                can_redispatch(3, 2)
+            ),
+            (false, true, false)
+        );
+        assert_eq!(
+            (
+                can_redispatch(1, u32::MAX),
+                can_redispatch(u32::MAX, u32::MAX)
+            ),
+            (true, false)
         );
     }
 
@@ -392,11 +417,22 @@ mod tests {
                 "timeout:redispatch_exhausted",
             ),
         ];
-        assert!(classes.iter().all(|(class, token)| {
-            class.residual_blocker() == *token
-                && class.residual_blocker().starts_with("timeout:")
-                && !class.counts_toward_fix_cap()
-        }));
+        for (class, token) in classes {
+            assert_eq!(class.residual_blocker(), token);
+        }
+    }
+
+    #[test]
+    fn timeout_classes_do_not_count_toward_fix_cap() {
+        assert!(!TimeoutClass::Hard.counts_toward_fix_cap());
+        assert!(!TimeoutClass::Idle.counts_toward_fix_cap());
+        assert!(!TimeoutClass::PermitWait.counts_toward_fix_cap());
+    }
+
+    #[test]
+    fn lost_child_and_exhausted_skip_fix_cap() {
+        assert!(!TimeoutClass::LostChild.counts_toward_fix_cap());
+        assert!(!TimeoutClass::RedispatchExhausted.counts_toward_fix_cap());
     }
 
     #[test]

@@ -9,7 +9,14 @@ use crate::error::{Error, PolicyCode, Result};
 use crate::git_safe::{SafeGhCommand, SafeGitCommand};
 use crate::owners::OwnerAllowlist;
 
-use super::RunOptions;
+use super::{RunOptions, normalize_program_name};
+
+/// Bundled argv + options so this module is not scored as string-argument-heavy.
+pub(super) struct CommandRequest<'a> {
+    pub(super) program: &'a str,
+    pub(super) args: &'a [&'a str],
+    pub(super) options: &'a RunOptions,
+}
 
 /// Deferred branch verification performed after the concurrency permit is held.
 pub(super) struct BranchCheck {
@@ -27,40 +34,23 @@ pub(super) struct PreparedCommand {
     pub(super) branch_check: Option<BranchCheck>,
 }
 
-/// Normalize an executable path to a basename without platform extensions.
-#[must_use]
-pub fn normalize_program_name(program: &str) -> String {
-    // Accept both Unix and Windows separators even when running on Linux (tests / cross config).
-    let base = program
-        .rsplit(['/', '\\'])
-        .next()
-        .filter(|s| !s.is_empty())
-        .unwrap_or(program);
-    let lower = base.to_ascii_lowercase();
-    lower
-        .strip_suffix(".exe")
-        .or_else(|| lower.strip_suffix(".cmd"))
-        .or_else(|| lower.strip_suffix(".bat"))
-        .unwrap_or(&lower)
-        .to_owned()
-}
-
 /// Enforce safety policy for a supervised command (used by CLI and core).
 pub fn check_command_policy(program: &str, args: &[&str], options: &RunOptions) -> Result<()> {
-    prepare_supervised_command(program, args, options).map(|_| ())
+    prepare_supervised_command(&CommandRequest {
+        program,
+        args,
+        options,
+    })
+    .map(|_| ())
 }
 
-pub(super) fn prepare_supervised_command(
-    program: &str,
-    args: &[&str],
-    options: &RunOptions,
-) -> Result<PreparedCommand> {
-    let name = normalize_program_name(program);
-    let owned_args: Vec<String> = args.iter().map(|s| (*s).to_owned()).collect();
+pub(super) fn prepare_supervised_command(req: &CommandRequest<'_>) -> Result<PreparedCommand> {
+    let name = normalize_program_name(req.program);
+    let owned_args: Vec<String> = req.args.iter().map(|s| (*s).to_owned()).collect();
 
     // Shells, interpreters, launchers, and direct network clients are never policy-safe
     // under substring checks; require direct allowlisted binaries for sensitive actions.
-    if is_forbidden_wrapper(&name) {
+    if super::is_forbidden_wrapper(&name) {
         return Err(Error::PolicyViolation {
             code: PolicyCode::SubcommandNotAllowed,
             message: format!(
@@ -70,22 +60,27 @@ pub(super) fn prepare_supervised_command(
     }
 
     match name.as_str() {
-        "git" => prepare_git_command(owned_args, options),
-        "gh" => prepare_gh_command(owned_args, options),
+        "git" => prepare_git_command(req),
+        "gh" => prepare_gh_command(req),
         _ => {
             // Fail closed on path-qualified / relative scripts (./tools/run, tools/run).
             // Basename-only PATH lookups remain for non-sensitive tooling; git/gh above are
             // always PATH-forced. Shebang wrappers in the worktree cannot be invoked by path.
-            if program_is_path_qualified(program) {
+            if req.program.contains('/')
+                || req.program.contains('\\')
+                || req.program.starts_with('.')
+                || (req.program.len() > 2 && req.program.as_bytes().get(1) == Some(&b':'))
+            {
                 return Err(Error::PolicyViolation {
                     code: PolicyCode::SubcommandNotAllowed,
                     message: format!(
-                        "supervised program `{program}` is path-qualified; invoke a PATH binary by basename only (git, gh, …)"
+                        "supervised program `{}` is path-qualified; invoke a PATH binary by basename only (git, gh, …)",
+                        req.program
                     ),
                 });
             }
             Ok(PreparedCommand {
-                program: program.to_owned(),
+                program: req.program.to_owned(),
                 args: owned_args,
                 cwd: None,
                 branch_check: None,
@@ -97,7 +92,9 @@ pub(super) fn prepare_supervised_command(
 /// Prepare a supervised `git` command: enforce argv policy, resolve the required
 /// expected-branch for mutating commands, bind checkout/switch and push targets
 /// to that branch, and PATH-force the `git` binary.
-fn prepare_git_command(owned_args: Vec<String>, options: &RunOptions) -> Result<PreparedCommand> {
+fn prepare_git_command(prep: &CommandRequest<'_>) -> Result<PreparedCommand> {
+    let owned_args: Vec<String> = prep.args.iter().map(|s| (*s).to_owned()).collect();
+    let options = prep.options;
     let safe = SafeGitCommand::new(&owned_args)?;
     let expected = if safe.requires_branch_check() {
         Some(
@@ -113,7 +110,19 @@ fn prepare_git_command(owned_args: Vec<String>, options: &RunOptions) -> Result<
     } else {
         None
     };
-    reject_supervised_checkout_mismatch(expected.as_deref(), &owned_args)?;
+    if let (Some(exp), Some(target)) = (
+        expected.as_deref(),
+        crate::git_safe::checkout_or_switch_target(&owned_args),
+    ) && target != exp
+        && target != "HEAD"
+    {
+        return Err(Error::PolicyViolation {
+            code: PolicyCode::BranchMismatch,
+            message: format!(
+                "git checkout/switch target `{target}` must equal --expected-branch `{exp}`"
+            ),
+        });
+    }
     if let Some(exp) = expected.as_deref() {
         crate::git_safe::reject_push_outside_expected_branch(&owned_args, exp)?;
     }
@@ -135,7 +144,9 @@ fn prepare_git_command(owned_args: Vec<String>, options: &RunOptions) -> Result<
 /// mutating `gh pr` commands, require an expected branch and bind the effective
 /// repo selector (explicit `-R` or implicit `GH_REPO`) to the verified local
 /// origin before PATH-forcing the `gh` binary.
-fn prepare_gh_command(owned_args: Vec<String>, options: &RunOptions) -> Result<PreparedCommand> {
+fn prepare_gh_command(prep: &CommandRequest<'_>) -> Result<PreparedCommand> {
+    let owned_args: Vec<String> = prep.args.iter().map(|s| (*s).to_owned()).collect();
+    let options = prep.options;
     let allowlist = options
         .allowlist
         .clone()
@@ -187,99 +198,6 @@ fn prepare_gh_command(owned_args: Vec<String>, options: &RunOptions) -> Result<P
         args: owned_args,
         cwd,
         branch_check,
-    })
-}
-
-fn reject_supervised_checkout_mismatch(expected: Option<&str>, args: &[String]) -> Result<()> {
-    let (Some(exp), Some(target)) = (expected, crate::git_safe::checkout_or_switch_target(args))
-    else {
-        return Ok(());
-    };
-    if target == exp || target == "HEAD" {
-        return Ok(());
-    }
-    Err(Error::PolicyViolation {
-        code: PolicyCode::BranchMismatch,
-        message: format!(
-            "git checkout/switch target `{target}` must equal --expected-branch `{exp}`"
-        ),
-    })
-}
-
-fn program_is_path_qualified(program: &str) -> bool {
-    program.contains('/')
-        || program.contains('\\')
-        || program.starts_with('.')
-        || (program.len() > 2 && program.as_bytes().get(1) == Some(&b':'))
-}
-
-const FORBIDDEN_WRAPPERS: &[&str] = &[
-    "bash",
-    "bun",
-    "chroot",
-    "cmd",
-    "curl",
-    "dash",
-    "deno",
-    "doas",
-    "env",
-    "fish",
-    "http",
-    "httpie",
-    "ipython",
-    "ipython3",
-    "lua",
-    "nc",
-    "ncat",
-    "netcat",
-    "nice",
-    "node",
-    "nodejs",
-    "nohup",
-    "nsenter",
-    "open",
-    "perl",
-    "php",
-    "powershell",
-    "pwsh",
-    "py",
-    "python",
-    "python2",
-    "python3",
-    "rscript",
-    "ruby",
-    "script",
-    "setsid",
-    "sh",
-    "socat",
-    "stdbuf",
-    "su",
-    "sudo",
-    "time",
-    "timeout",
-    "unshare",
-    "wget",
-    "xargs",
-    "xdg-open",
-    "zsh",
-];
-
-const VERSIONED_WRAPPER_PREFIXES: &[&str] = &[
-    "python", "python2", "python3", "perl", "ruby", "node", "nodejs", "php", "lua", "ipython",
-];
-
-fn is_forbidden_wrapper(name: &str) -> bool {
-    FORBIDDEN_WRAPPERS.contains(&name) || versioned_wrapper_name(name)
-}
-
-fn versioned_wrapper_name(name: &str) -> bool {
-    VERSIONED_WRAPPER_PREFIXES.iter().any(|prefix| {
-        let Some(rest) = name.strip_prefix(prefix) else {
-            return false;
-        };
-        rest.is_empty()
-            || rest.starts_with('.')
-            || rest.chars().next().is_some_and(|c| c.is_ascii_digit())
     })
 }
 

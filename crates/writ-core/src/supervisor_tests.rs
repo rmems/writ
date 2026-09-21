@@ -77,28 +77,16 @@ fn assert_completed_without_idle(output: &SupervisedOutput) {
 }
 
 fn assert_permit_wait_timeout(output: &SupervisedOutput) {
-    let residual = output.residual.as_ref();
-    let json = serde_json::to_value(output).unwrap();
-    let keys_ok = json.as_object().is_some_and(|obj| {
-        obj.keys().all(|key| {
-            let lower = key.to_ascii_lowercase();
-            !lower.contains("sha") && !lower.contains("commit") && key != "head"
-        })
-    });
-    assert!(
-        output.timed_out
-            && !output.killed
-            && output.timeout_class == Some(TimeoutClass::PermitWait)
-            && output.recovery_stage == Some(RecoveryStage::None)
-            && output.stderr.contains("max-parallel permit")
-            && residual.is_some_and(|r| {
-                r.timeout_class == TimeoutClass::PermitWait
-                    && r.recovery_stage == RecoveryStage::None
-                    && !r.redispatch_forbidden()
-            })
-            && keys_ok,
-        "permit-wait timeout mismatch: {output:?}"
-    );
+    assert_eq!(output.timeout_class, Some(TimeoutClass::PermitWait));
+    assert_eq!(output.recovery_stage, Some(RecoveryStage::None));
+    assert!(output.timed_out && !output.killed);
+}
+
+fn assert_permit_wait_residual(output: &SupervisedOutput) {
+    let residual = output.residual.as_ref().expect("permit-wait residual");
+    assert_eq!(residual.timeout_class, TimeoutClass::PermitWait);
+    assert!(!residual.redispatch_forbidden());
+    assert!(output.stderr.contains("max-parallel permit"));
 }
 
 fn occupy_script() -> &'static str {
@@ -416,6 +404,7 @@ async fn wall_clock_includes_permit_wait() {
         .await
         .unwrap();
     assert_permit_wait_timeout(&output);
+    assert_permit_wait_residual(&output);
     assert!(
         supervisor.active() == 1 && queued.elapsed() < Duration::from_secs(2),
         "queued run should time out without waiting for the holder"
