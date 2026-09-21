@@ -83,6 +83,9 @@ Platforms set identity without forking these templates. Empty values fall back t
 | Key | Env | Type | Default | Purpose |
 | --- | --- | --- | --- | --- |
 | `agent_id` / `attribution` | `WRIT_AGENT_ID`, else `WRIT_ATTRIBUTION` | string | `worktrees-hives agent` | Identity line on replies |
+| `task_id` | `WRIT_TASK_ID`, else `--task` | string | omitted | Linear or issue id when one exists |
+| `branch` | `WRIT_BRANCH`, else `--branch` | string | omitted | Assigned branch when one exists |
+| `session_id` | `WRIT_SESSION_ID`, else `--session` | string | omitted | Agent session id when one exists |
 | `include_sha_on_fix` | `WRIT_INCLUDE_SHA_ON_FIX` | bool | `true` | Callers intend to attach a SHA after code fixes. Review-fix replies after a successful push still include that SHA. Coordination messages omit it. |
 | `attribution_placement` | `WRIT_ATTRIBUTION_PLACEMENT` | `footer` \| `header` | `footer` | Where the line goes |
 
@@ -127,17 +130,17 @@ No code change: the check already covers this path.
 worktrees-hives agent
 ```
 
-Peer coordination (intent, dependency, overlap/help, handoff) — omit `--commit-sha`; do not wait for a push:
+Peer coordination (intent, dependency, overlap/help, handoff, conflict) — include real task/branch/session identity; omit `--commit-sha`; do not wait for a push:
 
 ```bash
-writ attribution format --body "Overlap: I own SKILL.md Reply attribution templates; RM-145 owns the rest of SKILL.md. Next: collab-message docs without a fabricated SHA."
+writ attribution format --body "Overlap: I own SKILL.md Reply attribution templates; RM-145 owns the rest of SKILL.md." --task RM-128 --branch cursor/reply-attribution-config-6e46 --session bc-fa8ed877
 ```
 
 ```text
-Overlap: I own SKILL.md Reply attribution templates; RM-145 owns the rest of SKILL.md. Next: collab-message docs without a fabricated SHA.
+Overlap: I own SKILL.md Reply attribution templates; RM-145 owns the rest of SKILL.md.
 
 ---
-worktrees-hives agent
+worktrees-hives agent | task RM-128 | branch cursor/reply-attribution-config-6e46 | session bc-fa8ed877
 ```
 
 Optional PR-level summary comment (`--pr-comment` uses a blank line instead of `---`):
@@ -172,7 +175,7 @@ SAFETY RULES (non-negotiable):
 - Before editing, verify: worktree path, branch name, clean assigned state, and remote alignment; exact remote-base equality applies only to a newly created unpublished branch, while a published branch must match its expected upstream relationship
 - Repair a clean bootstrap source or unpublished verified-base alignment; abort on unsafe identity or path mismatch
 - After the first tested implementation and before publication, obtain one independent risk-matched review; add review only for a named high-risk boundary or an actual finding
-- Use `writ attribution format` for automated replies. Intent/dependency/overlap/help/handoff messages need identity and must not invent a SHA. After a successful push, review-fix replies include that real SHA.
+- Use `writ attribution format` for automated replies. Intent/dependency/overlap/help/handoff/conflict messages need real agent/task/branch/session identity and must not invent a SHA. After a successful push, review-fix replies include that real SHA.
 ```
 
 Worker prompts must not grant GitHub PR merge authority. Local assigned-branch integration is allowed.

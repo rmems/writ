@@ -75,7 +75,7 @@ cargo test --workspace
 
 ## Review replies
 
-Post a review-fix reply only after its commit is pushed. Include attribution on every automated thread reply, optional PR comment, and peer coordination message. After a code fix, include the pushed SHA; for intent/dependency/overlap/help/handoff messages and when no code changed, include attribution without inventing a SHA. Peers may talk before any push exists.
+Post a review-fix reply only after its commit is pushed. Include attribution on every automated thread reply, optional PR comment, and peer coordination message. Identify the real agent plus task, branch, and session when those exist. After a code fix, include the pushed SHA; for intent/dependency/overlap/help/handoff/conflict messages and when no code changed, include attribution without inventing a SHA. Peers may talk before any push exists.
 
 Render with `writ attribution format` so platforms set `agent_id` (`WRIT_AGENT_ID`) without forking reply logic. Canonical templates live in [`SKILL.md`](SKILL.md#reply-attribution). Thread reply after a successful push:
 

@@ -181,6 +181,15 @@ enum AttributionAction {
         /// `footer` (default) or `header`.
         #[arg(long)]
         placement: Option<String>,
+        /// Linear or issue id when one exists. Omit rather than inventing.
+        #[arg(long)]
+        task: Option<String>,
+        /// Assigned branch when one exists. Omit rather than inventing.
+        #[arg(long)]
+        branch: Option<String>,
+        /// Agent session id when one exists. Omit rather than inventing.
+        #[arg(long)]
+        session: Option<String>,
         /// Format as a PR-level comment instead of a review thread reply.
         #[arg(long)]
         pr_comment: bool,
@@ -623,6 +632,9 @@ fn run_attribution(
             agent_id,
             commit_sha,
             placement,
+            task,
+            branch,
+            session,
             pr_comment,
         } => {
             if body.trim().is_empty() {
@@ -638,6 +650,15 @@ fn run_attribution(
             }
             if let Some(placement) = placement {
                 config.placement = writ_core::attribution::AttributionPlacement::coerce(&placement);
+            }
+            if let Some(task) = task.as_deref() {
+                config.task_id = writ_core::attribution::canonicalize_label(task);
+            }
+            if let Some(branch) = branch.as_deref() {
+                config.branch = writ_core::attribution::canonicalize_label(branch);
+            }
+            if let Some(session) = session.as_deref() {
+                config.session_id = writ_core::attribution::canonicalize_label(session);
             }
             let raw_sha = commit_sha.as_deref();
             let commit_sha = match raw_sha.map(str::trim) {
@@ -659,6 +680,9 @@ fn run_attribution(
                     serde_json::json!({
                         "text": text,
                         "agent_id": config.agent_id,
+                        "task_id": config.task_id,
+                        "branch": config.branch,
+                        "session_id": config.session_id,
                         "include_sha_on_fix": config.include_sha_on_fix,
                         "placement": config.placement,
                         "commit_sha": commit_sha,
@@ -1101,6 +1125,12 @@ mod tests {
             "Claude Code: worktrees-hives agent",
             "--commit-sha",
             "abc1234",
+            "--task",
+            "RM-128",
+            "--branch",
+            "cursor/reply-attribution-config-6e46",
+            "--session",
+            "bc-fa8ed877",
         ])
         .unwrap();
         let Some(super::Command::Attribution {
@@ -1109,6 +1139,9 @@ mod tests {
                     body,
                     agent_id,
                     commit_sha,
+                    task,
+                    branch,
+                    session,
                     pr_comment: false,
                     ..
                 },
@@ -1122,6 +1155,12 @@ mod tests {
             Some("Claude Code: worktrees-hives agent")
         );
         assert_eq!(commit_sha.as_deref(), Some("abc1234"));
+        assert_eq!(task.as_deref(), Some("RM-128"));
+        assert_eq!(
+            branch.as_deref(),
+            Some("cursor/reply-attribution-config-6e46")
+        );
+        assert_eq!(session.as_deref(), Some("bc-fa8ed877"));
 
         let hyphenated = Cli::try_parse_from([
             "writ",
@@ -1168,6 +1207,9 @@ mod tests {
         agent_id: Option<&'static str>,
         commit_sha: Option<&'static str>,
         placement: Option<&'static str>,
+        task: Option<&'static str>,
+        branch: Option<&'static str>,
+        session: Option<&'static str>,
         pr_comment: bool,
     }
 
@@ -1181,6 +1223,9 @@ mod tests {
                     agent_id: case.agent_id.map(str::to_owned),
                     commit_sha: case.commit_sha.map(str::to_owned),
                     placement: case.placement.map(str::to_owned),
+                    task: case.task.map(str::to_owned),
+                    branch: case.branch.map(str::to_owned),
+                    session: case.session.map(str::to_owned),
                     pr_comment: case.pr_comment,
                 },
             }),
@@ -1227,6 +1272,9 @@ mod tests {
             agent_id: Some("worktrees-hives agent"),
             commit_sha: None,
             placement: None,
+            task: None,
+            branch: None,
+            session: None,
             pr_comment: false,
         })
         .await;
@@ -1245,6 +1293,9 @@ mod tests {
                 agent_id: Some("worktrees-hives agent"),
                 commit_sha: None,
                 placement: None,
+                task: Some("RM-128"),
+                branch: Some("cursor/reply-attribution-config-6e46"),
+                session: Some("bc-fa8ed877"),
                 pr_comment: false,
             })
             .await,
@@ -1254,13 +1305,20 @@ mod tests {
             format_data(&collab),
             (
                 Some(
-                    "Overlap: I own SKILL.md Reply attribution; RM-145 owns the rest.\n\n---\nworktrees-hives agent"
+                    "Overlap: I own SKILL.md Reply attribution; RM-145 owns the rest.\n\n---\nworktrees-hives agent | task RM-128 | branch cursor/reply-attribution-config-6e46 | session bc-fa8ed877"
                 ),
                 None,
                 Some(true),
                 true
             )
         );
+        assert_eq!(collab["data"]["task_id"], "RM-128");
+        assert_eq!(
+            collab["data"]["branch"],
+            "cursor/reply-attribution-config-6e46"
+        );
+        assert_eq!(collab["data"]["session_id"], "bc-fa8ed877");
+        assert!(collab["data"]["commit_sha"].is_null());
     }
 
     #[tokio::test]
@@ -1272,6 +1330,9 @@ mod tests {
                 agent_id: Some("worktrees-hives agent"),
                 commit_sha: Some("abc1234"),
                 placement: Some("footer"),
+                task: None,
+                branch: None,
+                session: None,
                 pr_comment: false,
             })
             .await,
@@ -1297,6 +1358,9 @@ mod tests {
                 agent_id: Some("Codex: worktrees-hives agent"),
                 commit_sha: Some("  "),
                 placement: None,
+                task: None,
+                branch: None,
+                session: None,
                 pr_comment: true,
             })
             .await,
@@ -1321,6 +1385,9 @@ mod tests {
                 agent_id: None,
                 commit_sha: None,
                 placement: None,
+                task: None,
+                branch: None,
+                session: None,
                 pr_comment: false,
             },
             FormatCase {
@@ -1329,6 +1396,9 @@ mod tests {
                 agent_id: None,
                 commit_sha: Some("not-a-sha"),
                 placement: None,
+                task: None,
+                branch: None,
+                session: None,
                 pr_comment: false,
             },
         ] {
@@ -1345,6 +1415,9 @@ mod tests {
             agent_id: None,
             commit_sha: None,
             placement: None,
+            task: None,
+            branch: None,
+            session: None,
             pr_comment: false,
         });
         assert_eq!(json_error_command(&cli), Some("attribution.format"));
@@ -1354,6 +1427,9 @@ mod tests {
             agent_id: None,
             commit_sha: None,
             placement: None,
+            task: None,
+            branch: None,
+            session: None,
             pr_comment: false,
         })
         .await;
@@ -1393,6 +1469,9 @@ mod tests {
                 agent_id: Some("   "),
                 commit_sha: None,
                 placement: None,
+                task: None,
+                branch: None,
+                session: None,
                 pr_comment: false,
             })
             .await,

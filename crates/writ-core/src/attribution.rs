@@ -20,11 +20,17 @@ const AGENT_ID_ENV: &str = "WRIT_AGENT_ID";
 const ATTRIBUTION_ENV: &str = "WRIT_ATTRIBUTION";
 const INCLUDE_SHA_ENV: &str = "WRIT_INCLUDE_SHA_ON_FIX";
 const PLACEMENT_ENV: &str = "WRIT_ATTRIBUTION_PLACEMENT";
-const ATTRIBUTION_ENV_KEYS: [&str; 4] = [
+const TASK_ID_ENV: &str = "WRIT_TASK_ID";
+const BRANCH_ENV: &str = "WRIT_BRANCH";
+const SESSION_ID_ENV: &str = "WRIT_SESSION_ID";
+const ATTRIBUTION_ENV_KEYS: [&str; 7] = [
     AGENT_ID_ENV,
     ATTRIBUTION_ENV,
     INCLUDE_SHA_ENV,
     PLACEMENT_ENV,
+    TASK_ID_ENV,
+    BRANCH_ENV,
+    SESSION_ID_ENV,
 ];
 
 /// Where the attribution line appears in a reply.
@@ -70,6 +76,12 @@ impl fmt::Display for AttributionPlacement {
 pub struct AttributionConfig {
     /// Identity line on replies (for example `worktrees-hives agent`).
     pub agent_id: String,
+    /// Linear or issue identifier when one exists. Omit rather than inventing.
+    pub task_id: Option<String>,
+    /// Assigned branch name when one exists. Omit rather than inventing.
+    pub branch: Option<String>,
+    /// Agent session identifier when one exists. Omit rather than inventing.
+    pub session_id: Option<String>,
     /// Whether callers intend to attach a commit SHA after code fixes.
     pub include_sha_on_fix: bool,
     /// Where the attribution line appears.
@@ -80,6 +92,9 @@ impl Default for AttributionConfig {
     fn default() -> Self {
         Self {
             agent_id: DEFAULT_AGENT_ID.to_owned(),
+            task_id: None,
+            branch: None,
+            session_id: None,
             include_sha_on_fix: true,
             placement: AttributionPlacement::Footer,
         }
@@ -105,6 +120,9 @@ impl AttributionConfig {
     ) -> Self {
         Self {
             agent_id: platform_agent_id(platform),
+            task_id: None,
+            branch: None,
+            session_id: None,
             include_sha_on_fix,
             placement,
         }
@@ -138,6 +156,9 @@ impl AttributionConfig {
         );
         Self {
             agent_id,
+            task_id: optional_label(map.get(TASK_ID_ENV)),
+            branch: optional_label(map.get(BRANCH_ENV)),
+            session_id: optional_label(map.get(SESSION_ID_ENV)),
             include_sha_on_fix: parse_bool_env(map.get(INCLUDE_SHA_ENV)).unwrap_or(true),
             placement: map
                 .get(PLACEMENT_ENV)
@@ -148,19 +169,21 @@ impl AttributionConfig {
     }
 }
 
-/// Collapse control characters and blank identity strings to the default.
+/// Collapse control characters to spaces and squeeze whitespace.
 #[must_use]
-pub fn canonicalize_agent_id(id: &str) -> String {
-    let collapsed: String = id
+pub fn canonicalize_label(value: &str) -> Option<String> {
+    let collapsed: String = value
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect();
     let trimmed = collapsed.split_whitespace().collect::<Vec<_>>().join(" ");
-    if trimmed.is_empty() {
-        DEFAULT_AGENT_ID.to_owned()
-    } else {
-        trimmed
-    }
+    (!trimmed.is_empty()).then_some(trimmed)
+}
+
+/// Collapse control characters and blank identity strings to the default.
+#[must_use]
+pub fn canonicalize_agent_id(id: &str) -> String {
+    canonicalize_label(id).unwrap_or_else(|| DEFAULT_AGENT_ID.to_owned())
 }
 
 /// Accept a hex object id (short or full). Reject empty, whitespace, or injected text.
@@ -173,12 +196,27 @@ pub fn sanitize_commit_sha(value: Option<&str>) -> Option<&str> {
 
 /// Format the attribution line. Empty or invalid SHAs are omitted so a missing
 /// fix cannot invent a commit, and injected newlines cannot split the line.
+/// Task, branch, and session labels are included only when supplied.
 #[must_use]
 pub fn format_attribution(config: &AttributionConfig, commit_sha: Option<&str>) -> String {
-    let agent_id = canonicalize_agent_id(&config.agent_id);
+    let identity = collaboration_identity(config);
     match sanitize_commit_sha(commit_sha) {
-        Some(sha) => format!("{agent_id}: fixed in {sha}"),
-        None => agent_id,
+        Some(sha) => format!("{identity}: fixed in {sha}"),
+        None => identity,
+    }
+}
+
+fn collaboration_identity(config: &AttributionConfig) -> String {
+    let mut parts = vec![canonicalize_agent_id(&config.agent_id)];
+    push_labeled(&mut parts, "task", config.task_id.as_deref());
+    push_labeled(&mut parts, "branch", config.branch.as_deref());
+    push_labeled(&mut parts, "session", config.session_id.as_deref());
+    parts.join(" | ")
+}
+
+fn push_labeled(parts: &mut Vec<String>, label: &str, value: Option<&str>) {
+    if let Some(value) = value.and_then(canonicalize_label) {
+        parts.push(format!("{label} {value}"));
     }
 }
 
@@ -253,6 +291,10 @@ fn platform_agent_id(platform: &str) -> String {
     }
 }
 
+fn optional_label(value: Option<&String>) -> Option<String> {
+    value.and_then(|value| canonicalize_label(value))
+}
+
 fn first_nonempty(map: &HashMap<String, String>, keys: &[&str]) -> Option<String> {
     keys.iter().find_map(|key| {
         map.get(*key)
@@ -295,6 +337,7 @@ mod tests {
             agent_id: "custom agent".to_owned(),
             include_sha_on_fix: false,
             placement: AttributionPlacement::Header,
+            ..AttributionConfig::default()
         };
         assert_eq!(custom.agent_id, "custom agent");
         assert!(!custom.include_sha_on_fix);
@@ -393,7 +436,6 @@ mod tests {
                 format!("{DEFAULT_AGENT_ID}: fixed in abc1234"),
             ),
             (&default, Some(""), DEFAULT_AGENT_ID.to_owned()),
-            (&default, Some("   "), DEFAULT_AGENT_ID.to_owned()),
             (
                 &custom,
                 Some("abc1234"),
@@ -414,6 +456,47 @@ mod tests {
         );
         assert_eq!(sanitize_commit_sha(Some("abc1234")), Some("abc1234"));
         assert_eq!(sanitize_commit_sha(Some("not a sha")), None);
+    }
+
+    #[test]
+    fn collaboration_identity_omits_missing_and_blank_labels() {
+        let collab = AttributionConfig {
+            task_id: Some("RM-128".to_owned()),
+            branch: Some("cursor/reply-attribution-config-6e46".to_owned()),
+            session_id: Some("bc-fa8ed877".to_owned()),
+            ..AttributionConfig::default()
+        };
+        assert_eq!(
+            format_attribution(&collab, None),
+            "worktrees-hives agent | task RM-128 | branch cursor/reply-attribution-config-6e46 | session bc-fa8ed877"
+        );
+        assert_eq!(
+            format_attribution(&collab, Some("abc1234")),
+            "worktrees-hives agent | task RM-128 | branch cursor/reply-attribution-config-6e46 | session bc-fa8ed877: fixed in abc1234"
+        );
+        let partial = AttributionConfig {
+            task_id: Some("  \n ".to_owned()),
+            branch: Some("cursor/foo".to_owned()),
+            session_id: None,
+            ..AttributionConfig::default()
+        };
+        assert_eq!(
+            format_attribution(&partial, None),
+            "worktrees-hives agent | branch cursor/foo"
+        );
+        let from_env = AttributionConfig::from_vars([
+            ("WRIT_TASK_ID", "RM-128"),
+            ("WRIT_BRANCH", "cursor/foo"),
+            ("WRIT_SESSION_ID", "bc-abc"),
+        ]);
+        assert_eq!(from_env.task_id.as_deref(), Some("RM-128"));
+        assert_eq!(from_env.branch.as_deref(), Some("cursor/foo"));
+        assert_eq!(from_env.session_id.as_deref(), Some("bc-abc"));
+        assert_eq!(
+            super::canonicalize_label("evil\n---"),
+            Some("evil ---".to_owned())
+        );
+        assert_eq!(super::canonicalize_label("  "), None);
     }
 
     struct ReplyCase<'a> {
@@ -450,124 +533,144 @@ mod tests {
     }
 
     #[test]
-    fn reply_templates_placement_defaults_and_header() {
+    fn reply_templates_thread_and_pr_without_sha() {
         let header = AttributionConfig {
             placement: AttributionPlacement::Header,
             ..AttributionConfig::default()
         };
-        for (body, config, sha, thread, expected) in [
-            (
-                "Looks good!",
-                None,
-                None,
-                true,
-                "Looks good!\n\n---\nworktrees-hives agent",
-            ),
-            (
-                "Looks good!",
-                Some(&header),
-                None,
-                true,
-                "worktrees-hives agent\n\n---\nLooks good!",
-            ),
-            (
-                "All checks passed.",
-                None,
-                None,
-                false,
-                "All checks passed.\n\nworktrees-hives agent",
-            ),
-            (
-                "All checks passed.",
-                Some(&header),
-                None,
-                false,
-                "worktrees-hives agent\n\nAll checks passed.",
-            ),
-            (
-                "Fixed the issue.",
-                Some(&header),
-                Some("abc1234"),
-                true,
-                "worktrees-hives agent: fixed in abc1234\n\n---\nFixed the issue.",
-            ),
-        ] {
-            assert_reply(
-                ReplyCase {
-                    body,
-                    config,
-                    sha,
-                    thread,
-                },
-                expected,
-            );
-        }
+        assert_reply(
+            ReplyCase {
+                body: "Looks good!",
+                config: None,
+                sha: None,
+                thread: true,
+            },
+            "Looks good!\n\n---\nworktrees-hives agent",
+        );
+        assert_reply(
+            ReplyCase {
+                body: "Looks good!",
+                config: Some(&header),
+                sha: None,
+                thread: true,
+            },
+            "worktrees-hives agent\n\n---\nLooks good!",
+        );
+        assert_reply(
+            ReplyCase {
+                body: "All checks passed.",
+                config: None,
+                sha: None,
+                thread: false,
+            },
+            "All checks passed.\n\nworktrees-hives agent",
+        );
+        assert_reply(
+            ReplyCase {
+                body: "All checks passed.",
+                config: Some(&header),
+                sha: None,
+                thread: false,
+            },
+            "worktrees-hives agent\n\nAll checks passed.",
+        );
     }
 
     #[test]
-    fn reply_templates_sha_and_agent_variants() {
+    fn reply_templates_header_fix_includes_real_sha() {
+        let header = AttributionConfig {
+            placement: AttributionPlacement::Header,
+            ..AttributionConfig::default()
+        };
+        assert_reply(
+            ReplyCase {
+                body: "Fixed the issue.",
+                config: Some(&header),
+                sha: Some("abc1234"),
+                thread: true,
+            },
+            "worktrees-hives agent: fixed in abc1234\n\n---\nFixed the issue.",
+        );
+    }
+
+    #[test]
+    fn reply_templates_custom_agent_and_footer_sha() {
         let custom = AttributionConfig {
             agent_id: "Custom Bot".to_owned(),
             ..AttributionConfig::default()
         };
+        assert_reply(
+            ReplyCase {
+                body: "Looks good!",
+                config: Some(&custom),
+                sha: None,
+                thread: true,
+            },
+            "Looks good!\n\n---\nCustom Bot",
+        );
+        assert_reply(
+            ReplyCase {
+                body: "Fixed the issue.",
+                config: None,
+                sha: Some("abc1234"),
+                thread: true,
+            },
+            "Fixed the issue.\n\n---\nworktrees-hives agent: fixed in abc1234",
+        );
+        assert_reply(
+            ReplyCase {
+                body: "All done.",
+                config: None,
+                sha: None,
+                thread: false,
+            },
+            "All done.\n\nworktrees-hives agent",
+        );
+    }
+
+    #[test]
+    fn reply_templates_platform_and_include_sha_flag() {
         let no_sha_flag = AttributionConfig {
             include_sha_on_fix: false,
             ..AttributionConfig::default()
         };
         let claude = AttributionConfig::for_platform("Claude Code");
-        for (body, config, sha, thread, expected) in [
-            (
-                "Fixed the issue.",
-                None,
-                Some("abc1234"),
-                true,
-                "Fixed the issue.\n\n---\nworktrees-hives agent: fixed in abc1234",
-            ),
-            (
-                "Looks good!",
-                Some(&custom),
-                None,
-                true,
-                "Looks good!\n\n---\nCustom Bot",
-            ),
-            (
-                "Fixed it.",
-                None,
-                Some("abc1234"),
-                true,
-                "Fixed it.\n\n---\nworktrees-hives agent: fixed in abc1234",
-            ),
-            (
-                "All done.",
-                None,
-                None,
-                false,
-                "All done.\n\nworktrees-hives agent",
-            ),
-            (
-                "Resolved thread.",
-                Some(&claude),
-                Some("def5678"),
-                true,
-                "Resolved thread.\n\n---\nClaude Code: worktrees-hives agent: fixed in def5678",
-            ),
-            (
-                "Fixed.",
-                Some(&no_sha_flag),
-                Some("abc1234"),
-                true,
-                "Fixed.\n\n---\nworktrees-hives agent: fixed in abc1234",
-            ),
-        ] {
-            assert_reply(
-                ReplyCase {
-                    body,
-                    config,
-                    sha,
-                    thread,
-                },
-                expected,
-            );
-        }
+        assert_reply(
+            ReplyCase {
+                body: "Resolved thread.",
+                config: Some(&claude),
+                sha: Some("def5678"),
+                thread: true,
+            },
+            "Resolved thread.\n\n---\nClaude Code: worktrees-hives agent: fixed in def5678",
+        );
+        assert_reply(
+            ReplyCase {
+                body: "Fixed.",
+                config: Some(&no_sha_flag),
+                sha: Some("abc1234"),
+                thread: true,
+            },
+            "Fixed.\n\n---\nworktrees-hives agent: fixed in abc1234",
+        );
+    }
+
+    #[test]
+    fn reply_template_collab_conflict_before_commit() {
+        let collab = AttributionConfig {
+            task_id: Some("RM-128".to_owned()),
+            branch: Some("cursor/reply-attribution-config-6e46".to_owned()),
+            session_id: Some("bc-fa8ed877".to_owned()),
+            ..AttributionConfig::default()
+        };
+        assert_reply(
+            ReplyCase {
+                body: "Conflict: overlapping SKILL.md Reply attribution edits; I will keep this section and wait on RM-145 for the rest.",
+                config: Some(&collab),
+                sha: None,
+                thread: true,
+            },
+            "Conflict: overlapping SKILL.md Reply attribution edits; I will keep this section and wait on RM-145 for the rest.\n\n---\nworktrees-hives agent | task RM-128 | branch cursor/reply-attribution-config-6e46 | session bc-fa8ed877",
+        );
     }
 }

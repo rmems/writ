@@ -4,10 +4,13 @@
   "command": "attribution.format",
   "data": {
     "agent_id": "worktrees-hives agent",
+    "branch": null,
     "commit_sha": null,
     "include_sha_on_fix": true,
     "is_thread_reply": true,
     "placement": "footer",
+    "session_id": null,
+    "task_id": null,
     "text": "Looks good!\n\n---\nworktrees-hives agent"
   },
   "error": null
