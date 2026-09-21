@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::*;
+use crate::timeout_policy::RecoveryStage;
 
 fn platform_pair(windows: &'static str, unix: &'static str) -> &'static str {
     let pair = (windows, unix);
@@ -77,10 +78,24 @@ fn assert_permit_wait_timeout(output: &SupervisedOutput) {
     assert!(
         output.timed_out
             && !output.killed
-            && output.timeout_class == Some(TimeoutClass::Hard)
+            && output.timeout_class == Some(TimeoutClass::PermitWait)
+            && output.recovery_stage == Some(RecoveryStage::None)
             && output.stderr.contains("max-parallel permit"),
         "permit-wait timeout mismatch: {output:?}"
     );
+    let residual = output.residual.as_ref().expect("permit-wait residual");
+    assert_eq!(residual.timeout_class, TimeoutClass::PermitWait);
+    assert_eq!(residual.recovery_stage, RecoveryStage::None);
+    assert!(!residual.redispatch_forbidden());
+    let json = serde_json::to_value(output).unwrap();
+    let obj = json.as_object().expect("object");
+    for key in obj.keys() {
+        let lower = key.to_ascii_lowercase();
+        assert!(
+            !lower.contains("sha") && !lower.contains("commit") && key != "head",
+            "timeout residual must not carry identity field `{key}`"
+        );
+    }
 }
 
 fn assert_policy_code(err: Error, expected: PolicyCode) {
@@ -453,6 +468,10 @@ async fn progress_ticks_while_waiting() {
     };
     let output = run_hanging_with_policy(&policy, &options).await;
     assert!(output.timed_out);
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while hits.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+        tokio::task::yield_now().await;
+    }
     assert!(
         hits.load(Ordering::SeqCst) >= 1,
         "expected progress ticks while waiting"
@@ -557,8 +576,71 @@ async fn grace_period_sends_term_before_kill() {
         .await;
     assert!(output.timed_out, "stderr={}", output.stderr);
     assert_eq!(output.timeout_class, Some(TimeoutClass::Hard));
+    assert_eq!(output.recovery_stage, Some(RecoveryStage::GracefulCancel));
+    assert!(!output.killed, "SIGTERM reap should not report killed");
     assert!(
         started.elapsed() < Duration::from_secs(3),
         "SIGTERM during grace should reap without waiting the full sleep"
     );
+}
+
+#[tokio::test]
+async fn idle_detects_silent_child_without_wall_clock() {
+    let policy = TimeoutPolicy {
+        idle: Some(Duration::from_millis(200)),
+        grace: Duration::ZERO,
+        progress_every: None,
+        ..TimeoutPolicy::from_worker_timeout(None)
+    };
+    assert!(policy.worker.is_none());
+    let started = Instant::now();
+    let output = run_hanging_with_policy(&policy, &RunOptions::default()).await;
+    assert_timeout_outcome(
+        &output,
+        TimeoutClass::Idle,
+        SupervisorErrorCode::IdleTimedOut,
+    );
+    assert_eq!(output.recovery_stage, Some(RecoveryStage::Kill));
+    assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn graceful_cancel_then_kill_when_term_ignored() {
+    let policy = TimeoutPolicy {
+        worker: Some(Duration::from_millis(150)),
+        grace: Duration::from_millis(200),
+        progress_every: None,
+        ..TimeoutPolicy::from_worker_timeout(None)
+    };
+    let started = Instant::now();
+    let output = Supervisor::new(1)
+        .run_unchecked_with_policy(
+            shell_program(),
+            &[shell_flag(), "trap '' TERM; sleep 60"],
+            &policy,
+            &RunOptions::default(),
+        )
+        .await;
+    assert_timeout_outcome(&output, TimeoutClass::Hard, SupervisorErrorCode::TimedOut);
+    assert_eq!(output.recovery_stage, Some(RecoveryStage::Kill));
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "SIGKILL after ignored SIGTERM should recover promptly"
+    );
+}
+
+#[tokio::test]
+async fn hang_residual_has_no_fake_sha_fields() {
+    let output = run_hanging(Duration::from_millis(150)).await;
+    let json = serde_json::to_value(&output).unwrap();
+    let residual = json.get("residual").expect("residual");
+    let obj = residual.as_object().expect("object");
+    for key in obj.keys() {
+        let lower = key.to_ascii_lowercase();
+        assert!(
+            !lower.contains("sha") && !lower.contains("commit") && !lower.contains("head"),
+            "timeout residual must not carry identity field `{key}`"
+        );
+    }
 }

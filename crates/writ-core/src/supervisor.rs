@@ -43,11 +43,16 @@ use crate::error::{Error, PolicyCode, Result};
 use crate::git_safe::{SafeGhCommand, SafeGitCommand};
 use crate::owners::OwnerAllowlist;
 use crate::timeout_policy::{
-    ProgressCallback, ProgressSnapshot, SupervisorStep, TimeoutClass, TimeoutPolicy,
+    ProgressCallback, ProgressSnapshot, RecoveryStage, SupervisorStep, TimeoutClass, TimeoutPolicy,
+    TimeoutResidual,
 };
 
 /// How long to wait for the child to exit after a timeout kill.
 const POST_KILL_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Bound pipe drain when no wall-clock deadline is set, so inherited pipes from
+/// background descendants cannot hang the supervisor forever.
+const ORPHAN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Cap captured stdout/stderr per stream to avoid memory exhaustion.
 const MAX_CAPTURE_BYTES: usize = 1_048_576;
@@ -104,6 +109,15 @@ pub struct SupervisedOutput {
     /// Always `0` from this supervisor: it never re-dispatches.
     #[serde(default)]
     pub redispatch_count: u32,
+    /// Last recovery action when a hang residual is present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery_stage: Option<RecoveryStage>,
+    /// Milliseconds from spawn to last captured child byte, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_output_ms: Option<u64>,
+    /// Additive hang residual (no SHA / commit / head fields).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub residual: Option<TimeoutResidual>,
 }
 
 impl SupervisedOutput {
@@ -126,6 +140,33 @@ impl SupervisedOutput {
 
     fn with_elapsed(mut self, started: Instant) -> Self {
         self.elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        if let Some(residual) = &mut self.residual {
+            residual.elapsed_ms = self.elapsed_ms;
+        }
+        self
+    }
+
+    fn with_hang_residual(
+        mut self,
+        policy: &TimeoutPolicy,
+        class: TimeoutClass,
+        stage: RecoveryStage,
+        last_output_ms: Option<u64>,
+        started: Instant,
+    ) -> Self {
+        let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.timeout_class = Some(class);
+        self.recovery_stage = Some(stage);
+        self.last_output_ms = last_output_ms;
+        self.elapsed_ms = elapsed_ms;
+        self.residual = Some(TimeoutResidual {
+            timeout_class: class,
+            recovery_stage: stage,
+            redispatch_count: 0,
+            max_redispatch_per_item: policy.max_redispatch_per_item,
+            elapsed_ms,
+            last_output_ms,
+        });
         self
     }
 }
@@ -272,7 +313,7 @@ impl Supervisor {
             Err(timeout) => return Ok(timeout),
         };
         let Some(child_policy) = child_policy_after_permit(policy, started.elapsed()) else {
-            return Ok(permit_wait_timeout(started));
+            return Ok(permit_wait_timeout(started, policy));
         };
 
         // Branch check immediately before spawn, while holding the permit.
@@ -377,7 +418,11 @@ impl Supervisor {
         };
 
         let pid = child.id();
-        let mut child = ProcessGroupChild { child, pid };
+        let mut child = ProcessGroupChild {
+            child,
+            pid,
+            reaped: false,
+        };
         let spawn_at = Instant::now();
         let last_activity_ms = Arc::new(AtomicU64::new(0));
 
@@ -426,7 +471,7 @@ async fn acquire_run_permit<'a>(
             started,
         )
         .await
-        .map_err(|()| permit_wait_timeout(started)),
+        .map_err(|()| permit_wait_timeout(started, policy)),
         None => Ok(supervisor
             .semaphore
             .acquire()
@@ -483,15 +528,20 @@ async fn acquire_permit_with_progress<'a>(
     }
 }
 
-fn permit_wait_timeout(started: Instant) -> SupervisedOutput {
+fn permit_wait_timeout(started: Instant, policy: &TimeoutPolicy) -> SupervisedOutput {
     SupervisedOutput {
         timed_out: true,
         stderr: "timed out waiting for max-parallel permit".to_owned(),
         error_code: Some(SupervisorErrorCode::TimedOut),
-        timeout_class: Some(TimeoutClass::Hard),
         ..SupervisedOutput::default()
     }
-    .with_elapsed(started)
+    .with_hang_residual(
+        policy,
+        TimeoutClass::PermitWait,
+        RecoveryStage::None,
+        None,
+        started,
+    )
 }
 
 fn emit_progress(
@@ -501,15 +551,19 @@ fn emit_progress(
     idle_for: Duration,
     step: SupervisorStep,
 ) {
-    if let Some(cb) = on_progress {
-        cb(&ProgressSnapshot {
-            active: supervisor.active(),
-            max_parallel: supervisor.max_parallel(),
-            elapsed: started.elapsed(),
-            idle_for,
-            step,
-        });
-    }
+    let Some(cb) = on_progress else {
+        return;
+    };
+    let snap = ProgressSnapshot {
+        active: supervisor.active(),
+        max_parallel: supervisor.max_parallel(),
+        elapsed: started.elapsed(),
+        idle_for,
+        step,
+    };
+    let cb = Arc::clone(cb);
+    // Host callbacks must not freeze hang recovery. Run them off the wait loop.
+    tokio::task::spawn_blocking(move || cb(&snap));
 }
 
 async fn sleep_until_opt(deadline: Option<Instant>) {
@@ -658,12 +712,7 @@ async fn recover_classified(finish: ChildFinish<'_>, class: TimeoutClass) -> Sup
         .emit(finish.supervisor, SupervisorStep::Recovering);
     recover_child(
         finish.child,
-        RecoverIo {
-            stdout_handle: finish.pipes.stdout,
-            stderr_handle: finish.pipes.stderr,
-            policy: finish.wait.policy,
-            pid: finish.wait.pid,
-        },
+        RecoverIo::from_wait(finish.pipes, finish.wait),
         class,
     )
     .await
@@ -679,7 +728,16 @@ async fn complete_child_wait(
             finish
                 .wait
                 .emit(finish.supervisor, SupervisorStep::Draining);
-            drain_exited_child(s, hard_deadline, finish.wait.pid, finish.pipes).await
+            drain_exited_child(
+                s,
+                hard_deadline,
+                finish.wait.pid,
+                finish.pipes,
+                finish.wait.policy,
+                finish.wait.run_started,
+                &finish.wait.last_activity_ms,
+            )
+            .await
         }
         Err(e) => {
             finish
@@ -687,12 +745,7 @@ async fn complete_child_wait(
                 .emit(finish.supervisor, SupervisorStep::Recovering);
             recover_lost_child(
                 finish.child,
-                RecoverIo {
-                    stdout_handle: finish.pipes.stdout,
-                    stderr_handle: finish.pipes.stderr,
-                    policy: finish.wait.policy,
-                    pid: finish.wait.pid,
-                },
+                RecoverIo::from_wait(finish.pipes, finish.wait),
                 &e,
             )
             .await
@@ -700,42 +753,48 @@ async fn complete_child_wait(
     }
 }
 
-/// Drain a normally-exited child's output pipes, honouring the hard deadline.
+/// Drain a normally-exited child's output pipes with a bounded wait.
 ///
-/// When a hard `worker` deadline is configured, pipe draining is bounded by it
-/// and a timeout collapses into a `Hard` timeout outcome; otherwise the pipes
-/// are joined without a bound.
+/// Drain is always capped: remaining wall-clock, or [`ORPHAN_DRAIN_TIMEOUT`].
+/// If leftover group members hold the pipes, recovery kills that group and
+/// records a hard residual. Captured bytes are kept. The harness checkout is
+/// not deleted.
 async fn drain_exited_child(
     status: std::process::ExitStatus,
     hard_deadline: Option<Instant>,
     pid: Option<u32>,
     pipes: PipePair,
+    policy: &TimeoutPolicy,
+    run_started: Instant,
+    last_activity_ms: &AtomicU64,
 ) -> SupervisedOutput {
     let PipePair {
         stdout: stdout_handle,
         stderr: stderr_handle,
     } = pipes;
-    match hard_deadline {
-        Some(deadline_at) => {
-            match drain_pipes_until(deadline_at, pid, stdout_handle, stderr_handle).await {
-                Ok((stdout, stderr)) => output_to_supervised(status, &stdout, &stderr),
-                Err((stdout, stderr)) => SupervisedOutput {
-                    timed_out: true,
-                    killed: true,
-                    stdout: String::from_utf8_lossy(&stdout).into_owned(),
-                    stderr: String::from_utf8_lossy(&stderr).into_owned(),
-                    stdout_truncated: stdout.len() >= MAX_CAPTURE_BYTES,
-                    stderr_truncated: stderr.len() >= MAX_CAPTURE_BYTES,
-                    error_code: Some(SupervisorErrorCode::TimedOut),
-                    timeout_class: Some(TimeoutClass::Hard),
-                    ..SupervisedOutput::default()
-                },
+    let deadline_at = hard_deadline.unwrap_or_else(|| Instant::now() + ORPHAN_DRAIN_TIMEOUT);
+    match drain_pipes_until(deadline_at, pid, stdout_handle, stderr_handle).await {
+        Ok((stdout, stderr)) => output_to_supervised(status, &stdout, &stderr),
+        Err((stdout, stderr)) => {
+            // Direct child already exited; leftover group members held the pipes.
+            // Kill is process containment only — the harness checkout is left intact.
+            SupervisedOutput {
+                timed_out: true,
+                killed: true,
+                stdout: String::from_utf8_lossy(&stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&stderr).into_owned(),
+                stdout_truncated: stdout.len() >= MAX_CAPTURE_BYTES,
+                stderr_truncated: stderr.len() >= MAX_CAPTURE_BYTES,
+                error_code: Some(SupervisorErrorCode::TimedOut),
+                ..SupervisedOutput::default()
             }
-        }
-        None => {
-            let stdout = stdout_handle.await.unwrap_or_default();
-            let stderr = stderr_handle.await.unwrap_or_default();
-            output_to_supervised(status, &stdout, &stderr)
+            .with_hang_residual(
+                policy,
+                TimeoutClass::Hard,
+                RecoveryStage::Kill,
+                nonzero_ms(last_activity_ms),
+                run_started,
+            )
         }
     }
 }
@@ -747,6 +806,21 @@ struct RecoverIo<'a> {
     stderr_handle: JoinHandle<Vec<u8>>,
     policy: &'a TimeoutPolicy,
     pid: Option<u32>,
+    run_started: Instant,
+    last_activity_ms: Arc<AtomicU64>,
+}
+
+impl<'a> RecoverIo<'a> {
+    fn from_wait(pipes: PipePair, wait: &'a ChildWait<'a>) -> Self {
+        Self {
+            stdout_handle: pipes.stdout,
+            stderr_handle: pipes.stderr,
+            policy: wait.policy,
+            pid: wait.pid,
+            run_started: wait.run_started,
+            last_activity_ms: Arc::clone(&wait.last_activity_ms),
+        }
+    }
 }
 
 async fn recover_lost_child(
@@ -771,58 +845,83 @@ async fn recover_child(
         stderr_handle,
         policy,
         pid,
+        run_started,
+        last_activity_ms,
     } = io;
     let error_code = match class {
         TimeoutClass::Idle => SupervisorErrorCode::IdleTimedOut,
         TimeoutClass::LostChild => SupervisorErrorCode::LostChild,
-        TimeoutClass::Hard | TimeoutClass::RedispatchExhausted => SupervisorErrorCode::TimedOut,
+        TimeoutClass::Hard | TimeoutClass::RedispatchExhausted | TimeoutClass::PermitWait => {
+            SupervisorErrorCode::TimedOut
+        }
     };
 
-    if policy.grace > Duration::ZERO {
+    let stage = if policy.grace > Duration::ZERO {
         terminate_process_group(pid);
         match tokio::time::timeout(policy.grace, child.wait()).await {
             Ok(Ok(_)) => {
-                // Parent exited after SIGTERM; still SIGKILL the group so
-                // grandchildren do not wait for Drop.
+                // Parent exited after SIGTERM; SIGKILL remaining group members
+                // while the original pgid is still this pid, then disarm so Drop
+                // cannot SIGKILL a reused PID.
                 kill_process_group(pid);
+                child.disarm();
+                RecoveryStage::GracefulCancel
             }
             Ok(Err(_)) | Err(_) => {
                 let _ = child.kill().await;
                 let _ = tokio::time::timeout(POST_KILL_JOIN_TIMEOUT, child.wait()).await;
+                child.disarm();
+                RecoveryStage::Kill
             }
         }
     } else {
         let _ = child.kill().await;
         let _ = tokio::time::timeout(POST_KILL_JOIN_TIMEOUT, child.wait()).await;
-    }
+        child.disarm();
+        RecoveryStage::Kill
+    };
 
     let stdout = join_with_timeout(stdout_handle).await;
     let stderr = join_with_timeout(stderr_handle).await;
+    let last_output_ms = nonzero_ms(&last_activity_ms);
+    let timed_out = class != TimeoutClass::LostChild;
+    let killed = stage == RecoveryStage::Kill;
     SupervisedOutput {
-        timed_out: true,
-        killed: true,
+        timed_out,
+        killed,
         stdout: String::from_utf8_lossy(&stdout).into_owned(),
         stderr: String::from_utf8_lossy(&stderr).into_owned(),
         stdout_truncated: stdout.len() >= MAX_CAPTURE_BYTES,
         stderr_truncated: stderr.len() >= MAX_CAPTURE_BYTES,
         error_code: Some(error_code),
-        timeout_class: Some(class),
         ..SupervisedOutput::default()
     }
+    .with_hang_residual(policy, class, stage, last_output_ms, run_started)
 }
 
 /// Child that kills its Unix process group on Drop (in addition to tokio kill_on_drop).
 struct ProcessGroupChild {
     child: tokio::process::Child,
     pid: Option<u32>,
+    reaped: bool,
 }
 
 impl ProcessGroupChild {
     async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
-        self.child.wait().await
+        let status = self.child.wait().await?;
+        self.disarm();
+        Ok(status)
+    }
+
+    fn disarm(&mut self) {
+        self.reaped = true;
+        self.pid = None;
     }
 
     async fn kill(&mut self) -> std::io::Result<()> {
+        if self.reaped {
+            return Ok(());
+        }
         kill_process_group(self.pid);
         self.child.kill().await
     }
@@ -830,8 +929,10 @@ impl ProcessGroupChild {
 
 impl Drop for ProcessGroupChild {
     fn drop(&mut self) {
-        kill_process_group(self.pid);
-        let _ = self.child.start_kill();
+        if !self.reaped {
+            kill_process_group(self.pid);
+            let _ = self.child.start_kill();
+        }
     }
 }
 
@@ -1177,6 +1278,11 @@ fn normalize_existing_or_future_dir(path: &std::path::Path) -> Result<PathBuf> {
     }
 }
 
+fn nonzero_ms(stamp: &AtomicU64) -> Option<u64> {
+    let v = stamp.load(Ordering::Relaxed);
+    (v > 0).then_some(v)
+}
+
 async fn drain_pipes_until(
     deadline_at: Instant,
     pid: Option<u32>,
@@ -1284,6 +1390,9 @@ fn output_to_supervised(
         timeout_class: None,
         elapsed_ms: 0,
         redispatch_count: 0,
+        recovery_stage: None,
+        last_output_ms: None,
+        residual: None,
     };
     if killed {
         out = out.with_error(SupervisorErrorCode::Killed);

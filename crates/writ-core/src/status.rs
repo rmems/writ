@@ -5,7 +5,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::contract::Response;
-use crate::timeout_policy::TimeoutClass;
+use crate::timeout_policy::{RecoveryStage, TimeoutClass};
 
 /// Lifecycle state of a watched job process.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -116,6 +116,15 @@ pub struct JobStatus {
     /// Successful fix attempts. Timeout residuals must not increment this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fix_count: Option<u32>,
+    /// Last supervisor recovery action for a hang residual.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_stage: Option<RecoveryStage>,
+    /// Milliseconds from spawn to last captured child byte, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_output_ms: Option<u64>,
+    /// Host redispatch cap recorded on the residual. Supervisor never consumes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_redispatch_per_item: Option<u32>,
 }
 
 impl JobStatus {
@@ -136,6 +145,9 @@ impl JobStatus {
             residual_blockers: Vec::new(),
             redispatch_count: None,
             fix_count: None,
+            recovery_stage: None,
+            last_output_ms: None,
+            max_redispatch_per_item: None,
         }
     }
 }
@@ -330,6 +342,9 @@ mod tests {
             &serde_json::json!(["timeout:idle"])
         );
         assert_eq!(v.get("fix_count").unwrap(), 0);
+        assert!(v.get("sha").is_none());
+        assert!(v.get("commit").is_none());
+        assert!(v.get("head").is_none());
         assert!(
             !TimeoutClass::Idle.counts_toward_fix_cap(),
             "timeout residual must not be treated as a fix"

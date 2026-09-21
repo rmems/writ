@@ -163,31 +163,61 @@ enum WorktreeAction {
 #[derive(Debug, Args)]
 struct SupervisorTimeouts {
     /// Wall-clock timeout in seconds. 0 means no timeout.
-    #[arg(long, default_value_t = writ_core::timeout_policy::DEFAULT_WORKER_SECS)]
+    #[arg(
+        long,
+        env = "WRIT_SUPERVISOR_TIMEOUT_SECS",
+        default_value_t = writ_core::timeout_policy::DEFAULT_WORKER_SECS
+    )]
     timeout: u64,
 
     /// Idle hang detector: no captured output for this many seconds. 0 disables.
-    #[arg(long, default_value_t = writ_core::timeout_policy::DEFAULT_IDLE_SECS)]
+    /// `--stall` is an alias from the RM-129 comparison lane (same detector).
+    #[arg(
+        long,
+        alias = "stall",
+        env = "WRIT_SUPERVISOR_IDLE_SECS",
+        default_value_t = writ_core::timeout_policy::DEFAULT_IDLE_SECS
+    )]
     idle: u64,
 
     /// Optional per-step cap in seconds. 0 disables.
-    #[arg(long, default_value_t = writ_core::timeout_policy::DEFAULT_STEP_SECS)]
+    #[arg(
+        long,
+        env = "WRIT_SUPERVISOR_STEP_SECS",
+        default_value_t = writ_core::timeout_policy::DEFAULT_STEP_SECS
+    )]
     step: u64,
 
     /// Overall wait budget in seconds. 0 falls back to `--timeout`.
-    #[arg(long, default_value_t = writ_core::timeout_policy::DEFAULT_ORCHESTRATOR_SECS)]
+    #[arg(
+        long,
+        env = "WRIT_SUPERVISOR_ORCHESTRATOR_SECS",
+        default_value_t = writ_core::timeout_policy::DEFAULT_ORCHESTRATOR_SECS
+    )]
     orchestrator: u64,
 
     /// Seconds between SIGTERM and SIGKILL (Unix). 0 = kill immediately.
-    #[arg(long, default_value_t = writ_core::timeout_policy::DEFAULT_GRACE_SECS)]
+    #[arg(
+        long,
+        env = "WRIT_SUPERVISOR_GRACE_SECS",
+        default_value_t = writ_core::timeout_policy::DEFAULT_GRACE_SECS
+    )]
     grace: u64,
 
     /// Progress tick interval on stderr while waiting. 0 disables.
-    #[arg(long, default_value_t = writ_core::timeout_policy::DEFAULT_PROGRESS_SECS)]
+    #[arg(
+        long,
+        env = "WRIT_SUPERVISOR_PROGRESS_SECS",
+        default_value_t = writ_core::timeout_policy::DEFAULT_PROGRESS_SECS
+    )]
     progress_secs: u64,
 
     /// Harness redispatch budget recorded on the policy. Supervisor never retries.
-    #[arg(long, default_value_t = writ_core::timeout_policy::DEFAULT_MAX_REDISPATCH_PER_ITEM)]
+    #[arg(
+        long,
+        env = "WRIT_SUPERVISOR_MAX_REDISPATCH",
+        default_value_t = writ_core::timeout_policy::DEFAULT_MAX_REDISPATCH_PER_ITEM
+    )]
     max_redispatch: u32,
 }
 
@@ -1091,6 +1121,23 @@ mod tests {
         assert_eq!(progress_secs, 1);
         assert_eq!(max_redispatch, 1);
         assert_eq!(cmd, vec!["true"]);
+    }
+
+    #[test]
+    fn supervisor_run_parses_stall_as_idle_alias() {
+        let cli =
+            Cli::try_parse_from(["writ", "supervisor", "run", "--stall", "9", "true"]).unwrap();
+        let Some(super::Command::Supervisor {
+            action:
+                super::SupervisorAction::Run {
+                    timeouts: super::SupervisorTimeouts { idle, .. },
+                    ..
+                },
+        }) = cli.command
+        else {
+            panic!("expected supervisor run");
+        };
+        assert_eq!(idle, 9);
     }
 
     #[test]

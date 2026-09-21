@@ -92,7 +92,7 @@ Worker prompts must not grant GitHub PR merge authority. Local assigned-branch i
 
 ### Timeouts and hang recovery
 
-Long-running supervised commands use `writ supervisor run` with the named policy in [`docs/timeout-policy.md`](docs/timeout-policy.md). The supervisor kills hung children (hard/idle/lost-child) and never retries, merges, or bare-force-pushes. Harness re-dispatch is capped by `max_redispatch_per_item` (default 1). Timeout residuals do not increment `fix_count`.
+Long-running supervised commands use `writ supervisor run` with the named policy in [`docs/timeout-policy.md`](docs/timeout-policy.md). A timeout is a recovery and handoff event: the supervisor contains the child (hard/idle/lost-child/permit-wait) and never retries, merges, bare-force-pushes, deletes a harness checkout, or invents a SHA. Harness re-dispatch is capped by `RedispatchBudget` / `max_redispatch_per_item` (default 1). Timeout residuals do not increment `fix_count`.
 
 ### Enforcement routing
 

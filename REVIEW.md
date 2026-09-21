@@ -60,7 +60,7 @@ Rust owns the hard safety boundary. Reviewers should check:
 - Branch verification occurs immediately before mutation to reduce time-of-check/time-of-use risk.
 - Canonicalization and component checks prevent `..`, symlink, or prefix-based path escape.
 - State writes for the hook lease store go through SQLite (`rusqlite` bundled). `watched.json` remains a read-only legacy path; do not add a writer for it.
-- Process timeouts terminate and reap children. This is implemented in `supervisor.rs` (wall-clock timeout inclusive of permit wait, idle hang detection, SIGTERM-then-SIGKILL grace on Unix -- Windows kills only the direct child after grace, per the `supervisor.rs` platform notes -- and wrapper/interpreter rejection); changes to it require timeout, idle, reaping, and recovery-policy tests, not a deferral. Recovery must not merge or bare-force-push.
+- Process timeouts terminate and reap children. This is implemented in `supervisor.rs` (wall-clock timeout inclusive of permit wait, idle hang detection starting at spawn, SIGTERM-then-SIGKILL grace on Unix -- Windows kills only the direct child after grace -- Drop disarm after reap, bounded pipe drain, and wrapper/interpreter rejection); changes to it require timeout, idle, reaping, and recovery-policy tests, not a deferral. Recovery must not merge, bare-force-push, delete a harness-owned checkout, or emit a fake SHA.
 - Public error codes are stable enough for callers to classify without parsing prose.
 - Unsafe Rust remains forbidden unless a separately reviewed design justifies it.
 
