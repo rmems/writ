@@ -188,6 +188,8 @@ pub enum PolicyCode {
     OwnerNotAllowed,
     /// The import source is not the configured base-repository remote.
     UnauthorizedSource,
+    /// A job's active lease is held by a different worktree path.
+    LeaseConflict,
 }
 
 impl PolicyCode {
@@ -206,6 +208,7 @@ impl PolicyCode {
             Self::WorktreeResumeUnproven => "WORKTREE_RESUME_UNPROVEN",
             Self::OwnerNotAllowed => "OWNER_NOT_ALLOWED",
             Self::UnauthorizedSource => "UNAUTHORIZED_SOURCE",
+            Self::LeaseConflict => "LEASE_CONFLICT",
         }
     }
 }

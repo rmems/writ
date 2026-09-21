@@ -42,15 +42,10 @@ fn empty_args_rejected() {
 // ---- merge tests ----
 
 #[test]
-fn merge_subcommand_rejected() {
-    let err = SafeGitCommand::new(&["merge".to_owned(), "feature".to_owned()]).unwrap_err();
-    assert!(matches!(
-        err,
-        Error::PolicyViolation {
-            code: PolicyCode::MergeBlocked,
-            ..
-        }
-    ));
+fn merge_subcommand_is_allowlisted() {
+    let cmd = SafeGitCommand::new(&["merge".to_owned(), "feature".to_owned()]).unwrap();
+    assert_eq!(cmd.subcommand(), "merge");
+    assert!(cmd.requires_branch_check());
 }
 
 #[test]
@@ -1465,6 +1460,8 @@ fn temp_repo_with_branch(branch: &str) -> std::path::PathBuf {
     git(&["checkout", "-b", branch]);
     git(&["config", "user.email", "test@example.com"]);
     git(&["config", "user.name", "writ-core-test"]);
+    // Keep blob contents byte-identical on Windows runners (autocrlf rewrites \n).
+    git(&["config", "core.autocrlf", "false"]);
     std::fs::write(
         dir.join("README"),
         "init
@@ -1525,4 +1522,173 @@ fn run_verifies_expected_branch_for_mutating() {
     }
 
     let _ = std::fs::remove_dir_all(&repo);
+}
+
+fn git_in(dir: &std::path::Path, args: &[&str]) {
+    let null_dev = if cfg!(windows) { "NUL" } else { "/dev/null" };
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", null_dev)
+        .output()
+        .expect("spawn git");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed in {}: {}",
+        dir.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Two assigned feature-branch worktrees that share one repository.
+fn two_assigned_worktrees() -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+    let repo = temp_repo_with_branch("main");
+    let worker_a = repo.with_file_name(format!(
+        "{}-worker-a",
+        repo.file_name().unwrap().to_string_lossy()
+    ));
+    let worker_b = repo.with_file_name(format!(
+        "{}-worker-b",
+        repo.file_name().unwrap().to_string_lossy()
+    ));
+    git_in(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "worker-a",
+            worker_a.to_str().expect("utf8 worktree path"),
+        ],
+    );
+    git_in(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "worker-b",
+            worker_b.to_str().expect("utf8 worktree path"),
+        ],
+    );
+    std::fs::write(worker_a.join("a.txt"), "from-a\n").unwrap();
+    git_in(&worker_a, &["add", "a.txt"]);
+    git_in(&worker_a, &["commit", "-m", "worker-a change"]);
+    std::fs::write(worker_b.join("b.txt"), "from-b\n").unwrap();
+    git_in(&worker_b, &["add", "b.txt"]);
+    git_in(&worker_b, &["commit", "-m", "worker-b change"]);
+    (repo, worker_a, worker_b)
+}
+
+fn remove_all(repo: &std::path::Path, worker_a: &std::path::Path, worker_b: &std::path::Path) {
+    let _ = std::fs::remove_dir_all(worker_a);
+    let _ = std::fs::remove_dir_all(worker_b);
+    let _ = std::fs::remove_dir_all(repo);
+}
+
+/// `cmd` must be refused with MERGE_BLOCKED whose message contains `needle`.
+fn expect_merge_blocked(
+    cmd: &SafeGitCommand,
+    dir: &std::path::Path,
+    expected_branch: Option<&str>,
+    needle: &str,
+) {
+    let err = cmd.run(dir, expected_branch).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::MergeBlocked,
+                ..
+            }
+        ),
+        "{err}"
+    );
+    assert!(format!("{err}").contains(needle), "{err}");
+}
+
+#[test]
+fn two_worktree_local_merge_integrates_peer_branch() {
+    let (repo, worker_a, worker_b) = two_assigned_worktrees();
+    let cmd = SafeGitCommand::new(&[
+        "merge".to_owned(),
+        "--no-edit".to_owned(),
+        "worker-a".to_owned(),
+    ])
+    .unwrap();
+    let out = cmd
+        .run(&worker_b, Some("worker-b"))
+        .expect("peer merge should be admitted");
+    assert_eq!(out.exit_code, 0, "stderr={}", out.stderr);
+    assert_eq!(
+        std::fs::read_to_string(worker_b.join("a.txt")).unwrap(),
+        "from-a\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(worker_b.join("b.txt")).unwrap(),
+        "from-b\n"
+    );
+    remove_all(&repo, &worker_a, &worker_b);
+}
+
+#[test]
+fn merge_on_default_branch_is_blocked() {
+    let (repo, worker_a, worker_b) = two_assigned_worktrees();
+    let cmd = SafeGitCommand::new(&["merge".to_owned(), "worker-a".to_owned()]).unwrap();
+    expect_merge_blocked(&cmd, &repo, None, "default branch");
+    remove_all(&repo, &worker_a, &worker_b);
+}
+
+#[test]
+fn merge_refuses_to_lose_uncommitted_wip() {
+    let (repo, worker_a, worker_b) = two_assigned_worktrees();
+    std::fs::write(worker_b.join("wip.txt"), "keep-me\n").unwrap();
+    let cmd = SafeGitCommand::new(&["merge".to_owned(), "worker-a".to_owned()]).unwrap();
+    expect_merge_blocked(&cmd, &worker_b, Some("worker-b"), "uncommitted work");
+    assert_eq!(
+        std::fs::read_to_string(worker_b.join("wip.txt")).unwrap(),
+        "keep-me\n"
+    );
+    assert!(
+        !worker_b.join("a.txt").exists(),
+        "peer file must not appear after refused merge"
+    );
+    remove_all(&repo, &worker_a, &worker_b);
+}
+
+#[test]
+fn merge_abort_is_allowed_with_dirty_tree() {
+    let repo = temp_repo_with_branch("worker-a");
+    std::fs::write(repo.join("wip.txt"), "keep-me\n").unwrap();
+    let cmd = SafeGitCommand::new(&["merge".to_owned(), "--abort".to_owned()]).unwrap();
+    let out = cmd
+        .run(&repo, Some("worker-a"))
+        .expect("merge --abort is recovery, not a new integration");
+    // Git may exit non-zero if there is no merge in progress; policy must still admit it.
+    assert!(
+        out.exit_code == 0 || out.stderr.contains("MERGE_HEAD"),
+        "stderr={}",
+        out.stderr
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.join("wip.txt")).unwrap(),
+        "keep-me\n"
+    );
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+#[test]
+fn pull_on_default_branch_is_blocked() {
+    let (repo, worker_a, worker_b) = two_assigned_worktrees();
+    let cmd = SafeGitCommand::new(&[
+        "pull".to_owned(),
+        "--rebase".to_owned(),
+        "origin".to_owned(),
+        "main".to_owned(),
+    ])
+    .unwrap();
+    expect_merge_blocked(&cmd, &repo, None, "default branch");
+    remove_all(&repo, &worker_a, &worker_b);
 }

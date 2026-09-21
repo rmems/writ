@@ -58,7 +58,8 @@ enum Command {
         action: SupervisorAction,
     },
 
-    /// Isolated git worktree lifecycle (create/list/remove/prune).
+    /// Checkout coordination (register/unregister/inspect/list) plus the
+    /// deprecated managed lifecycle (create/remove/prune).
     Worktree {
         #[command(subcommand)]
         action: WorktreeAction,
@@ -96,7 +97,32 @@ enum CiAction {
 
 #[derive(Debug, Subcommand)]
 enum WorktreeAction {
-    /// Create a worktree for a hive job under the sandboxed base path.
+    /// Register an existing, harness-created checkout for coordination.
+    ///
+    /// Writ does not create, move, or modify the checkout; this only writes a
+    /// coordination record in the shared lease store. Works for any path:
+    /// a linked worktree, the primary checkout, or a standalone clone.
+    Register {
+        /// Path to an existing git checkout (any location).
+        path: PathBuf,
+        /// Job id for the coordination record (default: checkout dir name).
+        #[arg(long)]
+        job: Option<String>,
+    },
+    /// Release the coordination record for a checkout. Never deletes files,
+    /// branches, or uncommitted changes.
+    Unregister {
+        /// Path of the registered checkout.
+        path: PathBuf,
+    },
+    /// Read-only inspection of a checkout: branch, HEAD, dirty/detached state,
+    /// repo identity. Writes nothing.
+    Inspect {
+        /// Path to an existing git checkout.
+        path: PathBuf,
+    },
+    /// Deprecated: create a worktree under the sandboxed base path.
+    /// The harness should create checkouts itself; use `register` instead.
     Create {
         /// Repository root (git dir / working tree).
         #[arg(long)]
@@ -129,9 +155,10 @@ enum WorktreeAction {
         )]
         schema_version: u8,
     },
-    /// List hive worktrees under the configured base.
+    /// List registered checkouts in the shared coordination store.
     List,
-    /// Remove a worktree path (must stay under the sandbox base).
+    /// Deprecated: remove a worktree path (must stay under the sandbox base).
+    /// The harness owns physical cleanup; use `unregister` for coordination.
     Remove {
         /// Absolute or relative worktree path.
         path: PathBuf,
@@ -139,7 +166,8 @@ enum WorktreeAction {
         #[arg(long)]
         force: bool,
     },
-    /// Prune stale git worktree metadata for a repo.
+    /// Deprecated: prune stale git worktree metadata for a repo.
+    /// Equivalent to `git worktree prune`; physical cleanup is harness-owned.
     Prune {
         #[arg(long)]
         repo: PathBuf,
@@ -332,6 +360,9 @@ fn worktree_schema_version(cli: &Cli) -> u8 {
 fn worktree_command_name(cli: &Cli) -> Option<&'static str> {
     match &cli.command {
         Some(Command::Worktree { action }) => Some(match action {
+            WorktreeAction::Register { .. } => "worktree.register",
+            WorktreeAction::Unregister { .. } => "worktree.unregister",
+            WorktreeAction::Inspect { .. } => "worktree.inspect",
             WorktreeAction::Create { .. } => "worktree.create",
             WorktreeAction::List => "worktree.list",
             WorktreeAction::Remove { .. } => "worktree.remove",
@@ -410,6 +441,74 @@ fn worktree_create_response(
     ))
 }
 
+fn checkout_json(info: &writ_core::checkout::CheckoutInfo) -> serde_json::Value {
+    serde_json::json!({
+        "path": info.path,
+        "branch": info.branch,
+        "head_commit": info.head_commit,
+        "common_dir": info.common_dir,
+        "linked_worktree": info.linked_worktree,
+        "origin_slug": info.origin_slug,
+        "dirty": info.dirty,
+    })
+}
+
+fn worktree_register_response(
+    path: PathBuf,
+    job: Option<String>,
+) -> writ_core::error::Result<writ_core::contract::Response<serde_json::Value>> {
+    use writ_core::checkout::CheckoutRegistry;
+    use writ_core::contract::Response;
+
+    let registry = CheckoutRegistry::new()?;
+    let job_id = job.unwrap_or_else(|| writ_core::checkout::default_job_id(&path));
+    let info = registry.register(&path, &job_id)?;
+    let mut data = checkout_json(&info);
+    data["job_id"] = serde_json::Value::String(job_id);
+    Ok(Response::success("worktree.register", data))
+}
+
+fn worktree_unregister_response(
+    path: PathBuf,
+) -> writ_core::error::Result<writ_core::contract::Response<serde_json::Value>> {
+    use writ_core::checkout::CheckoutRegistry;
+    use writ_core::contract::Response;
+
+    let released = CheckoutRegistry::new()?.unregister(&path)?;
+    Ok(Response::success(
+        "worktree.unregister",
+        serde_json::json!({ "released": released.is_some() }),
+    ))
+}
+
+fn worktree_inspect_response(
+    path: PathBuf,
+) -> writ_core::error::Result<writ_core::contract::Response<serde_json::Value>> {
+    use writ_core::contract::Response;
+
+    let info = writ_core::checkout::inspect_checkout(&path)?;
+    Ok(Response::success("worktree.inspect", checkout_json(&info)))
+}
+
+fn worktree_list_response()
+-> writ_core::error::Result<writ_core::contract::Response<serde_json::Value>> {
+    use writ_core::checkout::CheckoutRegistry;
+    use writ_core::contract::Response;
+
+    let worktrees = CheckoutRegistry::new()?.registered()?;
+    Ok(Response::success(
+        "worktree.list",
+        serde_json::json!({
+            "worktrees": worktrees.iter().map(|lease| serde_json::json!({
+                "path": lease.worktree_path,
+                "branch": lease.branch,
+                "job_id": lease.job_id,
+                "mode": lease.mode.as_str(),
+            })).collect::<Vec<_>>(),
+        }),
+    ))
+}
+
 fn worktree_response(
     action: WorktreeAction,
     allowlist: &writ_core::owners::OwnerAllowlist,
@@ -418,6 +517,10 @@ fn worktree_response(
     use writ_core::worktree::WorktreeManager;
 
     match action {
+        WorktreeAction::Register { path, job } => worktree_register_response(path, job),
+        WorktreeAction::Unregister { path } => worktree_unregister_response(path),
+        WorktreeAction::Inspect { path } => worktree_inspect_response(path),
+        WorktreeAction::List => worktree_list_response(),
         WorktreeAction::Create {
             repo,
             owner,
@@ -444,19 +547,6 @@ fn worktree_response(
                 schema_version,
             },
         ),
-        WorktreeAction::List => {
-            let manager = WorktreeManager::new()?;
-            let worktrees = manager.list()?;
-            Ok(Response::success(
-                "worktree.list",
-                serde_json::json!({
-                    "worktrees": worktrees.iter().map(|wt| serde_json::json!({
-                        "path": wt.path,
-                        "branch": wt.branch,
-                    })).collect::<Vec<_>>(),
-                }),
-            ))
-        }
         WorktreeAction::Remove { path, force } => {
             let manager = WorktreeManager::new()?;
             manager.remove(&path, force)?;
@@ -1679,14 +1769,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn git_safe_blocks_merge() {
+    async fn git_safe_blocks_mergetool() {
         let cli = Cli {
             json: false,
             allowed_owners: None,
             command: Some(super::Command::GitSafe {
                 expected_branch: None,
                 repo: None,
-                args: vec!["merge".to_owned(), "feature".to_owned()],
+                args: vec!["mergetool".to_owned()],
             }),
         };
         let mut stdout = Vec::new();
