@@ -89,6 +89,10 @@ SAFETY RULES (non-negotiable):
 
 Local assigned-branch integration is allowed.
 
+### Timeouts and hang recovery
+
+Long-running supervised commands use `writ supervisor run` with the named policy in [`docs/timeout-policy.md`](docs/timeout-policy.md). A timeout is a recovery and handoff event: the supervisor contains the child (hard/idle/lost-child/permit-wait) and never retries, merges, bare-force-pushes, deletes a harness checkout, or invents a SHA. Harness re-dispatch is capped by `RedispatchBudget` / `max_redispatch_per_item` (default 1). Timeout residuals do not increment `fix_count`.
+
 ### Enforcement routing
 
 This skill is portable procedure, not a security boundary. Route orchestrated
