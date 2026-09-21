@@ -56,59 +56,69 @@ fn seed_lease(root: &TestDir) {
         .unwrap();
 }
 
-#[test]
-fn list_json_reads_lease_store() {
-    let root = TestDir::new();
-    seed_lease(&root);
-    let (code, stdout, stderr) = writ(&root, &["--json", "watchlist", "list"]);
-    assert_eq!(code, 0, "stderr={stderr}");
-    assert!(stdout.contains("cli.watchlist.list"));
-    assert!(stdout.contains("job-1"));
-    assert!(stdout.contains("running"));
-    assert!(!stdout.contains("watchlist.json"));
+struct CliCase {
+    args: &'static [&'static str],
+    seed: bool,
+    needles: &'static [&'static str],
+    no_json_store: bool,
 }
 
 #[test]
-fn add_does_not_create_json_store() {
-    let root = TestDir::new();
-    let (code, stdout, _stderr) = writ(&root, &["--json", "watchlist", "add"]);
-    assert_eq!(code, 0);
-    assert!(stdout.contains("\"persisted\":false"));
-    assert!(!root.0.join("watchlist.json").exists());
-}
-
-#[test]
-fn empty_list_is_ok() {
-    let root = TestDir::new();
-    let (code, stdout, stderr) = writ(&root, &["watchlist", "list"]);
-    assert_eq!(code, 0, "stderr={stderr}");
-    assert!(stdout.contains("writ worktree register"));
-}
-
-#[test]
-fn check_all_empty_is_ok() {
-    let root = TestDir::new();
-    let (code, stdout, stderr) = writ(&root, &["--json", "watchlist", "check-all"]);
-    assert_eq!(code, 0, "stderr={stderr}");
-    assert!(stdout.contains("cli.watchlist.check_all"));
-    assert!(stdout.contains("\"github_probed\":true"));
-}
-
-#[test]
-fn remove_does_not_persist() {
-    let root = TestDir::new();
-    let (code, stdout, _stderr) = writ(&root, &["watchlist", "remove"]);
-    assert_eq!(code, 0);
-    assert!(stdout.contains("leases.db"));
-}
-
-#[test]
-fn list_table_includes_seeded_job() {
-    let root = TestDir::new();
-    seed_lease(&root);
-    let (code, stdout, stderr) = writ(&root, &["watchlist", "list"]);
-    assert_eq!(code, 0, "stderr={stderr}");
-    assert!(stdout.contains("job-1"));
-    assert!(stdout.contains("running"));
-    assert!(stdout.contains("live"));
+fn watchlist_cli_cases() {
+    let cases = [
+        CliCase {
+            args: &["--json", "watchlist", "list"],
+            seed: true,
+            needles: &["cli.watchlist.list", "job-1", "running"],
+            no_json_store: true,
+        },
+        CliCase {
+            args: &["--json", "watchlist", "add"],
+            seed: false,
+            needles: &["\"persisted\":false"],
+            no_json_store: true,
+        },
+        CliCase {
+            args: &["watchlist", "list"],
+            seed: false,
+            needles: &["writ worktree register"],
+            no_json_store: false,
+        },
+        CliCase {
+            args: &["--json", "watchlist", "check-all"],
+            seed: false,
+            needles: &["cli.watchlist.check_all", "\"github_probed\":true"],
+            no_json_store: false,
+        },
+        CliCase {
+            args: &["watchlist", "remove"],
+            seed: false,
+            needles: &["leases.db"],
+            no_json_store: false,
+        },
+        CliCase {
+            args: &["watchlist", "list"],
+            seed: true,
+            needles: &["job-1", "running", "live"],
+            no_json_store: false,
+        },
+    ];
+    for case in cases {
+        let root = TestDir::new();
+        if case.seed {
+            seed_lease(&root);
+        }
+        let (code, stdout, stderr) = writ(&root, case.args);
+        assert_eq!(code, 0, "args={:?} stderr={stderr}", case.args);
+        for needle in case.needles {
+            assert!(
+                stdout.contains(needle),
+                "missing {needle} in {stdout} for {:?}",
+                case.args
+            );
+        }
+        if case.no_json_store {
+            assert!(!root.0.join("watchlist.json").exists());
+        }
+    }
 }

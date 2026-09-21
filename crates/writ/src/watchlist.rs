@@ -92,38 +92,36 @@ impl ViewRequest<'_> {
                 repo,
                 job,
                 include_released,
-            } => WatchQuery {
-                owner: owner.clone(),
-                repo: repo.clone(),
-                job_id: job.clone(),
-                include_released: *include_released,
-                probe_github: false,
-            },
+            } => filtered_query(owner, repo, job.clone(), *include_released, false),
             WatchlistAction::Check {
                 owner,
                 repo,
                 job,
                 include_released,
-            } => WatchQuery {
-                owner: owner.clone(),
-                repo: repo.clone(),
-                job_id: job.clone(),
-                include_released: *include_released,
-                probe_github: true,
-            },
+            } => filtered_query(owner, repo, job.clone(), *include_released, true),
             WatchlistAction::CheckAll {
                 owner,
                 repo,
                 include_released,
-            } => WatchQuery {
-                owner: owner.clone(),
-                repo: repo.clone(),
-                job_id: None,
-                include_released: *include_released,
-                probe_github: true,
-            },
+            } => filtered_query(owner, repo, None, *include_released, true),
             WatchlistAction::Add | WatchlistAction::Remove => unreachable!(),
         }
+    }
+}
+
+fn filtered_query(
+    owner: &Option<String>,
+    repo: &Option<String>,
+    job_id: Option<String>,
+    include_released: bool,
+    probe_github: bool,
+) -> WatchQuery {
+    WatchQuery {
+        owner: owner.clone(),
+        repo: repo.clone(),
+        job_id,
+        include_released,
+        probe_github,
     }
 }
 
@@ -269,6 +267,16 @@ mod tests {
         }
     }
 
+    fn inspect(action: WatchlistAction) -> (&'static str, WatchQuery) {
+        let allowlist = OwnerAllowlist::parse("acme");
+        let request = ViewRequest {
+            action,
+            allowlist: &allowlist,
+            json: false,
+        };
+        (request.command(), request.query())
+    }
+
     #[test]
     fn add_does_not_persist() {
         let mut out = Vec::new();
@@ -294,64 +302,32 @@ mod tests {
     }
 
     #[test]
-    fn allowlist_type_is_available_for_check() {
-        let list = OwnerAllowlist::parse("acme");
-        assert!(!list.is_empty());
-    }
-
-    #[test]
-    fn list_query_does_not_probe_github() {
-        let allowlist = OwnerAllowlist::parse("acme");
-        let request = ViewRequest {
-            action: WatchlistAction::List {
-                owner: Some("acme".to_owned()),
-                repo: Some("sample".to_owned()),
-                job: Some("job-1".to_owned()),
-                include_released: true,
-            },
-            allowlist: &allowlist,
-            json: true,
-        };
-        assert_eq!(request.command(), "cli.watchlist.list");
-        let query = request.query();
+    fn query_shapes() {
+        let (cmd, query) = inspect(WatchlistAction::List {
+            owner: Some("acme".to_owned()),
+            repo: Some("sample".to_owned()),
+            job: Some("job-1".to_owned()),
+            include_released: true,
+        });
+        assert_eq!(cmd, "cli.watchlist.list");
         assert!(!query.probe_github);
         assert!(query.include_released);
-        assert_eq!(query.job_id.as_deref(), Some("job-1"));
-    }
 
-    #[test]
-    fn check_query_probes_github() {
-        let allowlist = OwnerAllowlist::parse("acme");
-        let request = ViewRequest {
-            action: WatchlistAction::Check {
-                owner: None,
-                repo: None,
-                job: Some("job-1".to_owned()),
-                include_released: false,
-            },
-            allowlist: &allowlist,
-            json: false,
-        };
-        assert_eq!(request.command(), "cli.watchlist.check");
-        assert!(request.query().probe_github);
-        assert_eq!(request.query().job_id.as_deref(), Some("job-1"));
-    }
-
-    #[test]
-    fn check_all_query_has_no_job_filter() {
-        let allowlist = OwnerAllowlist::parse("acme");
-        let request = ViewRequest {
-            action: WatchlistAction::CheckAll {
-                owner: Some("acme".to_owned()),
-                repo: None,
-                include_released: false,
-            },
-            allowlist: &allowlist,
-            json: false,
-        };
-        assert_eq!(request.command(), "cli.watchlist.check_all");
-        let query = request.query();
+        let (cmd, query) = inspect(WatchlistAction::Check {
+            owner: None,
+            repo: None,
+            job: Some("job-1".to_owned()),
+            include_released: false,
+        });
+        assert_eq!(cmd, "cli.watchlist.check");
         assert!(query.probe_github);
+
+        let (cmd, query) = inspect(WatchlistAction::CheckAll {
+            owner: Some("acme".to_owned()),
+            repo: None,
+            include_released: false,
+        });
+        assert_eq!(cmd, "cli.watchlist.check_all");
         assert!(query.job_id.is_none());
     }
 

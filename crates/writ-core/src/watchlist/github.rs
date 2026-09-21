@@ -271,101 +271,52 @@ mod tests {
     use super::*;
     use crate::owners::OwnerAllowlist;
 
+    fn acme(number: u64) -> PrRef<'static> {
+        PrRef {
+            repo: "acme/sample",
+            number,
+        }
+    }
+
+    fn view_json(rollup: &str) -> String {
+        format!(
+            r#"{{"number":1,"title":"t","url":"https://example.test","state":"OPEN","headRefName":"feat","baseRefName":"main","statusCheckRollup":{rollup}}}"#
+        )
+    }
+
+    fn parsed(rollup: &str) -> PrSnapshot {
+        parse_pr_view(acme(1), &view_json(rollup)).unwrap()
+    }
+
     #[test]
     fn parse_uses_context_and_status_when_name_missing() {
-        let json = r#"{
-          "number": 1,
-          "title": "t",
-          "url": "https://example.test",
-          "state": "OPEN",
-          "headRefName": "feat",
-          "baseRefName": "main",
-          "mergeable": "MERGEABLE",
-          "statusCheckRollup": [{"context": "ci", "status": "IN_PROGRESS", "conclusion": ""}]
-        }"#;
-        let snap = parse_pr_view(
-            PrRef {
-                repo: "acme/sample",
-                number: 1,
-            },
-            json,
-        )
-        .unwrap();
+        let snap = parsed(r#"[{"context":"ci","status":"IN_PROGRESS","conclusion":""}]"#);
         assert_eq!(snap.checks[0].name, "ci");
         assert_eq!(snap.checks[0].state, "IN_PROGRESS");
     }
 
     #[test]
     fn parse_list_empty_is_none() {
-        assert!(
-            parse_pr_list(
-                PrRef {
-                    repo: "acme/sample",
-                    number: 0
-                },
-                "[]"
-            )
-            .unwrap()
-            .is_none()
-        );
+        assert!(parse_pr_list(acme(0), "[]").unwrap().is_none());
     }
 
     #[test]
     fn parse_list_takes_first() {
-        let json = r#"[{
-          "number": 9,
-          "title": "t",
-          "url": "https://example.test/9",
-          "state": "OPEN",
-          "headRefName": "feat",
-          "baseRefName": "main",
-          "statusCheckRollup": []
-        }]"#;
-        let snap = parse_pr_list(
-            PrRef {
-                repo: "acme/sample",
-                number: 0,
-            },
-            json,
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(snap.number, 9);
+        let json = format!("[{}]", view_json("[]"));
+        let snap = parse_pr_list(acme(0), &json).unwrap().unwrap();
+        assert_eq!(snap.number, 1);
         assert!(!snap.is_draft);
     }
 
     #[test]
     fn parse_rejects_invalid_json() {
-        let err = parse_pr_view(
-            PrRef {
-                repo: "acme/sample",
-                number: 1,
-            },
-            "not-json",
-        )
-        .unwrap_err();
+        let err = parse_pr_view(acme(1), "not-json").unwrap_err();
         assert!(err.contains("failed to parse gh pr view JSON"));
     }
 
     #[test]
     fn unnamed_check_uses_fallback_state() {
-        let json = r#"{
-          "number": 1,
-          "title": "t",
-          "url": "https://example.test",
-          "state": "OPEN",
-          "headRefName": "feat",
-          "baseRefName": "main",
-          "statusCheckRollup": [{}]
-        }"#;
-        let snap = parse_pr_view(
-            PrRef {
-                repo: "acme/sample",
-                number: 1,
-            },
-            json,
-        )
-        .unwrap();
+        let snap = parsed("[{}]");
         assert_eq!(snap.checks[0].name, "unnamed");
         assert_eq!(snap.checks[0].state, "UNKNOWN");
     }
@@ -385,10 +336,7 @@ mod tests {
 
     #[test]
     fn argv_builders_use_refs() {
-        let view = pr_view_args(PrRef {
-            repo: "acme/sample",
-            number: 12,
-        });
+        let view = pr_view_args(acme(12));
         assert!(view.contains(&"--repo".to_owned()));
         assert!(view.contains(&"12".to_owned()));
         let list = pr_list_args(BranchRef {
@@ -402,21 +350,19 @@ mod tests {
     #[test]
     fn gh_probe_rejects_disallowed_owner_before_gh() {
         let probe = GhPrProbe::new(OwnerAllowlist::parse("acme"));
-        let err = probe
-            .view(PrRef {
-                repo: "other/denied",
-                number: 1,
-            })
-            .unwrap_err();
+        let denied = PrRef {
+            repo: "other/denied",
+            number: 1,
+        };
         assert_eq!(
-            err,
+            probe.view(denied).unwrap_err(),
             ProbeError::OwnerNotAllowed {
                 repo: "other/denied".to_owned()
             }
         );
         let err = probe
             .find_by_branch(BranchRef {
-                repo: "other/denied",
+                repo: denied.repo,
                 branch: "hive/job",
             })
             .unwrap_err();
