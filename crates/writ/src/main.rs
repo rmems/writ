@@ -621,6 +621,76 @@ fn run_worktree(
     Ok(ExitCode::SUCCESS)
 }
 
+fn attribution_config_from_format(
+    agent_id: Option<&str>,
+    placement: Option<&str>,
+    task: Option<&str>,
+    branch: Option<&str>,
+    session: Option<&str>,
+) -> writ_core::attribution::AttributionConfig {
+    let mut config = writ_core::attribution::AttributionConfig::from_env();
+    if let Some(id) = agent_id {
+        config.agent_id = writ_core::attribution::canonicalize_agent_id(id);
+    }
+    if let Some(placement) = placement {
+        config.placement = writ_core::attribution::AttributionPlacement::coerce(placement);
+    }
+    if let Some(task) = task {
+        config.task_id = writ_core::attribution::canonicalize_label(task);
+    }
+    if let Some(branch) = branch {
+        config.branch = writ_core::attribution::canonicalize_label(branch);
+    }
+    if let Some(session) = session {
+        config.session_id = writ_core::attribution::canonicalize_label(session);
+    }
+    config
+}
+
+fn parse_format_commit_sha(raw: Option<&str>) -> writ_core::error::Result<Option<&str>> {
+    let Some(sha) = raw.map(str::trim).filter(|sha| !sha.is_empty()) else {
+        return Ok(None);
+    };
+    writ_core::attribution::sanitize_commit_sha(Some(sha))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid --commit-sha '{sha}'"),
+            )
+            .into()
+        })
+        .map(Some)
+}
+
+fn write_attribution_format(
+    json: bool,
+    config: &writ_core::attribution::AttributionConfig,
+    text: &str,
+    commit_sha: Option<&str>,
+    is_thread_reply: bool,
+    stdout: &mut impl Write,
+) -> io::Result<()> {
+    if !json {
+        return writeln!(stdout, "{text}");
+    }
+    let response = writ_core::contract::Response::success(
+        "attribution.format",
+        serde_json::json!({
+            "text": text,
+            "agent_id": config.agent_id,
+            "task_id": config.task_id,
+            "branch": config.branch,
+            "session_id": config.session_id,
+            "include_sha_on_fix": config.include_sha_on_fix,
+            "placement": config.placement,
+            "commit_sha": commit_sha,
+            "is_thread_reply": is_thread_reply,
+        }),
+    );
+    serde_json::to_writer(&mut *stdout, &response).map_err(io::Error::other)?;
+    stdout.write_all(b"\n")
+}
+
 fn run_attribution(
     action: AttributionAction,
     json: bool,
@@ -644,56 +714,22 @@ fn run_attribution(
                 )
                 .into());
             }
-            let mut config = writ_core::attribution::AttributionConfig::from_env();
-            if let Some(id) = agent_id.as_deref() {
-                config.agent_id = writ_core::attribution::canonicalize_agent_id(id);
-            }
-            if let Some(placement) = placement {
-                config.placement = writ_core::attribution::AttributionPlacement::coerce(&placement);
-            }
-            if let Some(task) = task.as_deref() {
-                config.task_id = writ_core::attribution::canonicalize_label(task);
-            }
-            if let Some(branch) = branch.as_deref() {
-                config.branch = writ_core::attribution::canonicalize_label(branch);
-            }
-            if let Some(session) = session.as_deref() {
-                config.session_id = writ_core::attribution::canonicalize_label(session);
-            }
-            let raw_sha = commit_sha.as_deref();
-            let commit_sha = match raw_sha.map(str::trim) {
-                None | Some("") => None,
-                Some(sha) => Some(
-                    writ_core::attribution::sanitize_commit_sha(Some(sha)).ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            format!("invalid --commit-sha '{sha}'"),
-                        )
-                    })?,
-                ),
-            };
-            let text =
-                writ_core::attribution::format_reply(body, Some(&config), commit_sha, !pr_comment);
-            if json {
-                let response = writ_core::contract::Response::success(
-                    "attribution.format",
-                    serde_json::json!({
-                        "text": text,
-                        "agent_id": config.agent_id,
-                        "task_id": config.task_id,
-                        "branch": config.branch,
-                        "session_id": config.session_id,
-                        "include_sha_on_fix": config.include_sha_on_fix,
-                        "placement": config.placement,
-                        "commit_sha": commit_sha,
-                        "is_thread_reply": !pr_comment,
-                    }),
-                );
-                serde_json::to_writer(&mut *stdout, &response).map_err(io::Error::other)?;
-                stdout.write_all(b"\n")?;
-            } else {
-                writeln!(stdout, "{text}")?;
-            }
+            let config = attribution_config_from_format(
+                agent_id.as_deref(),
+                placement.as_deref(),
+                task.as_deref(),
+                branch.as_deref(),
+                session.as_deref(),
+            );
+            let commit_sha = parse_format_commit_sha(commit_sha.as_deref())?;
+            let is_thread_reply = !pr_comment;
+            let text = writ_core::attribution::format_reply(
+                body,
+                Some(&config),
+                commit_sha,
+                is_thread_reply,
+            );
+            write_attribution_format(json, &config, &text, commit_sha, is_thread_reply, stdout)?;
             Ok(ExitCode::SUCCESS)
         }
     }
