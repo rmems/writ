@@ -135,7 +135,7 @@ The v1 decision that `writ` is the only authoritative runtime, that `SKILL.md` f
 
 `writ` is a **Rust workspace**. One binary owns both layers:
 
-- **Coordination state** — `writ worktree register`/`unregister`/`inspect`/`list` and `writ hook` grant and release SQLite lease rows (`leases` + `agents`) for harness-created checkouts. Path scopes, declared-path overlap, messages/handoffs, and ownership transfer build on this store — no second database. `state.rs` still only *reads* `watched.json`; that file is superseded by the lease store, not given a writer.
+- **Coordination state** — `writ worktree register`/`unregister`/`inspect`/`list` and `writ hook` grant and release SQLite lease rows (`leases` + `agents`) for harness-created checkouts. `writ status` / `writ jobs` read that same store. Path scopes, declared-path overlap, messages/handoffs, and ownership transfer build on this store — no second database. `state.rs` still only *reads* leftover `watched.json`; that file is superseded by the lease store, not given a writer, and is not the status authority.
 - **Safety boundary** — exact-base identity, path sandboxing, process supervision/timeouts, branch verification, and force-with-lease-only pushes, enforced at the process boundary to protect WIP and coordination integrity.
 - **Agent skill (`SKILL.md`)** — portable prompts describing when and how agents call the CLI on any platform.
 
@@ -184,7 +184,7 @@ The installable `SKILL.md` will own platform-facing prompts and command guidance
 
 ## Data flow
 
-**Supported today.** Checkout registration (`writ worktree register`/`unregister`/`inspect`/`list`), `writ git-safe` / `writ gh-safe` / `writ supervisor`, and `writ hook` (JSON on stdin) are implemented. The managed lifecycle commands (`worktree create`/`remove`/`prune`) are deprecated. Claude Code does not register that hook until the operator runs `writ install` (implemented; held back from shared settings pending the [#124](https://github.com/rmems/writ/issues/124) burn-in).
+**Supported today.** Checkout registration (`writ worktree register`/`unregister`/`inspect`/`list`), `writ status` / `writ jobs` (lease-store snapshot), `writ git-safe` / `writ gh-safe` / `writ supervisor`, and `writ hook` (JSON on stdin) are implemented. The managed lifecycle commands (`worktree create`/`remove`/`prune`) are deprecated. Claude Code does not register that hook until the operator runs `writ install` (implemented; held back from shared settings pending the [#124](https://github.com/rmems/writ/issues/124) burn-in).
 
 1. The operator or agent supplies Linear task or GitHub PR context.
 2. The harness (Claude Code agent teams, `/batch`, Cursor, plain `git worktree add`, or an equivalent) assigns work and creates the isolated checkout wherever it wants.

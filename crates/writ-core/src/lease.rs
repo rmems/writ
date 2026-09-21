@@ -69,6 +69,20 @@ pub struct Lease {
     pub max_fix_cycles: Option<i64>,
     pub fix_cycles: Option<i64>,
     pub released_at: Option<i64>,
+    /// SQLite row id. Identity for the lease record, not an ownership generation.
+    pub row_id: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// One `agents` registry row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentRecord {
+    pub agent_id: String,
+    pub agent_type: String,
+    pub session_id: Option<String>,
+    pub started_at: i64,
+    pub stopped_at: Option<i64>,
 }
 
 /// Inputs required to grant or refresh a writer lock.
@@ -113,7 +127,7 @@ struct LeaseSql {
     context: &'static str,
 }
 
-const LEASE_SELECT: &str = "SELECT repo, owner, repo_name, job_id, branch, branch_ref, worktree_path, start_commit, mode, ttl, heartbeat, max_files, max_churn, max_fix_cycles, fix_cycles, released_at FROM leases";
+const LEASE_SELECT: &str = "SELECT repo, owner, repo_name, job_id, branch, branch_ref, worktree_path, start_commit, mode, ttl, heartbeat, max_files, max_churn, max_fix_cycles, fix_cycles, released_at, id, created_at, updated_at FROM leases";
 
 /// SQLite-backed lease and agent registry.
 #[derive(Debug)]
@@ -289,16 +303,43 @@ impl LeaseStore {
 
     /// All currently held (unreleased) leases, in insertion order.
     pub fn list_active(&self) -> Result<Vec<Lease>> {
-        let query = format!("{LEASE_SELECT} WHERE released_at IS NULL ORDER BY id");
+        self.list_leases(
+            "WHERE released_at IS NULL ORDER BY id",
+            "list active leases",
+        )
+    }
+
+    /// All lease identity rows, including released ones, in insertion order.
+    pub fn list_all(&self) -> Result<Vec<Lease>> {
+        self.list_leases("ORDER BY id", "list leases")
+    }
+
+    /// Agent registry rows, live first, then by start time.
+    pub fn list_agents(&self) -> Result<Vec<AgentRecord>> {
         let conn = self.lock()?;
         let mut stmt = conn
-            .prepare(&query)
-            .map_err(|e| lease_err("list active leases", e))?;
+            .prepare(
+                "SELECT agent_id, agent_type, session_id, started_at, stopped_at
+                 FROM agents
+                 ORDER BY (stopped_at IS NOT NULL), started_at, agent_id",
+            )
+            .map_err(|e| lease_err("list agents", e))?;
+        let rows = stmt
+            .query_map([], agent_from_row)
+            .map_err(|e| lease_err("list agents", e))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| lease_err("list agents", e))
+    }
+
+    fn list_leases(&self, suffix: &str, context: &'static str) -> Result<Vec<Lease>> {
+        let query = format!("{LEASE_SELECT} {suffix}");
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(&query).map_err(|e| lease_err(context, e))?;
         let rows = stmt
             .query_map([], lease_from_row)
-            .map_err(|e| lease_err("list active leases", e))?;
+            .map_err(|e| lease_err(context, e))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| lease_err("list active leases", e))
+            .map_err(|e| lease_err(context, e))
     }
 
     /// Look up a lease by worktree path.
@@ -384,6 +425,7 @@ impl LeaseStore {
 fn lease_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Lease> {
     let identity = lease_identity(row)?;
     let limits = lease_limits(row)?;
+    let meta = lease_meta(row)?;
     Ok(Lease {
         repo: identity.repo,
         owner: identity.owner,
@@ -401,6 +443,33 @@ fn lease_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Lease> {
         max_fix_cycles: limits.max_fix_cycles,
         fix_cycles: limits.fix_cycles,
         released_at: limits.released_at,
+        row_id: meta.row_id,
+        created_at: meta.created_at,
+        updated_at: meta.updated_at,
+    })
+}
+
+fn agent_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRecord> {
+    Ok(AgentRecord {
+        agent_id: row.get(0)?,
+        agent_type: row.get(1)?,
+        session_id: row.get(2)?,
+        started_at: row.get(3)?,
+        stopped_at: row.get(4)?,
+    })
+}
+
+struct LeaseMeta {
+    row_id: i64,
+    created_at: i64,
+    updated_at: i64,
+}
+
+fn lease_meta(row: &rusqlite::Row<'_>) -> rusqlite::Result<LeaseMeta> {
+    Ok(LeaseMeta {
+        row_id: row.get(16)?,
+        created_at: row.get(17)?,
+        updated_at: row.get(18)?,
     })
 }
 
@@ -537,6 +606,8 @@ mod tests {
         assert_eq!(held.max_files, None);
         assert_eq!(held.fix_cycles, None);
         assert!(held.released_at.is_none());
+        assert!(held.row_id > 0);
+        assert!(held.created_at > 0);
 
         let released = store.release_by_path(&wt).unwrap().unwrap();
         assert_eq!(released.mode, LeaseMode::Unassigned);
@@ -544,6 +615,9 @@ mod tests {
 
         let active = store.list_active().unwrap();
         assert!(active.is_empty(), "released lease must not list as active");
+        let all = store.list_all().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].mode, LeaseMode::Unassigned);
 
         let resume = store
             .find_resume(ResumeKey {
@@ -611,7 +685,20 @@ mod tests {
                 session_id: Some("session-1"),
             })
             .unwrap();
+        store
+            .upsert_agent(AgentIdentity {
+                agent_id: "agent-2",
+                agent_type: "Worker",
+                session_id: None,
+            })
+            .unwrap();
         store.retire_agent("agent-1").unwrap();
+        let agents = store.list_agents().unwrap();
+        assert_eq!(agents.len(), 2);
+        assert_eq!(agents[0].agent_id, "agent-2");
+        assert!(agents[0].stopped_at.is_none());
+        assert_eq!(agents[1].agent_id, "agent-1");
+        assert!(agents[1].stopped_at.is_some());
         let conn = store.conn.lock().unwrap();
         let stopped: Option<i64> = conn
             .query_row(
