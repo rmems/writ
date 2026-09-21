@@ -66,11 +66,7 @@ pub(super) fn prepare_supervised_command(req: &CommandRequest<'_>) -> Result<Pre
             // Fail closed on path-qualified / relative scripts (./tools/run, tools/run).
             // Basename-only PATH lookups remain for non-sensitive tooling; git/gh above are
             // always PATH-forced. Shebang wrappers in the worktree cannot be invoked by path.
-            if req.program.contains('/')
-                || req.program.contains('\\')
-                || req.program.starts_with('.')
-                || (req.program.len() > 2 && req.program.as_bytes().get(1) == Some(&b':'))
-            {
+            if super::program_is_path_qualified(req.program) {
                 return Err(Error::PolicyViolation {
                     code: PolicyCode::SubcommandNotAllowed,
                     message: format!(
@@ -110,19 +106,7 @@ fn prepare_git_command(prep: &CommandRequest<'_>) -> Result<PreparedCommand> {
     } else {
         None
     };
-    if let (Some(exp), Some(target)) = (
-        expected.as_deref(),
-        crate::git_safe::checkout_or_switch_target(&owned_args),
-    ) && target != exp
-        && target != "HEAD"
-    {
-        return Err(Error::PolicyViolation {
-            code: PolicyCode::BranchMismatch,
-            message: format!(
-                "git checkout/switch target `{target}` must equal --expected-branch `{exp}`"
-            ),
-        });
-    }
+    super::reject_mismatched_checkout(expected.as_deref(), &owned_args)?;
     if let Some(exp) = expected.as_deref() {
         crate::git_safe::reject_push_outside_expected_branch(&owned_args, exp)?;
     }

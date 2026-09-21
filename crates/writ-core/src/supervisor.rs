@@ -39,7 +39,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use crate::error::Result;
+use crate::error::{Error, PolicyCode, Result};
 use crate::owners::OwnerAllowlist;
 
 #[path = "supervisor_cmd.rs"]
@@ -123,6 +123,43 @@ const FORBIDDEN_WRAPPERS: &[&str] = &[
 const VERSIONED_WRAPPER_PREFIXES: &[&str] = &[
     "python", "python2", "python3", "perl", "ruby", "node", "nodejs", "php", "lua", "ipython",
 ];
+
+pub(super) fn program_is_path_qualified(program: &str) -> bool {
+    if program.contains('/') {
+        return true;
+    }
+    if program.contains('\\') {
+        return true;
+    }
+    if program.starts_with('.') {
+        return true;
+    }
+    if program.len() <= 2 {
+        return false;
+    }
+    program.as_bytes().get(1) == Some(&b':')
+}
+
+pub(super) fn reject_mismatched_checkout(expected: Option<&str>, args: &[String]) -> Result<()> {
+    let Some(exp) = expected else {
+        return Ok(());
+    };
+    let Some(target) = crate::git_safe::checkout_or_switch_target(args) else {
+        return Ok(());
+    };
+    if target == exp {
+        return Ok(());
+    }
+    if target == "HEAD" {
+        return Ok(());
+    }
+    Err(Error::PolicyViolation {
+        code: PolicyCode::BranchMismatch,
+        message: format!(
+            "git checkout/switch target `{target}` must equal --expected-branch `{exp}`"
+        ),
+    })
+}
 
 pub(super) fn is_forbidden_wrapper(name: &str) -> bool {
     FORBIDDEN_WRAPPERS.contains(&name) || versioned_wrapper_name(name)
