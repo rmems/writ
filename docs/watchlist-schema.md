@@ -2,7 +2,7 @@
 
 `writ watchlist` is a **consumer** of shared coordination state. RM-825 owns `leases.db` (leases, and later `coord_claims` / `coord_messages`). This command never writes those tables and never creates `watchlist.json`.
 
-Path: `{user_data}/writ/leases.db`, overridable with `WRIT_LEASE_PATH`. The resolver still falls back to a pre-rename `worktrees-hives` root when `writ/` is absent. This process does not write into `pr-babysit/`.
+Path: `{user_data}/writ/leases.db`, overridable with `WRIT_LEASE_PATH`. The resolver still falls back to a pre-rename `worktrees-hives` root when `writ/` is absent. This process does not write into `pr-babysit/`. `list`/`check` open the lease store through the existing `LeaseStore` helper (which may create an empty `leases`/`agents` schema if the file is missing). Coord overlay opens the same file **read-only** and never creates `coord_*` tables.
 
 ## Commands
 

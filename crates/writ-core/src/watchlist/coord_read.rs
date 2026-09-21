@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
 use super::types::CoordOverlay;
 
@@ -70,7 +70,7 @@ impl CoordSnapshot {
 
 /// Open the lease DB read-only and load coord rows when the tables exist.
 pub(crate) fn load_coord_snapshot(path: &Path) -> CoordSnapshot {
-    let Ok(conn) = Connection::open(path) else {
+    let Ok(conn) = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY) else {
         return CoordSnapshot::default();
     };
     if !table_exists(&conn, "coord_claims") {
@@ -250,5 +250,14 @@ mod tests {
         assert!(overlay.paused);
         assert_eq!(overlay.waiting_on.as_deref(), Some("help:agent-b:job-2"));
         assert_eq!(overlay.overlaps.len(), 1);
+    }
+
+    #[test]
+    fn missing_file_fails_open_without_creating_db() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("absent.db");
+        let snap = load_coord_snapshot(&path);
+        assert!(!snap.available);
+        assert!(!path.exists());
     }
 }

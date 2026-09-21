@@ -465,4 +465,26 @@ mod tests {
         let data = load_view(&store, &query, None).unwrap();
         assert!(data.entries.is_empty());
     }
+
+    #[test]
+    fn merge_ready_lease_is_ready_for_integration() {
+        let tmp = tempdir().unwrap();
+        let db = tmp.path().join("leases.db");
+        let store = LeaseStore::open(&db).unwrap();
+        let repo = tmp.path().join("repo");
+        let wt = tmp.path().join("checkout");
+        std::fs::create_dir_all(&wt).unwrap();
+        store
+            .grant(grant_job(&repo, &wt, "job-1", "hive/job-1"))
+            .unwrap();
+        Connection::open(&db)
+            .unwrap()
+            .execute("UPDATE leases SET mode = 'MERGE_READY'", [])
+            .unwrap();
+        let data = load_view(&store, &WatchQuery::default(), None).unwrap();
+        assert_eq!(
+            data.entries[0].collab_status,
+            CollabStatus::ReadyForIntegration
+        );
+    }
 }
