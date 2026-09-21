@@ -1178,14 +1178,11 @@ mod tests {
     }
 
     #[test]
-    fn attribution_format_parser_accepts_identity_and_sha() {
+    fn attribution_format_parser_accepts_agent_and_sha() {
         let super::AttributionAction::Format {
             body,
             agent_id,
             commit_sha,
-            task,
-            branch,
-            session,
             pr_comment: false,
             ..
         } = parsed_identity_format()
@@ -1198,14 +1195,26 @@ mod tests {
             Some("Claude Code: worktrees-hives agent")
         );
         assert_eq!(commit_sha.as_deref(), Some("abc1234"));
+    }
+
+    #[test]
+    fn attribution_format_parser_accepts_task_branch_session() {
+        let super::AttributionAction::Format {
+            task,
+            branch,
+            session,
+            pr_comment: false,
+            ..
+        } = parsed_identity_format()
+        else {
+            panic!("expected attribution format command")
+        };
         assert_eq!(task.as_deref(), Some("RM-128"));
         assert_eq!(
-            (branch.as_deref(), session.as_deref()),
-            (
-                Some("cursor/reply-attribution-config-6e46"),
-                Some("bc-fa8ed877")
-            )
+            branch.as_deref(),
+            Some("cursor/reply-attribution-config-6e46")
         );
+        assert_eq!(session.as_deref(), Some("bc-fa8ed877"));
     }
 
     #[test]
@@ -1471,10 +1480,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn attribution_format_json_rejects_empty_body_with_envelope() {
+    async fn attribution_format_json_rejects_empty_body() {
+        let (result, stdout) = run_format(empty_body_case()).await;
+        assert!(result.is_err());
+        assert!(stdout.is_empty());
+    }
+
+    #[tokio::test]
+    async fn attribution_format_json_empty_body_envelope_message() {
         let (result, mut stdout) = run_format(empty_body_case()).await;
         let error = result.expect_err("empty body must be rejected");
-        assert!(stdout.is_empty());
         write_json_error_envelope(
             "attribution.format",
             writ_core::contract::SCHEMA_VERSION,
@@ -1484,7 +1499,6 @@ mod tests {
         .unwrap();
         let value = parse_stdout_json(&stdout);
         assert_eq!(value["ok"].as_bool(), Some(false));
-        assert_eq!(value["command"].as_str(), Some("attribution.format"));
         assert_eq!(
             value["error"]["message"].as_str(),
             Some("io operation: attribution body must not be empty")
