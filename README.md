@@ -76,7 +76,7 @@ Workers keep their harness-native isolation. `writ` is the shared memory and mes
 
 | Area | Today | Next |
 | --- | --- | --- |
-| `writ` CLI (`git-safe`, `gh-safe`, `worktree`, `supervisor`, `status`) | Implemented | Envelope-compatible additions only |
+| `writ` CLI (`git-safe`, `gh-safe`, `worktree`, `supervisor`, `status`, `attribution`) | Implemented | Envelope-compatible additions only |
 | Checkout registration (`worktree register/unregister/inspect/list`) | Implemented | Managed lifecycle (`create`/`remove`/`prune`) is deprecated |
 | Claude Code hook dispatcher / `writ install` | Implemented | Live burn-in outstanding ([#124](https://github.com/rmems/writ/issues/124)) |
 | SQLite lease store, agent registry | Skeleton (grant/release + registration) | Crash-consistency + same-host claims/messages/handoff (in flight) |
@@ -154,6 +154,7 @@ Implemented `writ` surface (`writ --help` is authoritative):
 | `writ supervisor run --timeout <secs> …` | Implemented | Spawn a child with wall-clock, idle, and grace recovery (`--idle`/`--stall`, `--grace`, `--progress-secs`, env `WRIT_SUPERVISOR_*`; see [`docs/timeout-policy.md`](docs/timeout-policy.md)). Timeout is a handoff residual: Unix SIGTERM-then-SIGKILL on the process group; Windows kills only the direct child (grandchildren may survive). Never deletes a harness checkout. |
 | `writ worktree register\|unregister\|inspect\|list` | Implemented | Coordination records for harness-owned checkouts. Register/unregister never touch files or branches. |
 | `writ worktree create\|remove\|prune` | Deprecated | Managed lifecycle kept for caller compatibility during the transition. `create` requires `--schema-version 2` and `--start-point`. |
+| `writ attribution format` | Implemented | Render review and collaboration replies with real agent/task/branch/session identity. Include a SHA only when one exists; never invent one. |
 | `writ --json` | Implemented | Version-1 JSON envelopes on stdout; diagnostics on stderr. Fixtures: [`docs/examples/`](docs/examples/). |
 | `writ install` / hook dispatcher | Implemented | Registers `writ hook` into `.claude/settings.json`; burn-in outstanding ([#124](https://github.com/rmems/writ/issues/124)). |
 

@@ -24,6 +24,7 @@ All of them, under `--json`:
 | `git-safe` / `gh-safe` | `git.safe` / `gh.safe` |
 | `worktree register\|unregister\|inspect\|list` | `worktree.register` etc. |
 | `worktree create\|remove\|prune` | `worktree.create` etc. (deprecated) |
+| `attribution format` | `attribution.format` |
 | `supervisor run` | `supervisor.run` (also `--idle`/`--stall`, `--grace`, `--progress-secs`, `WRIT_SUPERVISOR_*`; see [timeout-policy.md](../timeout-policy.md)) |
 | `install` | `cli.install` |
 | `hook` | no envelope even under `--json`: PreToolUse is allow/block via exit code; a WorktreeCreate event prints the registered checkout path only when the path is an existing git checkout — missing, nonexistent, or non-git paths produce no stdout |
@@ -56,6 +57,7 @@ writ --json status                            # cli.status
 writ --json git-safe --repo <repo> rev-parse --is-inside-work-tree   # git.safe
 writ --json worktree list                     # worktree.list
 writ --json worktree register <path>          # worktree.register
+writ --json attribution format --body "Looks good!"   # attribution.format
 # error envelope, no repository mutation:
 writ --json worktree create --schema-version 2 --repo <repo> <owner> <repo-name> <job> <branch>  # deprecated
 ```

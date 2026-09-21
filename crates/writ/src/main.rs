@@ -65,6 +65,12 @@ enum Command {
         action: WorktreeAction,
     },
 
+    /// Format an attributed PR thread reply or summary comment.
+    Attribution {
+        #[command(subcommand)]
+        action: AttributionAction,
+    },
+
     /// Dispatch a Claude Code hook event from JSON on stdin.
     Hook,
 
@@ -237,6 +243,38 @@ impl SupervisorTimeouts {
 }
 
 #[derive(Debug, Subcommand)]
+enum AttributionAction {
+    /// Render a reply body with attribution and optional commit SHA.
+    Format {
+        /// Main reply content.
+        #[arg(long, allow_hyphen_values = true)]
+        body: String,
+        /// Identity line. Overrides `WRIT_AGENT_ID` / `WRIT_ATTRIBUTION`.
+        #[arg(long)]
+        agent_id: Option<String>,
+        /// Actual commit SHA when discussing committed work. Omit for
+        /// coordination messages and when no code changed. Never invent a SHA.
+        #[arg(long)]
+        commit_sha: Option<String>,
+        /// `footer` (default) or `header`.
+        #[arg(long)]
+        placement: Option<String>,
+        /// Linear or issue id when one exists. Omit rather than inventing.
+        #[arg(long)]
+        task: Option<String>,
+        /// Assigned branch when one exists. Omit rather than inventing.
+        #[arg(long)]
+        branch: Option<String>,
+        /// Agent session id when one exists. Omit rather than inventing.
+        #[arg(long)]
+        session: Option<String>,
+        /// Format as a PR-level comment instead of a review thread reply.
+        #[arg(long)]
+        pr_comment: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum SupervisorAction {
     /// Run a command under supervision.
     Run {
@@ -266,27 +304,20 @@ enum SupervisorAction {
 async fn main() -> ExitCode {
     let cli = Cli::parse();
     let json = cli.json;
-    let worktree_command = worktree_command_name(&cli);
+    let envelope_command = json_error_command(&cli);
     let worktree_schema_version = worktree_schema_version(&cli);
 
     match run(cli, &mut io::stdout()).await {
         Ok(code) => code,
         Err(error) => {
-            if json && let Some(command) = worktree_command {
-                let response = writ_core::contract::Response {
-                    ok: false,
-                    schema_version: worktree_schema_version,
-                    command,
-                    data: worktree_error_data(&error),
-                    error: Some(writ_core::contract::ErrorData {
-                        code: error.code().to_owned(),
-                        message: error.to_string(),
-                    }),
-                };
+            if json && let Some(command) = envelope_command {
                 let mut stdout = io::stdout();
-                if serde_json::to_writer(&mut stdout, &response).is_ok() {
-                    let _ = stdout.write_all(b"\n");
-                }
+                let _ = write_json_error_envelope(
+                    command,
+                    worktree_schema_version,
+                    &error,
+                    &mut stdout,
+                );
             }
             let _ = writeln!(io::stderr(), "writ: {error}");
             ExitCode::from(error.exit_code())
@@ -431,6 +462,33 @@ fn worktree_command_name(cli: &Cli) -> Option<&'static str> {
         }),
         _ => None,
     }
+}
+
+fn json_error_command(cli: &Cli) -> Option<&'static str> {
+    worktree_command_name(cli).or(match &cli.command {
+        Some(Command::Attribution { .. }) => Some("attribution.format"),
+        _ => None,
+    })
+}
+
+fn write_json_error_envelope(
+    command: &'static str,
+    schema_version: u8,
+    error: &writ_core::error::Error,
+    stdout: &mut impl Write,
+) -> io::Result<()> {
+    let response = writ_core::contract::Response {
+        ok: false,
+        schema_version,
+        command,
+        data: worktree_error_data(error),
+        error: Some(writ_core::contract::ErrorData {
+            code: error.code().to_owned(),
+            message: error.to_string(),
+        }),
+    };
+    serde_json::to_writer(&mut *stdout, &response).map_err(io::Error::other)?;
+    stdout.write_all(b"\n")
 }
 
 /// Owned fields of a `worktree create` request, threaded from the CLI action to
@@ -640,6 +698,121 @@ fn run_worktree(
     Ok(ExitCode::SUCCESS)
 }
 
+fn attribution_config_from_format(
+    agent_id: Option<&str>,
+    placement: Option<&str>,
+    task: Option<&str>,
+    branch: Option<&str>,
+    session: Option<&str>,
+) -> writ_core::attribution::AttributionConfig {
+    let mut config = writ_core::attribution::AttributionConfig::from_env();
+    if let Some(id) = agent_id {
+        config.agent_id = writ_core::attribution::canonicalize_agent_id(id);
+    }
+    if let Some(placement) = placement {
+        config.placement = writ_core::attribution::AttributionPlacement::coerce(placement);
+    }
+    if let Some(task) = task {
+        config.task_id = writ_core::attribution::canonicalize_label(task);
+    }
+    if let Some(branch) = branch {
+        config.branch = writ_core::attribution::canonicalize_label(branch);
+    }
+    if let Some(session) = session {
+        config.session_id = writ_core::attribution::canonicalize_label(session);
+    }
+    config
+}
+
+fn parse_format_commit_sha(raw: Option<&str>) -> writ_core::error::Result<Option<&str>> {
+    let Some(sha) = raw.map(str::trim).filter(|sha| !sha.is_empty()) else {
+        return Ok(None);
+    };
+    writ_core::attribution::sanitize_commit_sha(Some(sha))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid --commit-sha '{sha}'"),
+            )
+            .into()
+        })
+        .map(Some)
+}
+
+fn write_attribution_format(
+    json: bool,
+    config: &writ_core::attribution::AttributionConfig,
+    text: &str,
+    commit_sha: Option<&str>,
+    is_thread_reply: bool,
+    stdout: &mut impl Write,
+) -> io::Result<()> {
+    if !json {
+        return writeln!(stdout, "{text}");
+    }
+    let response = writ_core::contract::Response::success(
+        "attribution.format",
+        serde_json::json!({
+            "text": text,
+            "agent_id": config.agent_id,
+            "task_id": config.task_id,
+            "branch": config.branch,
+            "session_id": config.session_id,
+            "include_sha_on_fix": config.include_sha_on_fix,
+            "placement": config.placement,
+            "commit_sha": commit_sha,
+            "is_thread_reply": is_thread_reply,
+        }),
+    );
+    serde_json::to_writer(&mut *stdout, &response).map_err(io::Error::other)?;
+    stdout.write_all(b"\n")
+}
+
+fn run_attribution(
+    action: AttributionAction,
+    json: bool,
+    stdout: &mut impl Write,
+) -> writ_core::error::Result<ExitCode> {
+    match action {
+        AttributionAction::Format {
+            body,
+            agent_id,
+            commit_sha,
+            placement,
+            task,
+            branch,
+            session,
+            pr_comment,
+        } => {
+            if body.trim().is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "attribution body must not be empty",
+                )
+                .into());
+            }
+            let config = attribution_config_from_format(
+                agent_id.as_deref(),
+                placement.as_deref(),
+                task.as_deref(),
+                branch.as_deref(),
+                session.as_deref(),
+            );
+            let commit_sha = parse_format_commit_sha(commit_sha.as_deref())?;
+            let is_thread_reply = !pr_comment;
+            let text = writ_core::attribution::format_reply(
+                body,
+                Some(&config),
+                commit_sha,
+                is_thread_reply,
+            );
+            write_attribution_format(json, &config, &text, commit_sha, is_thread_reply, stdout)?;
+            Ok(ExitCode::SUCCESS)
+        }
+    }
+}
+
+/// Entry point for CLI commands (status/jobs, git/gh-safe, supervisor, worktree, attribution).
 fn run_hook(stdout: &mut impl Write) -> writ_core::error::Result<ExitCode> {
     let mut input = String::new();
     io::stdin().read_to_string(&mut input)?;
@@ -712,7 +885,6 @@ fn writ_command(writ_bin: Option<PathBuf>) -> String {
     "writ".to_owned()
 }
 
-/// Entry point for CLI commands (status/jobs, git/gh-safe, supervisor, worktree).
 async fn run(cli: Cli, stdout: &mut impl Write) -> writ_core::error::Result<ExitCode> {
     let allowlist =
         writ_core::owners::OwnerAllowlist::from_cli_or_env(cli.allowed_owners.as_deref());
@@ -761,6 +933,7 @@ async fn run(cli: Cli, stdout: &mut impl Write) -> writ_core::error::Result<Exit
             }
         },
         Some(Command::Worktree { action }) => run_worktree(action, &allowlist, cli.json, stdout),
+        Some(Command::Attribution { action }) => run_attribution(action, cli.json, stdout),
         Some(Command::Hook) => run_hook(stdout),
         Some(Command::Install { settings, writ_bin }) => {
             run_install(settings, writ_bin, cli.json, stdout)
@@ -1037,7 +1210,10 @@ mod tests {
     use clap::{CommandFactory, Parser};
     use writ_core::status::{JobIdentity, JobStatus};
 
-    use super::{Cli, run, run_status, run_with_jobs, supervised_exit_code};
+    use super::{
+        Cli, json_error_command, run, run_status, run_with_jobs, supervised_exit_code,
+        write_json_error_envelope,
+    };
 
     fn sample_job() -> JobStatus {
         let mut job = JobStatus::new(JobIdentity {
@@ -1068,6 +1244,400 @@ mod tests {
     #[test]
     fn command_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    fn parse_format(args: &[&str]) -> super::AttributionAction {
+        let parsed = Cli::try_parse_from(args).unwrap();
+        let Some(super::Command::Attribution { action }) = parsed.command else {
+            panic!("expected attribution command")
+        };
+        action
+    }
+
+    fn parsed_identity_format() -> super::AttributionAction {
+        parse_format(&[
+            "writ",
+            "attribution",
+            "format",
+            "--body",
+            "Looks good!",
+            "--agent-id",
+            "Claude Code: writ agent",
+            "--commit-sha",
+            "abc1234",
+            "--task",
+            "RM-128",
+            "--branch",
+            "cursor/reply-attribution-config-6e46",
+            "--session",
+            "bc-fa8ed877",
+        ])
+    }
+
+    #[test]
+    fn attribution_format_parser_accepts_agent_and_sha() {
+        let super::AttributionAction::Format {
+            body,
+            agent_id,
+            commit_sha,
+            pr_comment: false,
+            ..
+        } = parsed_identity_format()
+        else {
+            panic!("expected attribution format command")
+        };
+        assert_eq!(body, "Looks good!");
+        assert_eq!(
+            (agent_id.as_deref(), commit_sha.as_deref()),
+            (Some("Claude Code: writ agent"), Some("abc1234"))
+        );
+    }
+
+    #[test]
+    fn attribution_format_parser_accepts_task_and_branch() {
+        let super::AttributionAction::Format {
+            task,
+            branch,
+            pr_comment: false,
+            ..
+        } = parsed_identity_format()
+        else {
+            panic!("expected attribution format command")
+        };
+        assert_eq!(task.as_deref(), Some("RM-128"));
+        assert_eq!(
+            branch.as_deref(),
+            Some("cursor/reply-attribution-config-6e46")
+        );
+    }
+
+    #[test]
+    fn attribution_format_parser_accepts_session() {
+        let super::AttributionAction::Format {
+            session,
+            pr_comment: false,
+            ..
+        } = parsed_identity_format()
+        else {
+            panic!("expected attribution format command")
+        };
+        assert_eq!(session.as_deref(), Some("bc-fa8ed877"));
+    }
+
+    #[test]
+    fn attribution_format_parser_accepts_hyphen_body() {
+        let super::AttributionAction::Format {
+            body: hyphen_body, ..
+        } = parse_format(&[
+            "writ",
+            "attribution",
+            "format",
+            "--body",
+            "- Fixed the branch check.",
+        ]);
+        assert_eq!(hyphen_body, "- Fixed the branch check.");
+    }
+
+    #[test]
+    fn attribution_format_parser_accepts_pr_comment() {
+        let super::AttributionAction::Format {
+            pr_comment: true, ..
+        } = parse_format(&[
+            "writ",
+            "attribution",
+            "format",
+            "--body",
+            "All checks passed.",
+            "--pr-comment",
+        ])
+        else {
+            panic!("expected PR comment attribution format")
+        };
+    }
+
+    struct FormatCase {
+        json: bool,
+        body: &'static str,
+        agent_id: Option<&'static str>,
+        commit_sha: Option<&'static str>,
+        placement: Option<&'static str>,
+        task: Option<&'static str>,
+        branch: Option<&'static str>,
+        session: Option<&'static str>,
+        pr_comment: bool,
+    }
+
+    fn format_cli(case: FormatCase) -> Cli {
+        Cli {
+            json: case.json,
+            allowed_owners: None,
+            command: Some(super::Command::Attribution {
+                action: super::AttributionAction::Format {
+                    body: case.body.to_owned(),
+                    agent_id: case.agent_id.map(str::to_owned),
+                    commit_sha: case.commit_sha.map(str::to_owned),
+                    placement: case.placement.map(str::to_owned),
+                    task: case.task.map(str::to_owned),
+                    branch: case.branch.map(str::to_owned),
+                    session: case.session.map(str::to_owned),
+                    pr_comment: case.pr_comment,
+                },
+            }),
+        }
+    }
+
+    async fn run_format(case: FormatCase) -> (writ_core::error::Result<ExitCode>, Vec<u8>) {
+        let mut stdout = Vec::new();
+        let result = run(format_cli(case), &mut stdout).await;
+        (result, stdout)
+    }
+
+    fn parse_stdout_json(stdout: &[u8]) -> serde_json::Value {
+        serde_json::from_str(str::from_utf8(stdout).unwrap().trim()).unwrap()
+    }
+
+    fn format_envelope_ok(value: &serde_json::Value) -> bool {
+        value["ok"] == true
+            && value["schema_version"] == 1
+            && value["command"] == "attribution.format"
+            && value["error"].is_null()
+    }
+
+    async fn format_ok(case: FormatCase) -> Vec<u8> {
+        let (result, stdout) = run_format(case).await;
+        match result {
+            Ok(code) if code == ExitCode::SUCCESS => stdout,
+            other => panic!("expected successful attribution format, got {other:?}"),
+        }
+    }
+
+    async fn format_json(case: FormatCase) -> serde_json::Value {
+        parse_stdout_json(&format_ok(case).await)
+    }
+
+    impl FormatCase {
+        fn json_body(body: &'static str) -> Self {
+            Self {
+                json: true,
+                body,
+                agent_id: Some("writ agent"),
+                commit_sha: None,
+                placement: None,
+                task: None,
+                branch: None,
+                session: None,
+                pr_comment: false,
+            }
+        }
+    }
+
+    fn collab_overlap_case() -> FormatCase {
+        FormatCase {
+            task: Some("RM-128"),
+            branch: Some("cursor/reply-attribution-config-6e46"),
+            session: Some("bc-fa8ed877"),
+            ..FormatCase::json_body(
+                "Overlap: I own SKILL.md Reply attribution; RM-145 owns the rest.",
+            )
+        }
+    }
+
+    fn pushed_fix_case() -> FormatCase {
+        FormatCase {
+            commit_sha: Some("abc1234"),
+            placement: Some("footer"),
+            ..FormatCase::json_body("Fixed the issue.")
+        }
+    }
+
+    fn pr_comment_no_code_case() -> FormatCase {
+        FormatCase {
+            agent_id: Some("Codex: writ agent"),
+            commit_sha: Some("  "),
+            pr_comment: true,
+            ..FormatCase::json_body("No code change.")
+        }
+    }
+
+    #[tokio::test]
+    async fn attribution_format_human_omits_sha() {
+        let human = format_ok(FormatCase {
+            json: false,
+            ..FormatCase::json_body("Looks good!")
+        })
+        .await;
+        assert_eq!(
+            str::from_utf8(&human).unwrap(),
+            "Looks good!\n\n---\nwrit agent\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn attribution_format_collaboration_message_omits_sha() {
+        let collab = format_json(collab_overlap_case()).await;
+        assert!(format_envelope_ok(&collab), "{collab}");
+        assert_eq!(
+            collab["data"]["text"].as_str(),
+            Some(
+                "Overlap: I own SKILL.md Reply attribution; RM-145 owns the rest.\n\n---\nwrit agent | task RM-128 | branch cursor/reply-attribution-config-6e46 | session bc-fa8ed877"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn attribution_format_collaboration_message_has_no_sha() {
+        let collab = format_json(collab_overlap_case()).await;
+        assert!(collab["data"]["commit_sha"].is_null());
+    }
+
+    #[tokio::test]
+    async fn attribution_format_json_exposes_collab_identity_fields() {
+        let collab = format_json(collab_overlap_case()).await;
+        assert_eq!(
+            (
+                collab["data"]["task_id"].as_str(),
+                collab["data"]["branch"].as_str(),
+                collab["data"]["session_id"].as_str()
+            ),
+            (
+                Some("RM-128"),
+                Some("cursor/reply-attribution-config-6e46"),
+                Some("bc-fa8ed877")
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn attribution_format_json_includes_pushed_sha() {
+        let with_sha = format_json(pushed_fix_case()).await;
+        assert!(format_envelope_ok(&with_sha), "{with_sha}");
+        assert_eq!(
+            with_sha["data"]["text"].as_str(),
+            Some("Fixed the issue.\n\n---\nwrit agent: fixed in abc1234")
+        );
+    }
+
+    #[tokio::test]
+    async fn attribution_format_json_commit_sha_field() {
+        let with_sha = format_json(pushed_fix_case()).await;
+        assert_eq!(with_sha["data"]["commit_sha"].as_str(), Some("abc1234"));
+    }
+
+    #[tokio::test]
+    async fn attribution_format_pr_comment_omits_blank_sha() {
+        let omit_sha = format_json(pr_comment_no_code_case()).await;
+        assert_eq!(
+            omit_sha["data"]["text"].as_str(),
+            Some("No code change.\n\nCodex: writ agent")
+        );
+        assert!(omit_sha["data"]["commit_sha"].is_null());
+    }
+
+    #[tokio::test]
+    async fn attribution_format_pr_comment_is_not_thread_reply() {
+        let omit_sha = format_json(pr_comment_no_code_case()).await;
+        assert_eq!(omit_sha["data"]["is_thread_reply"].as_bool(), Some(false));
+    }
+
+    #[tokio::test]
+    async fn attribution_format_rejects_invalid_inputs() {
+        for case in [
+            FormatCase {
+                json: false,
+                body: "   ",
+                agent_id: None,
+                commit_sha: None,
+                placement: None,
+                task: None,
+                branch: None,
+                session: None,
+                pr_comment: false,
+            },
+            FormatCase {
+                json: false,
+                body: "Looks good!",
+                agent_id: None,
+                commit_sha: Some("not-a-sha"),
+                placement: None,
+                task: None,
+                branch: None,
+                session: None,
+                pr_comment: false,
+            },
+        ] {
+            let (result, stdout) = run_format(case).await;
+            assert!(result.is_err() && stdout.is_empty());
+        }
+    }
+
+    fn empty_body_case() -> FormatCase {
+        FormatCase {
+            json: true,
+            body: "",
+            agent_id: None,
+            commit_sha: None,
+            placement: None,
+            task: None,
+            branch: None,
+            session: None,
+            pr_comment: false,
+        }
+    }
+
+    #[test]
+    fn attribution_format_empty_body_maps_to_json_command() {
+        assert_eq!(
+            json_error_command(&format_cli(empty_body_case())),
+            Some("attribution.format")
+        );
+    }
+
+    #[tokio::test]
+    async fn attribution_format_json_rejects_empty_body() {
+        let (result, stdout) = run_format(empty_body_case()).await;
+        assert!(result.is_err());
+        assert!(stdout.is_empty());
+    }
+
+    #[tokio::test]
+    async fn attribution_format_json_empty_body_envelope_message() {
+        let (result, mut stdout) = run_format(empty_body_case()).await;
+        let error = result.expect_err("empty body must be rejected");
+        write_json_error_envelope(
+            "attribution.format",
+            writ_core::contract::SCHEMA_VERSION,
+            &error,
+            &mut stdout,
+        )
+        .unwrap();
+        let value = parse_stdout_json(&stdout);
+        assert_eq!(value["ok"].as_bool(), Some(false));
+        assert_eq!(
+            value["error"]["message"].as_str(),
+            Some("io operation: attribution body must not be empty")
+        );
+    }
+
+    #[tokio::test]
+    async fn attribution_format_empty_agent_id_falls_back_to_default() {
+        let empty_agent = parse_stdout_json(
+            &format_ok(FormatCase {
+                json: true,
+                body: "Looks good!",
+                agent_id: Some("   "),
+                commit_sha: None,
+                placement: None,
+                task: None,
+                branch: None,
+                session: None,
+                pr_comment: false,
+            })
+            .await,
+        );
+        assert_eq!(
+            empty_agent["data"]["agent_id"],
+            writ_core::attribution::DEFAULT_AGENT_ID
+        );
     }
 
     #[test]

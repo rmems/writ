@@ -112,7 +112,7 @@ Comment on the GitHub issue (MCP first) with:
 - pushed SHA (`git rev-parse HEAD` **after** that successful push)
 - what landed
 - residual blockers
-- agent name
+- agent name, using the [reply attribution](../../SKILL.md#reply-attribution) templates (`writ attribution format`)
 
 Do not claim a merge. Do not open a PR here. A local HEAD SHA after a failed or rejected push is not a completion report.
 

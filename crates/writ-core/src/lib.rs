@@ -3,6 +3,7 @@
 //! The module boundaries are established in the R1 scaffold. Their behavior is
 //! implemented by the linked foundation issues.
 
+pub mod attribution;
 mod bash_argv;
 pub mod checkout;
 pub mod contract;
