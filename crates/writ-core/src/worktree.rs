@@ -493,6 +493,7 @@ fn existing_worktree_mode(
             request,
             start_commit,
             worktree_path,
+            None,
             "existing worktree registration does not match branch identity and start commit",
         ));
     }
@@ -516,6 +517,7 @@ fn prove_resume(
             request,
             start_commit,
             worktree_path,
+            None,
             "no durable lease identity for this owner/repo/job/branch",
         ));
     };
@@ -524,6 +526,7 @@ fn prove_resume(
             request,
             start_commit,
             worktree_path,
+            None,
             &format!(
                 "lease start_commit {} does not match requested commit {}",
                 lease.start_commit,
@@ -546,6 +549,7 @@ fn prove_resume(
             request,
             start_commit,
             worktree_path,
+            None,
             &format!("branch moved: current commit {branch_commit}"),
         ));
     }
@@ -554,6 +558,7 @@ fn prove_resume(
             request,
             start_commit,
             worktree_path,
+            None,
             "branch is checked out in another worktree",
         ));
     }
@@ -613,23 +618,27 @@ fn resume_unproven(
     request: &WorktreeCreateRequest<'_>,
     start_commit: CommitId<'_>,
     worktree_path: &Path,
+    ownership: Option<&str>,
     reason: &str,
 ) -> Error {
     let residual =
         inspect_residual_state(request.repo_root, worktree_path, BranchName(request.branch));
+    let branch_ref = format!("refs/heads/{}", request.branch);
     Error::PolicyViolation {
         code: PolicyCode::WorktreeResumeUnproven,
         message: format!(
             "refusing to reuse existing branch {:?} at requested commit {}: {reason}; \
-             residual_state path={} path_exists={} registered={} branch_commit={} \
-             head_commit={}",
+             residual_state path={} path_exists={} registered={} branch_ref={} \
+             branch_commit={} head_commit={} ownership_evidence={}; automatic cleanup skipped",
             request.branch,
             start_commit.as_str(),
             worktree_path.display(),
             residual.path_exists,
             residual.worktree_registered,
+            branch_ref,
             residual.branch_commit.as_deref().unwrap_or("<absent>"),
-            residual.head_commit.as_deref().unwrap_or("<absent>")
+            residual.head_commit.as_deref().unwrap_or("<absent>"),
+            ownership.unwrap_or("lease=<absent>")
         ),
     }
 }

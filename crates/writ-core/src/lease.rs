@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -38,14 +38,19 @@ impl LeaseMode {
         }
     }
 
-    fn parse(value: &str) -> Self {
+    /// Parse a stored mode string, failing closed on unrecognized values.
+    fn parse(value: &str) -> Result<Self> {
         match value {
-            "WRITER_LOCKED" => Self::WriterLocked,
-            "REVIEW_ONLY" => Self::ReviewOnly,
-            "NEEDS_HUMAN" => Self::NeedsHuman,
-            "BLOCKED" => Self::Blocked,
-            "MERGE_READY" => Self::MergeReady,
-            _ => Self::Unassigned,
+            "UNASSIGNED" => Ok(Self::Unassigned),
+            "WRITER_LOCKED" => Ok(Self::WriterLocked),
+            "REVIEW_ONLY" => Ok(Self::ReviewOnly),
+            "NEEDS_HUMAN" => Ok(Self::NeedsHuman),
+            "BLOCKED" => Ok(Self::Blocked),
+            "MERGE_READY" => Ok(Self::MergeReady),
+            other => Err(Error::LeaseStore {
+                context: "parse lease mode",
+                message: format!("unrecognized lease mode: {other:?}"),
+            }),
         }
     }
 }
@@ -133,8 +138,11 @@ impl LeaseStore {
             })?;
         }
         let conn = Connection::open(&path).map_err(|e| lease_err("open lease store", e))?;
+        conn.busy_timeout(Duration::from_millis(5000))
+            .map_err(|e| lease_err("set lease busy timeout", e))?;
         conn.execute_batch(
             "
+            PRAGMA journal_mode = WAL;
             PRAGMA foreign_keys = ON;
             CREATE TABLE IF NOT EXISTS leases (
                 id INTEGER PRIMARY KEY,
@@ -455,12 +463,18 @@ fn lease_names(
 }
 
 fn lease_refs(row: &rusqlite::Row<'_>) -> rusqlite::Result<(String, String, String, LeaseMode)> {
-    Ok((
-        row.get(5)?,
-        row.get(6)?,
-        row.get(7)?,
-        LeaseMode::parse(&row.get::<_, String>(8)?),
-    ))
+    let mode_text = row.get::<_, String>(8)?;
+    let mode = LeaseMode::parse(&mode_text).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(
+            8,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                e.to_string(),
+            )),
+        )
+    })?;
+    Ok((row.get(5)?, row.get(6)?, row.get(7)?, mode))
 }
 
 fn lease_limits(row: &rusqlite::Row<'_>) -> rusqlite::Result<LeaseLimits> {

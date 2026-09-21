@@ -135,7 +135,7 @@ The v1 decision that `writ` is the only authoritative runtime, that `SKILL.md` f
 
 `writ` is a **Rust workspace**. One binary owns both layers:
 
-- **Coordination state** — `writ worktree register`/`unregister`/`inspect`/`list` and `writ hook` grant and release SQLite lease rows (`leases` + `agents`) for harness-created checkouts. Path scopes, declared-path overlap, messages/handoffs, and ownership transfer build on this store — no second database. `state.rs` still only *reads* `watched.json`; that file is superseded by the lease store, not given a writer.
+- **Coordination state** — `writ worktree register`/`unregister`/`inspect`/`list` and `writ hook` grant and release SQLite lease rows (`leases` + `agents`) for harness-created checkouts. Deprecated managed `create`/`remove` still persist lease identity for verified reclaim ([#141](https://github.com/rmems/writ/issues/141)). Path scopes, declared-path overlap, messages/handoffs, and ownership transfer build on this store — no second database. `state.rs` still only *reads* `watched.json`; that file is superseded by the lease store, not given a writer.
 - **Safety boundary** — exact-base identity, path sandboxing, process supervision/timeouts, branch verification, and force-with-lease-only pushes, enforced at the process boundary to protect WIP and coordination integrity.
 - **Agent skill (`SKILL.md`)** — portable prompts describing when and how agents call the CLI on any platform.
 

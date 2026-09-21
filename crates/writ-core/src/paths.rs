@@ -196,10 +196,25 @@ pub fn state_path() -> PathBuf {
 
 /// Resolve the SQLite lease-store path.
 ///
-/// Honours `WRIT_LEASE_PATH` when set and non-empty; otherwise
+/// Honours `WRIT_LEASE_PATH` when set and non-empty. When a custom worktree
+/// base is selected (`WRIT_WORKTREE_BASE` / `WH_WORKTREE_BASE`), the lease file
+/// lives next to that isolated base so reclaim identity does not leak across
+/// test or operator sandboxes. Otherwise defaults to
 /// `{resolved_state_root}/leases.db`.
 #[must_use]
 pub fn lease_store_path() -> PathBuf {
+    if let Some(custom) = std::env::var_os(LEASE_PATH_ENV).filter(|v| !v.is_empty()) {
+        return PathBuf::from(custom);
+    }
+    if first_nonempty(
+        std::env::var_os(WORKTREE_BASE_ENV).as_deref(),
+        std::env::var_os(LEGACY_WORKTREE_BASE_ENV).as_deref(),
+    )
+    .is_some()
+        && let Ok(base) = worktree_base_path()
+    {
+        return base.join("leases.db");
+    }
     resolve_lease_path_in(
         &user_data_dir(),
         std::env::var_os(LEASE_PATH_ENV).as_deref(),
@@ -386,6 +401,7 @@ mod tests {
             root.watched_json(),
             PathBuf::from("/tmp/writ-state/watched.json")
         );
+        assert_eq!(root.leases_db(), PathBuf::from("/tmp/writ-state/leases.db"));
     }
 
     #[test]
