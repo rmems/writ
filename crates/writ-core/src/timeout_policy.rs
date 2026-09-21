@@ -10,6 +10,19 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+/// CLI / env: wall-clock timeout in seconds (`0` = disabled).
+pub const ENV_TIMEOUT_SECS: &str = "WRIT_SUPERVISOR_TIMEOUT_SECS";
+/// CLI / env: SIGTERM grace before SIGKILL, in seconds.
+pub const ENV_GRACE_SECS: &str = "WRIT_SUPERVISOR_GRACE_SECS";
+/// CLI / env: idle (no captured output) hang detector, in seconds (`0` = disabled).
+pub const ENV_IDLE_SECS: &str = "WRIT_SUPERVISOR_IDLE_SECS";
+/// Legacy alias for [`ENV_IDLE_SECS`] (`--stall` / stall wording).
+pub const ENV_STALL_SECS: &str = "WRIT_SUPERVISOR_STALL_SECS";
+/// CLI / env: progress tick interval in seconds (`0` = disabled).
+pub const ENV_PROGRESS_SECS: &str = "WRIT_SUPERVISOR_PROGRESS_SECS";
+/// CLI / env: host redispatch cap after a residual (`0` = never redispatch).
+pub const ENV_MAX_REDISPATCH: &str = "WRIT_SUPERVISOR_MAX_REDISPATCH";
+
 /// Progress tick callback. Diagnostics only — never JSON stdout.
 pub type ProgressCallback = Arc<dyn Fn(&ProgressSnapshot) + Send + Sync>;
 
@@ -38,6 +51,8 @@ pub enum TimeoutClass {
     Hard,
     /// Process still alive but no captured stdout/stderr for `idle`.
     Idle,
+    /// Timed out while waiting for a process-local max-parallel permit (no child spawned).
+    PermitWait,
     /// Child PID/handle gone without a terminal status.
     LostChild,
     /// Harness redispatch budget exhausted (never emitted by `Supervisor::run`).
@@ -51,6 +66,7 @@ impl TimeoutClass {
         match self {
             Self::Hard => "timeout:hard",
             Self::Idle => "timeout:idle",
+            Self::PermitWait => "timeout:permit_wait",
             Self::LostChild => "timeout:lost_child",
             Self::RedispatchExhausted => "timeout:redispatch_exhausted",
         }
@@ -62,6 +78,18 @@ impl TimeoutClass {
     pub const fn counts_toward_fix_cap(self) -> bool {
         false
     }
+}
+
+/// Last recovery action the supervisor took. Never includes merge or push.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryStage {
+    /// No child to cancel (permit-wait timeout).
+    None,
+    /// Graceful cancel was sent and the child exited before the kill deadline.
+    GracefulCancel,
+    /// Process-group / child kill ran (after grace, or immediately when grace is 0).
+    Kill,
 }
 
 /// Lifecycle step surfaced in progress ticks.
@@ -201,9 +229,86 @@ pub fn can_redispatch(completed_attempts: u32, max_redispatch_per_item: u32) -> 
     completed_attempts < 1u32.saturating_add(max_redispatch_per_item)
 }
 
+/// Host-side cap that prevents infinite retry loops.
+///
+/// `writ supervisor run` does **not** consume this budget. A harness that
+/// re-invokes the supervisor after a residual must call [`Self::try_acquire`]
+/// once per retry.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct RedispatchBudget {
+    max_per_item: u32,
+    used: u32,
+}
+
+/// The host has already redispatched this item `max_per_item` times.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct RedispatchExhausted {
+    /// Configured cap.
+    pub max_per_item: u32,
+    /// Attempts already consumed.
+    pub used: u32,
+}
+
+impl RedispatchBudget {
+    /// Create a budget. `0` means the host must never redispatch.
+    #[must_use]
+    pub fn new(max_per_item: u32) -> Self {
+        Self {
+            max_per_item,
+            used: 0,
+        }
+    }
+
+    /// Configured cap.
+    #[must_use]
+    pub fn max_per_item(&self) -> u32 {
+        self.max_per_item
+    }
+
+    /// Redispatches already consumed.
+    #[must_use]
+    pub fn used(&self) -> u32 {
+        self.used
+    }
+
+    /// Remaining redispatches (`0` means mark residual and free the slot).
+    #[must_use]
+    pub fn remaining(&self) -> u32 {
+        self.max_per_item.saturating_sub(self.used)
+    }
+
+    /// True when `max_per_item == 0` (hosts must not retry).
+    #[must_use]
+    pub fn redispatch_forbidden(&self) -> bool {
+        self.max_per_item == 0
+    }
+
+    /// Consume one redispatch. Errors when the cap is exhausted.
+    pub fn try_acquire(&mut self) -> Result<(), RedispatchExhausted> {
+        if self.used >= self.max_per_item {
+            return Err(RedispatchExhausted {
+                max_per_item: self.max_per_item,
+                used: self.used,
+            });
+        }
+        self.used += 1;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn env_keys_match_documentation() {
+        assert_eq!(ENV_TIMEOUT_SECS, "WRIT_SUPERVISOR_TIMEOUT_SECS");
+        assert_eq!(ENV_GRACE_SECS, "WRIT_SUPERVISOR_GRACE_SECS");
+        assert_eq!(ENV_IDLE_SECS, "WRIT_SUPERVISOR_IDLE_SECS");
+        assert_eq!(ENV_STALL_SECS, "WRIT_SUPERVISOR_STALL_SECS");
+        assert_eq!(ENV_PROGRESS_SECS, "WRIT_SUPERVISOR_PROGRESS_SECS");
+        assert_eq!(ENV_MAX_REDISPATCH, "WRIT_SUPERVISOR_MAX_REDISPATCH");
+    }
 
     #[test]
     fn named_defaults_match_documented_keys() {
@@ -247,6 +352,7 @@ mod tests {
         for class in [
             TimeoutClass::Hard,
             TimeoutClass::Idle,
+            TimeoutClass::PermitWait,
             TimeoutClass::LostChild,
             TimeoutClass::RedispatchExhausted,
         ] {
@@ -258,6 +364,10 @@ mod tests {
         }
         assert_eq!(TimeoutClass::Hard.residual_blocker(), "timeout:hard");
         assert_eq!(TimeoutClass::Idle.residual_blocker(), "timeout:idle");
+        assert_eq!(
+            TimeoutClass::PermitWait.residual_blocker(),
+            "timeout:permit_wait"
+        );
         assert_eq!(
             TimeoutClass::LostChild.residual_blocker(),
             "timeout:lost_child"
@@ -287,6 +397,37 @@ mod tests {
             policy.child_limit(Duration::from_secs(10)),
             Some(Duration::ZERO)
         );
+    }
+
+    #[test]
+    fn redispatch_budget_caps_retries() {
+        let mut budget = RedispatchBudget::new(1);
+        budget.try_acquire().expect("first redispatch allowed");
+        let err = budget.try_acquire().expect_err("second redispatch blocked");
+        assert_eq!(err.max_per_item, 1);
+        assert_eq!(err.used, 1);
+        assert_eq!(budget.remaining(), 0);
+    }
+
+    #[test]
+    fn zero_budget_never_redispatches() {
+        let mut budget = RedispatchBudget::new(0);
+        assert!(budget.try_acquire().is_err());
+        assert!(budget.redispatch_forbidden());
+        assert_eq!(budget.remaining(), 0);
+    }
+
+    #[test]
+    fn recovery_stage_has_no_merge_or_push_variant() {
+        for stage in [
+            RecoveryStage::None,
+            RecoveryStage::GracefulCancel,
+            RecoveryStage::Kill,
+        ] {
+            let token = serde_json::to_string(&stage).unwrap();
+            assert!(!token.contains("merge"), "{token}");
+            assert!(!token.contains("push"), "{token}");
+        }
     }
 
     #[test]

@@ -43,7 +43,7 @@ use crate::error::{Error, PolicyCode, Result};
 use crate::git_safe::{SafeGhCommand, SafeGitCommand};
 use crate::owners::OwnerAllowlist;
 use crate::timeout_policy::{
-    ProgressCallback, ProgressSnapshot, SupervisorStep, TimeoutClass, TimeoutPolicy,
+    ProgressCallback, ProgressSnapshot, RecoveryStage, SupervisorStep, TimeoutClass, TimeoutPolicy,
 };
 
 /// How long to wait for the child to exit after a timeout kill.
@@ -51,6 +51,9 @@ const POST_KILL_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Cap captured stdout/stderr per stream to avoid memory exhaustion.
 const MAX_CAPTURE_BYTES: usize = 1_048_576;
+
+/// Bound pipe drain when no worker deadline is configured (inherited descriptors).
+const ORPHAN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Stable supervisor failure classifications (v1, additive on the wire).
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
@@ -104,6 +107,15 @@ pub struct SupervisedOutput {
     /// Always `0` from this supervisor: it never re-dispatches.
     #[serde(default)]
     pub redispatch_count: u32,
+    /// Configured host redispatch cap from the active [`TimeoutPolicy`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_redispatch_per_item: Option<u32>,
+    /// Last recovery action (TERM reap vs SIGKILL vs no child).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_stage: Option<RecoveryStage>,
+    /// Milliseconds from run start to the last captured child byte, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_output_ms: Option<u64>,
 }
 
 impl SupervisedOutput {
@@ -272,7 +284,7 @@ impl Supervisor {
             Err(timeout) => return Ok(timeout),
         };
         let Some(child_policy) = child_policy_after_permit(policy, started.elapsed()) else {
-            return Ok(permit_wait_timeout(started));
+            return Ok(permit_wait_timeout(started, policy));
         };
 
         // Branch check immediately before spawn, while holding the permit.
@@ -426,7 +438,7 @@ async fn acquire_run_permit<'a>(
             started,
         )
         .await
-        .map_err(|()| permit_wait_timeout(started)),
+        .map_err(|()| permit_wait_timeout(started, policy)),
         None => Ok(supervisor
             .semaphore
             .acquire()
@@ -483,15 +495,22 @@ async fn acquire_permit_with_progress<'a>(
     }
 }
 
-fn permit_wait_timeout(started: Instant) -> SupervisedOutput {
+fn permit_wait_timeout(started: Instant, policy: &TimeoutPolicy) -> SupervisedOutput {
     SupervisedOutput {
         timed_out: true,
         stderr: "timed out waiting for max-parallel permit".to_owned(),
         error_code: Some(SupervisorErrorCode::TimedOut),
-        timeout_class: Some(TimeoutClass::Hard),
+        timeout_class: Some(TimeoutClass::PermitWait),
+        recovery_stage: Some(RecoveryStage::None),
+        max_redispatch_per_item: Some(policy.max_redispatch_per_item),
         ..SupervisedOutput::default()
     }
     .with_elapsed(started)
+}
+
+fn nonzero_output_ms(last_activity_ms: &AtomicU64) -> Option<u64> {
+    let ms = last_activity_ms.load(Ordering::Relaxed);
+    (ms > 0).then_some(ms)
 }
 
 fn emit_progress(
@@ -624,6 +643,9 @@ async fn await_supervised_child(
             WaitTick::Progress => wait.emit(supervisor, SupervisorStep::Running),
             WaitTick::Continue => {}
             WaitTick::Finished(status) => {
+                if status.is_ok() {
+                    child.disarm();
+                }
                 return complete_child_wait(
                     ChildFinish {
                         supervisor,
@@ -665,6 +687,7 @@ async fn recover_classified(finish: ChildFinish<'_>, class: TimeoutClass) -> Sup
             pid: finish.wait.pid,
         },
         class,
+        &finish.wait.last_activity_ms,
     )
     .await
 }
@@ -693,6 +716,7 @@ async fn complete_child_wait(
                     policy: finish.wait.policy,
                     pid: finish.wait.pid,
                 },
+                &finish.wait.last_activity_ms,
                 &e,
             )
             .await
@@ -702,9 +726,8 @@ async fn complete_child_wait(
 
 /// Drain a normally-exited child's output pipes, honouring the hard deadline.
 ///
-/// When a hard `worker` deadline is configured, pipe draining is bounded by it
-/// and a timeout collapses into a `Hard` timeout outcome; otherwise the pipes
-/// are joined without a bound.
+/// Pipe draining is bounded by the hard `worker` deadline when set, otherwise
+/// by [`ORPHAN_DRAIN_TIMEOUT`] so inherited descriptors cannot hang the supervisor.
 async fn drain_exited_child(
     status: std::process::ExitStatus,
     hard_deadline: Option<Instant>,
@@ -715,28 +738,21 @@ async fn drain_exited_child(
         stdout: stdout_handle,
         stderr: stderr_handle,
     } = pipes;
-    match hard_deadline {
-        Some(deadline_at) => {
-            match drain_pipes_until(deadline_at, pid, stdout_handle, stderr_handle).await {
-                Ok((stdout, stderr)) => output_to_supervised(status, &stdout, &stderr),
-                Err((stdout, stderr)) => SupervisedOutput {
-                    timed_out: true,
-                    killed: true,
-                    stdout: String::from_utf8_lossy(&stdout).into_owned(),
-                    stderr: String::from_utf8_lossy(&stderr).into_owned(),
-                    stdout_truncated: stdout.len() >= MAX_CAPTURE_BYTES,
-                    stderr_truncated: stderr.len() >= MAX_CAPTURE_BYTES,
-                    error_code: Some(SupervisorErrorCode::TimedOut),
-                    timeout_class: Some(TimeoutClass::Hard),
-                    ..SupervisedOutput::default()
-                },
-            }
-        }
-        None => {
-            let stdout = stdout_handle.await.unwrap_or_default();
-            let stderr = stderr_handle.await.unwrap_or_default();
-            output_to_supervised(status, &stdout, &stderr)
-        }
+    let deadline_at = hard_deadline.unwrap_or_else(|| Instant::now() + ORPHAN_DRAIN_TIMEOUT);
+    match drain_pipes_until(deadline_at, pid, stdout_handle, stderr_handle).await {
+        Ok((stdout, stderr)) => output_to_supervised(status, &stdout, &stderr),
+        Err((stdout, stderr)) => SupervisedOutput {
+            timed_out: true,
+            killed: true,
+            stdout: String::from_utf8_lossy(&stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&stderr).into_owned(),
+            stdout_truncated: stdout.len() >= MAX_CAPTURE_BYTES,
+            stderr_truncated: stderr.len() >= MAX_CAPTURE_BYTES,
+            error_code: Some(SupervisorErrorCode::TimedOut),
+            timeout_class: Some(TimeoutClass::Hard),
+            recovery_stage: Some(RecoveryStage::Kill),
+            ..SupervisedOutput::default()
+        },
     }
 }
 
@@ -752,9 +768,10 @@ struct RecoverIo<'a> {
 async fn recover_lost_child(
     child: &mut ProcessGroupChild,
     io: RecoverIo<'_>,
+    last_activity_ms: &AtomicU64,
     error: &std::io::Error,
 ) -> SupervisedOutput {
-    let mut recovered = recover_child(child, io, TimeoutClass::LostChild).await;
+    let mut recovered = recover_child(child, io, TimeoutClass::LostChild, last_activity_ms).await;
     if recovered.stderr.is_empty() {
         recovered.stderr = format!("process error: {error}");
     }
@@ -765,6 +782,7 @@ async fn recover_child(
     child: &mut ProcessGroupChild,
     io: RecoverIo<'_>,
     class: TimeoutClass,
+    last_activity_ms: &AtomicU64,
 ) -> SupervisedOutput {
     let RecoverIo {
         stdout_handle,
@@ -775,38 +793,47 @@ async fn recover_child(
     let error_code = match class {
         TimeoutClass::Idle => SupervisorErrorCode::IdleTimedOut,
         TimeoutClass::LostChild => SupervisorErrorCode::LostChild,
-        TimeoutClass::Hard | TimeoutClass::RedispatchExhausted => SupervisorErrorCode::TimedOut,
+        TimeoutClass::Hard | TimeoutClass::PermitWait | TimeoutClass::RedispatchExhausted => {
+            SupervisorErrorCode::TimedOut
+        }
     };
 
-    if policy.grace > Duration::ZERO {
+    let stage = if policy.grace > Duration::ZERO {
         terminate_process_group(pid);
         match tokio::time::timeout(policy.grace, child.wait()).await {
             Ok(Ok(_)) => {
                 // Parent exited after SIGTERM; still SIGKILL the group so
                 // grandchildren do not wait for Drop.
                 kill_process_group(pid);
+                RecoveryStage::GracefulCancel
             }
             Ok(Err(_)) | Err(_) => {
                 let _ = child.kill().await;
                 let _ = tokio::time::timeout(POST_KILL_JOIN_TIMEOUT, child.wait()).await;
+                RecoveryStage::Kill
             }
         }
     } else {
         let _ = child.kill().await;
         let _ = tokio::time::timeout(POST_KILL_JOIN_TIMEOUT, child.wait()).await;
-    }
+        RecoveryStage::Kill
+    };
+    child.disarm();
 
     let stdout = join_with_timeout(stdout_handle).await;
     let stderr = join_with_timeout(stderr_handle).await;
     SupervisedOutput {
         timed_out: true,
-        killed: true,
+        killed: stage == RecoveryStage::Kill,
         stdout: String::from_utf8_lossy(&stdout).into_owned(),
         stderr: String::from_utf8_lossy(&stderr).into_owned(),
         stdout_truncated: stdout.len() >= MAX_CAPTURE_BYTES,
         stderr_truncated: stderr.len() >= MAX_CAPTURE_BYTES,
         error_code: Some(error_code),
         timeout_class: Some(class),
+        recovery_stage: Some(stage),
+        max_redispatch_per_item: Some(policy.max_redispatch_per_item),
+        last_output_ms: nonzero_output_ms(last_activity_ms),
         ..SupervisedOutput::default()
     }
 }
@@ -825,6 +852,11 @@ impl ProcessGroupChild {
     async fn kill(&mut self) -> std::io::Result<()> {
         kill_process_group(self.pid);
         self.child.kill().await
+    }
+
+    /// Clear the stored pid after a successful reap so Drop cannot SIGKILL a reused pid.
+    fn disarm(&mut self) {
+        self.pid = None;
     }
 }
 
@@ -1284,6 +1316,9 @@ fn output_to_supervised(
         timeout_class: None,
         elapsed_ms: 0,
         redispatch_count: 0,
+        max_redispatch_per_item: None,
+        recovery_stage: None,
+        last_output_ms: None,
     };
     if killed {
         out = out.with_error(SupervisorErrorCode::Killed);

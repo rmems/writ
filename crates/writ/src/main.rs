@@ -163,11 +163,20 @@ enum WorktreeAction {
 #[derive(Debug, Args)]
 struct SupervisorTimeouts {
     /// Wall-clock timeout in seconds. 0 means no timeout.
-    #[arg(long, default_value_t = writ_core::timeout_policy::DEFAULT_WORKER_SECS)]
+    #[arg(
+        long,
+        env = writ_core::timeout_policy::ENV_TIMEOUT_SECS,
+        default_value_t = writ_core::timeout_policy::DEFAULT_WORKER_SECS
+    )]
     timeout: u64,
 
     /// Idle hang detector: no captured output for this many seconds. 0 disables.
-    #[arg(long, default_value_t = writ_core::timeout_policy::DEFAULT_IDLE_SECS)]
+    #[arg(
+        long,
+        visible_alias = "stall",
+        env = writ_core::timeout_policy::ENV_IDLE_SECS,
+        default_value_t = writ_core::timeout_policy::DEFAULT_IDLE_SECS
+    )]
     idle: u64,
 
     /// Optional per-step cap in seconds. 0 disables.
@@ -179,15 +188,27 @@ struct SupervisorTimeouts {
     orchestrator: u64,
 
     /// Seconds between SIGTERM and SIGKILL (Unix). 0 = kill immediately.
-    #[arg(long, default_value_t = writ_core::timeout_policy::DEFAULT_GRACE_SECS)]
+    #[arg(
+        long,
+        env = writ_core::timeout_policy::ENV_GRACE_SECS,
+        default_value_t = writ_core::timeout_policy::DEFAULT_GRACE_SECS
+    )]
     grace: u64,
 
     /// Progress tick interval on stderr while waiting. 0 disables.
-    #[arg(long, default_value_t = writ_core::timeout_policy::DEFAULT_PROGRESS_SECS)]
+    #[arg(
+        long,
+        env = writ_core::timeout_policy::ENV_PROGRESS_SECS,
+        default_value_t = writ_core::timeout_policy::DEFAULT_PROGRESS_SECS
+    )]
     progress_secs: u64,
 
     /// Harness redispatch budget recorded on the policy. Supervisor never retries.
-    #[arg(long, default_value_t = writ_core::timeout_policy::DEFAULT_MAX_REDISPATCH_PER_ITEM)]
+    #[arg(
+        long,
+        env = writ_core::timeout_policy::ENV_MAX_REDISPATCH,
+        default_value_t = writ_core::timeout_policy::DEFAULT_MAX_REDISPATCH_PER_ITEM
+    )]
     max_redispatch: u32,
 }
 

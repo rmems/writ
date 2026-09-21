@@ -64,10 +64,13 @@ Each entry in the `jobs` array has these fields:
 | `process_state` | `ProcessState` | no | Lifecycle state of the job process. |
 | `last_error` | `string` | yes | Last error message if the job failed. Omitted when absent. |
 | `ci_class` | `CiClass` | no | CI classification for the job's head commit. |
-| `timeout_class` | `TimeoutClass` | yes | Stuck class when `process_state` is `timed_out`. Omitted when absent. Values: `hard`, `idle`, `lost_child`, `redispatch_exhausted`. |
-| `residual_blockers` | `string[]` | yes | Structured leftovers (e.g. `timeout:hard`). Omitted when empty. |
+| `timeout_class` | `TimeoutClass` | yes | Stuck class when `process_state` is `timed_out`. Omitted when absent. Values: `hard`, `idle`, `permit_wait`, `lost_child`, `redispatch_exhausted`. |
+| `residual_blockers` | `string[]` | yes | Structured leftovers (e.g. `timeout:hard`). Omitted when empty. No `sha` / `commit` / `head` fields on timeout residuals. |
 | `redispatch_count` | `u32` | yes | Completed terminal runs (harness-owned). Supervisor runs always report `0` internally. |
 | `fix_count` | `u32` | yes | Successful fix attempts. Timeout residuals must not increment this. |
+| `max_redispatch_per_item` | `u32` | yes | Configured host retry cap from policy. `0` means never redispatch ([`RedispatchBudget::redispatch_forbidden`](../crates/writ-core/src/timeout_policy.rs)). |
+| `recovery_stage` | `RecoveryStage` | yes | `none` (permit wait), `graceful_cancel` (TERM reap), or `kill`. Never `merge` or `push`. |
+| `last_output_ms` | `u64` | yes | Milliseconds from run start to last captured child byte, when known. |
 
 ## `ProcessState` enum
 

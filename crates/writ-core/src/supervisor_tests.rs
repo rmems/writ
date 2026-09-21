@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::*;
+use crate::timeout_policy::RecoveryStage;
 
 fn platform_pair(windows: &'static str, unix: &'static str) -> &'static str {
     let pair = (windows, unix);
@@ -77,7 +78,8 @@ fn assert_permit_wait_timeout(output: &SupervisedOutput) {
     assert!(
         output.timed_out
             && !output.killed
-            && output.timeout_class == Some(TimeoutClass::Hard)
+            && output.timeout_class == Some(TimeoutClass::PermitWait)
+            && output.recovery_stage == Some(RecoveryStage::None)
             && output.stderr.contains("max-parallel permit"),
         "permit-wait timeout mismatch: {output:?}"
     );
@@ -539,6 +541,27 @@ async fn wall_clock_includes_permit_wait() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn graceful_cancel_then_kill_when_term_ignored() {
+    let policy = TimeoutPolicy {
+        worker: Some(Duration::from_millis(200)),
+        grace: Duration::from_millis(200),
+        progress_every: None,
+        ..TimeoutPolicy::from_worker_timeout(None)
+    };
+    let output = Supervisor::new(1)
+        .run_unchecked_with_policy(
+            shell_program(),
+            &[shell_flag(), "trap '' TERM; while true; do :; done"],
+            &policy,
+            &RunOptions::default(),
+        )
+        .await;
+    assert_timeout_outcome(&output, TimeoutClass::Hard, SupervisorErrorCode::TimedOut);
+    assert_eq!(output.recovery_stage, Some(RecoveryStage::Kill));
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn grace_period_sends_term_before_kill() {
     let policy = TimeoutPolicy {
         worker: Some(Duration::from_millis(150)),
@@ -557,8 +580,33 @@ async fn grace_period_sends_term_before_kill() {
         .await;
     assert!(output.timed_out, "stderr={}", output.stderr);
     assert_eq!(output.timeout_class, Some(TimeoutClass::Hard));
+    assert_eq!(output.recovery_stage, Some(RecoveryStage::GracefulCancel));
+    assert!(
+        !output.killed,
+        "TERM-sensitive child should exit during grace"
+    );
     assert!(
         started.elapsed() < Duration::from_secs(3),
         "SIGTERM during grace should reap without waiting the full sleep"
     );
+}
+
+#[test]
+fn residual_has_no_fake_sha_fields() {
+    let output = SupervisedOutput {
+        timed_out: true,
+        timeout_class: Some(TimeoutClass::Hard),
+        recovery_stage: Some(RecoveryStage::Kill),
+        max_redispatch_per_item: Some(1),
+        ..SupervisedOutput::default()
+    };
+    let v = serde_json::to_value(&output).unwrap();
+    let obj = v.as_object().expect("object");
+    for key in obj.keys() {
+        let lower = key.to_ascii_lowercase();
+        assert!(
+            !lower.contains("sha") && !lower.contains("commit") && !lower.contains("head"),
+            "timeout residual must not carry identity field `{key}`"
+        );
+    }
 }

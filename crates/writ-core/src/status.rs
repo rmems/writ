@@ -5,7 +5,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::contract::Response;
-use crate::timeout_policy::TimeoutClass;
+use crate::timeout_policy::{RecoveryStage, TimeoutClass};
 
 /// Lifecycle state of a watched job process.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -116,6 +116,15 @@ pub struct JobStatus {
     /// Successful fix attempts. Timeout residuals must not increment this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fix_count: Option<u32>,
+    /// Configured host redispatch cap for this item (from policy / harness).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_redispatch_per_item: Option<u32>,
+    /// Last supervisor recovery action when `process_state` is `timed_out`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_stage: Option<RecoveryStage>,
+    /// Milliseconds from run start to last captured child output, if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_output_ms: Option<u64>,
 }
 
 impl JobStatus {
@@ -136,6 +145,9 @@ impl JobStatus {
             residual_blockers: Vec::new(),
             redispatch_count: None,
             fix_count: None,
+            max_redispatch_per_item: None,
+            recovery_stage: None,
+            last_output_ms: None,
         }
     }
 }

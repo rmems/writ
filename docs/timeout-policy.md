@@ -9,15 +9,15 @@ Related: process supervisor [#27](https://github.com/rmems/writ/issues/27), kern
 
 ## Config keys and defaults
 
-| Key | CLI | Default | Meaning |
-| --- | --- | --- | --- |
-| `worker_seconds` | `--timeout` | `0` (disabled) | Hard wall-clock for the run, **including** max-parallel permit wait |
-| `step_seconds` | `--step` | `0` (disabled) | Optional per-step cap; child sees `min(remaining worker, step)` |
-| `idle_seconds` | `--idle` | `0` (disabled) | Hang detector: process alive but no captured stdout/stderr |
+| Key | CLI | Env | Default | Meaning |
+| --- | --- | --- | --- | --- |
+| `worker_seconds` | `--timeout` | `WRIT_SUPERVISOR_TIMEOUT_SECS` | `0` (disabled) | Hard wall-clock for the run, **including** max-parallel permit wait |
+| `step_seconds` | `--step` | — | `0` (disabled) | Optional per-step cap; child sees `min(remaining worker, step)` |
+| `idle_seconds` | `--idle` (`--stall` alias) | `WRIT_SUPERVISOR_IDLE_SECS` (legacy: `WRIT_SUPERVISOR_STALL_SECS` documented in handoff) | `0` (disabled) | Hang detector: process alive but no captured stdout/stderr |
 | `orchestrator_seconds` | `--orchestrator` | `0` (falls back to worker) | Pool-level wait budget |
-| `grace_seconds` | `--grace` | `5` | Soft-cancel then kill |
-| `progress_secs` | `--progress-secs` | `15` | Stderr ticks while waiting; `0` disables |
-| `max_redispatch_per_item` | `--max-redispatch` | `1` | Harness retry budget. **Supervisor never retries** |
+| `grace_seconds` | `--grace` | `WRIT_SUPERVISOR_GRACE_SECS` | `5` | Soft-cancel then kill |
+| `progress_secs` | `--progress-secs` | `WRIT_SUPERVISOR_PROGRESS_SECS` | `15` | Stderr ticks while waiting; `0` disables |
+| `max_redispatch_per_item` | `--max-redispatch` | `WRIT_SUPERVISOR_MAX_REDISPATCH` | `1` | Harness retry budget. **Supervisor never retries**; hosts use [`RedispatchBudget`](../crates/writ-core/src/timeout_policy.rs) |
 
 Library: [`TimeoutPolicy`](../crates/writ-core/src/timeout_policy.rs). The original `Supervisor::run(..., timeout, ...)` API is wall-clock only with `grace = 0` (immediate kill) so existing callers keep their timing.
 
@@ -29,7 +29,8 @@ A run is **stuck** when any of:
 
 1. **Hard timeout** — elapsed ≥ worker / step / orchestrator limit (`timeout_class: hard`)
 2. **Idle timeout** — child alive, no captured output for `idle_seconds` (`timeout_class: idle`)
-3. **Lost child** — `wait` failed; PID/handle gone without a terminal status (`timeout_class: lost_child`)
+3. **Permit wait** — max-parallel queue exceeded the wall-clock budget before spawn (`timeout_class: permit_wait`, `recovery_stage: none`)
+4. **Lost child** — `wait` failed; PID/handle gone without a terminal status (`timeout_class: lost_child`)
 4. **Redispatch exhausted** — harness has already used `max_redispatch_per_item` extra runs (`timeout_class: redispatch_exhausted`). The supervisor never emits this class; `can_redispatch(completed_attempts, max)` is the decision helper.
 
 Heartbeat used by this binary: last stdout/stderr byte timestamp. Hosts may also watch a status file or step events; those map onto the same four classes (multi-platform hook for [#17](https://github.com/rmems/writ/issues/17)).
@@ -39,7 +40,7 @@ Heartbeat used by this binary: last stdout/stderr byte timestamp. Hosts may also
 1. **Detect** hard, idle, or lost-child.
 2. **Soft cancel** — Unix: `SIGTERM` to the process group. Windows: no SIGTERM group; wait `grace` then kill the direct child.
 3. **Kill** — if still alive after `grace`, Unix `SIGKILL` to the group; Windows `child.kill()` (direct child only; no job object yet).
-4. **State update** — JSON outcome: `timed_out`, `killed`, `error_code`, `timeout_class`, `elapsed_ms`, `redispatch_count: 0`. Watchlist fields: `process_state: timed_out`, `residual_blockers: ["timeout:hard"|…]`. Do **not** write a SHA unless a push was accepted by the remote.
+4. **State update** — JSON outcome: `timed_out`, `killed`, `error_code`, `timeout_class` (`permit_wait` when no child spawned), `recovery_stage` (`none` / `graceful_cancel` / `kill`), optional `last_output_ms`, `elapsed_ms`, `redispatch_count: 0`, `max_redispatch_per_item`. Watchlist fields: `process_state: timed_out`, `residual_blockers: ["timeout:hard"|…]`. Do **not** write a SHA unless a push was accepted by the remote. After reap, the supervisor **disarms** the process-group guard so a reused PID is not SIGKILL'd on Drop. Pipe drain is always bounded (30s when no worker deadline).
 5. **Re-dispatch or residual** — harness may run the item again only while `can_redispatch` is true (default: one extra run). Otherwise mark residual and free the slot. `writ` does not re-dispatch.
 
 If a host subagent API cannot kill: stop waiting, mark `timeout:lost_child` (or host-equivalent residual), warn the operator. Never merge, never bare `--force` / `-f`, never invent a SHA.
