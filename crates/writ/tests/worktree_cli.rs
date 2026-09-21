@@ -44,6 +44,17 @@ fn init_repo(root: &Path) -> PathBuf {
     git(&repo, &["init", "-b", "trunk"]);
     git(&repo, &["config", "user.email", "test@example.com"]);
     git(&repo, &["config", "user.name", "Test User"]);
+    // create binds the requested owner to the repository origin; the CLI tests
+    // request the `acme` owner, so the origin must belong to `acme`.
+    git(
+        &repo,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/acme/sample.git",
+        ],
+    );
     git(&repo, &["commit", "--allow-empty", "-m", "initial"]);
     repo
 }
@@ -61,9 +72,20 @@ struct CreateRequest<'a> {
 }
 
 fn writ_cmd(root: &Path, create_args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_writ"))
+    writ_cmd_with_owners(root, create_args, Some("acme"))
+}
+
+fn writ_cmd_with_owners(root: &Path, create_args: &[&str], allowed_owners: Option<&str>) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_writ"));
+    command
         .env("WRIT_WORKTREE_BASE", root.join("worktrees"))
         .env("WRIT_LEASE_PATH", root.join("leases.db"))
+        .env_remove("WRIT_ALLOWED_OWNERS")
+        .env_remove("WH_ALLOWED_OWNERS");
+    if let Some(owners) = allowed_owners {
+        command.env("WRIT_ALLOWED_OWNERS", owners);
+    }
+    command
         .args(["--json", "worktree", "create"])
         .args(create_args)
         .output()
@@ -488,6 +510,72 @@ fn reclaim_of_foreign_branch_reports_residual_state_without_deleting() {
     );
 }
 
+#[test]
+fn empty_allowlist_rejects_create_without_mutation() {
+    let (root, repo) = primed();
+    let start = git(&repo, &["rev-parse", "HEAD"]);
+    let args = identity_args(
+        &repo,
+        &CreateRequest {
+            job: "denied-empty",
+            branch: "feature/denied-empty",
+            start: &start,
+        },
+    );
+    let output = writ_cmd_with_owners(&root.0, &args, None);
+    assert_error_envelope(&output, 2, 2, "OWNER_NOT_ALLOWED");
+    assert_uncreated(&root.0, &repo, "denied-empty", "feature/denied-empty");
+}
+
+#[test]
+fn owner_outside_allowlist_rejects_create_without_mutation() {
+    let (root, repo) = primed();
+    let start = git(&repo, &["rev-parse", "HEAD"]);
+    let args = identity_args(
+        &repo,
+        &CreateRequest {
+            job: "denied-other",
+            branch: "feature/denied-other",
+            start: &start,
+        },
+    );
+    let output = writ_cmd_with_owners(&root.0, &args, Some("other"));
+    assert_error_envelope(&output, 2, 2, "OWNER_NOT_ALLOWED");
+    assert_uncreated(&root.0, &repo, "denied-other", "feature/denied-other");
+}
+
+#[test]
+fn explicit_allowed_owners_flag_overrides_env_and_creates() {
+    let (root, repo) = primed();
+    let start = git(&repo, &["rev-parse", "HEAD"]);
+    let args = identity_args(
+        &repo,
+        &CreateRequest {
+            job: "explicit",
+            branch: "feature/explicit",
+            start: &start,
+        },
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_writ"))
+        .env("WRIT_WORKTREE_BASE", root.0.join("worktrees"))
+        .env("WRIT_LEASE_PATH", root.0.join("leases.db"))
+        .env("WRIT_ALLOWED_OWNERS", "other")
+        .args([
+            "--json",
+            "--allowed-owners",
+            "github.com/Acme/Repo",
+            "worktree",
+            "create",
+        ])
+        .args(&args)
+        .output()
+        .unwrap();
+    let envelope = json(&output);
+    assert!(output.status.success());
+    assert_eq!(envelope["ok"], true);
+    assert_eq!(envelope["data"]["branch"], "feature/explicit");
+}
+
 fn fork_layout() -> (TestDir, PathBuf, String, String) {
     let root = TestDir::new();
     let origin = root.0.join("origin.git");
@@ -504,7 +592,11 @@ fn fork_layout() -> (TestDir, PathBuf, String, String) {
     let repo = init_repo(&root.0);
     git(
         &repo,
-        &["remote", "add", "origin", origin.to_str().unwrap()],
+        &[
+            "config",
+            &format!("url.{}.insteadOf", origin.display()),
+            "https://github.com/acme/sample.git",
+        ],
     );
     git(&repo, &["push", "origin", "HEAD:refs/heads/trunk"]);
     let base = git(&repo, &["rev-parse", "HEAD"]);

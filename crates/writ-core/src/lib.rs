@@ -4,6 +4,7 @@
 //! implemented by the linked foundation issues.
 
 mod bash_argv;
+pub mod checkout;
 pub mod contract;
 pub mod error;
 mod git_cmd;
@@ -12,6 +13,7 @@ pub mod hook;
 pub mod identity;
 pub mod install;
 pub mod lease;
+pub mod owners;
 pub mod paths;
 pub mod porcelain;
 mod pr_import;

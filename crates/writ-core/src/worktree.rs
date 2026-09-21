@@ -9,6 +9,7 @@ use crate::identity::{
     BranchName, BranchRef, CommitId, JobId, Owner, Repo, StartPoint, resolve_start_commit,
 };
 use crate::lease::{LeaseGrant, LeaseStore, ResumeKey};
+use crate::owners::OwnerAllowlist;
 use crate::paths::{canonicalize_for_tools, derive_worktree_path, worktree_base_path};
 use crate::porcelain;
 use crate::pr_import::{PrHeadImportRequest, import_and_verify_pr_head};
@@ -64,6 +65,7 @@ pub struct WorktreeCreateRequest<'a> {
 #[derive(Debug)]
 pub struct WorktreeManager {
     base_path: Option<PathBuf>,
+    allowlist: OwnerAllowlist,
     leases: LeaseStore,
 }
 
@@ -103,8 +105,19 @@ impl WorktreeManager {
         })?;
         Ok(Self {
             base_path: Some(base),
+            allowlist: OwnerAllowlist::from_env(),
             leases,
         })
+    }
+
+    /// Replace the owner allowlist used by create operations.
+    ///
+    /// Explicit per-call owners are the documented alternative to
+    /// `WRIT_ALLOWED_OWNERS`. An empty list still denies.
+    #[must_use]
+    pub fn with_allowlist(mut self, allowlist: OwnerAllowlist) -> Self {
+        self.allowlist = allowlist;
+        self
     }
 
     /// Get the base path this manager uses.
@@ -163,11 +176,13 @@ impl WorktreeManager {
 
     /// Create a worktree from a typed request used by CLI and orchestration adapters.
     pub fn create_with_request(&self, request: WorktreeCreateRequest<'_>) -> Result<Worktree> {
+        self.allowlist.enforce_owner(request.owner)?;
         let branch = BranchName(request.branch);
         let start_point = StartPoint(request.start_point);
         validate_worktree_branch(branch)?;
         let base = self.base_path()?;
         validate_repo_root(request.repo_root)?;
+        bind_owner_to_origin(request.repo_root, request.owner)?;
 
         // Resolve the caller-selected start point before any mutation. Appending
         // ^{commit} rejects trees/blobs and peels annotated tags to commits.
@@ -400,6 +415,38 @@ fn validate_repo_root(repo_root: &Path) -> Result<()> {
     })
 }
 
+/// Bind the caller-supplied owner to the repository's verified `origin` owner.
+///
+/// `enforce_owner` only proves the *requested* owner is on the allowlist; it does
+/// not prove the local repository at `repo_root` actually belongs to that owner. A
+/// caller could otherwise relabel an out-of-scope local checkout with any
+/// allowlisted owner and have the worktree created under it. Resolving `origin`
+/// and comparing owners closes that gap. Origin resolution failures fail closed
+/// (the error is propagated).
+///
+/// Behavior change (deliberate, deny-by-default per AGENTS.md): a supervised repo
+/// now MUST have a resolvable GitHub `origin` whose owner matches the requested
+/// owner. Repositories without a parseable GitHub `origin` that previously
+/// succeeded at `create` will now be rejected here. This is intended: without a
+/// verifiable origin the ownership claim cannot be proven, so the tighter check
+/// is required and must not be loosened. The equivalent mutating `gh pr` path
+/// applies the same origin binding via `git_safe::bind_gh_repo_selector_to_origin`.
+fn bind_owner_to_origin(repo_root: &Path, requested_owner: &str) -> Result<()> {
+    let origin_slug = crate::git_safe::origin_github_slug(repo_root)?;
+    let origin_owner = crate::git_safe::github_owner_name(&origin_slug);
+    let requested = crate::git_safe::github_owner_name(requested_owner);
+    if origin_owner.is_none() || origin_owner != requested {
+        return Err(Error::PolicyViolation {
+            code: PolicyCode::OwnerNotAllowed,
+            message: format!(
+                "requested owner {:?} does not match repository origin owner (origin `{}`)",
+                requested_owner, origin_slug
+            ),
+        });
+    }
+    Ok(())
+}
+
 fn decide_create_mode(
     request: &WorktreeCreateRequest<'_>,
     start_commit: CommitId<'_>,
@@ -433,9 +480,11 @@ fn existing_worktree_mode(
     let expected_branch = format!("refs/heads/{}", request.branch);
     if porcelain::registration_matches(
         &listing,
-        worktree_path,
-        BranchRef(&expected_branch),
-        start_commit,
+        porcelain::RegistrationIdentity {
+            path: worktree_path,
+            branch_ref: BranchRef(&expected_branch),
+            head: start_commit,
+        },
     ) {
         return Ok(Some(CreateMode::AlreadyPresent));
     }
@@ -776,9 +825,11 @@ impl CreationPostconditions<'_> {
         })?;
         if !porcelain::registration_matches(
             &listing,
-            self.worktree_path,
-            actual_branch_ref,
-            head_commit,
+            porcelain::RegistrationIdentity {
+                path: self.worktree_path,
+                branch_ref: actual_branch_ref,
+                head: head_commit,
+            },
         ) {
             return Err(self.failure(
                 Some(actual_branch_ref),
@@ -811,6 +862,18 @@ impl CreationPostconditions<'_> {
     }
 }
 
+/// Verifies the newly created worktree matches the requested branch and commit.
+///
+/// The checks form a best-effort, non-atomic evidence chain: the resolving
+/// steps (`actual_branch_ref`, `branch_commit`, `head_commit`, and
+/// `verify_registration`) each run a separate `git` subprocess, while
+/// `verify_identity` is a pure in-memory comparison of already-resolved values.
+/// Git offers no cross-invocation lock spanning the subprocess steps, so the
+/// observed state could in principle change between calls. This is intentional
+/// and not a correctness gap. True
+/// atomicity across sequential subprocesses is not achievable, and writ's
+/// one-writer-per-worktree concurrency model (see AGENTS.md) is what bounds
+/// concurrent mutation of a freshly created worktree, not this sequence.
 fn verify_creation_postconditions(postconditions: CreationPostconditions<'_>) -> Result<String> {
     let actual_branch_ref = postconditions.actual_branch_ref()?;
     let actual_branch = BranchRef(&actual_branch_ref);
@@ -1108,6 +1171,8 @@ mod tests {
             source: e,
         })?;
 
+        add_default_acme_origin(dir)?;
+
         // Configure git for testing
         Command::new("git")
             .arg("-C")
@@ -1161,6 +1226,24 @@ mod tests {
         Ok(dir.to_path_buf())
     }
 
+    fn add_default_acme_origin(dir: &Path) -> Result<()> {
+        Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/acme/test-repo.git",
+            ])
+            .output()
+            .map_err(|e| Error::Io {
+                context: "git remote add origin",
+                source: e,
+            })?;
+        Ok(())
+    }
+
     fn git_output(repo: &Path, args: &[&str]) -> String {
         let output = Command::new("git")
             .arg("-C")
@@ -1196,7 +1279,9 @@ mod tests {
             let repo = temp.path().join("repo");
             fs::create_dir(&repo).unwrap();
             let repo_root = init_test_repo_with_object_format(&repo, object_format).unwrap();
-            let manager = WorktreeManager::with_base(temp.path().join("worktrees")).unwrap();
+            let manager = WorktreeManager::with_base(temp.path().join("worktrees"))
+                .unwrap()
+                .with_allowlist(OwnerAllowlist::from_owners(["acme"]));
             Self {
                 temp,
                 repo_root,
@@ -1259,6 +1344,10 @@ mod tests {
             self.git(&["commit", "-m", message]);
             self.head()
         }
+
+        fn set_origin(&self, url: &str) {
+            self.git(&["remote", "set-url", "origin", url]);
+        }
     }
 
     fn assert_create_rejects_start_point_without_mutation(
@@ -1318,6 +1407,166 @@ mod tests {
             .unwrap();
 
         assert_eq!(wt.head_commit.as_deref(), Some(start_commit.as_str()));
+    }
+
+    #[test]
+    fn create_rejects_owner_outside_allowlist_without_mutation() {
+        let harness = Harness::sha1();
+        let start_commit = harness.head();
+        let result = harness.manager.create(
+            &harness.repo_root,
+            "other",
+            "test-repo",
+            "job-denied",
+            "feature/denied",
+            &start_commit,
+        );
+        assert!(matches!(
+            result,
+            Err(Error::PolicyViolation {
+                code: PolicyCode::OwnerNotAllowed,
+                ..
+            })
+        ));
+        assert!(
+            git_output(&harness.repo_root, &["branch", "--list", "feature/denied"])
+                .trim()
+                .is_empty()
+        );
+        assert!(
+            !harness
+                .manager
+                .base_path()
+                .unwrap()
+                .join("other/test-repo/job-denied")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn create_rejects_owner_not_matching_repo_origin_without_mutation() {
+        // `acme` is allowlisted, so enforce_owner passes, but the repository's
+        // verified origin belongs to `other`. Relabeling an out-of-scope local
+        // checkout with an allowlisted owner must be rejected.
+        let harness = Harness::sha1();
+        harness.set_origin("https://github.com/other/test-repo.git");
+        let start_commit = harness.head();
+        let result = harness.create(
+            "job-origin-mismatch",
+            "feature/origin-mismatch",
+            &start_commit,
+        );
+        assert!(
+            matches!(
+                result,
+                Err(Error::PolicyViolation {
+                    code: PolicyCode::OwnerNotAllowed,
+                    ..
+                })
+            ),
+            "expected OwnerNotAllowed for origin owner mismatch, got {result:?}"
+        );
+        assert!(
+            git_output(
+                &harness.repo_root,
+                &["branch", "--list", "feature/origin-mismatch"]
+            )
+            .trim()
+            .is_empty()
+        );
+        assert!(!harness.job_path("job-origin-mismatch").exists());
+    }
+
+    #[test]
+    fn create_rejects_filesystem_origin_masquerading_as_github_owner() {
+        let harness = Harness::sha1();
+        let local = harness.temp_path().join("acme").join("repo");
+        fs::create_dir_all(&local).unwrap();
+        harness.set_origin(local.to_str().unwrap());
+        let start_commit = harness.head();
+        let result = harness.create("job-path-origin", "feature/path-origin", &start_commit);
+        assert!(
+            matches!(
+                result,
+                Err(Error::PolicyViolation {
+                    code: PolicyCode::OwnerNotAllowed,
+                    ..
+                })
+            ),
+            "expected OwnerNotAllowed for filesystem origin, got {result:?}"
+        );
+        assert!(!harness.job_path("job-path-origin").exists());
+    }
+
+    #[test]
+    fn create_accepts_owner_matching_repo_origin() {
+        // Explicit host/owner form on the origin still binds by owner identity.
+        let harness = Harness::sha1();
+        harness.set_origin("git@github.com:Acme/Renamed.git");
+        let start_commit = harness.head();
+        let wt = harness
+            .create("job-origin-match", "feature/origin-match", &start_commit)
+            .unwrap();
+        assert!(wt.path.exists());
+    }
+
+    #[test]
+    fn create_rejects_empty_allowlist_without_mutation() {
+        let harness = Harness::sha1();
+        let start_commit = harness.head();
+        let manager = WorktreeManager::with_base(harness.temp_path().join("empty-allowlist"))
+            .unwrap()
+            .with_allowlist(OwnerAllowlist::default());
+        let result = manager.create(
+            &harness.repo_root,
+            "acme",
+            "test-repo",
+            "job-empty",
+            "feature/empty-allowlist",
+            &start_commit,
+        );
+        assert!(matches!(
+            result,
+            Err(Error::PolicyViolation {
+                code: PolicyCode::OwnerNotAllowed,
+                ..
+            })
+        ));
+        assert!(
+            git_output(
+                &harness.repo_root,
+                &["branch", "--list", "feature/empty-allowlist"]
+            )
+            .trim()
+            .is_empty()
+        );
+        assert!(
+            !harness
+                .temp_path()
+                .join("empty-allowlist/acme/test-repo/job-empty")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn create_honors_explicit_allowlist_case_and_host_form() {
+        let harness = Harness::sha1();
+        let start_commit = harness.head();
+        let manager = WorktreeManager::with_base(harness.temp_path().join("explicit-allowlist"))
+            .unwrap()
+            .with_allowlist(OwnerAllowlist::from_owners(["github.com/Acme/Repo"]));
+        let wt = manager
+            .create(
+                &harness.repo_root,
+                "ACME",
+                "test-repo",
+                "job-explicit",
+                "feature/explicit",
+                &start_commit,
+            )
+            .unwrap();
+        assert_eq!(wt.head_commit.as_deref(), Some(start_commit.as_str()));
+        assert!(wt.path.exists());
     }
 
     fn assert_unproven_resume(result: Result<Worktree>) {
@@ -1441,16 +1690,41 @@ mod tests {
 
         assert!(porcelain::registration_matches(
             &correct,
-            path,
-            BranchRef("refs/heads/feature/job"),
-            CommitId(&expected_head),
+            porcelain::RegistrationIdentity {
+                path,
+                branch_ref: BranchRef("refs/heads/feature/job"),
+                head: CommitId(&expected_head),
+            },
         ));
         assert!(!porcelain::registration_matches(
             &wrong_branch,
-            path,
-            BranchRef("refs/heads/feature/job"),
-            CommitId(&expected_head),
+            porcelain::RegistrationIdentity {
+                path,
+                branch_ref: BranchRef("refs/heads/feature/job"),
+                head: CommitId(&expected_head),
+            },
         ));
+    }
+
+    #[test]
+    fn successful_create_reports_registered_residual_state() {
+        let harness = Harness::sha1();
+        let start_commit = harness.head();
+        let wt = harness
+            .create("job-registered", "feature/registered", &start_commit)
+            .unwrap();
+        let residual = inspect_residual_state(
+            &harness.repo_root,
+            &wt.path,
+            BranchName("feature/registered"),
+        );
+        assert!(residual.path_exists);
+        assert!(residual.worktree_registered);
+        assert_eq!(
+            residual.branch_commit.as_deref(),
+            Some(start_commit.as_str())
+        );
+        assert_eq!(residual.head_commit.as_deref(), Some(start_commit.as_str()));
     }
 
     #[test]
@@ -1789,7 +2063,11 @@ mod tests {
                 &["init", "--bare", origin.to_str().unwrap()],
             );
             let base_head = harness.head();
-            harness.git(&["remote", "add", "origin", origin.to_str().unwrap()]);
+            harness.git(&[
+                "config",
+                &format!("url.{}.insteadOf", origin.display()),
+                "https://github.com/acme/test-repo.git",
+            ]);
             harness.git(&["push", "origin", "HEAD:refs/heads/main"]);
 
             let fork = harness.temp_path().join("fork");
@@ -2032,7 +2310,9 @@ mod tests {
         fs::create_dir(&repo).unwrap();
         let repo_root = init_test_repo_with_object_format(&repo, None).unwrap();
         let base = temp.path().join("work\ntrees");
-        let manager = WorktreeManager::with_base(base).unwrap();
+        let manager = WorktreeManager::with_base(base)
+            .unwrap()
+            .with_allowlist(OwnerAllowlist::from_owners(["acme"]));
         let start = git_output(&repo_root, &["rev-parse", "HEAD"]);
         let wt = manager
             .create_with_request(WorktreeCreateRequest {
@@ -2054,12 +2334,22 @@ mod tests {
             .output()
             .unwrap();
         assert!(listing.status.success());
-        assert!(porcelain::registration_matches(
-            &listing.stdout,
-            &wt.path,
-            BranchRef("refs/heads/feature/newline"),
-            CommitId(&start),
-        ));
+        assert!(
+            porcelain::registration_matches(
+                &listing.stdout,
+                porcelain::RegistrationIdentity {
+                    path: &wt.path,
+                    branch_ref: BranchRef("refs/heads/feature/newline"),
+                    head: CommitId(&start),
+                },
+            ),
+            "newline-containing worktree path must stay in one porcelain record"
+        );
+        let residual = inspect_residual_state(&repo_root, &wt.path, BranchName("feature/newline"));
+        assert!(
+            residual.worktree_registered,
+            "newline-path creation must report worktree_registered rather than a false postcondition miss"
+        );
         assert_eq!(wt.start_commit.as_deref(), Some(start.as_str()));
         assert_eq!(wt.head_commit.as_deref(), Some(start.as_str()));
     }
