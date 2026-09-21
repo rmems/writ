@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -104,9 +105,8 @@ fn normalize_strips_path_and_exe() {
     assert_eq!(normalize_program_name("GH.EXE"), "gh");
 }
 
-#[test]
-fn policy_blocks_known_unsafe_invocations() {
-    let cases: &[(&str, &[&str], PolicyCode)] = &[
+fn known_unsafe_policy_cases() -> &'static [(&'static str, &'static [&'static str], PolicyCode)] {
+    &[
         (
             "/usr/bin/git",
             &["push", "--force"],
@@ -152,15 +152,25 @@ fn policy_blocks_known_unsafe_invocations() {
             PolicyCode::SubcommandNotAllowed,
         ),
         ("git", &["commit", "-m", "x"], PolicyCode::BranchMismatch),
-    ];
-    for (program, args, expected) in cases {
+    ]
+}
+
+#[test]
+fn policy_blocks_known_unsafe_invocations() {
+    for (program, args, expected) in known_unsafe_policy_cases() {
         assert_default_policy(program, args, *expected);
     }
 }
 
+/// Fixed path outside the default worktree sandbox (not `temp_dir`, which Codacy
+/// flags for security-sensitive policy tests).
+fn repo_outside_worktree_base_fixture() -> PathBuf {
+    platform_pair(r"C:\Windows\Temp", "/tmp").into()
+}
+
 #[test]
 fn mutating_git_rejects_repo_outside_default_worktree_base() {
-    let repo = std::env::temp_dir();
+    let repo = repo_outside_worktree_base_fixture();
     assert_policy_code(
         check_command_policy(
             "git",
