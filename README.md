@@ -16,7 +16,7 @@ Cursor, Claude Code, Codex, and similar harnesses already spawn workers and give
 
 - **Does not own worker lifecycles.** Harnesses (Cursor, Claude Code, Codex, plain `git worktree add`) create and isolate checkouts. `writ worktree register` records them; it never creates, moves, fetches, resets, or deletes a checkout.
 - **Does not assign work.** Task decomposition and scheduling belong to the manager agent and the tracker.
-- **Does not replace GitHub or Linear.** Linear is the task tracker. GitHub is the source, PR, review, checks, and protected-branch merge authority.
+- **Does not replace GitHub or Linear.** Linear is the task tracker for teams that use it. GitHub is the source, PR, review, checks, and protected-branch merge authority.
 - **Does not silently allow duplicate ownership.** Two live owners of the same task is a detected collision, not a race.
 - **Local only.** SQLite coordination is same-host. Other transports are out of scope until implemented and tested.
 
@@ -192,7 +192,7 @@ The shared store carries intent, dependency-ready, blocker, overlap, help-reques
 
 | Tool | Role |
 | --- | --- |
-| **Linear** | Required task tracker: task identity, status, planning. |
+| **Linear** | Optional task tracker: task identity, status, planning, when the operator uses it. |
 | **GitHub** | Source of truth for code, PRs, reviews, checks, and protected-branch merges. |
 | **writ** | Same-host coordination state only. No task-tracker clone, no merge authority. |
 
@@ -297,7 +297,7 @@ criteria checkboxes, and the Linear footer documented in
 
 ## Roadmap and tracking
 
-- Product direction and task tracking: Linear (`writ` / `RM` tickets). Linear is authoritative for planning.
+- Product direction and task tracking for this repo: Linear (`writ` / `RM` tickets). Using Linear is a convention of this repository's maintainers, not a product requirement.
 - GitHub issues mirror actionable work items; they are optional, not a required workflow.
 - Open coordination work: crash-consistent lease/ownership records and the same-host claim/overlap/message/handoff layer build on the existing SQLite lease store.
 - Lease budgets (fix-loop bound): [#167](https://github.com/rmems/writ/issues/167)

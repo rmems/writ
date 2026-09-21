@@ -8,7 +8,7 @@ This file defines how coding agents contribute to `writ` and how the collaborati
 
 This is the authoritative repository contribution and autonomy contract. `CLAUDE.md`, `SKILL.md`, `REVIEW.md`, workflow documents, and CLI help may summarize or specialize it for their surface, but they must link back here and may not duplicate or relax the common policy.
 
-Interactive PR monitoring belongs to the installed companion `babysit-pr` skill. It is operator guidance, not a security boundary: Rust `writ-core` is the hard code-enforced boundary for worktree, branch, path, process, and push controls. GitHub owns remote source, PR, review, check, and protected-branch merge authority; Linear is the required task tracker. Neither is duplicated by `writ`.
+Interactive PR monitoring belongs to the installed companion `babysit-pr` skill. It is operator guidance, not a security boundary: Rust `writ-core` is the hard code-enforced boundary for worktree, branch, path, process, and push controls. GitHub owns remote source, PR, review, check, and protected-branch merge authority; Linear is the task tracker this repository's maintainers use. Neither is duplicated by `writ`.
 
 ## Non-negotiable safety
 
