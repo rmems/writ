@@ -22,10 +22,11 @@ All of them, under `--json`:
 | no subcommand | `cli.bootstrap` |
 | `status` / `jobs` | `cli.status` / `cli.jobs` |
 | `git-safe` / `gh-safe` | `git.safe` / `gh.safe` |
-| `worktree create\|list\|remove\|prune` | `worktree.create` etc. |
+| `worktree register\|unregister\|inspect\|list` | `worktree.register` etc. |
+| `worktree create\|remove\|prune` | `worktree.create` etc. (deprecated) |
 | `attribution format` | `attribution.format` |
 | `install` | `cli.install` |
-| `hook` | no envelope: PreToolUse is allow/block via exit code; WorktreeCreate prints the worktree path |
+| `hook` | no envelope even under `--json`: PreToolUse is allow/block via exit code; a WorktreeCreate event prints the registered checkout path only when the path is an existing git checkout — missing, nonexistent, or non-git paths produce no stdout |
 
 **The exception is the policy-violation path**, which prints plain text on stderr
 with exit code 2 instead of an envelope:
@@ -54,7 +55,8 @@ writ --json                                   # cli.bootstrap
 writ --json status                            # cli.status
 writ --json git-safe --repo <repo> rev-parse --is-inside-work-tree   # git.safe
 writ --json worktree list                     # worktree.list
+writ --json worktree register <path>          # worktree.register
 writ --json attribution format --body "Looks good!"   # attribution.format
 # error envelope, no repository mutation:
-writ --json worktree create --schema-version 2 --repo <repo> <owner> <repo-name> <job> <branch>
+writ --json worktree create --schema-version 2 --repo <repo> <owner> <repo-name> <job> <branch>  # deprecated
 ```

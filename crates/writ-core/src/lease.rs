@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::error::{Error, Result};
+use crate::error::{Error, PolicyCode, Result};
 
 /// Lease admission modes reserved by #124. Phase 1 only uses
 /// `WriterLocked` (held) and `Unassigned` (released, identity kept).
@@ -181,13 +181,18 @@ impl LeaseStore {
     }
 
     /// Grant or refresh a writer lock, keeping reserved budget columns null.
+    ///
+    /// The conflict target `(owner, repo_name, job_id)` refreshes in place only
+    /// when the existing row is released or names the same `worktree_path`; an
+    /// active lease held by a different checkout path is never seized — the
+    /// grant fails with [`PolicyCode::LeaseConflict`].
     pub fn grant(&self, grant: LeaseGrant<'_>) -> Result<Lease> {
         let now = now_secs();
         let repo = path_text(grant.repo);
         let worktree_path = path_text(grant.worktree_path);
         let branch_ref = format!("refs/heads/{}", grant.branch);
         let conn = self.lock()?;
-        conn.execute(
+        let changed = conn.execute(
             "
             INSERT INTO leases (
                 repo, owner, repo_name, job_id, branch, branch_ref, worktree_path,
@@ -204,6 +209,8 @@ impl LeaseStore {
                 heartbeat = excluded.heartbeat,
                 updated_at = excluded.updated_at,
                 released_at = NULL
+            WHERE leases.released_at IS NOT NULL
+                OR leases.worktree_path = excluded.worktree_path
             ",
             params![
                 repo,
@@ -220,6 +227,15 @@ impl LeaseStore {
         )
         .map_err(|e| lease_err("grant lease", e))?;
         drop(conn);
+        if changed == 0 {
+            return Err(Error::PolicyViolation {
+                code: PolicyCode::LeaseConflict,
+                message: format!(
+                    "job `{}` already holds an active lease for a different worktree path",
+                    grant.job_id
+                ),
+            });
+        }
         self.find_job(JobKey {
             owner: grant.owner,
             repo_name: grant.repo_name,
@@ -269,6 +285,20 @@ impl LeaseStore {
             },
             params![key.owner, key.repo_name, key.job_id],
         )
+    }
+
+    /// All currently held (unreleased) leases, in insertion order.
+    pub fn list_active(&self) -> Result<Vec<Lease>> {
+        let query = format!("{LEASE_SELECT} WHERE released_at IS NULL ORDER BY id");
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare(&query)
+            .map_err(|e| lease_err("list active leases", e))?;
+        let rows = stmt
+            .query_map([], lease_from_row)
+            .map_err(|e| lease_err("list active leases", e))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| lease_err("list active leases", e))
     }
 
     /// Look up a lease by worktree path.
@@ -512,6 +542,9 @@ mod tests {
         assert_eq!(released.mode, LeaseMode::Unassigned);
         assert!(released.released_at.is_some());
 
+        let active = store.list_active().unwrap();
+        assert!(active.is_empty(), "released lease must not list as active");
+
         let resume = store
             .find_resume(ResumeKey {
                 owner: "acme",
@@ -523,6 +556,48 @@ mod tests {
             .unwrap();
         assert_eq!(resume.start_commit, "abc123");
         assert_eq!(resume.branch_ref, "refs/heads/hive/gh-42");
+    }
+
+    #[test]
+    fn grant_refuses_active_lease_held_by_different_path() {
+        let tmp = tempdir().unwrap();
+        let store = LeaseStore::open(tmp.path().join("leases.db")).unwrap();
+        let repo = tmp.path().join("repo");
+        let wt_a = tmp.path().join("checkouts/a");
+        let wt_b = tmp.path().join("checkouts/b");
+        fn grant_for<'a>(repo: &'a Path, wt: &'a Path) -> LeaseGrant<'a> {
+            LeaseGrant {
+                repo,
+                owner: "local",
+                repo_name: "repo",
+                job_id: "job-1",
+                branch: "hive/job-1",
+                worktree_path: wt,
+                start_commit: "abc123",
+            }
+        }
+
+        store.grant(grant_for(&repo, &wt_a)).unwrap();
+
+        // A different path for the same job id is a conflict, not a seize.
+        let err = store.grant(grant_for(&repo, &wt_b)).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::LeaseConflict,
+                ..
+            }
+        ));
+
+        // Re-granting the same path refreshes in place.
+        let refreshed = store.grant(grant_for(&repo, &wt_a)).unwrap();
+        assert!(refreshed.released_at.is_none());
+        assert_eq!(refreshed.worktree_path, wt_a);
+
+        // After release, the other path can take the identity.
+        store.release_by_path(&wt_a).unwrap();
+        let moved = store.grant(grant_for(&repo, &wt_b)).unwrap();
+        assert_eq!(moved.worktree_path, wt_b);
     }
 
     #[test]
