@@ -134,7 +134,7 @@ fn status_envelope(root: &Path) -> serde_json::Value {
 
 fn assert_ok_envelope(envelope: &serde_json::Value, command: &str) {
     assert_eq!(envelope["ok"], true);
-    assert_eq!(envelope["schema_version"], 1);
+    assert_eq!(envelope["schema_version"], 2);
     assert_eq!(envelope["command"], command);
 }
 

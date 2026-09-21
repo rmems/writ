@@ -1844,7 +1844,7 @@ mod tests {
         let output = str::from_utf8(&stdout).unwrap();
         let v: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
 
-        assert_eq!(v.get("schema_version").expect("missing schema_version"), 1);
+        assert_eq!(v.get("schema_version").expect("missing schema_version"), 2);
         assert_eq!(v.get("command").expect("missing command"), "cli.status");
         assert!(v.get("ok").expect("missing ok").as_bool().unwrap());
         assert!(
@@ -1900,7 +1900,7 @@ mod tests {
         let output = str::from_utf8(&stdout).unwrap();
         let v: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
 
-        assert_eq!(v.get("schema_version").expect("missing schema_version"), 1);
+        assert_eq!(v.get("schema_version").expect("missing schema_version"), 2);
         assert_eq!(v.get("command").expect("missing command"), "cli.jobs");
         assert!(v.get("ok").expect("missing ok").as_bool().unwrap());
         assert!(

@@ -5,17 +5,22 @@ from the SQLite lease store (`leases` + `agents`). Human output is formatted fro
 the same snapshot. This is not a GitHub PR/check/merge gate and does not revive
 the deleted Python orchestrator or `watched.json`.
 
-Missing lease-store files are **not** an error and are **not** created: the
-command returns `ok: true` with empty `jobs` and `agents` arrays.
-
 ## Envelope
 
-All status responses use the shared v1 envelope (`crates/writ-core/src/contract.rs`):
+All status responses use the shared CLI envelope (`crates/writ-core/src/contract.rs`)
+with **`schema_version: 2`**. Version 2 is the lease-backed collaboration contract:
+`process_state` / `ci_class` serialize as `unknown`, and `collaboration_state` /
+`lease_mode` are first-class fields. Strict consumers of the earlier five-value
+`ProcessState` list must key off this version.
+
+Missing lease-store **files** are **not** an error and are **not** created. A path
+that exists but is not a regular file, or that cannot be stated/opened, is
+`STATE_LOAD_FAILED`.
 
 | Field | Type | Description |
 | --- | --- | --- |
 | `ok` | `bool` | `true` when the query succeeded. |
-| `schema_version` | `u8` | Always `1` for the current contract. |
+| `schema_version` | `u8` | `2` for this lease-backed status contract. |
 | `command` | `string` | `cli.status` or `cli.jobs`. |
 | `data` | `object` | Snapshot payload (see below). |
 | `error` | `object \| null` | Structured error payload; `null` on success. |
@@ -28,7 +33,7 @@ All status responses use the shared v1 envelope (`crates/writ-core/src/contract.
 | `jobs` | `JobStatus[]` | Lease identities, including released (`UNASSIGNED`) rows. |
 | `agents` | `AgentStatus[]` | Agent-registry rows from the same database. |
 
-Additive fields within schema version `1` are compatible. Removals or semantic
+Additive fields within schema version `2` are compatible. Removals or semantic
 renames require a version bump. Consumers should ignore unknown fields and must
 treat JSON `null` as unknown rather than inferring a value.
 
@@ -65,8 +70,8 @@ When the lease store cannot be opened or queried:
 | `redispatch_count` | `u32` | yes | Completed terminal runs (harness-owned). Supervisor runs always report `0` internally. |
 | `fix_count` | `u32` | yes | Successful fix attempts. Timeout residuals must not increment this. |
 | `collaboration_state` | `CollaborationState` | no | Mapped only from recorded `lease_mode`. |
-| `lease_mode` | `string \| null` | yes | Raw mode (`WRITER_LOCKED`, `UNASSIGNED`, \u2026). |
-| `head` | `string \| null` | yes | Live checkout `HEAD` when inspect succeeds, else lease `start_commit`. |
+| `lease_mode` | `string \| null` | yes | Exact stored mode text; unrecognized values are kept (not rewritten to `UNKNOWN`). |
+| `head` | `string \| null` | yes | Live checkout `HEAD` when inspect matches lease identity, else lease `start_commit`. |
 | `head_source` | `string \| null` | yes | `checkout` or `lease`. |
 | `lease_row_id` | `i64 \| null` | yes | SQLite row id. |
 | `updated_at` | `i64 \| null` | yes | Lease `updated_at` unix seconds. |
@@ -123,7 +128,7 @@ Agents are listed separately because the store does not join them to lease rows.
 ```json
 {
   "ok": true,
-  "schema_version": 1,
+  "schema_version": 2,
   "command": "cli.status",
   "data": {
     "source": "lease_store",
@@ -139,7 +144,7 @@ Agents are listed separately because the store does not join them to lease rows.
 ```json
 {
   "ok": true,
-  "schema_version": 1,
+  "schema_version": 2,
   "command": "cli.status",
   "data": {
     "source": "lease_store",
@@ -207,8 +212,8 @@ Agents are listed separately because the store does not join them to lease rows.
 
 ## Versioning
 
-The `schema_version` field is backward-compatible. Additive fields are introduced
-within version `1`. Removals or semantic renames require a version bump.
+The `schema_version` field for status/jobs is `2`. Additive fields are compatible
+within that version. Removals or semantic renames require a further bump.
 
 ## Commands
 

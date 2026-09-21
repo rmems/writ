@@ -9,7 +9,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::checkout::{CheckoutInfo, DETACHED_BRANCH, inspect_checkout};
+use crate::checkout::{CheckoutInfo, DETACHED_BRANCH, inspect_checkout_for_status};
 use crate::contract::Response;
 use crate::lease::{AgentRecord, Lease, LeaseMode, LeaseStore};
 use crate::paths::lease_store_path;
@@ -244,6 +244,9 @@ impl JobsData {
 pub type StatusReport = Response<JobsData>;
 
 const SOURCE_LEASE_STORE: &str = "lease_store";
+/// Lease-backed status/jobs envelope. Bumped because `process_state` and
+/// `ci_class` emit `unknown`, which strict v1 ProcessState decoders reject.
+pub const STATUS_SCHEMA_VERSION: u8 = 2;
 
 /// Map a recorded lease mode onto local collaboration state. No GitHub merge
 /// outcome is inferred.
@@ -336,7 +339,7 @@ fn job_from_lease(lease: &Lease) -> JobStatus {
 }
 
 fn resolve_head(lease: &Lease) -> (Option<String>, Option<String>, Option<bool>) {
-    match inspect_checkout(Path::new(&lease.worktree_path)) {
+    match inspect_checkout_for_status(Path::new(&lease.worktree_path)) {
         Ok(info) if checkout_matches_lease(&info, lease) => {
             (info.head_commit, Some("checkout".to_owned()), Some(false))
         }
@@ -351,9 +354,14 @@ fn resolve_head(lease: &Lease) -> (Option<String>, Option<String>, Option<bool>)
 /// The inspected checkout only supplies a live head when its recorded
 /// identity still matches the lease: same repository and same branch.
 fn checkout_matches_lease(info: &CheckoutInfo, lease: &Lease) -> bool {
-    info.owner == lease.owner
-        && info.repo_name == lease.repo_name
-        && info.branch.as_deref().unwrap_or(DETACHED_BRANCH) == lease.branch
+    let branch = info.branch.as_deref().unwrap_or(DETACHED_BRANCH);
+    if branch != lease.branch || info.owner != lease.owner || info.repo_name != lease.repo_name {
+        return false;
+    }
+    match crate::paths::canonicalize_for_tools(Path::new(&lease.repo)) {
+        Ok(recorded) => info.common_dir == recorded,
+        Err(_) => info.common_dir == Path::new(&lease.repo),
+    }
 }
 
 fn nonempty_head(start_commit: &str) -> Option<String> {
@@ -425,18 +433,18 @@ fn format_agent_line(agent: &AgentStatus) -> String {
     )
 }
 
-/// Build a successful v1 envelope response for the given command and snapshot.
+/// Build a successful status envelope for the given command and snapshot.
 #[must_use]
 pub fn status_response(command: &'static str, data: JobsData) -> StatusReport {
-    Response::success(command, data)
+    Response::success_with_schema(command, data, STATUS_SCHEMA_VERSION)
 }
 
-/// Build a failure v1 envelope when coordination state cannot be loaded.
+/// Build a failure envelope when coordination state cannot be loaded.
 #[must_use]
 pub fn status_error(command: &'static str, message: String) -> StatusReport {
     Response {
         ok: false,
-        schema_version: crate::contract::SCHEMA_VERSION,
+        schema_version: STATUS_SCHEMA_VERSION,
         command,
         data: JobsData::empty(),
         error: Some(crate::contract::ErrorData {
@@ -449,7 +457,7 @@ pub fn status_error(command: &'static str, message: String) -> StatusReport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contract::SCHEMA_VERSION;
+    use crate::checkout::CheckoutRegistry;
     use crate::lease::{AgentIdentity, LeaseGrant};
     use crate::timeout_policy::TimeoutClass;
     use tempfile::tempdir;
@@ -554,7 +562,7 @@ mod tests {
     }
 
     #[test]
-    fn status_response_uses_v1_envelope() {
+    fn status_response_uses_status_schema() {
         let mut data = JobsData::empty();
         data.jobs.push(sample_job());
         let v: serde_json::Value = serde_json::from_str(
@@ -563,7 +571,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             v.get("schema_version").expect("missing schema_version"),
-            SCHEMA_VERSION
+            STATUS_SCHEMA_VERSION
         );
         assert_eq!(v.get("command").expect("missing command"), "cli.status");
         assert!(v.get("ok").expect("missing ok").as_bool().unwrap());
@@ -946,21 +954,16 @@ mod tests {
     #[test]
     fn live_checkout_matching_lease_reports_checkout_head() {
         let tmp = tempdir().unwrap();
-        let store = LeaseStore::open(tmp.path().join("leases.db")).unwrap();
+        let db = tmp.path().join("leases.db");
         let wt = tmp.path().join("wt-live");
         let head = init_checkout(&wt, "hive/a");
-        store
-            .grant(LeaseGrant {
-                repo: &wt,
-                owner: "local",
-                repo_name: "wt-live",
-                job_id: "job-a",
-                branch: "hive/a",
-                worktree_path: &wt,
-                start_commit: &head,
-            })
+        CheckoutRegistry::with_store(LeaseStore::open(&db).unwrap())
+            .unwrap()
+            .register(&wt, "job-a")
             .unwrap();
-        let job = &load_from_store(&store).unwrap().jobs[0];
+        let job = &load_from_store(&LeaseStore::open(&db).unwrap())
+            .unwrap()
+            .jobs[0];
         assert_eq!(job.head.as_deref(), Some(head.as_str()));
         assert_eq!(job.head_source.as_deref(), Some("checkout"));
         assert_eq!(job.recovery_needed, Some(false));
@@ -969,22 +972,17 @@ mod tests {
     #[test]
     fn branch_switched_checkout_falls_back_to_lease_head() {
         let tmp = tempdir().unwrap();
-        let store = LeaseStore::open(tmp.path().join("leases.db")).unwrap();
+        let db = tmp.path().join("leases.db");
         let wt = tmp.path().join("wt-moved");
         let head = init_checkout(&wt, "hive/a");
-        store
-            .grant(LeaseGrant {
-                repo: &wt,
-                owner: "local",
-                repo_name: "wt-moved",
-                job_id: "job-a",
-                branch: "hive/a",
-                worktree_path: &wt,
-                start_commit: &head,
-            })
+        CheckoutRegistry::with_store(LeaseStore::open(&db).unwrap())
+            .unwrap()
+            .register(&wt, "job-a")
             .unwrap();
         git(&wt, &["checkout", "--quiet", "-b", "other"]);
-        let job = &load_from_store(&store).unwrap().jobs[0];
+        let job = &load_from_store(&LeaseStore::open(&db).unwrap())
+            .unwrap()
+            .jobs[0];
         assert_eq!(job.head.as_deref(), Some(head.as_str()));
         assert_eq!(job.head_source.as_deref(), Some("lease"));
         assert_eq!(job.recovery_needed, Some(true));

@@ -777,6 +777,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(lease.mode, LeaseMode::Unknown);
+        assert_eq!(lease.mode_raw, "NOT_A_MODE");
         assert_ne!(lease.mode, LeaseMode::Unassigned);
     }
 }
