@@ -43,15 +43,16 @@ Distinct from GitHub check status. Not a merge gate.
 | `paused` | Coord claim `paused_at` set; WIP is preserved |
 | `conflicted` | `NEEDS_HUMAN` or GitHub `mergeable=CONFLICTING` |
 | `ready_for_integration` | Lease mode `MERGE_READY` (local integration, not GitHub-merged) |
+| `released` | Lease released or `UNASSIGNED`; retained history row, not an active writer |
 
 ## `recovery_status`
 
 | Value | Meaning |
 | --- | --- |
-| `live` | Unreleased lease and checkout path exists |
+| `live` | Unreleased lease, checkout path exists, and heartbeat is fresh (or no `ttl`) |
 | `released` | Identity row kept after unregister |
 | `stale_heartbeat` | `ttl` elapsed since last heartbeat |
-| `missing_checkout` | Lease path is gone; harness owns cleanup |
+| `missing_checkout` | Worktree/checkout path is gone; harness owns cleanup |
 
 ## GitHub overlay
 

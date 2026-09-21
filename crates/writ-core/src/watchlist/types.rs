@@ -18,6 +18,8 @@ pub enum CollabStatus {
     Conflicted,
     /// Locally ready to integrate on the assigned branch (not GitHub-merged).
     ReadyForIntegration,
+    /// Lease released or unassigned; the row is retained for history only.
+    Released,
 }
 
 impl fmt::Display for CollabStatus {
@@ -28,6 +30,7 @@ impl fmt::Display for CollabStatus {
             Self::Paused => "paused",
             Self::Conflicted => "conflicted",
             Self::ReadyForIntegration => "ready_for_integration",
+            Self::Released => "released",
         })
     }
 }

@@ -12,6 +12,8 @@ use super::types::CoordOverlay;
 #[derive(Debug, Clone, Default)]
 pub(crate) struct CoordSnapshot {
     pub available: bool,
+    /// Set when coord tables exist but could not be read (e.g. schema drift).
+    pub error: Option<String>,
     claims: BTreeMap<JobId, ClaimRow>,
     messages: Vec<MessageRow>,
 }
@@ -81,14 +83,34 @@ pub(crate) fn load_coord_snapshot(path: &Path) -> CoordSnapshot {
     if !table_exists(&conn, "coord_claims") {
         return CoordSnapshot::default();
     }
-    let claims = load_claims(&conn).unwrap_or_default();
+    let claims = match load_claims(&conn) {
+        Ok(claims) => claims,
+        Err(err) => {
+            return CoordSnapshot {
+                available: true,
+                error: Some(format!("coord_claims: {err}")),
+                ..CoordSnapshot::default()
+            };
+        }
+    };
     let messages = if table_exists(&conn, "coord_messages") {
-        load_messages(&conn).unwrap_or_default()
+        match load_messages(&conn) {
+            Ok(messages) => messages,
+            Err(err) => {
+                return CoordSnapshot {
+                    available: true,
+                    error: Some(format!("coord_messages: {err}")),
+                    claims,
+                    ..CoordSnapshot::default()
+                };
+            }
+        }
     } else {
         Vec::new()
     };
     CoordSnapshot {
         available: true,
+        error: None,
         claims,
         messages,
     }

@@ -117,6 +117,34 @@ pub fn github_owner_name(spec: &str) -> Option<String> {
 /// GitHub remote (so a local fetch rewrite cannot spoof or hide the owner), and
 /// filesystem `origin` URLs are still rejected by [`is_supported_github_remote`].
 pub fn origin_github_slug(repo_dir: &Path) -> Result<String> {
+    let url = origin_remote_url(repo_dir)?;
+    normalize_github_repo_slug(&url).ok_or_else(|| Error::PolicyViolation {
+        code: PolicyCode::GitDirUnavailable,
+        message: format!("could not parse origin remote as GitHub owner/repo: {url}"),
+    })
+}
+
+/// Resolve `origin` to a host-qualified `gh` repository selector.
+///
+/// Returns `HOST/OWNER/REPO` for enterprise remotes and `OWNER/REPO` for
+/// github.com, so `gh --repo` targets the same host the checkout came from.
+/// Returns `Ok(None)` when `origin` is missing or not a supported GitHub remote.
+pub fn origin_github_repo_selector(repo_dir: &Path) -> Result<Option<String>> {
+    let url = match origin_remote_url(repo_dir) {
+        Ok(url) => url,
+        Err(Error::Io { .. }) => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    Ok(normalize_github_repo_identity(&url).map(|(host, slug)| {
+        if host == "github.com" {
+            slug
+        } else {
+            format!("{host}/{slug}")
+        }
+    }))
+}
+
+fn origin_remote_url(repo_dir: &Path) -> Result<String> {
     let output = Command::new("git")
         .arg("-C")
         .arg(repo_dir)
@@ -140,10 +168,7 @@ pub fn origin_github_slug(repo_dir: &Path) -> Result<String> {
             message: format!("origin remote `{url}` is not a supported GitHub or enterprise URL"),
         });
     }
-    normalize_github_repo_slug(&url).ok_or_else(|| Error::PolicyViolation {
-        code: PolicyCode::GitDirUnavailable,
-        message: format!("could not parse origin remote as GitHub owner/repo: {url}"),
-    })
+    Ok(url)
 }
 
 /// True for HTTPS/SSH/git remotes and SCP-style `git@host:owner/repo` remotes.

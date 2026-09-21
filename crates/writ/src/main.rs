@@ -475,6 +475,13 @@ fn worktree_command_name(cli: &Cli) -> Option<&'static str> {
 fn json_error_command(cli: &Cli) -> Option<&'static str> {
     worktree_command_name(cli).or(match &cli.command {
         Some(Command::Attribution { .. }) => Some("attribution.format"),
+        Some(Command::Watchlist { action }) => Some(match action {
+            watchlist::WatchlistAction::List { .. } => "cli.watchlist.list",
+            watchlist::WatchlistAction::Check { .. } => "cli.watchlist.check",
+            watchlist::WatchlistAction::CheckAll { .. } => "cli.watchlist.check_all",
+            watchlist::WatchlistAction::Add => "cli.watchlist.add",
+            watchlist::WatchlistAction::Remove => "cli.watchlist.remove",
+        }),
         _ => None,
     })
 }

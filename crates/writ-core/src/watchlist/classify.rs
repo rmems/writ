@@ -161,6 +161,7 @@ mod tests {
             repo: "acme/sample".to_owned(),
             number: 7,
             branch: "hive/job".to_owned(),
+            head_owner: Some("acme".to_owned()),
             base: "main".to_owned(),
             title: "t".to_owned(),
             url: "https://example.test/7".to_owned(),

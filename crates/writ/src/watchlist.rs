@@ -162,11 +162,17 @@ fn render_view(
     request: ViewRequest<'_>,
     stdout: &mut impl Write,
 ) -> writ_core::error::Result<ExitCode> {
-    let store = LeaseStore::open(lease_store_path())?;
-    let probe = GhPrProbe::new(request.allowlist.clone());
+    let path = lease_store_path();
     let query = request.query();
-    let github = query.probe_github.then_some(&probe as _);
-    let data = load_view(&store, &query, github)?;
+    // A view never creates the store: a missing leases.db is an empty view.
+    let data = if path.exists() {
+        let store = LeaseStore::open_read_only(&path)?;
+        let probe = GhPrProbe::new(request.allowlist.clone());
+        let github = query.probe_github.then_some(&probe as _);
+        load_view(&store, &query, github, request.allowlist)?
+    } else {
+        WatchlistData::empty(query.probe_github, false)
+    };
     write_output(request.json, request.command(), &data, stdout)?;
     Ok(ExitCode::SUCCESS)
 }

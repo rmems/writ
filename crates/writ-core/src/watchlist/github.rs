@@ -11,6 +11,8 @@ pub struct PrSnapshot {
     pub repo: String,
     pub number: u64,
     pub branch: String,
+    /// Owner of the head repository (differs from `repo` owner for fork PRs).
+    pub head_owner: Option<String>,
     pub base: String,
     pub title: String,
     pub url: String,
@@ -35,11 +37,27 @@ pub struct PrRef<'a> {
     pub number: u64,
 }
 
-/// Head branch in a repository, used to discover an associated PR.
+/// Head branch in a repository, used to match a listed PR to a lease.
 #[derive(Debug, Clone, Copy)]
 pub struct BranchRef<'a> {
     pub repo: &'a str,
     pub branch: &'a str,
+}
+
+impl BranchRef<'_> {
+    /// Whether `pr` belongs to this head: same branch and same head-repo owner
+    /// (fork PRs from identically named branches do not match).
+    #[must_use]
+    pub fn matches(&self, pr: &PrSnapshot) -> bool {
+        if !pr.branch.eq_ignore_ascii_case(self.branch) {
+            return false;
+        }
+        let expected = self.repo.rsplit('/').nth(1);
+        match (pr.head_owner.as_deref(), expected) {
+            (Some(actual), Some(expected)) => actual.eq_ignore_ascii_case(expected),
+            _ => true,
+        }
+    }
 }
 
 /// Probe failure. Callers map this into residuals rather than crashing the view.
@@ -92,8 +110,9 @@ pub trait GithubProbe {
     /// Fetch one pull request by repository and number.
     fn view(&self, target: PrRef<'_>) -> Result<PrSnapshot, ProbeError>;
 
-    /// Find a pull request whose head matches `head`, if one exists.
-    fn find_by_branch(&self, head: BranchRef<'_>) -> Result<Option<PrSnapshot>, ProbeError>;
+    /// List recent pull requests (all states) for `repo`, so callers can match
+    /// branches locally instead of running one subprocess per lease.
+    fn list_prs(&self, repo: &str) -> Result<Vec<PrSnapshot>, ProbeError>;
 }
 
 /// Probe that runs `gh pr view` / `gh pr list` after argv policy.
@@ -136,7 +155,7 @@ impl GhPrProbe {
         &self,
         target: PrRef<'_>,
         args: &[String],
-    ) -> Result<Option<PrSnapshot>, ProbeError> {
+    ) -> Result<Vec<PrSnapshot>, ProbeError> {
         let stdout = self.run_json(args, target)?;
         parse_pr_list(target, &stdout).map_err(|message| ProbeError::from_message(target, message))
     }
@@ -147,18 +166,12 @@ impl GithubProbe for GhPrProbe {
         self.decode_one(target, &pr_view_args(target))
     }
 
-    fn find_by_branch(&self, head: BranchRef<'_>) -> Result<Option<PrSnapshot>, ProbeError> {
-        self.decode_list(
-            PrRef {
-                repo: head.repo,
-                number: 0,
-            },
-            &pr_list_args(head),
-        )
+    fn list_prs(&self, repo: &str) -> Result<Vec<PrSnapshot>, ProbeError> {
+        self.decode_list(PrRef { repo, number: 0 }, &pr_list_args(repo))
     }
 }
 
-const PR_JSON_FIELDS: &str = "number,title,url,state,headRefName,baseRefName,mergeable,reviewDecision,isDraft,statusCheckRollup";
+const PR_JSON_FIELDS: &str = "number,title,url,state,headRefName,headRepositoryOwner,baseRefName,mergeable,reviewDecision,isDraft,statusCheckRollup";
 
 fn pr_view_args(target: PrRef<'_>) -> Vec<String> {
     vec![
@@ -172,18 +185,16 @@ fn pr_view_args(target: PrRef<'_>) -> Vec<String> {
     ]
 }
 
-fn pr_list_args(head: BranchRef<'_>) -> Vec<String> {
+fn pr_list_args(repo: &str) -> Vec<String> {
     vec![
         "pr".to_owned(),
         "list".to_owned(),
         "--repo".to_owned(),
-        head.repo.to_owned(),
-        "--head".to_owned(),
-        head.branch.to_owned(),
+        repo.to_owned(),
         "--state".to_owned(),
         "all".to_owned(),
         "--limit".to_owned(),
-        "1".to_owned(),
+        "50".to_owned(),
         "--json".to_owned(),
         PR_JSON_FIELDS.to_owned(),
     ]
@@ -197,6 +208,8 @@ struct GhPrView {
     state: String,
     #[serde(rename = "headRefName")]
     head_ref_name: String,
+    #[serde(rename = "headRepositoryOwner")]
+    head_repository_owner: Option<GhRepoOwner>,
     #[serde(rename = "baseRefName")]
     base_ref_name: String,
     mergeable: Option<String>,
@@ -206,6 +219,11 @@ struct GhPrView {
     is_draft: Option<bool>,
     #[serde(rename = "statusCheckRollup")]
     status_check_rollup: Option<Vec<GhCheck>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GhRepoOwner {
+    login: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -226,13 +244,13 @@ pub fn parse_pr_view(target: PrRef<'_>, stdout: &str) -> Result<PrSnapshot, Stri
     Ok(snapshot_from_view(target, view))
 }
 
-fn parse_pr_list(target: PrRef<'_>, stdout: &str) -> Result<Option<PrSnapshot>, String> {
+fn parse_pr_list(target: PrRef<'_>, stdout: &str) -> Result<Vec<PrSnapshot>, String> {
     let views: Vec<GhPrView> = serde_json::from_str(stdout)
         .map_err(|err| format!("failed to parse gh pr list JSON: {err}"))?;
     Ok(views
         .into_iter()
-        .next()
-        .map(|view| snapshot_from_view(target, view)))
+        .map(|view| snapshot_from_view(target, view))
+        .collect())
 }
 
 fn snapshot_from_view(target: PrRef<'_>, view: GhPrView) -> PrSnapshot {
@@ -246,6 +264,7 @@ fn snapshot_from_view(target: PrRef<'_>, view: GhPrView) -> PrSnapshot {
         repo: target.repo.to_owned(),
         number: view.number,
         branch: view.head_ref_name,
+        head_owner: view.head_repository_owner.map(|owner| owner.login),
         base: view.base_ref_name,
         title: view.title,
         url: view.url,
@@ -303,16 +322,20 @@ mod tests {
     }
 
     #[test]
-    fn parse_list_empty_is_none() {
-        assert!(parse_pr_list(acme(0), "[]").unwrap().is_none());
+    fn parse_list_empty_is_empty() {
+        assert!(parse_pr_list(acme(0), "[]").unwrap().is_empty());
     }
 
     #[test]
-    fn parse_list_takes_first() {
-        let json = format!("[{}]", view_json("[]"));
-        let snap = parse_pr_list(acme(0), &json).unwrap().unwrap();
-        assert_eq!(snap.number, 1);
-        assert!(!snap.is_draft);
+    fn parse_list_returns_all_with_head_owner() {
+        let mut view = serde_json::from_str::<serde_json::Value>(&view_json("[]")).unwrap();
+        view["headRepositoryOwner"] = serde_json::json!({"login": "acme"});
+        let json = serde_json::to_string(&vec![view]).unwrap();
+        let list = parse_pr_list(acme(0), &json).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].number, 1);
+        assert!(!list[0].is_draft);
+        assert_eq!(list[0].head_owner.as_deref(), Some("acme"));
     }
 
     #[test]
@@ -346,12 +369,34 @@ mod tests {
         let view = pr_view_args(acme(12));
         assert!(view.contains(&"--repo".to_owned()));
         assert!(view.contains(&"12".to_owned()));
-        let list = pr_list_args(BranchRef {
+        let list = pr_list_args("acme/sample");
+        assert!(list.contains(&"acme/sample".to_owned()));
+        assert!(list.contains(&"all".to_owned()));
+    }
+
+    #[test]
+    fn branch_ref_matches_only_same_owner_head() {
+        let head = BranchRef {
             repo: "acme/sample",
-            branch: "hive/job",
-        });
-        assert!(list.contains(&"--head".to_owned()));
-        assert!(list.contains(&"hive/job".to_owned()));
+            branch: "feat",
+        };
+        let snap = |head_owner: Option<&str>| PrSnapshot {
+            repo: "acme/sample".to_owned(),
+            number: 1,
+            branch: "feat".to_owned(),
+            head_owner: head_owner.map(str::to_owned),
+            base: "main".to_owned(),
+            title: String::new(),
+            url: String::new(),
+            state: "OPEN".to_owned(),
+            mergeable: None,
+            review_decision: None,
+            is_draft: false,
+            checks: Vec::new(),
+        };
+        assert!(head.matches(&snap(Some("acme"))));
+        assert!(!head.matches(&snap(Some("fork-owner"))));
+        assert!(head.matches(&snap(None)));
     }
 
     #[test]
@@ -367,12 +412,7 @@ mod tests {
                 repo: "other/denied".to_owned()
             }
         );
-        let err = probe
-            .find_by_branch(BranchRef {
-                repo: denied.repo,
-                branch: "hive/job",
-            })
-            .unwrap_err();
+        let err = probe.list_prs(denied.repo).unwrap_err();
         assert!(matches!(err, ProbeError::OwnerNotAllowed { .. }));
     }
 }
