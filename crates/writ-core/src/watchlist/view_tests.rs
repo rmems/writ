@@ -2,27 +2,26 @@
 
 use super::*;
 use crate::lease::{LeaseGrant, LeaseStore};
-use crate::watchlist::github::{CheckSnapshot, ProbeError};
+use crate::watchlist::github::{BranchRef, CheckSnapshot, PrRef, ProbeError};
 use rusqlite::Connection;
 use tempfile::tempdir;
 
 struct NoGithub;
 
 impl GithubProbe for NoGithub {
-    fn view(&self, repo: &str, _number: u64) -> std::result::Result<PrSnapshot, ProbeError> {
+    fn view(&self, target: PrRef<'_>) -> std::result::Result<PrSnapshot, ProbeError> {
         Err(ProbeError::Gh {
-            repo: repo.to_owned(),
+            repo: target.repo.to_owned(),
             message: "unused".to_owned(),
         })
     }
 
     fn find_by_branch(
         &self,
-        repo: &str,
-        _branch: &str,
+        head: BranchRef<'_>,
     ) -> std::result::Result<Option<PrSnapshot>, ProbeError> {
         Err(ProbeError::OwnerNotAllowed {
-            repo: repo.to_owned(),
+            repo: head.repo.to_owned(),
         })
     }
 }
@@ -30,19 +29,18 @@ impl GithubProbe for NoGithub {
 struct FakePr;
 
 impl GithubProbe for FakePr {
-    fn view(&self, _repo: &str, _number: u64) -> std::result::Result<PrSnapshot, ProbeError> {
+    fn view(&self, _target: PrRef<'_>) -> std::result::Result<PrSnapshot, ProbeError> {
         unimplemented!()
     }
 
     fn find_by_branch(
         &self,
-        repo: &str,
-        branch: &str,
+        head: BranchRef<'_>,
     ) -> std::result::Result<Option<PrSnapshot>, ProbeError> {
         Ok(Some(PrSnapshot {
-            repo: repo.to_owned(),
+            repo: head.repo.to_owned(),
             number: 41,
-            branch: branch.to_owned(),
+            branch: head.branch.to_owned(),
             base: "main".to_owned(),
             title: "fix".to_owned(),
             url: "https://example.test/41".to_owned(),
@@ -55,6 +53,21 @@ impl GithubProbe for FakePr {
                 state: "SUCCESS".to_owned(),
             }],
         }))
+    }
+}
+
+struct NoPr;
+
+impl GithubProbe for NoPr {
+    fn view(&self, _target: PrRef<'_>) -> std::result::Result<PrSnapshot, ProbeError> {
+        unimplemented!()
+    }
+
+    fn find_by_branch(
+        &self,
+        _head: BranchRef<'_>,
+    ) -> std::result::Result<Option<PrSnapshot>, ProbeError> {
+        Ok(None)
     }
 }
 
@@ -214,4 +227,114 @@ fn merge_ready_lease_is_ready_for_integration() {
         data.entries[0].collab_status,
         CollabStatus::ReadyForIntegration
     );
+}
+
+#[test]
+fn repo_and_job_filters() {
+    let seeded = seed_job();
+    let query = WatchQuery {
+        repo: Some("acme/sample".to_owned()),
+        job_id: Some("job-1".to_owned()),
+        ..WatchQuery::default()
+    };
+    let data = load_view(&seeded.store, &query, None).unwrap();
+    assert_eq!(data.entries.len(), 1);
+    let query = WatchQuery {
+        repo: Some("sample".to_owned()),
+        ..WatchQuery::default()
+    };
+    let data = load_view(&seeded.store, &query, None).unwrap();
+    assert_eq!(data.entries.len(), 1);
+    let query = WatchQuery {
+        repo: Some("other/repo".to_owned()),
+        ..WatchQuery::default()
+    };
+    let data = load_view(&seeded.store, &query, None).unwrap();
+    assert!(data.entries.is_empty());
+    let query = WatchQuery {
+        job_id: Some("missing".to_owned()),
+        ..WatchQuery::default()
+    };
+    let data = load_view(&seeded.store, &query, None).unwrap();
+    assert!(data.entries.is_empty());
+}
+
+#[test]
+fn include_released_lists_unassigned_rows() {
+    let seeded = seed_job();
+    exec_sql(
+        &seeded.store,
+        "UPDATE leases SET mode = 'UNASSIGNED', released_at = 99",
+    );
+    let hidden = load_view(&seeded.store, &WatchQuery::default(), None).unwrap();
+    assert!(hidden.entries.is_empty());
+    let query = WatchQuery {
+        include_released: true,
+        ..WatchQuery::default()
+    };
+    let data = load_view(&seeded.store, &query, None).unwrap();
+    assert_eq!(data.entries.len(), 1);
+    assert_eq!(data.entries[0].recovery_status, RecoveryStatus::Released);
+}
+
+#[test]
+fn missing_checkout_is_recovery_blocker() {
+    let seeded = seed_job();
+    exec_sql(
+        &seeded.store,
+        "UPDATE leases SET worktree_path = '/tmp/writ-missing-checkout-does-not-exist'",
+    );
+    let data = load_view(&seeded.store, &WatchQuery::default(), None).unwrap();
+    assert_eq!(
+        data.entries[0].recovery_status,
+        RecoveryStatus::MissingCheckout
+    );
+    assert!(
+        data.entries[0]
+            .residual_blockers
+            .iter()
+            .any(|b| b == "recovery:missing_checkout")
+    );
+}
+
+#[test]
+fn stale_heartbeat_is_recovery_blocker() {
+    let seeded = seed_job();
+    exec_sql(&seeded.store, "UPDATE leases SET ttl = 1, heartbeat = 1");
+    let data = load_view(&seeded.store, &WatchQuery::default(), None).unwrap();
+    assert_eq!(
+        data.entries[0].recovery_status,
+        RecoveryStatus::StaleHeartbeat
+    );
+}
+
+#[test]
+fn blocked_and_review_only_are_waiting() {
+    let seeded = seed_job();
+    exec_sql(&seeded.store, "UPDATE leases SET mode = 'BLOCKED'");
+    let data = load_view(&seeded.store, &WatchQuery::default(), None).unwrap();
+    assert_eq!(data.entries[0].collab_status, CollabStatus::Waiting);
+    exec_sql(&seeded.store, "UPDATE leases SET mode = 'REVIEW_ONLY'");
+    let data = load_view(&seeded.store, &WatchQuery::default(), None).unwrap();
+    assert_eq!(data.entries[0].collab_status, CollabStatus::Waiting);
+}
+
+#[test]
+fn needs_human_is_conflicted() {
+    let seeded = seed_job();
+    exec_sql(&seeded.store, "UPDATE leases SET mode = 'NEEDS_HUMAN'");
+    let data = load_view(&seeded.store, &WatchQuery::default(), None).unwrap();
+    assert_eq!(data.entries[0].collab_status, CollabStatus::Conflicted);
+}
+
+#[test]
+fn github_none_leaves_github_overlay_empty() {
+    let seeded = seed_job();
+    let query = WatchQuery {
+        probe_github: true,
+        ..WatchQuery::default()
+    };
+    let data = load_view(&seeded.store, &query, Some(&NoPr)).unwrap();
+    assert!(data.entries[0].github.is_none());
+    assert_eq!(data.entries[0].collab_status, CollabStatus::Running);
 }

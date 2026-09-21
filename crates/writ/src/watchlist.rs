@@ -240,6 +240,34 @@ fn blockers_cell(blockers: &[String]) -> String {
 mod tests {
     use super::*;
     use writ_core::owners::OwnerAllowlist;
+    use writ_core::watchlist::{
+        CollabStatus, CoordOverlay, RecoveryStatus, WatchEntry, WatchlistData,
+    };
+
+    fn sample_entry() -> WatchEntry {
+        WatchEntry {
+            job_id: "job-1".to_owned(),
+            owner: "acme".to_owned(),
+            repo: "acme/sample".to_owned(),
+            branch: "hive/job-1".to_owned(),
+            worktree_path: "/tmp/wt".to_owned(),
+            lease_mode: "WRITER_LOCKED".to_owned(),
+            collab_status: CollabStatus::Running,
+            recovery_status: RecoveryStatus::Live,
+            coord: CoordOverlay {
+                agent_id: None,
+                session_id: None,
+                intent: None,
+                owner_generation: None,
+                paused: false,
+                declared_paths: Vec::new(),
+                overlaps: Vec::new(),
+                waiting_on: None,
+            },
+            github: None,
+            residual_blockers: vec!["recovery:stale_heartbeat".to_owned()],
+        }
+    }
 
     #[test]
     fn add_does_not_persist() {
@@ -269,5 +297,121 @@ mod tests {
     fn allowlist_type_is_available_for_check() {
         let list = OwnerAllowlist::parse("acme");
         assert!(!list.is_empty());
+    }
+
+    #[test]
+    fn list_query_does_not_probe_github() {
+        let allowlist = OwnerAllowlist::parse("acme");
+        let request = ViewRequest {
+            action: WatchlistAction::List {
+                owner: Some("acme".to_owned()),
+                repo: Some("sample".to_owned()),
+                job: Some("job-1".to_owned()),
+                include_released: true,
+            },
+            allowlist: &allowlist,
+            json: true,
+        };
+        assert_eq!(request.command(), "cli.watchlist.list");
+        let query = request.query();
+        assert!(!query.probe_github);
+        assert!(query.include_released);
+        assert_eq!(query.job_id.as_deref(), Some("job-1"));
+    }
+
+    #[test]
+    fn check_query_probes_github() {
+        let allowlist = OwnerAllowlist::parse("acme");
+        let request = ViewRequest {
+            action: WatchlistAction::Check {
+                owner: None,
+                repo: None,
+                job: Some("job-1".to_owned()),
+                include_released: false,
+            },
+            allowlist: &allowlist,
+            json: false,
+        };
+        assert_eq!(request.command(), "cli.watchlist.check");
+        assert!(request.query().probe_github);
+        assert_eq!(request.query().job_id.as_deref(), Some("job-1"));
+    }
+
+    #[test]
+    fn check_all_query_has_no_job_filter() {
+        let allowlist = OwnerAllowlist::parse("acme");
+        let request = ViewRequest {
+            action: WatchlistAction::CheckAll {
+                owner: Some("acme".to_owned()),
+                repo: None,
+                include_released: false,
+            },
+            allowlist: &allowlist,
+            json: false,
+        };
+        assert_eq!(request.command(), "cli.watchlist.check_all");
+        let query = request.query();
+        assert!(query.probe_github);
+        assert!(query.job_id.is_none());
+    }
+
+    #[test]
+    fn write_output_table_includes_job_and_blockers() {
+        let mut out = Vec::new();
+        let data = WatchlistData {
+            entries: vec![sample_entry()],
+            coord_available: false,
+            github_probed: false,
+        };
+        write_output(false, "cli.watchlist.list", &data, &mut out).unwrap();
+        let body = String::from_utf8(out).unwrap();
+        assert!(body.contains("job-1"));
+        assert!(body.contains("running"));
+        assert!(body.contains("recovery:stale_heartbeat"));
+        assert!(body.contains("\t-\t"));
+    }
+
+    #[test]
+    fn github_cell_formats_numbered_and_unknown() {
+        assert_eq!(github_cell(None), "-");
+        let mut gh = writ_core::watchlist::GithubState {
+            number: 0,
+            title: String::new(),
+            url: String::new(),
+            branch: "b".to_owned(),
+            base: String::new(),
+            state: "UNKNOWN".to_owned(),
+            check_status: "unknown".to_owned(),
+            mergeable: None,
+            is_draft: false,
+            residual_blockers: Vec::new(),
+        };
+        assert_eq!(github_cell(Some(&gh)), "unknown");
+        gh.number = 12;
+        gh.check_status = "healthy".to_owned();
+        assert_eq!(github_cell(Some(&gh)), "#12:healthy");
+    }
+
+    #[test]
+    fn persist_hint_remove_human() {
+        let mut out = Vec::new();
+        persist_hint("remove", false, &mut out).unwrap();
+        let body = String::from_utf8(out).unwrap();
+        assert!(body.contains("leases.db"));
+    }
+
+    #[test]
+    fn write_json_envelope() {
+        let mut out = Vec::new();
+        write_output(
+            true,
+            "cli.watchlist.check_all",
+            &WatchlistData::empty(true, false),
+            &mut out,
+        )
+        .unwrap();
+        let body = String::from_utf8(out).unwrap();
+        assert!(body.contains("cli.watchlist.check_all"));
+        assert!(body.contains("\"github_probed\":true"));
     }
 }

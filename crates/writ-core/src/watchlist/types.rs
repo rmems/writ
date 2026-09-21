@@ -139,4 +139,26 @@ mod tests {
         let json = serde_json::to_string(&CollabStatus::ReadyForIntegration).unwrap();
         assert_eq!(json, "\"ready_for_integration\"");
     }
+
+    #[test]
+    fn status_display_tokens() {
+        assert_eq!(CollabStatus::Running.to_string(), "running");
+        assert_eq!(CollabStatus::Waiting.to_string(), "waiting");
+        assert_eq!(CollabStatus::Paused.to_string(), "paused");
+        assert_eq!(CollabStatus::Conflicted.to_string(), "conflicted");
+        assert_eq!(
+            CollabStatus::ReadyForIntegration.to_string(),
+            "ready_for_integration"
+        );
+        assert_eq!(RecoveryStatus::Live.to_string(), "live");
+        assert_eq!(RecoveryStatus::Released.to_string(), "released");
+        assert_eq!(
+            RecoveryStatus::StaleHeartbeat.to_string(),
+            "stale_heartbeat"
+        );
+        assert_eq!(
+            RecoveryStatus::MissingCheckout.to_string(),
+            "missing_checkout"
+        );
+    }
 }

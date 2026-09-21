@@ -84,3 +84,31 @@ fn empty_list_is_ok() {
     assert_eq!(code, 0, "stderr={stderr}");
     assert!(stdout.contains("writ worktree register"));
 }
+
+#[test]
+fn check_all_empty_is_ok() {
+    let root = TestDir::new();
+    let (code, stdout, stderr) = writ(&root, &["--json", "watchlist", "check-all"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert!(stdout.contains("cli.watchlist.check_all"));
+    assert!(stdout.contains("\"github_probed\":true"));
+}
+
+#[test]
+fn remove_does_not_persist() {
+    let root = TestDir::new();
+    let (code, stdout, _stderr) = writ(&root, &["watchlist", "remove"]);
+    assert_eq!(code, 0);
+    assert!(stdout.contains("leases.db"));
+}
+
+#[test]
+fn list_table_includes_seeded_job() {
+    let root = TestDir::new();
+    seed_lease(&root);
+    let (code, stdout, stderr) = writ(&root, &["watchlist", "list"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert!(stdout.contains("job-1"));
+    assert!(stdout.contains("running"));
+    assert!(stdout.contains("live"));
+}

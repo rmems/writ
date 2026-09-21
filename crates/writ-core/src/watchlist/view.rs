@@ -8,7 +8,7 @@ use crate::lease::{Lease, LeaseMode, LeaseStore};
 
 use super::classify::classify_snapshot;
 use super::coord_read::{CoordSnapshot, JobId, load_coord_snapshot};
-use super::github::{GithubProbe, PrSnapshot};
+use super::github::{BranchRef, GithubProbe, PrSnapshot};
 use super::types::{
     CollabStatus, CoordOverlay, GithubState, RecoveryStatus, WatchEntry, WatchlistData,
 };
@@ -108,7 +108,10 @@ fn entry_from_lease(
 
 fn probe_lease(lease: &Lease, probe: &dyn GithubProbe) -> Option<GithubState> {
     let repo = format!("{}/{}", lease.owner, lease.repo_name);
-    match probe.find_by_branch(&repo, &lease.branch) {
+    match probe.find_by_branch(BranchRef {
+        repo: &repo,
+        branch: &lease.branch,
+    }) {
         Ok(Some(snapshot)) => Some(github_state(snapshot)),
         Ok(None) => None,
         Err(err) => Some(GithubState {

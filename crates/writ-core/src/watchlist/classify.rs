@@ -120,7 +120,10 @@ fn resolve_status(
     if failed {
         return "failed".to_owned();
     }
-    if pending || snapshot.checks.is_empty() && blockers.is_empty() {
+    if pending {
+        return "pending".to_owned();
+    }
+    if snapshot.checks.is_empty() && blockers.is_empty() {
         return "pending".to_owned();
     }
     if blockers.is_empty() {
@@ -203,5 +206,72 @@ mod tests {
         pr.state = "MERGED".to_owned();
         let (status, _) = classify_snapshot(&pr);
         assert_eq!(status, "merged");
+    }
+
+    #[test]
+    fn closed_is_terminal() {
+        let mut pr = open_pr();
+        pr.state = "CLOSED".to_owned();
+        let (status, blockers) = classify_snapshot(&pr);
+        assert_eq!(status, "closed");
+        assert!(blockers.is_empty());
+    }
+
+    #[test]
+    fn draft_is_pending() {
+        let mut pr = open_pr();
+        pr.is_draft = true;
+        pr.checks = vec![CheckSnapshot {
+            name: "ci".to_owned(),
+            state: "SUCCESS".to_owned(),
+        }];
+        let (status, blockers) = classify_snapshot(&pr);
+        assert_eq!(status, "pending");
+        assert!(blockers.iter().any(|b| b == "draft:true"));
+    }
+
+    #[test]
+    fn failed_check_wins_over_review() {
+        let mut pr = open_pr();
+        pr.review_decision = Some("REVIEW_REQUIRED".to_owned());
+        pr.checks = vec![CheckSnapshot {
+            name: "CI / Test".to_owned(),
+            state: "FAILURE".to_owned(),
+        }];
+        let (status, blockers) = classify_snapshot(&pr);
+        assert_eq!(status, "failed");
+        assert!(blockers.iter().any(|b| b == "class_a:ci___test"));
+        assert!(blockers.iter().any(|b| b == "review:review_required"));
+    }
+
+    #[test]
+    fn successful_checks_are_healthy() {
+        let mut pr = open_pr();
+        pr.checks = vec![CheckSnapshot {
+            name: "ci".to_owned(),
+            state: "SUCCESS".to_owned(),
+        }];
+        let (status, blockers) = classify_snapshot(&pr);
+        assert_eq!(status, "healthy");
+        assert!(blockers.is_empty());
+    }
+
+    #[test]
+    fn changes_requested_is_residual() {
+        let mut pr = open_pr();
+        pr.review_decision = Some("CHANGES_REQUESTED".to_owned());
+        pr.checks = vec![CheckSnapshot {
+            name: "ci".to_owned(),
+            state: "SUCCESS".to_owned(),
+        }];
+        let (status, blockers) = classify_snapshot(&pr);
+        assert_eq!(status, "residual");
+        assert_eq!(blockers, vec!["review:changes_requested"]);
+    }
+
+    #[test]
+    fn empty_check_name_sanitizes() {
+        assert_eq!(sanitize_token(""), "unnamed");
+        assert_eq!(sanitize_token("!!!"), "___");
     }
 }

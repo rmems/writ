@@ -20,4 +20,4 @@ pub use types::{
 pub use view::{WatchQuery, load_view};
 
 pub use classify::classify_snapshot;
-pub use github::{PrSnapshot, parse_pr_view};
+pub use github::{BranchRef, PrRef, PrSnapshot, parse_pr_view};
