@@ -4,6 +4,7 @@
 //! implemented by the linked foundation issues.
 
 pub mod contract;
+pub mod coord;
 pub mod error;
 pub mod git_safe;
 mod identity;

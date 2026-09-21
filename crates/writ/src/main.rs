@@ -62,6 +62,12 @@ enum Command {
         #[command(subcommand)]
         action: LeaseAction,
     },
+
+    /// Same-host coordination claims and overlap/help/handoff messages.
+    Coord {
+        #[command(subcommand)]
+        action: CoordAction,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -135,6 +141,112 @@ enum LeaseAction {
         repo_name: String,
         /// Job id segment (e.g. gh-42).
         job_id: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum CoordAction {
+    /// Announce task/agent identity and declared paths; overlaps are advisory.
+    Announce {
+        /// GitHub-style owner segment.
+        owner: String,
+        /// Repository name segment.
+        repo_name: String,
+        /// Job id segment (e.g. gh-42).
+        job_id: String,
+        /// Agent identity that owns this claim.
+        #[arg(long)]
+        agent: String,
+        /// Optional session identity for stale-message distinction.
+        #[arg(long)]
+        session: Option<String>,
+        /// Optional declared intent string.
+        #[arg(long)]
+        intent: Option<String>,
+        /// Repo-relative paths this job intends to touch.
+        #[arg(long = "path")]
+        paths: Vec<String>,
+    },
+    /// Show one job's coordination claim.
+    Show {
+        owner: String,
+        repo_name: String,
+        job_id: String,
+    },
+    /// List live coordination claims in the shared store.
+    List,
+    /// Read overlap/help/handoff/ack messages for a job.
+    Inbox {
+        owner: String,
+        repo_name: String,
+        job_id: String,
+    },
+    /// Send a help, overlap, intent, dependency, or ack message.
+    Send {
+        owner: String,
+        repo_name: String,
+        job_id: String,
+        /// Sending agent identity.
+        #[arg(long)]
+        agent: String,
+        /// Message kind: intent, overlap, help, ack, or dependency.
+        #[arg(long)]
+        kind: String,
+        /// Message body.
+        #[arg(long)]
+        body: String,
+        #[arg(long)]
+        to_agent: Option<String>,
+        #[arg(long)]
+        to_owner: Option<String>,
+        #[arg(long)]
+        to_repo: Option<String>,
+        #[arg(long)]
+        to_job: Option<String>,
+        #[arg(long = "path")]
+        paths: Vec<String>,
+        #[arg(long)]
+        ack_of: Option<i64>,
+    },
+    /// Acknowledge a message; a matching handoff ACK transfers ownership.
+    Ack {
+        owner: String,
+        repo_name: String,
+        job_id: String,
+        /// Message id to acknowledge.
+        #[arg(long)]
+        id: i64,
+        /// Acknowledging agent identity.
+        #[arg(long)]
+        agent: String,
+        #[arg(long)]
+        session: Option<String>,
+    },
+    /// Pause the current owner and emit help without deleting WIP.
+    Pause {
+        owner: String,
+        repo_name: String,
+        job_id: String,
+        #[arg(long)]
+        agent: String,
+        #[arg(long)]
+        body: Option<String>,
+    },
+    /// Offer a generation-bound handoff. Ownership moves only after ACK.
+    Handoff {
+        owner: String,
+        repo_name: String,
+        job_id: String,
+        #[arg(long)]
+        agent: String,
+        #[arg(long)]
+        to_agent: String,
+        #[arg(long)]
+        to_job: Option<String>,
+        #[arg(long)]
+        generation: Option<i64>,
+        #[arg(long)]
+        body: String,
     },
 }
 
@@ -287,7 +399,9 @@ fn worktree_schema_version(cli: &Cli) -> u8 {
 }
 
 fn json_error_command(cli: &Cli) -> Option<&'static str> {
-    worktree_command_name(cli).or(lease_command_name(cli))
+    worktree_command_name(cli)
+        .or(lease_command_name(cli))
+        .or(coord_command_name(cli))
 }
 
 fn lease_command_name(cli: &Cli) -> Option<&'static str> {
@@ -295,6 +409,22 @@ fn lease_command_name(cli: &Cli) -> Option<&'static str> {
         Some(Command::Lease { action }) => Some(match action {
             LeaseAction::Inspect { .. } => "lease.inspect",
             LeaseAction::Reconcile { .. } => "lease.reconcile",
+        }),
+        _ => None,
+    }
+}
+
+fn coord_command_name(cli: &Cli) -> Option<&'static str> {
+    match &cli.command {
+        Some(Command::Coord { action }) => Some(match action {
+            CoordAction::Announce { .. } => "coord.announce",
+            CoordAction::Show { .. } => "coord.show",
+            CoordAction::List => "coord.list",
+            CoordAction::Inbox { .. } => "coord.inbox",
+            CoordAction::Send { .. } => "coord.send",
+            CoordAction::Ack { .. } => "coord.ack",
+            CoordAction::Pause { .. } => "coord.pause",
+            CoordAction::Handoff { .. } => "coord.handoff",
         }),
         _ => None,
     }
@@ -509,6 +639,195 @@ fn run_lease(
     emit_response(&response, json, stdout)
 }
 
+fn run_coord(
+    action: CoordAction,
+    json: bool,
+    stdout: &mut impl Write,
+) -> writ_core::error::Result<ExitCode> {
+    let response = coord_response(action)?;
+    emit_response(&response, json, stdout)
+}
+
+fn coord_response(
+    action: CoordAction,
+) -> writ_core::error::Result<writ_core::contract::Response<serde_json::Value>> {
+    use writ_core::contract::Response;
+    use writ_core::coord::{AckRequest, AnnounceRequest, HandoffRequest, MessageKind, SendRequest};
+    use writ_core::lease::{JobKey, LeaseStore};
+    use writ_core::paths::lease_store_path;
+
+    let store = LeaseStore::open(lease_store_path())?;
+    match action {
+        CoordAction::Announce {
+            owner,
+            repo_name,
+            job_id,
+            agent,
+            session,
+            intent,
+            paths,
+        } => {
+            let result = store.announce(AnnounceRequest {
+                owner: &owner,
+                repo_name: &repo_name,
+                job_id: &job_id,
+                agent_id: &agent,
+                session_id: session.as_deref(),
+                agent_type: "worker",
+                intent: intent.as_deref(),
+                paths: &paths,
+            })?;
+            Ok(Response::success(
+                "coord.announce",
+                serde_json::to_value(&result).map_err(std::io::Error::other)?,
+            ))
+        }
+        CoordAction::Show {
+            owner,
+            repo_name,
+            job_id,
+        } => {
+            let claim = store.find_claim(JobKey {
+                owner: &owner,
+                repo_name: &repo_name,
+                job_id: &job_id,
+            })?;
+            Ok(Response::success(
+                "coord.show",
+                serde_json::json!({ "claim": claim }),
+            ))
+        }
+        CoordAction::List => {
+            let claims = store.list_claims()?;
+            Ok(Response::success(
+                "coord.list",
+                serde_json::json!({ "claims": claims }),
+            ))
+        }
+        CoordAction::Inbox {
+            owner,
+            repo_name,
+            job_id,
+        } => {
+            let messages = store.inbox(JobKey {
+                owner: &owner,
+                repo_name: &repo_name,
+                job_id: &job_id,
+            })?;
+            Ok(Response::success(
+                "coord.inbox",
+                serde_json::json!({ "messages": messages }),
+            ))
+        }
+        CoordAction::Send {
+            owner,
+            repo_name,
+            job_id,
+            agent,
+            kind,
+            body,
+            to_agent,
+            to_owner,
+            to_repo,
+            to_job,
+            paths,
+            ack_of,
+        } => {
+            let message = store.send_message(SendRequest {
+                owner: &owner,
+                repo_name: &repo_name,
+                job_id: &job_id,
+                agent_id: &agent,
+                kind: MessageKind::parse(&kind)?,
+                body: &body,
+                to_agent_id: to_agent.as_deref(),
+                to_owner: to_owner.as_deref(),
+                to_repo_name: to_repo.as_deref(),
+                to_job_id: to_job.as_deref(),
+                paths: &paths,
+                ack_of,
+            })?;
+            Ok(Response::success(
+                "coord.send",
+                serde_json::to_value(&message).map_err(std::io::Error::other)?,
+            ))
+        }
+        CoordAction::Ack {
+            owner,
+            repo_name,
+            job_id,
+            id,
+            agent,
+            session,
+        } => {
+            let (ack, claim) = store.ack_message(AckRequest {
+                message_id: id,
+                owner: &owner,
+                repo_name: &repo_name,
+                job_id: &job_id,
+                agent_id: &agent,
+                session_id: session.as_deref(),
+            })?;
+            Ok(Response::success(
+                "coord.ack",
+                serde_json::json!({
+                    "ack": ack,
+                    "claim": claim,
+                }),
+            ))
+        }
+        CoordAction::Pause {
+            owner,
+            repo_name,
+            job_id,
+            agent,
+            body,
+        } => {
+            let (claim, help) = store.pause_claim(
+                JobKey {
+                    owner: &owner,
+                    repo_name: &repo_name,
+                    job_id: &job_id,
+                },
+                &agent,
+                body.as_deref(),
+            )?;
+            Ok(Response::success(
+                "coord.pause",
+                serde_json::json!({
+                    "claim": claim,
+                    "help": help,
+                }),
+            ))
+        }
+        CoordAction::Handoff {
+            owner,
+            repo_name,
+            job_id,
+            agent,
+            to_agent,
+            to_job,
+            generation,
+            body,
+        } => {
+            let message = store.propose_handoff(HandoffRequest {
+                owner: &owner,
+                repo_name: &repo_name,
+                job_id: &job_id,
+                from_agent_id: &agent,
+                to_agent_id: &to_agent,
+                to_job_id: to_job.as_deref(),
+                expected_generation: generation,
+                body: &body,
+            })?;
+            Ok(Response::success(
+                "coord.handoff",
+                serde_json::to_value(&message).map_err(std::io::Error::other)?,
+            ))
+        }
+    }
+}
+
 /// Entry point for CLI commands (status/jobs, git/gh-safe, supervisor, worktree).
 async fn run(cli: Cli, stdout: &mut impl Write) -> writ_core::error::Result<ExitCode> {
     match cli.command {
@@ -553,6 +872,7 @@ async fn run(cli: Cli, stdout: &mut impl Write) -> writ_core::error::Result<Exit
         },
         Some(Command::Worktree { action }) => run_worktree(action, cli.json, stdout),
         Some(Command::Lease { action }) => run_lease(action, cli.json, stdout),
+        Some(Command::Coord { action }) => run_coord(action, cli.json, stdout),
         None => {
             if cli.json {
                 serde_json::to_writer(
@@ -924,6 +1244,42 @@ mod tests {
                 action: super::LeaseAction::Reconcile { .. },
             })
         ));
+    }
+
+    #[test]
+    fn coord_announce_parser_accepts_identity_and_paths() {
+        let parsed = Cli::try_parse_from([
+            "writ",
+            "coord",
+            "announce",
+            "acme",
+            "sample",
+            "job",
+            "--agent",
+            "agent-a",
+            "--session",
+            "sess-1",
+            "--intent",
+            "edit coord",
+            "--path",
+            "crates/writ-core/src/coord.rs",
+        ])
+        .unwrap();
+        let Some(super::Command::Coord {
+            action:
+                super::CoordAction::Announce {
+                    agent,
+                    job_id,
+                    paths,
+                    ..
+                },
+        }) = parsed.command
+        else {
+            panic!("expected coord announce")
+        };
+        assert_eq!(agent, "agent-a");
+        assert_eq!(job_id, "job");
+        assert_eq!(paths, vec!["crates/writ-core/src/coord.rs"]);
     }
 
     #[tokio::test]

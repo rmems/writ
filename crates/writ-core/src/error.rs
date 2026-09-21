@@ -174,6 +174,12 @@ pub enum PolicyCode {
     LeaseReleased,
     /// A tombstoned lease cannot be resurrected by reconcile or prepare.
     LeaseTombstoned,
+    /// No live lease exists for the requested coordination claim.
+    CoordClaimMissing,
+    /// Another agent already owns this job claim; pause is not a seize.
+    CoordClaimHeld,
+    /// A handoff ACK named a stale owner generation.
+    CoordStaleGeneration,
 }
 
 impl PolicyCode {
@@ -193,6 +199,9 @@ impl PolicyCode {
             Self::LeaseNeedsAttention => "LEASE_NEEDS_ATTENTION",
             Self::LeaseReleased => "LEASE_RELEASED",
             Self::LeaseTombstoned => "LEASE_TOMBSTONED",
+            Self::CoordClaimMissing => "COORD_CLAIM_MISSING",
+            Self::CoordClaimHeld => "COORD_CLAIM_HELD",
+            Self::CoordStaleGeneration => "COORD_STALE_GENERATION",
         }
     }
 }

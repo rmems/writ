@@ -94,7 +94,7 @@ impl AllocationState {
         }
     }
 
-    fn is_terminal(self) -> bool {
+    pub(crate) fn is_terminal(self) -> bool {
         matches!(self, Self::Released | Self::Tombstoned)
     }
 
@@ -360,6 +360,7 @@ impl LeaseStore {
         )
         .map_err(|e| lease_err("initialize lease schema", e))?;
         ensure_crash_consistency_columns(&conn)?;
+        crate::coord::ensure_schema(&conn)?;
         Ok(Self {
             path,
             conn: Mutex::new(conn),
@@ -1086,7 +1087,7 @@ impl LeaseStore {
         .map_err(|e| lease_err("lookup operation phase", e))
     }
 
-    fn lock(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
+    pub(crate) fn lock(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
         self.conn.lock().map_err(|_| Error::LeaseStore {
             context: "lease store",
             message: "lease store mutex poisoned".to_owned(),
@@ -1278,6 +1279,18 @@ struct GitEvidence {
     worktree_registered: bool,
 }
 
+/// Match a `git worktree list --porcelain` dump against a stored path.
+///
+/// Git may spell the same directory with different separators, casing, or a
+/// canonical prefix than `Path::to_string_lossy`, so callers must not use
+/// substring `contains`.
+fn porcelain_lists_worktree(listing: &str, worktree_path: &Path) -> bool {
+    listing.lines().any(|line| {
+        line.strip_prefix("worktree ")
+            .is_some_and(|path| crate::paths::same_existing_path(Path::new(path), worktree_path))
+    })
+}
+
 fn inspect_git(repo_root: &Path, worktree_path: &Path, branch: &str) -> GitEvidence {
     let branch_ref = if branch.is_empty() {
         String::new()
@@ -1302,13 +1315,7 @@ fn inspect_git(repo_root: &Path, worktree_path: &Path, branch: &str) -> GitEvide
         &["rev-parse", "--verify", "--end-of-options", "HEAD^{commit}"],
     );
     let worktree_registered = optional_git_stdout(repo_root, &["worktree", "list", "--porcelain"])
-        .is_some_and(|listing| {
-            listing.lines().any(|line| {
-                line.strip_prefix("worktree ").is_some_and(|path| {
-                    crate::paths::same_existing_path(Path::new(path), worktree_path)
-                })
-            })
-        });
+        .is_some_and(|listing| porcelain_lists_worktree(&listing, worktree_path));
     GitEvidence {
         path_exists: worktree_path.exists(),
         branch_ref,
@@ -1686,7 +1693,11 @@ mod tests {
         assert_eq!(outcome.as_str(), "needs_attention");
         assert!(harness.worktree.exists());
         let listing = git(&harness.repo, &["worktree", "list", "--porcelain"]);
-        assert!(listing.contains(&harness.worktree.to_string_lossy().to_string()));
+        assert!(
+            porcelain_lists_worktree(&listing, &harness.worktree),
+            "fail-closed reconcile must keep the registered worktree; listing={listing:?} expected={:?}",
+            harness.worktree
+        );
     }
 
     #[test]

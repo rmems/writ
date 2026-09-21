@@ -22,7 +22,7 @@ Claude Code agent teams have real coordination and [documented zero isolation](h
 > [!NOTE]
 > **Status: the enforcement core is real; the hook layer is not built yet.**
 > Shipping today are the `git`/`gh` allowlists, exact-base worktree verification, path sandboxing, process supervision, and the absence of any merge path — reachable through the `writ` CLI, including `writ worktree create`, which remains supported.
-> Not yet built: the `PreToolUse`/`WorktreeCreate` hook dispatcher and `writ install`. Those remain milestone **M1** ([#124](https://github.com/rmems/writ/issues/124)). `writ worktree create` now persists a crash-consistent SQLite lease row before git mutation ([#136](https://github.com/rmems/writ/issues/136)); `writ lease inspect` / `writ lease reconcile` report and recover interrupted allocations without adopting unproven state. Until hooks land, enforcement still applies only to commands routed through `writ` deliberately — it is **opt-in, not unbypassable**.
+> Not yet built: the `PreToolUse`/`WorktreeCreate` hook dispatcher and `writ install`. Those remain milestone **M1** ([#124](https://github.com/rmems/writ/issues/124)). `writ worktree create` now persists a crash-consistent SQLite lease row before git mutation ([#136](https://github.com/rmems/writ/issues/136)); `writ lease inspect` / `writ lease reconcile` report and recover interrupted allocations without adopting unproven state. The same `leases.db` file also holds same-host `writ coord` claims and overlap/help/handoff messages. Until hooks land, enforcement still applies only to commands routed through `writ` deliberately — it is **opt-in, not unbypassable**.
 
 ## Architecture
 
