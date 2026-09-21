@@ -654,6 +654,9 @@ mod tests {
         let all = store.list_all().unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].mode, LeaseMode::Unassigned);
+        let all = store.list_all().unwrap();
+        assert_eq!(all.len(), 1);
+        assert!(all[0].released_at.is_some());
 
         let resume = store
             .find_resume(ResumeKey {

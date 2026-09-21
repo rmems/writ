@@ -21,6 +21,7 @@ All of them, under `--json`:
 | --- | --- |
 | no subcommand | `cli.bootstrap` |
 | `status` / `jobs` | `cli.status` / `cli.jobs` |
+| `watchlist list\|check\|check-all` | `cli.watchlist.list` / `cli.watchlist.check` / `cli.watchlist.check_all` |
 | `git-safe` / `gh-safe` | `git.safe` / `gh.safe` |
 | `worktree register\|unregister\|inspect\|list` | `worktree.register` etc. |
 | `worktree create\|remove\|prune` | `worktree.create` etc. (deprecated) |
