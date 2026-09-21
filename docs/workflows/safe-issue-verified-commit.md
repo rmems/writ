@@ -21,11 +21,11 @@ Do not hard-code an owner. Multi-repo discovery and scheduling still use `WRIT_A
 Abort and report if any of these fail:
 
 - Issue is closed, is a pull request, or has no actionable acceptance criteria
-- Owner is outside the configured allowlist (unless the operator named this repo/job explicitly). **No code enforces this today** -- `WRIT_ALLOWED_OWNERS` has no reader under `crates/` since the Python layer was removed, so this stop depends on the operator, not the boundary (#146).
+- Owner is outside the configured allowlist (unless the operator named this repo/job explicitly).
 - Unsafe identity or path mismatch, a genuine ownership collision, or a non-recoverable cleanliness/remote check. Exact remote-base equality applies only to a newly created, unpublished assigned branch. A published branch must have the expected upstream and local/remote relationship instead. Repair a clean bootstrap source or unpublished verified-base alignment before editing; do not abort isolated work because a primary checkout is dirty or stale.
 - `writ` is missing and no enforcing wrapper is available (mutating runs). An "enforcing wrapper" means a wrapper that routes the mutation through `writ-core`'s allowlist and branch verification; a wrapper that merely calls `git` directly is not one, and does not satisfy this check.
 - Any required quality gate fails or times out
-- A deny-listed command would be required (GitHub merge, local merge of another PR or stacked/peer branch, bare `--force` / `-f`)
+- A deny-listed command would be required (GitHub PR merge, local merge into `main`/`master`, dirty-WIP merge, bare `--force` / `-f`)
 - `git push` exits non-zero or the remote rejects the push
 
 ## Stages
@@ -41,11 +41,12 @@ Abort and report if any of these fail:
 
 1. If this repo uses Beads, run `bd prime`, inspect `bd ready`, and claim the relevant bead.
 2. Start from an up-to-date base. Never edit `main` or `master`.
-3. Create or reuse a dedicated branch and isolated worktree:
-   - Required: `writ --json worktree create --schema-version 2 --repo <repo> --start-point <exact-commit-or-ref> <owner> <repo-name> <job-id> <branch>` (`WRIT_BIN` or `PATH`). Never omit the caller-selected boundary version/start point or derive it from the source checkout's ambient `HEAD`.
+3. Create or reuse a dedicated branch and isolated checkout:
+   - The harness creates the checkout wherever it wants (native worktree support, or plain `git worktree add <path> -b <branch> <remote>/<base>` after fetching). `writ worktree create` is deprecated; do not use it for new work. Never derive the start point from the source checkout's ambient `HEAD`.
+   - Required: `writ --json worktree register <path> --job <job-id>` (`WRIT_BIN` or `PATH`). Registration is coordination-only: it records the observed branch/HEAD/dirty state and grants a lease row. It does not create, move, fetch, reset, or delete the checkout, and a standalone clone registers fine.
    - If `writ` is missing, stop, unless a wrapper routes the mutation through `writ-core` -- the same definition as the hard stop above. A wrapper that re-implements the checks itself and then calls `git` directly does **not** qualify: re-implemented policy is prompt-level text, not the code-enforced boundary.
-   - What routing through `writ-core` actually gets you, so the promise is not larger than the code: the git/gh argv allowlist, no merge path, force-with-lease only, sandboxed path derivation with symlink rejection, exact-base resolution, branch and `HEAD` postcondition verification, supervised child processes, and origin-slug matching for `gh -R`. **Owner-allowlist enforcement is not among them.** `WRIT_ALLOWED_OWNERS` has no reader anywhere under `crates/`; it was enforced in the Python layer removed by [#144](https://github.com/rmems/writ/issues/144), so it is currently policy text with no code behind it.
-   - Raw `git worktree add` is forbidden on mutating runs.
+   - What routing through `writ-core` actually gets you, so the promise is not larger than the code: the git/gh argv allowlist, local feature-branch merge with default-branch and dirty-WIP guards, no GitHub PR merge path, force-with-lease only, branch verification, supervised child processes, origin-slug matching for `gh -R`, and owner-allowlist enforcement for `gh` repository selectors (`-R` / `--repo` in any pflag spelling, plus `GH_REPO`; `WRIT_ALLOWED_OWNERS`, `WH_ALLOWED_OWNERS`, or `--allowed-owners` / explicit API args; empty or unset denies). Checkout placement and lifecycle are no longer writ-enforced; they are the harness's responsibility.
+
 4. Suggested issue branch: `hive/issue-<n>-<short-slug>` (document any local override).
 5. For a newly created, unpublished assigned branch, fetch the intended remote base and prove that the branch equals that exact remote-base commit before edits. It may have no upstream only for this creation proof; never use an ambient or stale `HEAD` as the base.
 6. For a published assigned branch, fetch and verify the configured expected upstream and the expected local/remote relationship; do not compare the branch for equality with the base. Stop on an unexpected upstream, unexpected remote commit, behind state, or divergence.
@@ -97,7 +98,7 @@ Then:
 2. Always run the complete native suite named in Stage 4 exactly once (with the same process timeouts) on the exact `HEAD` that would be pushed. An issue may add focused checks but must not replace or reduce this suite. Any later tree change invalidates the run and requires repeating final alignment and this full suite. If any gate fails or times out, **do not push**. Report residuals.
 3. For a first publication, push the already verified remote and assigned branch explicitly: `git push -u <verified-remote> <assigned-branch>`. After upstream is set, use `git push`. If the command exits non-zero or the remote rejects the update, **stop before Stage 7**: record the push failure as a residual. Do **not** report `git rev-parse HEAD` as the pushed SHA.
 
-- Never merge, including a local `git merge` of another PR or stacked/peer branch.
+- Never merge a GitHub pull request. Local `git merge` of peer work into this assigned feature branch is allowed; never merge into `main`/`master`, and refuse a merge that would lose uncommitted WIP.
 - Never `git push --force` or `git push -f`.
 - `--force-with-lease` only on **this** job branch after a rebase you own, after the identity check above succeeds.
 

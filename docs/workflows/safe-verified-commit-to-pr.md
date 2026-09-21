@@ -1,6 +1,6 @@
 # Safe Verified Commit → PR
 
-Portable worker contract for any coding agent. Runs **after** [Safe Issue → Verified Commit](safe-issue-verified-commit.md). Opens or updates a human-reviewable pull request. Never merges.
+Portable worker contract for any coding agent. Runs **after** [Safe Issue → Verified Commit](safe-issue-verified-commit.md). Opens or updates a human-reviewable pull request. Does not merge the pull request.
 
 Safety rules live in [`AGENTS.md`](../../AGENTS.md), [`SKILL.md`](../../SKILL.md), and [`REVIEW.md`](../../REVIEW.md). This file does not relax them.
 
@@ -21,8 +21,8 @@ One issue → one PR unless the issue explicitly groups work.
 
 - No verified push yet — run the commit workflow first.
 - Shared `main`/`master` checkout — work only in the job worktree/branch.
-- Owner outside the configured allowlist unless the operator named this job. **Not enforced in code today** (#146): the allowlist has no reader under `crates/` after the Python removal, so this stop is operator-upheld.
-- Any merge command, merge API, auto-merge, or merge-queue enablement.
+- Owner outside the configured allowlist unless the operator named this job.
+- Any GitHub PR merge command, merge API, auto-merge, or merge-queue enablement. Local feature-branch integration is not this stop.
 - Bare `git push --force` / `git push -f`.
 - Opening a no-op “kick CI” PR.
 
@@ -98,7 +98,7 @@ Comment on the GitHub issue with PR URL, the **validated** pushed commit SHA, re
 
 If interactive monitoring is needed after handoff, invoke the installed companion `babysit-pr` skill. This workflow itself only creates or updates the PR and hands it off.
 
-### 10. Never merge
+### 10. Do not merge the pull request
 
 Success is **PR opened (or updated) and handoff ready**, not “landed on main.”
 
@@ -114,4 +114,4 @@ If the PR is already merged, report that a human merged it and stop.
 
 ## Done when
 
-An open (or draft) PR has auto-merge and merge-queue disabled, `Fixes`/`Refs` the **input** GitHub issue with the required keyword, includes a matching Linear `RM-*` link when a twin exists, remote source-branch tip and PR head both equal the recorded `head_sha`, the issue comment includes URL + validated SHA + agent, and no merge path was invoked.
+An open (or draft) PR has auto-merge and merge-queue disabled, `Fixes`/`Refs` the **input** GitHub issue with the required keyword, includes a matching Linear `RM-*` link when a twin exists, remote source-branch tip and PR head both equal the recorded `head_sha`, the issue comment includes URL + validated SHA + agent, and no GitHub PR merge path was invoked.

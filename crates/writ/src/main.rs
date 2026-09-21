@@ -13,6 +13,13 @@ struct Cli {
     #[arg(long, global = true)]
     json: bool,
 
+    /// Comma-separated GitHub owners allowed for worktree create and `gh -R`.
+    ///
+    /// Overrides `WRIT_ALLOWED_OWNERS` / `WH_ALLOWED_OWNERS` when present. An
+    /// empty value is still deny-by-default.
+    #[arg(long, global = true, value_name = "OWNERS")]
+    allowed_owners: Option<String>,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -51,7 +58,8 @@ enum Command {
         action: SupervisorAction,
     },
 
-    /// Isolated git worktree lifecycle (create/list/remove/prune).
+    /// Checkout coordination (register/unregister/inspect/list) plus the
+    /// deprecated managed lifecycle (create/remove/prune).
     Worktree {
         #[command(subcommand)]
         action: WorktreeAction,
@@ -73,7 +81,32 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum WorktreeAction {
-    /// Create a worktree for a hive job under the sandboxed base path.
+    /// Register an existing, harness-created checkout for coordination.
+    ///
+    /// Writ does not create, move, or modify the checkout; this only writes a
+    /// coordination record in the shared lease store. Works for any path:
+    /// a linked worktree, the primary checkout, or a standalone clone.
+    Register {
+        /// Path to an existing git checkout (any location).
+        path: PathBuf,
+        /// Job id for the coordination record (default: checkout dir name).
+        #[arg(long)]
+        job: Option<String>,
+    },
+    /// Release the coordination record for a checkout. Never deletes files,
+    /// branches, or uncommitted changes.
+    Unregister {
+        /// Path of the registered checkout.
+        path: PathBuf,
+    },
+    /// Read-only inspection of a checkout: branch, HEAD, dirty/detached state,
+    /// repo identity. Writes nothing.
+    Inspect {
+        /// Path to an existing git checkout.
+        path: PathBuf,
+    },
+    /// Deprecated: create a worktree under the sandboxed base path.
+    /// The harness should create checkouts itself; use `register` instead.
     Create {
         /// Repository root (git dir / working tree).
         #[arg(long)]
@@ -106,9 +139,10 @@ enum WorktreeAction {
         )]
         schema_version: u8,
     },
-    /// List hive worktrees under the configured base.
+    /// List registered checkouts in the shared coordination store.
     List,
-    /// Remove a worktree path (must stay under the sandbox base).
+    /// Deprecated: remove a worktree path (must stay under the sandbox base).
+    /// The harness owns physical cleanup; use `unregister` for coordination.
     Remove {
         /// Absolute or relative worktree path.
         path: PathBuf,
@@ -116,7 +150,8 @@ enum WorktreeAction {
         #[arg(long)]
         force: bool,
     },
-    /// Prune stale git worktree metadata for a repo.
+    /// Deprecated: prune stale git worktree metadata for a repo.
+    /// Equivalent to `git worktree prune`; physical cleanup is harness-owned.
     Prune {
         #[arg(long)]
         repo: PathBuf,
@@ -356,6 +391,9 @@ fn worktree_schema_version(cli: &Cli) -> u8 {
 fn worktree_command_name(cli: &Cli) -> Option<&'static str> {
     match &cli.command {
         Some(Command::Worktree { action }) => Some(match action {
+            WorktreeAction::Register { .. } => "worktree.register",
+            WorktreeAction::Unregister { .. } => "worktree.unregister",
+            WorktreeAction::Inspect { .. } => "worktree.inspect",
             WorktreeAction::Create { .. } => "worktree.create",
             WorktreeAction::List => "worktree.list",
             WorktreeAction::Remove { .. } => "worktree.remove",
@@ -365,50 +403,30 @@ fn worktree_command_name(cli: &Cli) -> Option<&'static str> {
     }
 }
 
-fn worktree_response(
-    action: WorktreeAction,
-) -> writ_core::error::Result<writ_core::contract::Response<serde_json::Value>> {
-    use writ_core::contract::Response;
-    use writ_core::worktree::WorktreeManager;
-
-    match action {
-        create @ WorktreeAction::Create { .. } => worktree_create_response(create),
-        WorktreeAction::List => {
-            let manager = WorktreeManager::new()?;
-            let worktrees = manager.list()?;
-            Ok(Response::success(
-                "worktree.list",
-                serde_json::json!({
-                    "worktrees": worktrees.iter().map(|wt| serde_json::json!({
-                        "path": wt.path,
-                        "branch": wt.branch,
-                    })).collect::<Vec<_>>(),
-                }),
-            ))
-        }
-        WorktreeAction::Remove { path, force } => {
-            let manager = WorktreeManager::new()?;
-            manager.remove(&path, force)?;
-            Ok(Response::success(
-                "worktree.remove",
-                serde_json::json!({ "removed": path }),
-            ))
-        }
-        WorktreeAction::Prune { repo } => {
-            let manager = WorktreeManager::new()?;
-            manager.prune(&repo)?;
-            Ok(Response::success("worktree.prune", serde_json::json!({})))
-        }
-    }
+/// Owned fields of a `worktree create` request, threaded from the CLI action to
+/// [`worktree_create_response`] so the dispatch arm stays small.
+struct WorktreeCreateArgs {
+    repo: PathBuf,
+    owner: String,
+    repo_name: String,
+    job_id: String,
+    branch: String,
+    start_point: Option<String>,
+    pr_number: Option<u64>,
+    source_remote: Option<String>,
+    head_repo: Option<String>,
+    schema_version: u8,
 }
 
+/// Build the `worktree.create` response, preserving the exact JSON envelope.
 fn worktree_create_response(
-    action: WorktreeAction,
+    allowlist: &writ_core::owners::OwnerAllowlist,
+    args: WorktreeCreateArgs,
 ) -> writ_core::error::Result<writ_core::contract::Response<serde_json::Value>> {
     use writ_core::contract::Response;
     use writ_core::worktree::{WorktreeCreateRequest, WorktreeManager};
 
-    let WorktreeAction::Create {
+    let WorktreeCreateArgs {
         repo,
         owner,
         repo_name,
@@ -419,17 +437,15 @@ fn worktree_create_response(
         source_remote,
         head_repo,
         schema_version,
-    } = action
-    else {
-        unreachable!("worktree_create_response requires Create");
-    };
+    } = args;
+
     if schema_version == writ_core::contract::SCHEMA_VERSION {
         return Err(writ_core::error::Error::ContractUpgradeRequired {
             required_schema_version: writ_core::contract::EXACT_BASE_SCHEMA_VERSION,
         });
     }
     let start_point = start_point.ok_or(writ_core::error::Error::StartPointRequired)?;
-    let manager = WorktreeManager::new()?;
+    let manager = WorktreeManager::new()?.with_allowlist(allowlist.clone());
     let wt = manager.create_with_request(WorktreeCreateRequest {
         repo_root: &repo,
         owner: &owner,
@@ -456,12 +472,135 @@ fn worktree_create_response(
     ))
 }
 
+fn checkout_json(info: &writ_core::checkout::CheckoutInfo) -> serde_json::Value {
+    serde_json::json!({
+        "path": info.path,
+        "branch": info.branch,
+        "head_commit": info.head_commit,
+        "common_dir": info.common_dir,
+        "linked_worktree": info.linked_worktree,
+        "origin_slug": info.origin_slug,
+        "dirty": info.dirty,
+    })
+}
+
+fn worktree_register_response(
+    path: PathBuf,
+    job: Option<String>,
+) -> writ_core::error::Result<writ_core::contract::Response<serde_json::Value>> {
+    use writ_core::checkout::CheckoutRegistry;
+    use writ_core::contract::Response;
+
+    let registry = CheckoutRegistry::new()?;
+    let job_id = job.unwrap_or_else(|| writ_core::checkout::default_job_id(&path));
+    let info = registry.register(&path, &job_id)?;
+    let mut data = checkout_json(&info);
+    data["job_id"] = serde_json::Value::String(job_id);
+    Ok(Response::success("worktree.register", data))
+}
+
+fn worktree_unregister_response(
+    path: PathBuf,
+) -> writ_core::error::Result<writ_core::contract::Response<serde_json::Value>> {
+    use writ_core::checkout::CheckoutRegistry;
+    use writ_core::contract::Response;
+
+    let released = CheckoutRegistry::new()?.unregister(&path)?;
+    Ok(Response::success(
+        "worktree.unregister",
+        serde_json::json!({ "released": released.is_some() }),
+    ))
+}
+
+fn worktree_inspect_response(
+    path: PathBuf,
+) -> writ_core::error::Result<writ_core::contract::Response<serde_json::Value>> {
+    use writ_core::contract::Response;
+
+    let info = writ_core::checkout::inspect_checkout(&path)?;
+    Ok(Response::success("worktree.inspect", checkout_json(&info)))
+}
+
+fn worktree_list_response()
+-> writ_core::error::Result<writ_core::contract::Response<serde_json::Value>> {
+    use writ_core::checkout::CheckoutRegistry;
+    use writ_core::contract::Response;
+
+    let worktrees = CheckoutRegistry::new()?.registered()?;
+    Ok(Response::success(
+        "worktree.list",
+        serde_json::json!({
+            "worktrees": worktrees.iter().map(|lease| serde_json::json!({
+                "path": lease.worktree_path,
+                "branch": lease.branch,
+                "job_id": lease.job_id,
+                "mode": lease.mode.as_str(),
+            })).collect::<Vec<_>>(),
+        }),
+    ))
+}
+
+fn worktree_response(
+    action: WorktreeAction,
+    allowlist: &writ_core::owners::OwnerAllowlist,
+) -> writ_core::error::Result<writ_core::contract::Response<serde_json::Value>> {
+    use writ_core::contract::Response;
+    use writ_core::worktree::WorktreeManager;
+
+    match action {
+        WorktreeAction::Register { path, job } => worktree_register_response(path, job),
+        WorktreeAction::Unregister { path } => worktree_unregister_response(path),
+        WorktreeAction::Inspect { path } => worktree_inspect_response(path),
+        WorktreeAction::List => worktree_list_response(),
+        WorktreeAction::Create {
+            repo,
+            owner,
+            repo_name,
+            job_id,
+            branch,
+            start_point,
+            pr_number,
+            source_remote,
+            head_repo,
+            schema_version,
+        } => worktree_create_response(
+            allowlist,
+            WorktreeCreateArgs {
+                repo,
+                owner,
+                repo_name,
+                job_id,
+                branch,
+                start_point,
+                pr_number,
+                source_remote,
+                head_repo,
+                schema_version,
+            },
+        ),
+        WorktreeAction::Remove { path, force } => {
+            let manager = WorktreeManager::new()?;
+            manager.remove(&path, force)?;
+            Ok(Response::success(
+                "worktree.remove",
+                serde_json::json!({ "removed": path }),
+            ))
+        }
+        WorktreeAction::Prune { repo } => {
+            let manager = WorktreeManager::new()?;
+            manager.prune(&repo)?;
+            Ok(Response::success("worktree.prune", serde_json::json!({})))
+        }
+    }
+}
+
 fn run_worktree(
     action: WorktreeAction,
+    allowlist: &writ_core::owners::OwnerAllowlist,
     json: bool,
     stdout: &mut impl Write,
 ) -> writ_core::error::Result<ExitCode> {
-    let response = worktree_response(action)?;
+    let response = worktree_response(action, allowlist)?;
 
     if json {
         write_json_line(stdout, &response)?;
@@ -545,6 +684,8 @@ fn writ_command(writ_bin: Option<PathBuf>) -> String {
 
 /// Entry point for CLI commands (status/jobs, git/gh-safe, supervisor, worktree).
 async fn run(cli: Cli, stdout: &mut impl Write) -> writ_core::error::Result<ExitCode> {
+    let allowlist =
+        writ_core::owners::OwnerAllowlist::from_cli_or_env(cli.allowed_owners.as_deref());
     match cli.command {
         Some(Command::Status) => {
             run_status(
@@ -564,7 +705,7 @@ async fn run(cli: Cli, stdout: &mut impl Write) -> writ_core::error::Result<Exit
             repo,
             args,
         }) => run_git_safe(&args, expected_branch.as_deref(), repo, cli.json, stdout),
-        Some(Command::GhSafe { args }) => run_gh_safe(&args, cli.json, stdout),
+        Some(Command::GhSafe { args }) => run_gh_safe(&args, &allowlist, cli.json, stdout),
         Some(Command::Supervisor { action }) => match action {
             SupervisorAction::Run {
                 timeouts,
@@ -576,16 +717,20 @@ async fn run(cli: Cli, stdout: &mut impl Write) -> writ_core::error::Result<Exit
                 run_supervisor(
                     cli.json,
                     &timeouts,
-                    expected_branch,
-                    repo,
                     max_parallel,
                     cmd,
+                    writ_core::supervisor::RunOptions {
+                        expected_branch,
+                        repo,
+                        allowlist: Some(allowlist),
+                        ..Default::default()
+                    },
                     stdout,
                 )
                 .await
             }
         },
-        Some(Command::Worktree { action }) => run_worktree(action, cli.json, stdout),
+        Some(Command::Worktree { action }) => run_worktree(action, &allowlist, cli.json, stdout),
         Some(Command::Hook) => run_hook(stdout),
         Some(Command::Install { settings, writ_bin }) => {
             run_install(settings, writ_bin, cli.json, stdout)
@@ -612,10 +757,9 @@ fn secs_opt(secs: u64) -> Option<Duration> {
 async fn run_supervisor(
     json: bool,
     timeouts: &SupervisorTimeouts,
-    expected_branch: Option<String>,
-    repo: Option<PathBuf>,
     max_parallel: usize,
     cmd: Vec<String>,
+    mut options: writ_core::supervisor::RunOptions,
     stdout: &mut impl Write,
 ) -> writ_core::error::Result<ExitCode> {
     let program = match cmd.first() {
@@ -630,16 +774,11 @@ async fn run_supervisor(
     };
     let args: Vec<&str> = cmd[1..].iter().map(|s| s.as_str()).collect();
     let policy = timeouts.to_policy();
-    let on_progress = policy.progress_every.map(|_| {
+    options.on_progress = policy.progress_every.map(|_| {
         std::sync::Arc::new(|snap: &writ_core::timeout_policy::ProgressSnapshot| {
             eprintln!("{}", snap.format_line());
         }) as writ_core::timeout_policy::ProgressCallback
     });
-    let options = writ_core::supervisor::RunOptions {
-        expected_branch,
-        repo,
-        on_progress,
-    };
 
     // One-shot CLI: a single awaited child cannot contend with itself.
     // Library callers may still use Supervisor::new(n) for in-process fan-out.
@@ -799,10 +938,11 @@ fn run_git_safe(
 
 fn run_gh_safe(
     args: &[String],
+    allowlist: &writ_core::owners::OwnerAllowlist,
     json: bool,
     stdout: &mut impl Write,
 ) -> writ_core::error::Result<ExitCode> {
-    let cmd = writ_core::git_safe::SafeGhCommand::new(args)?;
+    let cmd = writ_core::git_safe::SafeGhCommand::with_allowlist(args, allowlist)?;
     let output = cmd.run()?;
 
     write_safe_result("gh.safe", cmd.args(), &output, json, stdout)?;
@@ -1045,6 +1185,7 @@ mod tests {
     async fn json_mode_writes_v1_envelope_to_stdout() {
         let cli = Cli {
             json: true,
+            allowed_owners: None,
             command: None,
         };
         let mut stdout = Vec::new();
@@ -1062,6 +1203,7 @@ mod tests {
     async fn default_mode_keeps_stdout_empty() {
         let cli = Cli {
             json: false,
+            allowed_owners: None,
             command: None,
         };
         let mut stdout = Vec::new();
@@ -1235,6 +1377,7 @@ mod tests {
     async fn supervisor_run_non_json_emits_raw_supervised_output() {
         let cli = Cli {
             json: false,
+            allowed_owners: None,
             command: Some(super::Command::Supervisor {
                 action: super::SupervisorAction::Run {
                     timeouts: disabled_timeouts(),
@@ -1269,6 +1412,7 @@ mod tests {
     async fn supervisor_run_blocks_unsafe_git_command() {
         let cli = Cli {
             json: false,
+            allowed_owners: None,
             command: Some(super::Command::Supervisor {
                 action: super::SupervisorAction::Run {
                     timeouts: disabled_timeouts(),
@@ -1296,6 +1440,7 @@ mod tests {
     async fn supervisor_run_blocks_path_qualified_git_force() {
         let cli = Cli {
             json: true,
+            allowed_owners: None,
             command: Some(super::Command::Supervisor {
                 action: super::SupervisorAction::Run {
                     timeouts: disabled_timeouts(),
@@ -1338,6 +1483,7 @@ mod tests {
     async fn supervisor_run_json_nonzero_sets_ok_false() {
         let cli = Cli {
             json: true,
+            allowed_owners: None,
             command: Some(super::Command::Supervisor {
                 action: super::SupervisorAction::Run {
                     timeouts: disabled_timeouts(),
@@ -1392,6 +1538,7 @@ mod tests {
     async fn supervisor_run_blocks_unsafe_gh_command() {
         let cli = Cli {
             json: false,
+            allowed_owners: None,
             command: Some(super::Command::Supervisor {
                 action: super::SupervisorAction::Run {
                     timeouts: disabled_timeouts(),
@@ -1419,6 +1566,7 @@ mod tests {
     async fn supervisor_run_json_wraps_v1_envelope() {
         let cli = Cli {
             json: true,
+            allowed_owners: None,
             command: Some(super::Command::Supervisor {
                 action: super::SupervisorAction::Run {
                     timeouts: disabled_timeouts(),
@@ -1475,6 +1623,7 @@ mod tests {
     async fn git_safe_valid_command_executes() {
         let cli = Cli {
             json: false,
+            allowed_owners: None,
             command: Some(super::Command::GitSafe {
                 expected_branch: None,
                 repo: None,
@@ -1495,6 +1644,7 @@ mod tests {
     async fn git_safe_json_mode_includes_exit_code() {
         let cli = Cli {
             json: true,
+            allowed_owners: None,
             command: Some(super::Command::GitSafe {
                 expected_branch: None,
                 repo: None,
@@ -1520,13 +1670,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn git_safe_blocks_merge() {
+    async fn git_safe_blocks_mergetool() {
         let cli = Cli {
             json: false,
+            allowed_owners: None,
             command: Some(super::Command::GitSafe {
                 expected_branch: None,
                 repo: None,
-                args: vec!["merge".to_owned(), "feature".to_owned()],
+                args: vec!["mergetool".to_owned()],
             }),
         };
         let mut stdout = Vec::new();
@@ -1545,6 +1696,7 @@ mod tests {
     async fn git_safe_blocks_bare_force() {
         let cli = Cli {
             json: false,
+            allowed_owners: None,
             command: Some(super::Command::GitSafe {
                 expected_branch: None,
                 repo: None,
@@ -1578,6 +1730,7 @@ mod tests {
     async fn gh_safe_pr_merge_blocked() {
         let cli = Cli {
             json: false,
+            allowed_owners: None,
             command: Some(super::Command::GhSafe {
                 args: vec!["pr".to_owned(), "merge".to_owned()],
             }),
@@ -1598,6 +1751,7 @@ mod tests {
     async fn gh_safe_api_blocked() {
         let cli = Cli {
             json: false,
+            allowed_owners: None,
             command: Some(super::Command::GhSafe {
                 args: vec!["api".to_owned(), "repos/acme/example-org".to_owned()],
             }),
@@ -1619,6 +1773,7 @@ mod tests {
         // May fail if gh is not auth'd; policy must accept `pr view`.
         let cli = Cli {
             json: true,
+            allowed_owners: None,
             command: Some(super::Command::GhSafe {
                 args: vec!["pr".to_owned(), "view".to_owned(), "1".to_owned()],
             }),
@@ -1637,5 +1792,49 @@ mod tests {
             }
             Err(e) => panic!("unexpected error: {e}"),
         }
+    }
+
+    #[tokio::test]
+    async fn gh_safe_repo_selector_outside_allowlist_is_blocked() {
+        let cli = Cli {
+            json: false,
+            allowed_owners: Some("acme".to_owned()),
+            command: Some(super::Command::GhSafe {
+                args: vec![
+                    "pr".to_owned(),
+                    "view".to_owned(),
+                    "-R".to_owned(),
+                    "other/repo".to_owned(),
+                    "1".to_owned(),
+                ],
+            }),
+        };
+        let mut stdout = Vec::new();
+        let err = run(cli, &mut stdout).await.unwrap_err();
+        assert!(matches!(
+            err,
+            writ_core::error::Error::PolicyViolation {
+                code: writ_core::error::PolicyCode::OwnerNotAllowed,
+                ..
+            }
+        ));
+        assert!(stdout.is_empty());
+    }
+
+    #[test]
+    fn allowed_owners_flag_is_global() {
+        let parsed = Cli::try_parse_from([
+            "writ",
+            "--allowed-owners",
+            "acme,example-org",
+            "gh-safe",
+            "pr",
+            "view",
+            "-R",
+            "acme/repo",
+            "1",
+        ])
+        .unwrap();
+        assert_eq!(parsed.allowed_owners.as_deref(), Some("acme,example-org"));
     }
 }

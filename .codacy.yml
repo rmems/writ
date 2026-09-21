@@ -51,36 +51,48 @@ engines:
   # fixtures as production code. Exclude complexity here the same way as
   # `worktree.rs`; security engines stay enabled.
   #
+  # `git_safe/**` is the git/gh argv classifier surface (formerly a single
+  # `git_safe.rs`). Complexity engines stay scoped here; security engines stay
+  # enabled on these paths.
+  #
   # `paths.rs` is included because Codacy's complexity engine does not parse
   # `#[cfg]` and reported `strip_verbatim_prefix` as 231 LOC (the rest of the
   # file) on the rename PR. The Windows body is split out so a working parser
   # stays under the limit; the exclusion keeps the same parser artifact from
   # blocking a rename-as-new-file scan. Security engines stay enabled on this
   # file.
+  #
+  # `checkout.rs` is the harness-owned checkout registration surface
+  # (inspect + register/unregister). Its unit tests live in-module because they
+  # need `pub(crate)` helpers, so file-NLOC counts fixtures as production code —
+  # the same reason `pr_import.rs` is excluded. Security engines stay enabled.
   complexity:
     exclude_paths:
       - "crates/*/tests/**"
+      - "crates/*/src/checkout.rs"
       - "crates/*/src/worktree.rs"
       - "crates/*/src/error.rs"
-      - "crates/*/src/git_safe.rs"
+      - "crates/*/src/git_safe/**"
       - "crates/*/src/main.rs"
       - "crates/*/src/paths.rs"
       - "crates/*/src/pr_import.rs"
   metric:
     exclude_paths:
       - "crates/*/tests/**"
+      - "crates/*/src/checkout.rs"
       - "crates/*/src/worktree.rs"
       - "crates/*/src/error.rs"
-      - "crates/*/src/git_safe.rs"
+      - "crates/*/src/git_safe/**"
       - "crates/*/src/main.rs"
       - "crates/*/src/paths.rs"
       - "crates/*/src/pr_import.rs"
   lizard:
     exclude_paths:
       - "crates/*/tests/**"
+      - "crates/*/src/checkout.rs"
       - "crates/*/src/worktree.rs"
       - "crates/*/src/error.rs"
-      - "crates/*/src/git_safe.rs"
+      - "crates/*/src/git_safe/**"
       - "crates/*/src/main.rs"
       - "crates/*/src/paths.rs"
       - "crates/*/src/pr_import.rs"
