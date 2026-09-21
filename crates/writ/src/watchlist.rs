@@ -92,36 +92,38 @@ impl ViewRequest<'_> {
                 repo,
                 job,
                 include_released,
-            } => filtered_query(owner, repo, job.clone(), *include_released, false),
+            } => WatchQuery {
+                owner: owner.clone(),
+                repo: repo.clone(),
+                job_id: job.clone(),
+                include_released: *include_released,
+                probe_github: false,
+            },
             WatchlistAction::Check {
                 owner,
                 repo,
                 job,
                 include_released,
-            } => filtered_query(owner, repo, job.clone(), *include_released, true),
+            } => WatchQuery {
+                owner: owner.clone(),
+                repo: repo.clone(),
+                job_id: job.clone(),
+                include_released: *include_released,
+                probe_github: true,
+            },
             WatchlistAction::CheckAll {
                 owner,
                 repo,
                 include_released,
-            } => filtered_query(owner, repo, None, *include_released, true),
+            } => WatchQuery {
+                owner: owner.clone(),
+                repo: repo.clone(),
+                job_id: None,
+                include_released: *include_released,
+                probe_github: true,
+            },
             WatchlistAction::Add | WatchlistAction::Remove => unreachable!(),
         }
-    }
-}
-
-fn filtered_query(
-    owner: &Option<String>,
-    repo: &Option<String>,
-    job_id: Option<String>,
-    include_released: bool,
-    probe_github: bool,
-) -> WatchQuery {
-    WatchQuery {
-        owner: owner.clone(),
-        repo: repo.clone(),
-        job_id,
-        include_released,
-        probe_github,
     }
 }
 
