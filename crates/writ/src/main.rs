@@ -5,6 +5,8 @@ use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
 
+mod watchlist;
+
 /// Manage isolated issue-to-PR jobs and their durable state.
 #[derive(Debug, Parser)]
 #[command(name = "writ", version, about, long_about = None)]
@@ -82,6 +84,12 @@ enum Command {
         /// Executable the hook should invoke (default: `WRIT_BIN`, then `writ` on `PATH`).
         #[arg(long)]
         writ_bin: Option<PathBuf>,
+    },
+
+    /// Collaboration status view over the shared lease store (not a second store).
+    Watchlist {
+        #[command(subcommand)]
+        action: watchlist::WatchlistAction,
     },
 }
 
@@ -467,6 +475,13 @@ fn worktree_command_name(cli: &Cli) -> Option<&'static str> {
 fn json_error_command(cli: &Cli) -> Option<&'static str> {
     worktree_command_name(cli).or(match &cli.command {
         Some(Command::Attribution { .. }) => Some("attribution.format"),
+        Some(Command::Watchlist { action }) => Some(match action {
+            watchlist::WatchlistAction::List { .. } => "cli.watchlist.list",
+            watchlist::WatchlistAction::Check { .. } => "cli.watchlist.check",
+            watchlist::WatchlistAction::CheckAll { .. } => "cli.watchlist.check_all",
+            watchlist::WatchlistAction::Add => "cli.watchlist.add",
+            watchlist::WatchlistAction::Remove => "cli.watchlist.remove",
+        }),
         _ => None,
     })
 }
@@ -933,6 +948,7 @@ async fn run(cli: Cli, stdout: &mut impl Write) -> writ_core::error::Result<Exit
         Some(Command::Install { settings, writ_bin }) => {
             run_install(settings, writ_bin, cli.json, stdout)
         }
+        Some(Command::Watchlist { action }) => watchlist::run(action, &allowlist, cli.json, stdout),
         None => {
             if cli.json {
                 serde_json::to_writer(
