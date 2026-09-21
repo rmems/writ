@@ -1411,18 +1411,59 @@ mod tests {
         }
     }
 
+    async fn format_json(case: FormatCase) -> serde_json::Value {
+        parse_stdout_json(&format_ok(case).await)
+    }
+
+    impl FormatCase {
+        fn json_body(body: &'static str) -> Self {
+            Self {
+                json: true,
+                body,
+                agent_id: Some("writ agent"),
+                commit_sha: None,
+                placement: None,
+                task: None,
+                branch: None,
+                session: None,
+                pr_comment: false,
+            }
+        }
+    }
+
+    fn collab_overlap_case() -> FormatCase {
+        FormatCase {
+            task: Some("RM-128"),
+            branch: Some("cursor/reply-attribution-config-6e46"),
+            session: Some("bc-fa8ed877"),
+            ..FormatCase::json_body(
+                "Overlap: I own SKILL.md Reply attribution; RM-145 owns the rest.",
+            )
+        }
+    }
+
+    fn pushed_fix_case() -> FormatCase {
+        FormatCase {
+            commit_sha: Some("abc1234"),
+            placement: Some("footer"),
+            ..FormatCase::json_body("Fixed the issue.")
+        }
+    }
+
+    fn pr_comment_no_code_case() -> FormatCase {
+        FormatCase {
+            agent_id: Some("Codex: writ agent"),
+            commit_sha: Some("  "),
+            pr_comment: true,
+            ..FormatCase::json_body("No code change.")
+        }
+    }
+
     #[tokio::test]
     async fn attribution_format_human_omits_sha() {
         let human = format_ok(FormatCase {
             json: false,
-            body: "Looks good!",
-            agent_id: Some("writ agent"),
-            commit_sha: None,
-            placement: None,
-            task: None,
-            branch: None,
-            session: None,
-            pr_comment: false,
+            ..FormatCase::json_body("Looks good!")
         })
         .await;
         assert_eq!(
@@ -1433,20 +1474,7 @@ mod tests {
 
     #[tokio::test]
     async fn attribution_format_collaboration_message_omits_sha() {
-        let collab = parse_stdout_json(
-            &format_ok(FormatCase {
-                json: true,
-                body: "Overlap: I own SKILL.md Reply attribution; RM-145 owns the rest.",
-                agent_id: Some("writ agent"),
-                commit_sha: None,
-                placement: None,
-                task: Some("RM-128"),
-                branch: Some("cursor/reply-attribution-config-6e46"),
-                session: Some("bc-fa8ed877"),
-                pr_comment: false,
-            })
-            .await,
-        );
+        let collab = format_json(collab_overlap_case()).await;
         assert!(format_envelope_ok(&collab), "{collab}");
         assert_eq!(
             collab["data"]["text"].as_str(),
@@ -1458,39 +1486,13 @@ mod tests {
 
     #[tokio::test]
     async fn attribution_format_collaboration_message_has_no_sha() {
-        let collab = parse_stdout_json(
-            &format_ok(FormatCase {
-                json: true,
-                body: "Overlap: I own SKILL.md Reply attribution; RM-145 owns the rest.",
-                agent_id: Some("writ agent"),
-                commit_sha: None,
-                placement: None,
-                task: Some("RM-128"),
-                branch: Some("cursor/reply-attribution-config-6e46"),
-                session: Some("bc-fa8ed877"),
-                pr_comment: false,
-            })
-            .await,
-        );
+        let collab = format_json(collab_overlap_case()).await;
         assert!(collab["data"]["commit_sha"].is_null());
     }
 
     #[tokio::test]
     async fn attribution_format_json_exposes_collab_identity_fields() {
-        let collab = parse_stdout_json(
-            &format_ok(FormatCase {
-                json: true,
-                body: "Overlap: I own SKILL.md Reply attribution; RM-145 owns the rest.",
-                agent_id: Some("writ agent"),
-                commit_sha: None,
-                placement: None,
-                task: Some("RM-128"),
-                branch: Some("cursor/reply-attribution-config-6e46"),
-                session: Some("bc-fa8ed877"),
-                pr_comment: false,
-            })
-            .await,
-        );
+        let collab = format_json(collab_overlap_case()).await;
         assert_eq!(
             (
                 collab["data"]["task_id"].as_str(),
@@ -1507,20 +1509,7 @@ mod tests {
 
     #[tokio::test]
     async fn attribution_format_json_includes_pushed_sha() {
-        let with_sha = parse_stdout_json(
-            &format_ok(FormatCase {
-                json: true,
-                body: "Fixed the issue.",
-                agent_id: Some("writ agent"),
-                commit_sha: Some("abc1234"),
-                placement: Some("footer"),
-                task: None,
-                branch: None,
-                session: None,
-                pr_comment: false,
-            })
-            .await,
-        );
+        let with_sha = format_json(pushed_fix_case()).await;
         assert!(format_envelope_ok(&with_sha), "{with_sha}");
         assert_eq!(
             with_sha["data"]["text"].as_str(),
@@ -1530,39 +1519,13 @@ mod tests {
 
     #[tokio::test]
     async fn attribution_format_json_commit_sha_field() {
-        let with_sha = parse_stdout_json(
-            &format_ok(FormatCase {
-                json: true,
-                body: "Fixed the issue.",
-                agent_id: Some("writ agent"),
-                commit_sha: Some("abc1234"),
-                placement: Some("footer"),
-                task: None,
-                branch: None,
-                session: None,
-                pr_comment: false,
-            })
-            .await,
-        );
+        let with_sha = format_json(pushed_fix_case()).await;
         assert_eq!(with_sha["data"]["commit_sha"].as_str(), Some("abc1234"));
     }
 
     #[tokio::test]
     async fn attribution_format_pr_comment_omits_blank_sha() {
-        let omit_sha = parse_stdout_json(
-            &format_ok(FormatCase {
-                json: true,
-                body: "No code change.",
-                agent_id: Some("Codex: writ agent"),
-                commit_sha: Some("  "),
-                placement: None,
-                task: None,
-                branch: None,
-                session: None,
-                pr_comment: true,
-            })
-            .await,
-        );
+        let omit_sha = format_json(pr_comment_no_code_case()).await;
         assert_eq!(
             omit_sha["data"]["text"].as_str(),
             Some("No code change.\n\nCodex: writ agent")
@@ -1572,20 +1535,7 @@ mod tests {
 
     #[tokio::test]
     async fn attribution_format_pr_comment_is_not_thread_reply() {
-        let omit_sha = parse_stdout_json(
-            &format_ok(FormatCase {
-                json: true,
-                body: "No code change.",
-                agent_id: Some("Codex: writ agent"),
-                commit_sha: Some("  "),
-                placement: None,
-                task: None,
-                branch: None,
-                session: None,
-                pr_comment: true,
-            })
-            .await,
-        );
+        let omit_sha = format_json(pr_comment_no_code_case()).await;
         assert_eq!(omit_sha["data"]["is_thread_reply"].as_bool(), Some(false));
     }
 
