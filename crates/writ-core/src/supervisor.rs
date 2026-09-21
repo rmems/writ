@@ -109,6 +109,9 @@ pub struct SupervisedOutput {
     /// Always `0` from this supervisor: it never re-dispatches.
     #[serde(default)]
     pub redispatch_count: u32,
+    /// Configured host redispatch cap from the active [`TimeoutPolicy`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_redispatch_per_item: Option<u32>,
     /// Last recovery action when a hang residual is present.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recovery_stage: Option<RecoveryStage>,
@@ -158,6 +161,7 @@ impl SupervisedOutput {
         self.timeout_class = Some(class);
         self.recovery_stage = Some(stage);
         self.last_output_ms = last_output_ms;
+        self.max_redispatch_per_item = Some(policy.max_redispatch_per_item);
         self.elapsed_ms = elapsed_ms;
         self.residual = Some(TimeoutResidual {
             timeout_class: class,
@@ -678,6 +682,9 @@ async fn await_supervised_child(
             WaitTick::Progress => wait.emit(supervisor, SupervisorStep::Running),
             WaitTick::Continue => {}
             WaitTick::Finished(status) => {
+                if status.is_ok() {
+                    child.disarm();
+                }
                 return complete_child_wait(
                     ChildFinish {
                         supervisor,
@@ -851,7 +858,7 @@ async fn recover_child(
     let error_code = match class {
         TimeoutClass::Idle => SupervisorErrorCode::IdleTimedOut,
         TimeoutClass::LostChild => SupervisorErrorCode::LostChild,
-        TimeoutClass::Hard | TimeoutClass::RedispatchExhausted | TimeoutClass::PermitWait => {
+        TimeoutClass::Hard | TimeoutClass::PermitWait | TimeoutClass::RedispatchExhausted => {
             SupervisorErrorCode::TimedOut
         }
     };
@@ -864,22 +871,20 @@ async fn recover_child(
                 // while the original pgid is still this pid, then disarm so Drop
                 // cannot SIGKILL a reused PID.
                 kill_process_group(pid);
-                child.disarm();
                 RecoveryStage::GracefulCancel
             }
             Ok(Err(_)) | Err(_) => {
                 let _ = child.kill().await;
                 let _ = tokio::time::timeout(POST_KILL_JOIN_TIMEOUT, child.wait()).await;
-                child.disarm();
                 RecoveryStage::Kill
             }
         }
     } else {
         let _ = child.kill().await;
         let _ = tokio::time::timeout(POST_KILL_JOIN_TIMEOUT, child.wait()).await;
-        child.disarm();
         RecoveryStage::Kill
     };
+    child.disarm();
 
     let stdout = join_with_timeout(stdout_handle).await;
     let stderr = join_with_timeout(stderr_handle).await;
@@ -1390,6 +1395,7 @@ fn output_to_supervised(
         timeout_class: None,
         elapsed_ms: 0,
         redispatch_count: 0,
+        max_redispatch_per_item: None,
         recovery_stage: None,
         last_output_ms: None,
         residual: None,

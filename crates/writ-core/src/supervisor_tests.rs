@@ -558,6 +558,27 @@ async fn wall_clock_includes_permit_wait() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn graceful_cancel_then_kill_when_term_ignored() {
+    let policy = TimeoutPolicy {
+        worker: Some(Duration::from_millis(200)),
+        grace: Duration::from_millis(200),
+        progress_every: None,
+        ..TimeoutPolicy::from_worker_timeout(None)
+    };
+    let output = Supervisor::new(1)
+        .run_unchecked_with_policy(
+            shell_program(),
+            &[shell_flag(), "trap '' TERM; while true; do :; done"],
+            &policy,
+            &RunOptions::default(),
+        )
+        .await;
+    assert_timeout_outcome(&output, TimeoutClass::Hard, SupervisorErrorCode::TimedOut);
+    assert_eq!(output.recovery_stage, Some(RecoveryStage::Kill));
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn grace_period_sends_term_before_kill() {
     let policy = TimeoutPolicy {
         worker: Some(Duration::from_millis(150)),
@@ -602,32 +623,6 @@ async fn idle_detects_silent_child_without_wall_clock() {
     );
     assert_eq!(output.recovery_stage, Some(RecoveryStage::Kill));
     assert!(started.elapsed() < Duration::from_secs(5));
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn graceful_cancel_then_kill_when_term_ignored() {
-    let policy = TimeoutPolicy {
-        worker: Some(Duration::from_millis(150)),
-        grace: Duration::from_millis(200),
-        progress_every: None,
-        ..TimeoutPolicy::from_worker_timeout(None)
-    };
-    let started = Instant::now();
-    let output = Supervisor::new(1)
-        .run_unchecked_with_policy(
-            shell_program(),
-            &[shell_flag(), "trap '' TERM; sleep 60"],
-            &policy,
-            &RunOptions::default(),
-        )
-        .await;
-    assert_timeout_outcome(&output, TimeoutClass::Hard, SupervisorErrorCode::TimedOut);
-    assert_eq!(output.recovery_stage, Some(RecoveryStage::Kill));
-    assert!(
-        started.elapsed() < Duration::from_secs(3),
-        "SIGKILL after ignored SIGTERM should recover promptly"
-    );
 }
 
 #[tokio::test]

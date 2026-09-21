@@ -61,12 +61,12 @@ pub enum TimeoutClass {
     Hard,
     /// Process still alive but no captured stdout/stderr for `idle`.
     Idle,
+    /// Timed out while waiting for a process-local max-parallel permit (no child spawned).
+    PermitWait,
     /// Child PID/handle gone without a terminal status.
     LostChild,
     /// Harness redispatch budget exhausted (never emitted by `Supervisor::run`).
     RedispatchExhausted,
-    /// Wall-clock fired while waiting for a process-local max-parallel permit.
-    PermitWait,
 }
 
 impl TimeoutClass {
@@ -76,9 +76,9 @@ impl TimeoutClass {
         match self {
             Self::Hard => "timeout:hard",
             Self::Idle => "timeout:idle",
+            Self::PermitWait => "timeout:permit_wait",
             Self::LostChild => "timeout:lost_child",
             Self::RedispatchExhausted => "timeout:redispatch_exhausted",
-            Self::PermitWait => "timeout:permit_wait",
         }
     }
 
@@ -88,6 +88,18 @@ impl TimeoutClass {
     pub const fn counts_toward_fix_cap(self) -> bool {
         false
     }
+}
+
+/// Last recovery action the supervisor took. Never includes merge or push.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryStage {
+    /// No child to cancel (permit-wait timeout).
+    None,
+    /// Graceful cancel was sent and the child exited before the kill deadline.
+    GracefulCancel,
+    /// Process-group / child kill ran (after grace, or immediately when grace is 0).
+    Kill,
 }
 
 /// Lifecycle step surfaced in progress ticks.
@@ -137,18 +149,6 @@ impl ProgressSnapshot {
             self.idle_for.as_secs()
         )
     }
-}
-
-/// Last recovery action the supervisor took. Never includes merge or push.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RecoveryStage {
-    /// No child to cancel (permit-wait timeout).
-    None,
-    /// Graceful cancel was sent and the child exited before the kill deadline.
-    GracefulCancel,
-    /// Process-group / child kill ran (after grace, or immediately when grace is 0).
-    Kill,
 }
 
 /// Additive hang residual for `SupervisedOutput` / watchlist hosts.
@@ -247,6 +247,12 @@ impl RedispatchBudget {
         }
         self.used += 1;
         Ok(())
+    }
+
+    /// True when `max_per_item == 0` (hosts must not retry).
+    #[must_use]
+    pub fn redispatch_forbidden(&self) -> bool {
+        self.max_per_item == 0
     }
 }
 
@@ -384,9 +390,9 @@ mod tests {
         for class in [
             TimeoutClass::Hard,
             TimeoutClass::Idle,
+            TimeoutClass::PermitWait,
             TimeoutClass::LostChild,
             TimeoutClass::RedispatchExhausted,
-            TimeoutClass::PermitWait,
         ] {
             assert!(class.residual_blocker().starts_with("timeout:"));
             assert!(
@@ -397,16 +403,16 @@ mod tests {
         assert_eq!(TimeoutClass::Hard.residual_blocker(), "timeout:hard");
         assert_eq!(TimeoutClass::Idle.residual_blocker(), "timeout:idle");
         assert_eq!(
+            TimeoutClass::PermitWait.residual_blocker(),
+            "timeout:permit_wait"
+        );
+        assert_eq!(
             TimeoutClass::LostChild.residual_blocker(),
             "timeout:lost_child"
         );
         assert_eq!(
             TimeoutClass::RedispatchExhausted.residual_blocker(),
             "timeout:redispatch_exhausted"
-        );
-        assert_eq!(
-            TimeoutClass::PermitWait.residual_blocker(),
-            "timeout:permit_wait"
         );
     }
 
@@ -424,6 +430,7 @@ mod tests {
     fn zero_budget_never_redispatches() {
         let mut budget = RedispatchBudget::new(0);
         assert!(budget.try_acquire().is_err());
+        assert!(budget.redispatch_forbidden());
         assert_eq!(budget.remaining(), 0);
     }
 
