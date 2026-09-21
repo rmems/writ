@@ -23,7 +23,11 @@ pub struct WatchQuery {
     pub probe_github: bool,
 }
 
-/// Load the collaboration view. Never writes leases, coord tables, or JSON state.
+/// Load a filtered collaboration view from leases and optional overlays.
+///
+/// GitHub probe failures become residual blockers. Lease-store read failures are
+/// returned to the caller. This function never writes leases, coordination tables,
+/// or JSON state.
 pub fn load_view(
     store: &LeaseStore,
     query: &WatchQuery,

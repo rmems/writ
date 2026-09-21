@@ -77,6 +77,7 @@ impl ProbeError {
         }
     }
 
+    /// Encode the probe failure as a watchlist residual blocker.
     #[must_use]
     pub fn residual(&self) -> String {
         match self {
@@ -88,7 +89,10 @@ impl ProbeError {
 
 /// Source of PR metadata. Production uses allowlisted `gh`.
 pub trait GithubProbe {
+    /// Fetch one pull request by repository and number.
     fn view(&self, target: PrRef<'_>) -> Result<PrSnapshot, ProbeError>;
+
+    /// Find a pull request whose head matches `head`, if one exists.
     fn find_by_branch(&self, head: BranchRef<'_>) -> Result<Option<PrSnapshot>, ProbeError>;
 }
 
@@ -99,6 +103,7 @@ pub struct GhPrProbe {
 }
 
 impl GhPrProbe {
+    /// Construct a probe that permits GitHub access only for `allowlist` owners.
     #[must_use]
     pub fn new(allowlist: OwnerAllowlist) -> Self {
         Self { allowlist }
@@ -212,7 +217,9 @@ struct GhCheck {
     status: Option<String>,
 }
 
-/// Parse `gh pr view --json` stdout.
+/// Parse `gh pr view --json` output and associate it with `target.repo`.
+///
+/// Returns an error message when `stdout` is not a valid pull-request payload.
 pub fn parse_pr_view(target: PrRef<'_>, stdout: &str) -> Result<PrSnapshot, String> {
     let view: GhPrView = serde_json::from_str(stdout)
         .map_err(|err| format!("failed to parse gh pr view JSON: {err}"))?;

@@ -120,6 +120,7 @@ pub struct WatchlistData {
 }
 
 impl WatchlistData {
+    /// Construct an entry-free payload while preserving overlay availability flags.
     #[must_use]
     pub fn empty(github_probed: bool, coord_available: bool) -> Self {
         Self {
