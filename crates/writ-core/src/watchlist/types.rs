@@ -120,6 +120,7 @@ pub struct WatchlistData {
 }
 
 impl WatchlistData {
+    /// Construct an empty payload with the supplied probe and coordination availability flags.
     #[must_use]
     pub fn empty(github_probed: bool, coord_available: bool) -> Self {
         Self {

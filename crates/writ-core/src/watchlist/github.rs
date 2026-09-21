@@ -77,6 +77,7 @@ impl ProbeError {
         }
     }
 
+    /// Format this failure as a residual blocker for a watchlist row.
     #[must_use]
     pub fn residual(&self) -> String {
         match self {
@@ -88,7 +89,10 @@ impl ProbeError {
 
 /// Source of PR metadata. Production uses allowlisted `gh`.
 pub trait GithubProbe {
+    /// Fetch a pull request by repository and number.
     fn view(&self, target: PrRef<'_>) -> Result<PrSnapshot, ProbeError>;
+
+    /// Find a pull request for a head branch, returning `None` when no match exists.
     fn find_by_branch(&self, head: BranchRef<'_>) -> Result<Option<PrSnapshot>, ProbeError>;
 }
 
@@ -99,6 +103,7 @@ pub struct GhPrProbe {
 }
 
 impl GhPrProbe {
+    /// Create a `gh`-backed probe restricted to the supplied owner allowlist.
     #[must_use]
     pub fn new(allowlist: OwnerAllowlist) -> Self {
         Self { allowlist }

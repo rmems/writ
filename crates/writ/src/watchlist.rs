@@ -49,6 +49,7 @@ pub enum WatchlistAction {
     Remove,
 }
 
+/// Execute a watchlist action and write its human-readable or JSON response to `stdout`.
 pub fn run(
     action: WatchlistAction,
     allowlist: &OwnerAllowlist,
