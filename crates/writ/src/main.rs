@@ -1287,10 +1287,7 @@ mod tests {
             panic!("expected attribution format command")
         };
         assert_eq!(body, "Looks good!");
-        assert_eq!(
-            agent_id.as_deref(),
-            Some("Claude Code: writ agent")
-        );
+        assert_eq!(agent_id.as_deref(), Some("Claude Code: writ agent"));
         assert_eq!(commit_sha.as_deref(), Some("abc1234"));
     }
 
