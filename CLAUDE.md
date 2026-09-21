@@ -2,7 +2,7 @@
 
 This file provides instructions and context for AI coding agents working on this project.
 
-`writ` is a Rust-first, provider-neutral coordination layer for parallel coding agents: harnesses own worker and checkout lifecycle, and `writ` supplies shared coordination state (identity, ownership leases, declared paths, messages, handoff, recovery). GitHub is the source/PR/review/checks authority; Linear is the task tracker.
+`writ` is a Rust-first, provider-neutral coordination layer for parallel coding agents: harnesses own worker and checkout lifecycle, and `writ` supplies shared coordination state (identity, ownership leases, declared paths, messages, handoff, recovery). GitHub is the source/PR/review/checks authority; Linear is the task tracker used by this repository's maintainers.
 
 ## Repository policy
 
