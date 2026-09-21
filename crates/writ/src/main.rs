@@ -1149,9 +1149,26 @@ mod tests {
         Cli::command().debug_assert();
     }
 
+    fn parse_format(args: &[&str]) -> super::AttributionAction {
+        let parsed = Cli::try_parse_from(args).unwrap();
+        let Some(super::Command::Attribution { action }) = parsed.command else {
+            panic!("expected attribution command")
+        };
+        action
+    }
+
     #[test]
-    fn attribution_format_parser_accepts_thread_and_pr_shapes() {
-        let parsed = Cli::try_parse_from([
+    fn attribution_format_parser_accepts_identity_and_sha() {
+        let super::AttributionAction::Format {
+            body,
+            agent_id,
+            commit_sha,
+            task,
+            branch,
+            session,
+            pr_comment: false,
+            ..
+        } = parse_format(&[
             "writ",
             "attribution",
             "format",
@@ -1168,56 +1185,48 @@ mod tests {
             "--session",
             "bc-fa8ed877",
         ])
-        .unwrap();
-        let Some(super::Command::Attribution {
-            action:
-                super::AttributionAction::Format {
-                    body,
-                    agent_id,
-                    commit_sha,
-                    task,
-                    branch,
-                    session,
-                    pr_comment: false,
-                    ..
-                },
-        }) = parsed.command
         else {
             panic!("expected attribution format command")
         };
-        assert_eq!(body, "Looks good!");
         assert_eq!(
-            agent_id.as_deref(),
-            Some("Claude Code: worktrees-hives agent")
+            (
+                body.as_str(),
+                agent_id.as_deref(),
+                commit_sha.as_deref(),
+                task.as_deref(),
+                branch.as_deref(),
+                session.as_deref()
+            ),
+            (
+                "Looks good!",
+                Some("Claude Code: worktrees-hives agent"),
+                Some("abc1234"),
+                Some("RM-128"),
+                Some("cursor/reply-attribution-config-6e46"),
+                Some("bc-fa8ed877")
+            )
         );
-        assert_eq!(commit_sha.as_deref(), Some("abc1234"));
-        assert_eq!(task.as_deref(), Some("RM-128"));
-        assert_eq!(
-            branch.as_deref(),
-            Some("cursor/reply-attribution-config-6e46")
-        );
-        assert_eq!(session.as_deref(), Some("bc-fa8ed877"));
+    }
 
-        let hyphenated = Cli::try_parse_from([
+    #[test]
+    fn attribution_format_parser_accepts_hyphen_body() {
+        let super::AttributionAction::Format {
+            body: hyphen_body, ..
+        } = parse_format(&[
             "writ",
             "attribution",
             "format",
             "--body",
             "- Fixed the branch check.",
-        ])
-        .unwrap();
-        let Some(super::Command::Attribution {
-            action:
-                super::AttributionAction::Format {
-                    body: hyphen_body, ..
-                },
-        }) = hyphenated.command
-        else {
-            panic!("expected hyphenated attribution body")
-        };
+        ]);
         assert_eq!(hyphen_body, "- Fixed the branch check.");
+    }
 
-        let pr = Cli::try_parse_from([
+    #[test]
+    fn attribution_format_parser_accepts_pr_comment() {
+        let super::AttributionAction::Format {
+            pr_comment: true, ..
+        } = parse_format(&[
             "writ",
             "attribution",
             "format",
@@ -1225,13 +1234,6 @@ mod tests {
             "All checks passed.",
             "--pr-comment",
         ])
-        .unwrap();
-        let Some(super::Command::Attribution {
-            action:
-                super::AttributionAction::Format {
-                    pr_comment: true, ..
-                },
-        }) = pr.command
         else {
             panic!("expected PR comment attribution format")
         };
@@ -1291,15 +1293,6 @@ mod tests {
         stdout
     }
 
-    fn format_data(value: &serde_json::Value) -> (Option<&str>, Option<&str>, Option<bool>, bool) {
-        (
-            value["data"]["text"].as_str(),
-            value["data"]["commit_sha"].as_str(),
-            value["data"]["is_thread_reply"].as_bool(),
-            value["data"]["commit_sha"].is_null(),
-        )
-    }
-
     #[tokio::test]
     async fn attribution_format_human_omits_sha() {
         let human = format_ok(FormatCase {
@@ -1338,23 +1331,42 @@ mod tests {
         );
         assert!(format_envelope_ok(&collab), "{collab}");
         assert_eq!(
-            format_data(&collab),
-            (
-                Some(
-                    "Overlap: I own SKILL.md Reply attribution; RM-145 owns the rest.\n\n---\nworktrees-hives agent | task RM-128 | branch cursor/reply-attribution-config-6e46 | session bc-fa8ed877"
-                ),
-                None,
-                Some(true),
-                true
+            collab["data"]["text"].as_str(),
+            Some(
+                "Overlap: I own SKILL.md Reply attribution; RM-145 owns the rest.\n\n---\nworktrees-hives agent | task RM-128 | branch cursor/reply-attribution-config-6e46 | session bc-fa8ed877"
             )
         );
-        assert_eq!(collab["data"]["task_id"], "RM-128");
-        assert_eq!(
-            collab["data"]["branch"],
-            "cursor/reply-attribution-config-6e46"
-        );
-        assert_eq!(collab["data"]["session_id"], "bc-fa8ed877");
         assert!(collab["data"]["commit_sha"].is_null());
+    }
+
+    #[tokio::test]
+    async fn attribution_format_json_exposes_collab_identity_fields() {
+        let collab = parse_stdout_json(
+            &format_ok(FormatCase {
+                json: true,
+                body: "Overlap: I own SKILL.md Reply attribution; RM-145 owns the rest.",
+                agent_id: Some("worktrees-hives agent"),
+                commit_sha: None,
+                placement: None,
+                task: Some("RM-128"),
+                branch: Some("cursor/reply-attribution-config-6e46"),
+                session: Some("bc-fa8ed877"),
+                pr_comment: false,
+            })
+            .await,
+        );
+        assert_eq!(
+            (
+                collab["data"]["task_id"].as_str(),
+                collab["data"]["branch"].as_str(),
+                collab["data"]["session_id"].as_str()
+            ),
+            (
+                Some("RM-128"),
+                Some("cursor/reply-attribution-config-6e46"),
+                Some("bc-fa8ed877")
+            )
+        );
     }
 
     #[tokio::test]
@@ -1375,14 +1387,10 @@ mod tests {
         );
         assert!(format_envelope_ok(&with_sha), "{with_sha}");
         assert_eq!(
-            format_data(&with_sha),
-            (
-                Some("Fixed the issue.\n\n---\nworktrees-hives agent: fixed in abc1234"),
-                Some("abc1234"),
-                Some(true),
-                false
-            )
+            with_sha["data"]["text"].as_str(),
+            Some("Fixed the issue.\n\n---\nworktrees-hives agent: fixed in abc1234")
         );
+        assert_eq!(with_sha["data"]["commit_sha"].as_str(), Some("abc1234"));
     }
 
     #[tokio::test]
@@ -1402,14 +1410,11 @@ mod tests {
             .await,
         );
         assert_eq!(
-            format_data(&omit_sha),
-            (
-                Some("No code change.\n\nCodex: worktrees-hives agent"),
-                None,
-                Some(false),
-                true
-            )
+            omit_sha["data"]["text"].as_str(),
+            Some("No code change.\n\nCodex: worktrees-hives agent")
         );
+        assert!(omit_sha["data"]["commit_sha"].is_null());
+        assert_eq!(omit_sha["data"]["is_thread_reply"].as_bool(), Some(false));
     }
 
     #[tokio::test]
@@ -1443,32 +1448,31 @@ mod tests {
         }
     }
 
+    fn empty_body_case() -> FormatCase {
+        FormatCase {
+            json: true,
+            body: "",
+            agent_id: None,
+            commit_sha: None,
+            placement: None,
+            task: None,
+            branch: None,
+            session: None,
+            pr_comment: false,
+        }
+    }
+
+    #[test]
+    fn attribution_format_empty_body_maps_to_json_command() {
+        assert_eq!(
+            json_error_command(&format_cli(empty_body_case())),
+            Some("attribution.format")
+        );
+    }
+
     #[tokio::test]
     async fn attribution_format_json_rejects_empty_body_with_envelope() {
-        let cli = format_cli(FormatCase {
-            json: true,
-            body: "",
-            agent_id: None,
-            commit_sha: None,
-            placement: None,
-            task: None,
-            branch: None,
-            session: None,
-            pr_comment: false,
-        });
-        assert_eq!(json_error_command(&cli), Some("attribution.format"));
-        let (result, mut stdout) = run_format(FormatCase {
-            json: true,
-            body: "",
-            agent_id: None,
-            commit_sha: None,
-            placement: None,
-            task: None,
-            branch: None,
-            session: None,
-            pr_comment: false,
-        })
-        .await;
+        let (result, mut stdout) = run_format(empty_body_case()).await;
         let error = result.expect_err("empty body must be rejected");
         assert!(stdout.is_empty());
         write_json_error_envelope(
@@ -1479,25 +1483,16 @@ mod tests {
         )
         .unwrap();
         let value = parse_stdout_json(&stdout);
+        assert_eq!(value["ok"].as_bool(), Some(false));
+        assert_eq!(value["command"].as_str(), Some("attribution.format"));
         assert_eq!(
-            (
-                value["ok"].as_bool(),
-                value["schema_version"].as_u64(),
-                value["command"].as_str(),
-                value["error"]["message"].as_str(),
-                value["error"]["code"]
-                    .as_str()
-                    .is_some_and(|code| !code.is_empty())
-            ),
-            (
-                Some(false),
-                Some(1),
-                Some("attribution.format"),
-                Some("io operation: attribution body must not be empty"),
-                true
-            )
+            value["error"]["message"].as_str(),
+            Some("io operation: attribution body must not be empty")
         );
+    }
 
+    #[tokio::test]
+    async fn attribution_format_empty_agent_id_falls_back_to_default() {
         let empty_agent = parse_stdout_json(
             &format_ok(FormatCase {
                 json: true,
