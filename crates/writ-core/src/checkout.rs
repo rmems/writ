@@ -616,6 +616,43 @@ mod tests {
     }
 
     #[test]
+    fn register_second_job_for_same_path_fails() {
+        let (tmp, repo) = init_repo();
+        let wt = tmp.path().join("wts/one");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "job/one",
+                wt.to_str().unwrap(),
+            ],
+        );
+
+        let store = LeaseStore::open(tmp.path().join("leases.db")).unwrap();
+        let registry = CheckoutRegistry::with_store(store).unwrap();
+        registry.register(&wt, "job-a").unwrap();
+
+        let err = registry.register(&wt, "job-b").unwrap_err();
+        assert!(matches!(
+            err,
+            crate::error::Error::PolicyViolation {
+                code: crate::error::PolicyCode::LeaseConflict,
+                ..
+            }
+        ));
+        assert_eq!(registry.registered().unwrap().len(), 1);
+
+        registry.unregister(&wt).unwrap();
+        registry.register(&wt, "job-b").unwrap();
+        let active = registry.registered().unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].job_id, "job-b");
+    }
+
+    #[test]
     fn unregister_releases_lease_after_checkout_deleted() {
         let (tmp, repo) = init_repo();
         let wt = tmp.path().join("wts/gone");
