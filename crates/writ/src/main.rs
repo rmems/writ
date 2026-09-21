@@ -1246,6 +1246,21 @@ mod tests {
         }
     }
 
+    /// Assert the shared success envelope shape and return `data` for further
+    /// per-command checks.
+    fn ok_envelope<'v>(v: &'v serde_json::Value, command: &str) -> &'v serde_json::Value {
+        assert_eq!(v.get("ok").and_then(serde_json::Value::as_bool), Some(true));
+        assert_eq!(
+            v.get("command").and_then(serde_json::Value::as_str),
+            Some(command)
+        );
+        assert!(
+            v.get("error").expect("missing error").is_null(),
+            "error must be explicitly null, not absent"
+        );
+        v.get("data").expect("missing data")
+    }
+
     #[test]
     fn command_definition_is_valid() {
         Cli::command().debug_assert();
@@ -1844,21 +1859,20 @@ mod tests {
         let output = str::from_utf8(&stdout).unwrap();
         let v: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
 
-        assert_eq!(v.get("schema_version").expect("missing schema_version"), 2);
-        assert_eq!(v.get("command").expect("missing command"), "cli.status");
-        assert!(v.get("ok").expect("missing ok").as_bool().unwrap());
-        assert!(
-            v.get("error").expect("missing error").is_null(),
-            "error must be explicitly null, not absent"
+        let data = ok_envelope(&v, "cli.status");
+        assert_eq!(
+            (
+                v.get("schema_version").expect("missing schema_version"),
+                data.get("source").expect("missing source")
+            ),
+            (&serde_json::json!(2), &serde_json::json!("lease_store"))
         );
-        let data = v.get("data").expect("missing data");
-        assert_eq!(data.get("source").expect("missing source"), "lease_store");
-        let jobs = data
-            .get("jobs")
-            .expect("missing data.jobs")
-            .as_array()
-            .expect("data.jobs must be an array");
-        assert!(jobs.is_empty());
+        assert_eq!(
+            data.get("jobs")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(0)
+        );
         assert!(v.get("jobs").is_none(), "jobs must be nested under data");
     }
 
@@ -1871,23 +1885,25 @@ mod tests {
         let output = str::from_utf8(&stdout).unwrap();
         let v: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
 
-        let data = v.get("data").expect("missing data");
+        let data = ok_envelope(&v, "cli.status");
         let jobs = data
             .get("jobs")
-            .expect("missing data.jobs")
-            .as_array()
+            .and_then(serde_json::Value::as_array)
             .expect("data.jobs must be an array");
         assert_eq!(jobs.len(), 1);
-        assert_eq!(jobs[0].get("job_id").expect("missing job_id"), "writ-1");
         assert_eq!(
-            jobs[0]
-                .get("collaboration_state")
-                .expect("missing collaboration_state"),
-            "running"
-        );
-        assert_eq!(
-            jobs[0].get("process_state").expect("missing process_state"),
-            "unknown"
+            (
+                jobs[0].get("job_id").expect("missing job_id"),
+                jobs[0]
+                    .get("collaboration_state")
+                    .expect("missing collaboration_state"),
+                jobs[0].get("process_state").expect("missing process_state")
+            ),
+            (
+                &serde_json::json!("writ-1"),
+                &serde_json::json!("running"),
+                &serde_json::json!("unknown")
+            )
         );
     }
 
@@ -1900,20 +1916,14 @@ mod tests {
         let output = str::from_utf8(&stdout).unwrap();
         let v: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
 
+        let data = ok_envelope(&v, "cli.jobs");
         assert_eq!(v.get("schema_version").expect("missing schema_version"), 2);
-        assert_eq!(v.get("command").expect("missing command"), "cli.jobs");
-        assert!(v.get("ok").expect("missing ok").as_bool().unwrap());
-        assert!(
-            v.get("error").expect("missing error").is_null(),
-            "error must be explicitly null, not absent"
+        assert_eq!(
+            data.get("jobs")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(0)
         );
-        let data = v.get("data").expect("missing data");
-        let jobs = data
-            .get("jobs")
-            .expect("missing data.jobs")
-            .as_array()
-            .expect("data.jobs must be an array");
-        assert!(jobs.is_empty());
         assert!(v.get("jobs").is_none(), "jobs must be nested under data");
     }
 
@@ -1967,22 +1977,21 @@ mod tests {
 
         let output = str::from_utf8(&stdout).unwrap();
         let v: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
-        assert_eq!(v.get("ok").expect("missing ok"), false);
         assert_eq!(
-            v.get("error")
-                .expect("missing error")
-                .get("code")
-                .expect("missing code"),
-            "STATE_LOAD_FAILED"
+            (
+                v.get("ok").expect("missing ok"),
+                v.pointer("/error/code").expect("missing error.code")
+            ),
+            (
+                &serde_json::json!(false),
+                &serde_json::json!("STATE_LOAD_FAILED")
+            )
         );
-        assert!(
-            v.get("data")
-                .expect("missing data")
-                .get("jobs")
-                .expect("missing jobs")
-                .as_array()
-                .expect("jobs array")
-                .is_empty()
+        assert_eq!(
+            v.pointer("/data/jobs")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(0)
         );
     }
 

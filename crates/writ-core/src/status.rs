@@ -78,43 +78,46 @@ pub enum CiClass {
     Unknown,
 }
 
-impl fmt::Display for ProcessState {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Pending => "pending",
-            Self::Running => "running",
-            Self::Completed => "completed",
-            Self::Failed => "failed",
-            Self::Cancelled => "cancelled",
-            Self::TimedOut => "timed_out",
-            Self::Unknown => "unknown",
-        })
-    }
+macro_rules! impl_snake_case_display {
+    ($ty:ty, $($variant:ident => $text:literal),+ $(,)?) => {
+        impl fmt::Display for $ty {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(match self {
+                    $(Self::$variant => $text,)+
+                })
+            }
+        }
+    };
 }
 
-impl fmt::Display for CollaborationState {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Running => "running",
-            Self::Waiting => "waiting",
-            Self::Paused => "paused",
-            Self::Conflicted => "conflicted",
-            Self::ReadyForIntegration => "ready_for_integration",
-            Self::Unassigned => "unassigned",
-            Self::Unknown => "unknown",
-        })
-    }
+impl_snake_case_display! {
+    ProcessState,
+    Pending => "pending",
+    Running => "running",
+    Completed => "completed",
+    Failed => "failed",
+    Cancelled => "cancelled",
+    TimedOut => "timed_out",
+    Unknown => "unknown",
 }
 
-impl fmt::Display for CiClass {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Pass => "pass",
-            Self::Fail => "fail",
-            Self::Pending => "pending",
-            Self::Unknown => "unknown",
-        })
-    }
+impl_snake_case_display! {
+    CollaborationState,
+    Running => "running",
+    Waiting => "waiting",
+    Paused => "paused",
+    Conflicted => "conflicted",
+    ReadyForIntegration => "ready_for_integration",
+    Unassigned => "unassigned",
+    Unknown => "unknown",
+}
+
+impl_snake_case_display! {
+    CiClass,
+    Pass => "pass",
+    Fail => "fail",
+    Pending => "pending",
+    Unknown => "unknown",
 }
 
 /// Status of a single registered checkout / lease identity.
