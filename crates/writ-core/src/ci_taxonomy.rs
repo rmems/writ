@@ -14,6 +14,8 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::status::CiClass;
+
 /// Check ownership / fixability class.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 pub enum CheckClass {
@@ -211,6 +213,30 @@ pub struct ClassifiedCheck {
     pub observation: ObservationKind,
 }
 
+/// Concise CI observation for collaboration/status consumers (RM-139 / RM-127).
+///
+/// This is a derived view of [`ClassificationReport`]. It is **not** a second
+/// store: `ci classify` does not write `watched.json` or lease rows. Callers
+/// copy these fields into shared status surfaces when they already have a
+/// classify result.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CollaborationCiStatus {
+    /// Same tokens as [`CiClass`]. `fail` only when GitHub marked a required check failed.
+    pub ci_class: CiClass,
+    /// Always `false`: an external/advisory/unknown gate must not freeze other jobs.
+    pub blocks_unrelated_workers: bool,
+    /// `true` unless this rollup has a required-check failure.
+    pub continue_other_work: bool,
+    pub required_failure_count: usize,
+    pub pending_count: usize,
+    pub advisory_finding_count: usize,
+    pub external_access_count: usize,
+    pub unknown_requiredness_count: usize,
+    pub residual_codes: Vec<String>,
+    pub fixable_failure_count: usize,
+    pub forbid_empty_retrigger_commit: bool,
+}
+
 /// Classification of a full PR check rollup.
 #[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ClassificationReport {
@@ -347,6 +373,51 @@ impl ClassificationReport {
                 .iter()
                 .all(|c| c.entry.conclusion.is_terminal_passing())
     }
+
+    /// Job-level rollup for [`JobStatus.ci_class`](crate::status::JobStatus).
+    ///
+    /// `fail` is only [`ObservationKind::RequiredFailure`]. Advisory findings,
+    /// `ACTION_REQUIRED` external-access, pending, and unknown requiredness are
+    /// not treated as a writ merge gate.
+    #[must_use]
+    pub fn job_ci_class(&self) -> CiClass {
+        if self.checks.is_empty() {
+            return CiClass::Unknown;
+        }
+        if !self.required_failures().is_empty() {
+            return CiClass::Fail;
+        }
+        if !self.pending_checks().is_empty() {
+            return CiClass::Pending;
+        }
+        if self
+            .checks
+            .iter()
+            .any(|c| c.entry.requirement == Requirement::Required)
+            || self.all_passed()
+        {
+            return CiClass::Pass;
+        }
+        CiClass::Unknown
+    }
+
+    /// Compact payload for RM-139 / RM-127. Not persisted here.
+    #[must_use]
+    pub fn collaboration_status(&self) -> CollaborationCiStatus {
+        CollaborationCiStatus {
+            ci_class: self.job_ci_class(),
+            blocks_unrelated_workers: false,
+            continue_other_work: self.required_failures().is_empty(),
+            required_failure_count: self.required_failures().len(),
+            pending_count: self.pending_checks().len(),
+            advisory_finding_count: self.advisory_findings().len(),
+            external_access_count: self.external_access().len(),
+            unknown_requiredness_count: self.unknown_requiredness().len(),
+            residual_codes: self.residual_codes(),
+            fixable_failure_count: self.fixable_failures().len(),
+            forbid_empty_retrigger_commit: true,
+        }
+    }
 }
 
 /// Parse one raw check object. Unknown conclusions become [`CheckConclusion::Pending`].
@@ -436,6 +507,7 @@ pub fn classify_response_data(report: &ClassificationReport) -> Value {
         "github_is_required_check_authority": true,
         "unknown_requiredness_is_not_a_writ_merge_gate": true,
         "operator_note": "GitHub is the required-check authority. A provider name does not decide requiredness. Unknown requiredness, advisory findings, pending results, and external access/configuration problems are reported and are not writ merge gates.",
+        "collaboration": report.collaboration_status(),
     })
 }
 
@@ -1534,5 +1606,77 @@ mod tests {
                 .unwrap()
                 .contains("GitHub is the required-check authority")
         );
+        assert_eq!(data["collaboration"]["ci_class"], "unknown");
+        assert_eq!(data["collaboration"]["blocks_unrelated_workers"], false);
+        assert_eq!(data["collaboration"]["continue_other_work"], true);
+        assert_eq!(data["collaboration"]["forbid_empty_retrigger_commit"], true);
+    }
+
+    #[test]
+    fn collaboration_status_does_not_freeze_unrelated_workers() {
+        let unknown_fail =
+            classify_checks(&[raw_check("Build & Test", "CI", "fail", actions_url())]);
+        assert_eq!(unknown_fail.job_ci_class(), CiClass::Unknown);
+        let collab = unknown_fail.collaboration_status();
+        assert!(!collab.blocks_unrelated_workers);
+        assert!(collab.continue_other_work);
+        assert_eq!(collab.unknown_requiredness_count, 1);
+
+        let pending = classify_checks(&[raw_check("Build & Test", "CI", "pending", actions_url())]);
+        assert_eq!(pending.job_ci_class(), CiClass::Pending);
+        assert!(pending.collaboration_status().continue_other_work);
+
+        let external = classify_checks_json(&json!([{
+            "name": "Codacy Static Code Analysis",
+            "link": "https://app.codacy.com/gh/acme/example-org/pull-requests/12",
+            "conclusion": "ACTION_REQUIRED",
+        }]))
+        .unwrap();
+        assert_eq!(external.job_ci_class(), CiClass::Unknown);
+        assert_eq!(external.collaboration_status().external_access_count, 1);
+        assert!(!external.collaboration_status().blocks_unrelated_workers);
+
+        let required_fail = classify_checks_json(&json!([{
+            "name": "Build & Test",
+            "workflow": "CI",
+            "bucket": "fail",
+            "link": actions_url(),
+            "isRequired": true,
+        }]))
+        .unwrap();
+        assert_eq!(required_fail.job_ci_class(), CiClass::Fail);
+        assert!(!required_fail.collaboration_status().continue_other_work);
+        assert!(
+            !required_fail
+                .collaboration_status()
+                .blocks_unrelated_workers
+        );
+
+        let required_pass_advisory_fail = classify_checks_json(&json!([
+            {
+                "name": "Build & Test",
+                "workflow": "CI",
+                "bucket": "pass",
+                "link": actions_url(),
+                "isRequired": true,
+            },
+            {
+                "name": "Codacy Static Code Analysis",
+                "bucket": "fail",
+                "link": "https://app.codacy.com/gh/acme/example-org/pull-requests/12",
+                "isRequired": false,
+            }
+        ]))
+        .unwrap();
+        assert_eq!(required_pass_advisory_fail.job_ci_class(), CiClass::Pass);
+        assert_eq!(
+            required_pass_advisory_fail
+                .collaboration_status()
+                .advisory_finding_count,
+            1
+        );
+
+        let empty = ClassificationReport::default();
+        assert_eq!(empty.job_ci_class(), CiClass::Unknown);
     }
 }

@@ -81,6 +81,8 @@ When monitoring PR checks, classify each row from `gh pr checks --json name,stat
 
 `skipping` is non-blocking. `pending` means continue other work without rerun spam. **Prefer a real fix or `gh run rerun` over noise commits.** Residual codes belong in watchlist notes and the final report.
 
+`writ --json ci classify` emits a compact `data.collaboration` object (`ci_class`, observation counts, `residual_codes`, `blocks_unrelated_workers: false`). Copy that into existing RM-139 / RM-127 status views. Do **not** write `watched.json`, a second store, or a lease row for CI. An externally blocked service must not freeze unrelated workers.
+
 Requiredness is **not** the Class A/B/C letter and is **not** inferred from a provider name. Pass `isRequired` from GraphQL when available. Count `required_failure` separately from advisory findings, pending results, `ACTION_REQUIRED` external-access/configuration problems, and unknown requiredness. Unknown is a report, not a writ merge gate and not a pass. Do not disable checks, fabricate success, or empty-commit to retrigger a bot.
 
 ### Platform-neutral worker prompt template

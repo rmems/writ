@@ -92,6 +92,13 @@ unknown) is also in that classifier; `CiClass` does not infer it from a vendor.
 | `pending` | Checks are queued or in progress. |
 | `unknown` | CI status could not be determined. |
 
+`JobStatus.ci_class` is a job-level rollup, not Class A/B/C. Map it from
+`writ --json ci classify` → `data.collaboration.ci_class` when a classify
+result is available: `fail` only for GitHub-required failures; advisory,
+pending, external-access, and unknown requiredness stay non-fail. Copy
+`residual_codes` into existing watchlist notes. **Do not** persist a second
+CI store from this command; `state.rs` remains read-only for `watched.json`.
+
 ## Example: empty report
 
 ```json

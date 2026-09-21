@@ -94,6 +94,21 @@
                 }
             }
         ],
+        "collaboration": {
+            "advisory_finding_count": 0,
+            "blocks_unrelated_workers": false,
+            "ci_class": "pending",
+            "continue_other_work": true,
+            "external_access_count": 0,
+            "fixable_failure_count": 2,
+            "forbid_empty_retrigger_commit": true,
+            "pending_count": 1,
+            "required_failure_count": 0,
+            "residual_codes": [
+                "class_c:kilo_pending"
+            ],
+            "unknown_requiredness_count": 2
+        },
         "external_access_codes": [],
         "fixable_failure_count": 2,
         "github_is_required_check_authority": true,

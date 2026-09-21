@@ -207,6 +207,7 @@ Implemented `writ` surface (`writ --help` is authoritative):
 | Command | Status | Operator meaning |
 | --- | --- | --- |
 | `writ status` / `writ jobs` | Implemented (read-only) | Show watched jobs. Empty unless an external process wrote the state file. See [`docs/status-schema.md`](docs/status-schema.md). |
+| `writ ci classify` | Implemented | Classify `gh pr checks` / `statusCheckRollup` JSON. Emits residual codes plus a compact `collaboration` view for status consumers. Does not write state. |
 | `writ git-safe …` | Implemented | Run a git command after the allowlist and, for mutations, expected-branch checks. |
 | `writ gh-safe …` | Implemented | Run a `gh` command after the allowlist. GitHub PR merge operations are rejected. |
 | `writ supervisor run --timeout <secs> …` | Implemented | Spawn a child with wall-clock timeout. Unix kills the process group; Windows kills only the direct child (grandchildren may survive). |

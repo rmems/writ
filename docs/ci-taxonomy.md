@@ -144,6 +144,15 @@ is a job-level rollup, not A/B/C. Watchlist consumers should keep
 `required_failure_codes` distinct from `advisory_finding_codes`,
 `pending_codes`, `external_access_codes`, and `unknown_requiredness_codes`.
 
+`writ --json ci classify` also emits `data.collaboration`: a compact copy of
+that rollup (`ci_class`, observation counts, `residual_codes`).
+`blocks_unrelated_workers` is always `false` so an external/advisory/unknown
+gate does not freeze other jobs. `continue_other_work` is `true` unless a
+required check failed. This object is a **derived view** of the classify
+result. It does not write `watched.json` or the lease store; RM-139 / RM-127
+consume it. Empty retrigger commits remain forbidden
+(`forbid_empty_retrigger_commit: true`).
+
 ## CLI
 
 ```bash

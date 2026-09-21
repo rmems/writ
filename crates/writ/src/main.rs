@@ -1030,6 +1030,12 @@ fn write_classify_result(
         report.required_failures().len(),
         report.residual_codes().join(",")
     )?;
+    let collab = report.collaboration_status();
+    writeln!(
+        stdout,
+        "collaboration ci_class={} blocks_unrelated_workers={} continue_other_work={}",
+        collab.ci_class, collab.blocks_unrelated_workers, collab.continue_other_work
+    )?;
     writeln!(
         stdout,
         "github is the required-check authority; unknown/advisory/pending/external-access are not writ merge gates"
@@ -1144,6 +1150,16 @@ mod tests {
             v.pointer("/data/unknown_requiredness_is_not_a_writ_merge_gate")
                 .expect("unknown_requiredness_is_not_a_writ_merge_gate"),
             true
+        );
+        assert_eq!(
+            v.pointer("/data/collaboration/ci_class")
+                .expect("collaboration.ci_class"),
+            "pending"
+        );
+        assert_eq!(
+            v.pointer("/data/collaboration/blocks_unrelated_workers")
+                .expect("blocks_unrelated_workers"),
+            false
         );
         let _ = std::fs::remove_file(path);
     }
