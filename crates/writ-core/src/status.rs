@@ -5,7 +5,7 @@
 //! merge state is not mixed into this snapshot.
 
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -355,13 +355,21 @@ fn resolve_head(lease: &Lease) -> (Option<String>, Option<String>, Option<bool>)
 /// identity still matches the lease: same repository and same branch.
 fn checkout_matches_lease(info: &CheckoutInfo, lease: &Lease) -> bool {
     let branch = info.branch.as_deref().unwrap_or(DETACHED_BRANCH);
-    if branch != lease.branch || info.owner != lease.owner || info.repo_name != lease.repo_name {
+    if branch != lease.branch {
         return false;
     }
-    match crate::paths::canonicalize_for_tools(Path::new(&lease.repo)) {
-        Ok(recorded) => info.common_dir == recorded,
-        Err(_) => info.common_dir == Path::new(&lease.repo),
+    if info.owner != lease.owner {
+        return false;
     }
+    if info.repo_name != lease.repo_name {
+        return false;
+    }
+    info.common_dir == recorded_common_dir(lease)
+}
+
+fn recorded_common_dir(lease: &Lease) -> PathBuf {
+    crate::paths::canonicalize_for_tools(Path::new(&lease.repo))
+        .unwrap_or_else(|_| PathBuf::from(&lease.repo))
 }
 
 fn nonempty_head(start_commit: &str) -> Option<String> {
