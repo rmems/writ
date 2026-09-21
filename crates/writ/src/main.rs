@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 
 /// Manage isolated issue-to-PR jobs and their durable state.
 #[derive(Debug, Parser)]
@@ -164,6 +164,84 @@ enum WorktreeAction {
     },
 }
 
+/// Timeout-policy knobs for `writ supervisor run`, grouped so the many
+/// second-valued budgets travel together instead of as loose primitives.
+#[derive(Debug, Args)]
+struct SupervisorTimeouts {
+    /// Wall-clock timeout in seconds. 0 means no timeout.
+    #[arg(
+        long,
+        env = writ_core::timeout_policy::ENV_TIMEOUT_SECS,
+        default_value_t = writ_core::timeout_policy::DEFAULT_WORKER_SECS
+    )]
+    timeout: u64,
+
+    /// Idle hang detector: no captured output for this many seconds. 0 disables.
+    /// `--stall` is an alias from the RM-129 comparison lane (same detector).
+    #[arg(
+        long,
+        visible_alias = "stall",
+        env = writ_core::timeout_policy::ENV_IDLE_SECS,
+        default_value_t = writ_core::timeout_policy::DEFAULT_IDLE_SECS
+    )]
+    idle: u64,
+
+    /// Optional per-step cap in seconds. 0 disables.
+    #[arg(
+        long,
+        env = writ_core::timeout_policy::ENV_STEP_SECS,
+        default_value_t = writ_core::timeout_policy::DEFAULT_STEP_SECS
+    )]
+    step: u64,
+
+    /// Overall wait budget in seconds. 0 falls back to `--timeout`.
+    #[arg(
+        long,
+        env = writ_core::timeout_policy::ENV_ORCHESTRATOR_SECS,
+        default_value_t = writ_core::timeout_policy::DEFAULT_ORCHESTRATOR_SECS
+    )]
+    orchestrator: u64,
+
+    /// Seconds between SIGTERM and SIGKILL (Unix). 0 = kill immediately.
+    #[arg(
+        long,
+        env = writ_core::timeout_policy::ENV_GRACE_SECS,
+        default_value_t = writ_core::timeout_policy::DEFAULT_GRACE_SECS
+    )]
+    grace: u64,
+
+    /// Progress tick interval on stderr while waiting. 0 disables.
+    #[arg(
+        long,
+        env = writ_core::timeout_policy::ENV_PROGRESS_SECS,
+        default_value_t = writ_core::timeout_policy::DEFAULT_PROGRESS_SECS
+    )]
+    progress_secs: u64,
+
+    /// Harness redispatch budget recorded on the policy. Supervisor never retries.
+    #[arg(
+        long,
+        env = writ_core::timeout_policy::ENV_MAX_REDISPATCH,
+        default_value_t = writ_core::timeout_policy::DEFAULT_MAX_REDISPATCH_PER_ITEM
+    )]
+    max_redispatch: u32,
+}
+
+impl SupervisorTimeouts {
+    /// Build the core timeout policy from the parsed second-valued budgets.
+    fn to_policy(&self) -> writ_core::timeout_policy::TimeoutPolicy {
+        writ_core::timeout_policy::TimeoutPolicy {
+            worker: secs_opt(self.timeout),
+            step: secs_opt(self.step),
+            idle: secs_opt(self.idle),
+            orchestrator: secs_opt(self.orchestrator),
+            grace: Duration::from_secs(self.grace),
+            max_redispatch_per_item: self.max_redispatch,
+            progress_every: secs_opt(self.progress_secs),
+        }
+    }
+}
+
 #[derive(Debug, Subcommand)]
 enum AttributionAction {
     /// Render a reply body with attribution and optional commit SHA.
@@ -200,9 +278,8 @@ enum AttributionAction {
 enum SupervisorAction {
     /// Run a command under supervision.
     Run {
-        /// Wall-clock timeout in seconds. 0 means no timeout.
-        #[arg(long, default_value = "0")]
-        timeout: u64,
+        #[command(flatten)]
+        timeouts: SupervisorTimeouts,
 
         /// Expected branch for mutating supervised `git` / `gh pr` commands.
         #[arg(long)]
@@ -833,7 +910,7 @@ async fn run(cli: Cli, stdout: &mut impl Write) -> writ_core::error::Result<Exit
         Some(Command::GhSafe { args }) => run_gh_safe(&args, &allowlist, cli.json, stdout),
         Some(Command::Supervisor { action }) => match action {
             SupervisorAction::Run {
-                timeout,
+                timeouts,
                 expected_branch,
                 repo,
                 max_parallel,
@@ -841,13 +918,14 @@ async fn run(cli: Cli, stdout: &mut impl Write) -> writ_core::error::Result<Exit
             } => {
                 run_supervisor(
                     cli.json,
-                    timeout,
+                    &timeouts,
                     max_parallel,
                     cmd,
                     writ_core::supervisor::RunOptions {
                         expected_branch,
                         repo,
                         allowlist: Some(allowlist),
+                        ..Default::default()
                     },
                     stdout,
                 )
@@ -874,13 +952,17 @@ async fn run(cli: Cli, stdout: &mut impl Write) -> writ_core::error::Result<Exit
     }
 }
 
+fn secs_opt(secs: u64) -> Option<Duration> {
+    (secs > 0).then(|| Duration::from_secs(secs))
+}
+
 /// Run `writ supervisor run` with policy-checked core supervisor and consistent JSON envelopes.
 async fn run_supervisor(
     json: bool,
-    timeout_secs: u64,
+    timeouts: &SupervisorTimeouts,
     max_parallel: usize,
     cmd: Vec<String>,
-    options: writ_core::supervisor::RunOptions,
+    mut options: writ_core::supervisor::RunOptions,
     stdout: &mut impl Write,
 ) -> writ_core::error::Result<ExitCode> {
     let program = match cmd.first() {
@@ -894,16 +976,20 @@ async fn run_supervisor(
         }
     };
     let args: Vec<&str> = cmd[1..].iter().map(|s| s.as_str()).collect();
-    let timeout = if timeout_secs == 0 {
-        None
-    } else {
-        Some(Duration::from_secs(timeout_secs))
-    };
+    let policy = timeouts.to_policy();
+    options.on_progress = policy.progress_every.map(|_| {
+        std::sync::Arc::new(|snap: &writ_core::timeout_policy::ProgressSnapshot| {
+            eprintln!("{}", snap.format_line());
+        }) as writ_core::timeout_policy::ProgressCallback
+    });
 
     // One-shot CLI: a single awaited child cannot contend with itself.
     // Library callers may still use Supervisor::new(n) for in-process fan-out.
     let supervisor = writ_core::supervisor::Supervisor::new(max_parallel.max(1));
-    match supervisor.run(program, &args, timeout, &options).await {
+    match supervisor
+        .run_with_policy(program, &args, &policy, &options)
+        .await
+    {
         Ok(output) => {
             write_supervisor_result(json, Ok(&output), stdout)?;
             if json {
@@ -1122,7 +1208,7 @@ mod tests {
     use std::str;
 
     use clap::{CommandFactory, Parser};
-    use writ_core::status::{CiClass, JobStatus, ProcessState};
+    use writ_core::status::{JobIdentity, JobStatus};
 
     use super::{
         Cli, json_error_command, run, run_status, run_with_jobs, supervised_exit_code,
@@ -1130,17 +1216,28 @@ mod tests {
     };
 
     fn sample_job() -> JobStatus {
-        JobStatus {
+        let mut job = JobStatus::new(JobIdentity {
             job_id: "writ-1".to_owned(),
             owner: "acme".to_owned(),
             repo: "example-org".to_owned(),
-            issue_number: Some(29),
-            pr_number: None,
             worktree_path: "/tmp/wt/writ-1".to_owned(),
             branch: "feature/foo".to_owned(),
-            process_state: ProcessState::Running,
-            last_error: None,
-            ci_class: CiClass::Pending,
+        });
+        job.issue_number = Some(29);
+        job
+    }
+
+    /// Timeout knobs with every second-valued budget disabled, matching the
+    /// hand-built `Run` variants these tests previously constructed inline.
+    fn disabled_timeouts() -> super::SupervisorTimeouts {
+        super::SupervisorTimeouts {
+            timeout: 0,
+            idle: 0,
+            step: 0,
+            orchestrator: 0,
+            grace: 0,
+            progress_secs: 0,
+            max_redispatch: 1,
         }
     }
 
@@ -1165,7 +1262,7 @@ mod tests {
             "--body",
             "Looks good!",
             "--agent-id",
-            "Claude Code: worktrees-hives agent",
+            "Claude Code: writ agent",
             "--commit-sha",
             "abc1234",
             "--task",
@@ -1192,7 +1289,7 @@ mod tests {
         assert_eq!(body, "Looks good!");
         assert_eq!(
             agent_id.as_deref(),
-            Some("Claude Code: worktrees-hives agent")
+            Some("Claude Code: writ agent")
         );
         assert_eq!(commit_sha.as_deref(), Some("abc1234"));
     }
@@ -1307,7 +1404,7 @@ mod tests {
         let human = format_ok(FormatCase {
             json: false,
             body: "Looks good!",
-            agent_id: Some("worktrees-hives agent"),
+            agent_id: Some("writ agent"),
             commit_sha: None,
             placement: None,
             task: None,
@@ -1318,7 +1415,7 @@ mod tests {
         .await;
         assert_eq!(
             str::from_utf8(&human).unwrap(),
-            "Looks good!\n\n---\nworktrees-hives agent\n"
+            "Looks good!\n\n---\nwrit agent\n"
         );
     }
 
@@ -1328,7 +1425,7 @@ mod tests {
             &format_ok(FormatCase {
                 json: true,
                 body: "Overlap: I own SKILL.md Reply attribution; RM-145 owns the rest.",
-                agent_id: Some("worktrees-hives agent"),
+                agent_id: Some("writ agent"),
                 commit_sha: None,
                 placement: None,
                 task: Some("RM-128"),
@@ -1342,7 +1439,7 @@ mod tests {
         assert_eq!(
             collab["data"]["text"].as_str(),
             Some(
-                "Overlap: I own SKILL.md Reply attribution; RM-145 owns the rest.\n\n---\nworktrees-hives agent | task RM-128 | branch cursor/reply-attribution-config-6e46 | session bc-fa8ed877"
+                "Overlap: I own SKILL.md Reply attribution; RM-145 owns the rest.\n\n---\nwrit agent | task RM-128 | branch cursor/reply-attribution-config-6e46 | session bc-fa8ed877"
             )
         );
         assert!(collab["data"]["commit_sha"].is_null());
@@ -1354,7 +1451,7 @@ mod tests {
             &format_ok(FormatCase {
                 json: true,
                 body: "Overlap: I own SKILL.md Reply attribution; RM-145 owns the rest.",
-                agent_id: Some("worktrees-hives agent"),
+                agent_id: Some("writ agent"),
                 commit_sha: None,
                 placement: None,
                 task: Some("RM-128"),
@@ -1384,7 +1481,7 @@ mod tests {
             &format_ok(FormatCase {
                 json: true,
                 body: "Fixed the issue.",
-                agent_id: Some("worktrees-hives agent"),
+                agent_id: Some("writ agent"),
                 commit_sha: Some("abc1234"),
                 placement: Some("footer"),
                 task: None,
@@ -1397,7 +1494,7 @@ mod tests {
         assert!(format_envelope_ok(&with_sha), "{with_sha}");
         assert_eq!(
             with_sha["data"]["text"].as_str(),
-            Some("Fixed the issue.\n\n---\nworktrees-hives agent: fixed in abc1234")
+            Some("Fixed the issue.\n\n---\nwrit agent: fixed in abc1234")
         );
         assert_eq!(with_sha["data"]["commit_sha"].as_str(), Some("abc1234"));
     }
@@ -1408,7 +1505,7 @@ mod tests {
             &format_ok(FormatCase {
                 json: true,
                 body: "No code change.",
-                agent_id: Some("Codex: worktrees-hives agent"),
+                agent_id: Some("Codex: writ agent"),
                 commit_sha: Some("  "),
                 placement: None,
                 task: None,
@@ -1420,7 +1517,7 @@ mod tests {
         );
         assert_eq!(
             omit_sha["data"]["text"].as_str(),
-            Some("No code change.\n\nCodex: worktrees-hives agent")
+            Some("No code change.\n\nCodex: writ agent")
         );
         assert!(omit_sha["data"]["commit_sha"].is_null());
         assert_eq!(omit_sha["data"]["is_thread_reply"].as_bool(), Some(false));
@@ -1525,6 +1622,76 @@ mod tests {
             empty_agent["data"]["agent_id"],
             writ_core::attribution::DEFAULT_AGENT_ID
         );
+    }
+
+    #[test]
+    fn supervisor_run_parses_named_timeout_policy_flags() {
+        let cli = Cli::try_parse_from([
+            "writ",
+            "supervisor",
+            "run",
+            "--timeout",
+            "10",
+            "--idle",
+            "3",
+            "--step",
+            "2",
+            "--orchestrator",
+            "15",
+            "--grace",
+            "5",
+            "--progress-secs",
+            "1",
+            "--max-redispatch",
+            "1",
+            "true",
+        ])
+        .unwrap();
+        let Some(super::Command::Supervisor {
+            action:
+                super::SupervisorAction::Run {
+                    timeouts:
+                        super::SupervisorTimeouts {
+                            timeout,
+                            idle,
+                            step,
+                            orchestrator,
+                            grace,
+                            progress_secs,
+                            max_redispatch,
+                        },
+                    cmd,
+                    ..
+                },
+        }) = cli.command
+        else {
+            panic!("expected supervisor run");
+        };
+        assert_eq!(timeout, 10);
+        assert_eq!(idle, 3);
+        assert_eq!(step, 2);
+        assert_eq!(orchestrator, 15);
+        assert_eq!(grace, 5);
+        assert_eq!(progress_secs, 1);
+        assert_eq!(max_redispatch, 1);
+        assert_eq!(cmd, vec!["true"]);
+    }
+
+    #[test]
+    fn supervisor_run_parses_stall_as_idle_alias() {
+        let cli =
+            Cli::try_parse_from(["writ", "supervisor", "run", "--stall", "9", "true"]).unwrap();
+        let Some(super::Command::Supervisor {
+            action:
+                super::SupervisorAction::Run {
+                    timeouts: super::SupervisorTimeouts { idle, .. },
+                    ..
+                },
+        }) = cli.command
+        else {
+            panic!("expected supervisor run");
+        };
+        assert_eq!(idle, 9);
     }
 
     #[test]
@@ -1814,7 +1981,7 @@ mod tests {
             allowed_owners: None,
             command: Some(super::Command::Supervisor {
                 action: super::SupervisorAction::Run {
-                    timeout: 0,
+                    timeouts: disabled_timeouts(),
                     expected_branch: None,
                     repo: None,
                     max_parallel: 1,
@@ -1849,7 +2016,7 @@ mod tests {
             allowed_owners: None,
             command: Some(super::Command::Supervisor {
                 action: super::SupervisorAction::Run {
-                    timeout: 0,
+                    timeouts: disabled_timeouts(),
                     expected_branch: None,
                     repo: None,
                     max_parallel: 1,
@@ -1877,7 +2044,7 @@ mod tests {
             allowed_owners: None,
             command: Some(super::Command::Supervisor {
                 action: super::SupervisorAction::Run {
-                    timeout: 0,
+                    timeouts: disabled_timeouts(),
                     expected_branch: None,
                     repo: None,
                     max_parallel: 1,
@@ -1920,7 +2087,7 @@ mod tests {
             allowed_owners: None,
             command: Some(super::Command::Supervisor {
                 action: super::SupervisorAction::Run {
-                    timeout: 0,
+                    timeouts: disabled_timeouts(),
                     expected_branch: None,
                     repo: None,
                     max_parallel: 1,
@@ -1975,7 +2142,7 @@ mod tests {
             allowed_owners: None,
             command: Some(super::Command::Supervisor {
                 action: super::SupervisorAction::Run {
-                    timeout: 0,
+                    timeouts: disabled_timeouts(),
                     expected_branch: None,
                     repo: None,
                     max_parallel: 1,
@@ -2003,7 +2170,7 @@ mod tests {
             allowed_owners: None,
             command: Some(super::Command::Supervisor {
                 action: super::SupervisorAction::Run {
-                    timeout: 0,
+                    timeouts: disabled_timeouts(),
                     expected_branch: None,
                     repo: None,
                     max_parallel: 1,
@@ -2040,26 +2207,15 @@ mod tests {
     #[test]
     fn supervised_exit_code_maps_timeout_and_kill() {
         let timed_out = writ_core::supervisor::SupervisedOutput {
-            exit_code: None,
             timed_out: true,
             killed: true,
-            stdout: String::new(),
-            stderr: String::new(),
-            stdout_truncated: false,
-            stderr_truncated: false,
-            error_code: None,
+            ..writ_core::supervisor::SupervisedOutput::default()
         };
         assert_eq!(supervised_exit_code(&timed_out), ExitCode::from(124));
 
         let child_fail = writ_core::supervisor::SupervisedOutput {
             exit_code: Some(7),
-            timed_out: false,
-            killed: false,
-            stdout: String::new(),
-            stderr: String::new(),
-            stdout_truncated: false,
-            stderr_truncated: false,
-            error_code: None,
+            ..writ_core::supervisor::SupervisedOutput::default()
         };
         assert_eq!(supervised_exit_code(&child_fail), ExitCode::from(7));
     }

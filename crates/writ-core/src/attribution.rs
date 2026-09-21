@@ -3,9 +3,9 @@
 //!
 //! Restores GitHub [#14](https://github.com/rmems/writ/issues/14) / Linear RM-128
 //! after the Python orchestrator was removed. Platforms override `agent_id`
-//! without forking reply templates. This is transparency for posted comments,
-//! not Git commit identity and not a merge path. Coordination messages may omit
-//! a SHA; never invent one.
+//! without forking reply templates. This is a formatter over the lease-store
+//! identity fields (`agent_id`, `session_id`, job/task, branch) — not a second
+//! message backend. Coordination messages may omit a SHA; never invent one.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -13,8 +13,10 @@ use std::fmt;
 
 use serde::Serialize;
 
+use crate::lease::AgentIdentity;
+
 /// Default identity line on automated replies.
-pub const DEFAULT_AGENT_ID: &str = "worktrees-hives agent";
+pub const DEFAULT_AGENT_ID: &str = "writ agent";
 
 const AGENT_ID_ENV: &str = "WRIT_AGENT_ID";
 const ATTRIBUTION_ENV: &str = "WRIT_ATTRIBUTION";
@@ -74,7 +76,7 @@ impl fmt::Display for AttributionPlacement {
 /// real fix cannot be silently dropped.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AttributionConfig {
-    /// Identity line on replies (for example `worktrees-hives agent`).
+    /// Identity line on replies (for example `writ agent`).
     pub agent_id: String,
     /// Linear or issue identifier when one exists. Omit rather than inventing.
     pub task_id: Option<String>,
@@ -104,7 +106,7 @@ impl Default for AttributionConfig {
 impl AttributionConfig {
     /// Config with a platform-specific `agent_id`.
     ///
-    /// Uses `{platform}: worktrees-hives agent` so a later `: fixed in <sha>`
+    /// Uses `{platform}: writ agent` so a later `: fixed in <sha>`
     /// suffix contains a single colon separator.
     #[must_use]
     pub fn for_platform(platform: &str) -> Self {
@@ -128,7 +130,7 @@ impl AttributionConfig {
         }
     }
 
-    /// Load config from the four `WRIT_*` attribution environment keys.
+    /// Load config from the named `WRIT_*` attribution environment keys.
     ///
     /// Reads those keys with [`std::env::var_os`] so a non-UTF-8 value elsewhere
     /// in the process environment cannot panic `vars()` or drop the JSON envelope.
@@ -165,6 +167,25 @@ impl AttributionConfig {
                 .map_or(AttributionPlacement::Footer, |value| {
                     AttributionPlacement::coerce(value)
                 }),
+        }
+    }
+
+    /// Build attribution from the lease-store agent row plus optional job/branch.
+    ///
+    /// Does not open SQLite or invent a commit SHA. Blank labels are omitted.
+    #[must_use]
+    pub fn from_lease_identity(
+        identity: AgentIdentity<'_>,
+        job_id: Option<&str>,
+        branch: Option<&str>,
+    ) -> Self {
+        Self {
+            agent_id: canonicalize_agent_id(identity.agent_id),
+            task_id: job_id.and_then(canonicalize_label),
+            branch: branch.and_then(canonicalize_label),
+            session_id: identity.session_id.and_then(canonicalize_label),
+            include_sha_on_fix: true,
+            placement: AttributionPlacement::Footer,
         }
     }
 }
@@ -344,13 +365,13 @@ mod tests {
         assert_eq!(custom.placement, AttributionPlacement::Header);
 
         let claude = AttributionConfig::for_platform("Claude Code");
-        assert_eq!(claude.agent_id, "Claude Code: worktrees-hives agent");
+        assert_eq!(claude.agent_id, "Claude Code: writ agent");
         assert!(claude.include_sha_on_fix);
         assert_eq!(claude.placement, AttributionPlacement::Footer);
 
         let codex =
             AttributionConfig::for_platform_with("Codex", false, AttributionPlacement::Header);
-        assert_eq!(codex.agent_id, "Codex: worktrees-hives agent");
+        assert_eq!(codex.agent_id, "Codex: writ agent");
         assert!(!codex.include_sha_on_fix);
         assert_eq!(codex.placement, AttributionPlacement::Header);
 
@@ -477,11 +498,11 @@ mod tests {
         };
         assert_eq!(
             format_attribution(&collab, None),
-            "worktrees-hives agent | task RM-128 | branch cursor/reply-attribution-config-6e46 | session bc-fa8ed877"
+            "writ agent | task RM-128 | branch cursor/reply-attribution-config-6e46 | session bc-fa8ed877"
         );
         assert_eq!(
             format_attribution(&collab, Some("abc1234")),
-            "worktrees-hives agent | task RM-128 | branch cursor/reply-attribution-config-6e46 | session bc-fa8ed877: fixed in abc1234"
+            "writ agent | task RM-128 | branch cursor/reply-attribution-config-6e46 | session bc-fa8ed877: fixed in abc1234"
         );
         let partial = AttributionConfig {
             task_id: Some("  \n ".to_owned()),
@@ -491,8 +512,26 @@ mod tests {
         };
         assert_eq!(
             format_attribution(&partial, None),
-            "worktrees-hives agent | branch cursor/foo"
+            "writ agent | branch cursor/foo"
         );
+    }
+
+    #[test]
+    fn lease_identity_formats_without_inventing_a_sha() {
+        let config = AttributionConfig::from_lease_identity(
+            crate::lease::AgentIdentity {
+                agent_id: "worker-1",
+                agent_type: "cursor",
+                session_id: Some("sess-9"),
+            },
+            Some("RM-128"),
+            Some("cursor/reply-attribution-config-6e46"),
+        );
+        assert_eq!(
+            format_attribution(&config, None),
+            "worker-1 | task RM-128 | branch cursor/reply-attribution-config-6e46 | session sess-9"
+        );
+        assert!(!format_attribution(&config, None).contains("fixed in"));
     }
 
     #[test]
@@ -553,7 +592,7 @@ mod tests {
                 sha: None,
                 thread: true,
             },
-            "Looks good!\n\n---\nworktrees-hives agent",
+            "Looks good!\n\n---\nwrit agent",
         );
         assert_reply(
             ReplyCase {
@@ -562,7 +601,7 @@ mod tests {
                 sha: None,
                 thread: true,
             },
-            "worktrees-hives agent\n\n---\nLooks good!",
+            "writ agent\n\n---\nLooks good!",
         );
         assert_reply(
             ReplyCase {
@@ -571,7 +610,7 @@ mod tests {
                 sha: None,
                 thread: false,
             },
-            "All checks passed.\n\nworktrees-hives agent",
+            "All checks passed.\n\nwrit agent",
         );
         assert_reply(
             ReplyCase {
@@ -580,7 +619,7 @@ mod tests {
                 sha: None,
                 thread: false,
             },
-            "worktrees-hives agent\n\nAll checks passed.",
+            "writ agent\n\nAll checks passed.",
         );
     }
 
@@ -597,7 +636,7 @@ mod tests {
                 sha: Some("abc1234"),
                 thread: true,
             },
-            "worktrees-hives agent: fixed in abc1234\n\n---\nFixed the issue.",
+            "writ agent: fixed in abc1234\n\n---\nFixed the issue.",
         );
     }
 
@@ -623,7 +662,7 @@ mod tests {
                 sha: Some("abc1234"),
                 thread: true,
             },
-            "Fixed the issue.\n\n---\nworktrees-hives agent: fixed in abc1234",
+            "Fixed the issue.\n\n---\nwrit agent: fixed in abc1234",
         );
         assert_reply(
             ReplyCase {
@@ -632,7 +671,7 @@ mod tests {
                 sha: None,
                 thread: false,
             },
-            "All done.\n\nworktrees-hives agent",
+            "All done.\n\nwrit agent",
         );
     }
 
@@ -650,7 +689,7 @@ mod tests {
                 sha: Some("def5678"),
                 thread: true,
             },
-            "Resolved thread.\n\n---\nClaude Code: worktrees-hives agent: fixed in def5678",
+            "Resolved thread.\n\n---\nClaude Code: writ agent: fixed in def5678",
         );
         assert_reply(
             ReplyCase {
@@ -659,7 +698,7 @@ mod tests {
                 sha: Some("abc1234"),
                 thread: true,
             },
-            "Fixed.\n\n---\nworktrees-hives agent: fixed in abc1234",
+            "Fixed.\n\n---\nwrit agent: fixed in abc1234",
         );
     }
 
@@ -678,7 +717,7 @@ mod tests {
                 sha: None,
                 thread: true,
             },
-            "Conflict: overlapping SKILL.md Reply attribution edits; I will keep this section and wait on RM-145 for the rest.\n\n---\nworktrees-hives agent | task RM-128 | branch cursor/reply-attribution-config-6e46 | session bc-fa8ed877",
+            "Conflict: overlapping SKILL.md Reply attribution edits; I will keep this section and wait on RM-145 for the rest.\n\n---\nwrit agent | task RM-128 | branch cursor/reply-attribution-config-6e46 | session bc-fa8ed877",
         );
     }
 }

@@ -61,21 +61,18 @@ mod tests {
 
     use super::load_jobs_from;
     use crate::paths::resolve_state_path;
-    use crate::status::{CiClass, JobStatus, ProcessState};
+    use crate::status::{JobIdentity, JobStatus};
 
     fn sample_job() -> JobStatus {
-        JobStatus {
+        let mut job = JobStatus::new(JobIdentity {
             job_id: "writ-1".to_owned(),
             owner: "acme".to_owned(),
             repo: "example-org".to_owned(),
-            issue_number: Some(1),
-            pr_number: None,
             worktree_path: "/tmp/worktrees/acme/example-org/writ-1".to_owned(),
             branch: "feature/status".to_owned(),
-            process_state: ProcessState::Running,
-            last_error: None,
-            ci_class: CiClass::Pending,
-        }
+        });
+        job.issue_number = Some(1);
+        job
     }
 
     fn unique_path(prefix: &str) -> std::path::PathBuf {

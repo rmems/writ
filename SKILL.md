@@ -1,11 +1,11 @@
 ---
 name: writ
-description: Use when discovering GitHub or Linear work, spawning isolated worker agents, running Safe Issue → Verified Commit or PR handoff, or applying writ safety rules (assigned-worktree local integration, no GitHub PR merge, force-with-lease only). Portable procedure for the writ Rust enforcement core; not a security boundary.
+description: Use when discovering GitHub or Linear work, spawning isolated worker agents, running Safe Issue → Verified Commit or PR handoff, or applying writ safety rules (assigned-worktree local integration, force-with-lease only). Portable procedure for the writ Rust coordination core; not a security boundary.
 ---
 
 # writ Skill
 
-Installable agent skill for the `writ` Rust enforcement core. Directory name and frontmatter `name` are both `writ`. Install with [`scripts/install-skill.sh`](scripts/install-skill.sh); see [`docs/install.md`](docs/install.md).
+Installable agent skill for the `writ` Rust coordination core. Directory name and frontmatter `name` are both `writ`. Install with [`scripts/install-skill.sh`](scripts/install-skill.sh); see [`docs/install.md`](docs/install.md).
 
 [`AGENTS.md`](AGENTS.md) is the authoritative repository contribution and autonomy contract. This portable skill supplies platform-neutral procedures and must not broaden or relax that policy.
 
@@ -31,7 +31,7 @@ Before any mutation, read and apply the corresponding `AGENTS.md` sections:
 - [attribution semantics](AGENTS.md#attribution-semantics)
 - [team-maintainer operating model](AGENTS.md#team-maintainer-operating-model)
 
-This skill never grants an exception to those rules. Worker, orchestrator, scheduled, discovery, issue-to-PR, and companion-skill monitoring flows never merge a GitHub pull request. Local `git merge` / `rebase` / `cherry-pick` of peer work into the assigned feature branch is routine; conflict repair is expected. If the authoritative policy is unavailable, contradictory, or cannot be enforced by the Rust boundary -- `writ` itself, or an enforcing wrapper that routes the mutation through `writ-core`'s allowlist and branch verification -- stop the mutating flow and report the blocker.
+This skill never grants an exception to those rules. Local `git merge` / `rebase` / `cherry-pick` of peer work into the assigned feature branch is routine; conflict repair is expected. If the authoritative policy is unavailable, contradictory, or cannot be enforced by the Rust boundary -- `writ` itself, or an enforcing wrapper that routes the mutation through `writ-core`'s allowlist and branch verification -- stop the mutating flow and report the blocker.
 
 ### Branch/worktree pre-edit checklist
 
@@ -68,7 +68,7 @@ When handing off a pull request, report:
 - **Residual issues:** List of unresolved CI failures, review comments, or blockers
 - **Agent attribution:** Every automated PR comment and thread reply uses the templates below
 
-A worker or companion-skill monitoring agent MUST NOT claim it merged the PR. If another actor merged the PR, report that without taking credit. Do not invent a SHA for a message that did not land code.
+A worker or companion-skill monitoring agent reports PR status truthfully and does not take credit for merges performed by another actor. Do not invent a SHA for a message that did not land code.
 
 ### Reply attribution
 
@@ -82,7 +82,7 @@ Platforms set identity without forking these templates. Empty values fall back t
 
 | Key | Env | Type | Default | Purpose |
 | --- | --- | --- | --- | --- |
-| `agent_id` / `attribution` | `WRIT_AGENT_ID`, else `WRIT_ATTRIBUTION` | string | `worktrees-hives agent` | Identity line on replies |
+| `agent_id` / `attribution` | `WRIT_AGENT_ID`, else `WRIT_ATTRIBUTION` | string | `writ agent` | Identity line on replies |
 | `task_id` | `WRIT_TASK_ID`, else `--task` | string | omitted | Linear or issue id when one exists |
 | `branch` | `WRIT_BRANCH`, else `--branch` | string | omitted | Assigned branch when one exists |
 | `session_id` | `WRIT_SESSION_ID`, else `--session` | string | omitted | Agent session id when one exists |
@@ -93,12 +93,12 @@ Override `agent_id` with `WRIT_AGENT_ID` (or `writ attribution format --agent-id
 
 | Platform | Example `agent_id` |
 | --- | --- |
-| Generic default | `worktrees-hives agent` |
-| Claude Code | `Claude Code: worktrees-hives agent` |
-| Codex | `Codex: worktrees-hives agent` |
-| OpenClaw | `OpenClaw: worktrees-hives agent` |
+| Generic default | `writ agent` |
+| Claude Code | `Claude Code: writ agent` |
+| Codex | `Codex: writ agent` |
+| OpenClaw | `OpenClaw: writ agent` |
 
-The `{platform}: worktrees-hives agent` shape keeps a single colon when the formatter appends `: fixed in <sha>`.
+The `{platform}: writ agent` shape keeps a single colon when the formatter appends `: fixed in <sha>`.
 
 #### Templates
 
@@ -114,7 +114,7 @@ writ attribution format --body "Fixed the branch check and added the mismatch re
 Fixed the branch check and added the mismatch regression test.
 
 ---
-worktrees-hives agent: fixed in abc1234
+writ agent: fixed in abc1234
 ```
 
 Thread reply when no code change landed — omit `--commit-sha`; do not invent a SHA:
@@ -127,7 +127,7 @@ writ attribution format --body "No code change: the check already covers this pa
 No code change: the check already covers this path.
 
 ---
-worktrees-hives agent
+writ agent
 ```
 
 Peer coordination (intent, dependency, overlap/help, handoff, conflict) — include real task/branch/session identity; omit `--commit-sha`; do not wait for a push:
@@ -140,7 +140,7 @@ writ attribution format --body "Overlap: I own SKILL.md Reply attribution templa
 Overlap: I own SKILL.md Reply attribution templates; RM-145 owns the rest of SKILL.md.
 
 ---
-worktrees-hives agent | task RM-128 | branch cursor/reply-attribution-config-6e46 | session bc-fa8ed877
+writ agent | task RM-128 | branch cursor/reply-attribution-config-6e46 | session bc-fa8ed877
 ```
 
 Optional PR-level summary comment (`--pr-comment` uses a blank line instead of `---`):
@@ -152,7 +152,7 @@ writ attribution format --pr-comment --body "Ready for review." --commit-sha abc
 ```text
 Ready for review.
 
-worktrees-hives agent: fixed in abc1234
+writ agent: fixed in abc1234
 ```
 
 `--placement header` puts the identity line above the body. `--agent-id` overrides the env default for one reply.
@@ -165,7 +165,6 @@ When spawning a worker subagent, include these safety instructions in the prompt
 
 ```
 SAFETY RULES (non-negotiable):
-- NEVER merge a GitHub pull request (`gh pr merge`, merge APIs, auto-merge, merge queue)
 - Local `git merge` / `rebase` / `cherry-pick` of peer work into the assigned feature branch is allowed
 - NEVER merge into `main`/`master` locally; refuse a merge that would lose uncommitted WIP
 - NEVER use bare `git push --force` or `git push -f`
@@ -178,11 +177,15 @@ SAFETY RULES (non-negotiable):
 - Use `writ attribution format` for automated replies. Intent/dependency/overlap/help/handoff/conflict messages need real agent/task/branch/session identity and must not invent a SHA. After a successful push, review-fix replies include that real SHA.
 ```
 
-Worker prompts must not grant GitHub PR merge authority. Local assigned-branch integration is allowed.
+Local assigned-branch integration is allowed.
+
+### Timeouts and hang recovery
+
+Long-running supervised commands use `writ supervisor run` with the named policy in [`docs/timeout-policy.md`](docs/timeout-policy.md). A timeout is a recovery and handoff event: the supervisor contains the child (hard/idle/lost-child/permit-wait) and never retries, merges, bare-force-pushes, deletes a harness checkout, or invents a SHA. Harness re-dispatch is capped by `RedispatchBudget` / `max_redispatch_per_item` (default 1). Timeout residuals do not increment `fix_count`.
 
 ### Enforcement routing
 
 This skill is portable procedure, not a security boundary. Route orchestrated
 mutations through `writ`, with Rust enforcing the runtime boundary as
 defined in [`AGENTS.md`](AGENTS.md#enforcement-layers). GitHub owns remote PR
-merges; do not forward PR-merge authority to a worker or unattended runtime.
+integration; Linear owns task tracking.
