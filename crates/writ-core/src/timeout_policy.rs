@@ -350,70 +350,53 @@ mod tests {
 
     #[test]
     fn named_defaults_match_documented_keys() {
-        assert_eq!(DEFAULT_WORKER_SECS, 0);
-        assert_eq!(DEFAULT_STEP_SECS, 0);
-        assert_eq!(DEFAULT_IDLE_SECS, 0);
-        assert_eq!(DEFAULT_ORCHESTRATOR_SECS, 0);
-        assert_eq!(DEFAULT_GRACE_SECS, 5);
-        assert_eq!(DEFAULT_PROGRESS_SECS, 15);
-        assert_eq!(DEFAULT_MAX_REDISPATCH_PER_ITEM, 1);
         let policy = TimeoutPolicy::default();
-        assert_eq!(policy.grace, Duration::from_secs(5));
-        assert_eq!(policy.max_redispatch_per_item, 1);
-        assert_eq!(
-            policy.progress_every,
-            Some(Duration::from_secs(DEFAULT_PROGRESS_SECS))
+        assert!(
+            DEFAULT_WORKER_SECS == 0
+                && DEFAULT_STEP_SECS == 0
+                && DEFAULT_IDLE_SECS == 0
+                && DEFAULT_ORCHESTRATOR_SECS == 0
+                && DEFAULT_GRACE_SECS == 5
+                && DEFAULT_PROGRESS_SECS == 15
+                && DEFAULT_MAX_REDISPATCH_PER_ITEM == 1
+                && policy.grace == Duration::from_secs(5)
+                && policy.max_redispatch_per_item == 1
+                && policy.progress_every == Some(Duration::from_secs(DEFAULT_PROGRESS_SECS))
         );
     }
 
     #[test]
     fn redispatch_budget_allows_one_retry_by_default() {
         let max = DEFAULT_MAX_REDISPATCH_PER_ITEM;
-        assert!(can_redispatch(1, max), "first failure may redispatch once");
         assert!(
-            !can_redispatch(2, max),
-            "second terminal run exhausts default budget"
+            can_redispatch(1, max)
+                && !can_redispatch(2, max)
+                && !can_redispatch(3, max)
+                && !can_redispatch(1, 0)
+                && can_redispatch(2, 2)
+                && !can_redispatch(3, 2)
+                && can_redispatch(1, u32::MAX)
+                && !can_redispatch(u32::MAX, u32::MAX)
         );
-        assert!(!can_redispatch(3, max));
-        assert!(!can_redispatch(1, 0), "max 0 means no retry");
-        assert!(can_redispatch(2, 2));
-        assert!(!can_redispatch(3, 2));
-        assert!(
-            can_redispatch(1, u32::MAX),
-            "max budget must not overflow in 1 + max_redispatch"
-        );
-        assert!(!can_redispatch(u32::MAX, u32::MAX));
     }
 
     #[test]
     fn residual_tokens_and_fix_cap() {
-        for class in [
-            TimeoutClass::Hard,
-            TimeoutClass::Idle,
-            TimeoutClass::PermitWait,
-            TimeoutClass::LostChild,
-            TimeoutClass::RedispatchExhausted,
-        ] {
-            assert!(class.residual_blocker().starts_with("timeout:"));
-            assert!(
-                !class.counts_toward_fix_cap(),
-                "timeout must not increment fix_count"
-            );
-        }
-        assert_eq!(TimeoutClass::Hard.residual_blocker(), "timeout:hard");
-        assert_eq!(TimeoutClass::Idle.residual_blocker(), "timeout:idle");
-        assert_eq!(
-            TimeoutClass::PermitWait.residual_blocker(),
-            "timeout:permit_wait"
-        );
-        assert_eq!(
-            TimeoutClass::LostChild.residual_blocker(),
-            "timeout:lost_child"
-        );
-        assert_eq!(
-            TimeoutClass::RedispatchExhausted.residual_blocker(),
-            "timeout:redispatch_exhausted"
-        );
+        let classes = [
+            (TimeoutClass::Hard, "timeout:hard"),
+            (TimeoutClass::Idle, "timeout:idle"),
+            (TimeoutClass::PermitWait, "timeout:permit_wait"),
+            (TimeoutClass::LostChild, "timeout:lost_child"),
+            (
+                TimeoutClass::RedispatchExhausted,
+                "timeout:redispatch_exhausted",
+            ),
+        ];
+        assert!(classes.iter().all(|(class, token)| {
+            class.residual_blocker() == *token
+                && class.residual_blocker().starts_with("timeout:")
+                && !class.counts_toward_fix_cap()
+        }));
     }
 
     #[test]
@@ -476,14 +459,17 @@ mod tests {
 
     #[test]
     fn named_env_keys_are_stable() {
-        assert_eq!(ENV_TIMEOUT_SECS, "WRIT_SUPERVISOR_TIMEOUT_SECS");
-        assert_eq!(ENV_IDLE_SECS, "WRIT_SUPERVISOR_IDLE_SECS");
-        assert_eq!(ENV_STALL_SECS, "WRIT_SUPERVISOR_STALL_SECS");
-        assert_eq!(ENV_STEP_SECS, "WRIT_SUPERVISOR_STEP_SECS");
-        assert_eq!(ENV_ORCHESTRATOR_SECS, "WRIT_SUPERVISOR_ORCHESTRATOR_SECS");
-        assert_eq!(ENV_GRACE_SECS, "WRIT_SUPERVISOR_GRACE_SECS");
-        assert_eq!(ENV_PROGRESS_SECS, "WRIT_SUPERVISOR_PROGRESS_SECS");
-        assert_eq!(ENV_MAX_REDISPATCH, "WRIT_SUPERVISOR_MAX_REDISPATCH");
+        let keys = [
+            (ENV_TIMEOUT_SECS, "WRIT_SUPERVISOR_TIMEOUT_SECS"),
+            (ENV_IDLE_SECS, "WRIT_SUPERVISOR_IDLE_SECS"),
+            (ENV_STALL_SECS, "WRIT_SUPERVISOR_STALL_SECS"),
+            (ENV_STEP_SECS, "WRIT_SUPERVISOR_STEP_SECS"),
+            (ENV_ORCHESTRATOR_SECS, "WRIT_SUPERVISOR_ORCHESTRATOR_SECS"),
+            (ENV_GRACE_SECS, "WRIT_SUPERVISOR_GRACE_SECS"),
+            (ENV_PROGRESS_SECS, "WRIT_SUPERVISOR_PROGRESS_SECS"),
+            (ENV_MAX_REDISPATCH, "WRIT_SUPERVISOR_MAX_REDISPATCH"),
+        ];
+        assert!(keys.iter().all(|(got, want)| got == want));
     }
 
     #[test]

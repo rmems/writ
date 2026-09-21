@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -69,136 +68,88 @@ fn assert_json_contains(json: &str, needles: &[&str]) {
 }
 
 fn assert_completed_without_idle(output: &SupervisedOutput) {
-    assert_eq!(output.exit_code, Some(0), "stderr={}", output.stderr);
-    assert!(!output.timed_out);
-    assert_ne!(output.timeout_class, Some(TimeoutClass::Idle));
+    assert!(
+        output.exit_code == Some(0)
+            && !output.timed_out
+            && output.timeout_class != Some(TimeoutClass::Idle),
+        "expected completed non-idle run: {output:?}"
+    );
 }
 
 fn assert_permit_wait_timeout(output: &SupervisedOutput) {
+    let residual = output.residual.as_ref();
+    let json = serde_json::to_value(output).unwrap();
+    let keys_ok = json.as_object().is_some_and(|obj| {
+        obj.keys().all(|key| {
+            let lower = key.to_ascii_lowercase();
+            !lower.contains("sha") && !lower.contains("commit") && key != "head"
+        })
+    });
     assert!(
         output.timed_out
             && !output.killed
             && output.timeout_class == Some(TimeoutClass::PermitWait)
             && output.recovery_stage == Some(RecoveryStage::None)
-            && output.stderr.contains("max-parallel permit"),
+            && output.stderr.contains("max-parallel permit")
+            && residual.is_some_and(|r| {
+                r.timeout_class == TimeoutClass::PermitWait
+                    && r.recovery_stage == RecoveryStage::None
+                    && !r.redispatch_forbidden()
+            })
+            && keys_ok,
         "permit-wait timeout mismatch: {output:?}"
     );
-    let residual = output.residual.as_ref().expect("permit-wait residual");
-    assert_eq!(residual.timeout_class, TimeoutClass::PermitWait);
-    assert_eq!(residual.recovery_stage, RecoveryStage::None);
-    assert!(!residual.redispatch_forbidden());
-    let json = serde_json::to_value(output).unwrap();
-    let obj = json.as_object().expect("object");
-    for key in obj.keys() {
-        let lower = key.to_ascii_lowercase();
-        assert!(
-            !lower.contains("sha") && !lower.contains("commit") && key != "head",
-            "timeout residual must not carry identity field `{key}`"
-        );
+}
+
+fn occupy_script() -> &'static str {
+    platform_pair("ping -n 8 127.0.0.1 >NUL", "sleep 4")
+}
+
+fn queued_true_cmd() -> (&'static str, &'static [&'static str]) {
+    platform_pair_cmd("where.exe", &["where.exe"], "true", &[])
+}
+
+fn platform_pair_cmd(
+    windows_prog: &'static str,
+    windows_args: &'static [&'static str],
+    unix_prog: &'static str,
+    unix_args: &'static [&'static str],
+) -> (&'static str, &'static [&'static str]) {
+    if cfg!(windows) {
+        (windows_prog, windows_args)
+    } else {
+        (unix_prog, unix_args)
     }
 }
 
-fn assert_policy_code(err: Error, expected: PolicyCode) {
-    assert!(matches!(
-        err,
-        Error::PolicyViolation { code, .. } if code == expected
-    ));
+fn chatting_script() -> &'static str {
+    platform_pair(
+        "echo a & ping -n 2 127.0.0.1 >NUL & echo b",
+        "echo a; sleep 0.15; echo b; sleep 0.15; echo c",
+    )
 }
 
-fn assert_default_policy(program: &str, args: &[&str], expected: PolicyCode) {
-    assert_policy_code(
-        check_command_policy(program, args, &RunOptions::default()).unwrap_err(),
-        expected,
-    );
-}
-
-#[test]
-fn normalize_strips_path_and_exe() {
-    assert_eq!(normalize_program_name("/usr/bin/git"), "git");
-    assert_eq!(normalize_program_name("C:\\Program Files\\git.exe"), "git");
-    assert_eq!(normalize_program_name("./gh"), "gh");
-    assert_eq!(normalize_program_name("GH.EXE"), "gh");
-}
-
-fn known_unsafe_policy_cases() -> &'static [(&'static str, &'static [&'static str], PolicyCode)] {
-    &[
-        (
-            "/usr/bin/git",
-            &["push", "--force"],
-            PolicyCode::BareForcePush,
-        ),
-        ("gh", &["pr", "merge"], PolicyCode::MergeBlocked),
-        ("./tools/run", &[], PolicyCode::SubcommandNotAllowed),
-        (
-            "sh",
-            &["-c", "gh pr merge 1"],
-            PolicyCode::SubcommandNotAllowed,
-        ),
-        (
-            "setsid",
-            &["gh", "pr", "merge"],
-            PolicyCode::SubcommandNotAllowed,
-        ),
-        (
-            "env",
-            &["gh", "pr", "merge"],
-            PolicyCode::SubcommandNotAllowed,
-        ),
-        (
-            "python3.11",
-            &["-c", "print(1)"],
-            PolicyCode::SubcommandNotAllowed,
-        ),
-        (
-            "python3",
-            &[
-                "-c",
-                "import subprocess; subprocess.run(['gh','pr','merge','1'])",
-            ],
-            PolicyCode::SubcommandNotAllowed,
-        ),
-        (
-            "curl",
-            &[
-                "-X",
-                "PUT",
-                "https://api.github.com/repos/o/r/pulls/1/merge",
-            ],
-            PolicyCode::SubcommandNotAllowed,
-        ),
-        ("git", &["commit", "-m", "x"], PolicyCode::BranchMismatch),
-    ]
-}
-
-#[test]
-fn policy_blocks_known_unsafe_invocations() {
-    for (program, args, expected) in known_unsafe_policy_cases() {
-        assert_default_policy(program, args, *expected);
+fn chatting_idle_policy() -> TimeoutPolicy {
+    #[cfg(windows)]
+    {
+        TimeoutPolicy {
+            idle: Some(Duration::from_millis(2500)),
+            worker: Some(Duration::from_secs(15)),
+            grace: Duration::ZERO,
+            progress_every: None,
+            ..TimeoutPolicy::from_worker_timeout(None)
+        }
     }
-}
-
-/// Fixed path outside the default worktree sandbox (not `temp_dir`, which Codacy
-/// flags for security-sensitive policy tests).
-fn repo_outside_worktree_base_fixture() -> PathBuf {
-    platform_pair(r"C:\Windows\Temp", "/tmp").into()
-}
-
-#[test]
-fn mutating_git_rejects_repo_outside_default_worktree_base() {
-    let repo = repo_outside_worktree_base_fixture();
-    assert_policy_code(
-        check_command_policy(
-            "git",
-            &["commit", "-m", "x"],
-            &RunOptions {
-                expected_branch: Some("feature".to_owned()),
-                repo: Some(repo),
-                ..RunOptions::default()
-            },
-        )
-        .unwrap_err(),
-        PolicyCode::PathNotAllowed,
-    );
+    #[cfg(not(windows))]
+    {
+        TimeoutPolicy {
+            idle: Some(Duration::from_millis(400)),
+            worker: Some(Duration::from_secs(5)),
+            grace: Duration::ZERO,
+            progress_every: None,
+            ..TimeoutPolicy::from_worker_timeout(None)
+        }
+    }
 }
 
 #[tokio::test]
@@ -208,11 +159,10 @@ async fn runs_command_to_completion() {
         .run_unchecked(shell_program(), &[shell_flag(), "echo hello"], None)
         .await;
 
-    assert_eq!(output.exit_code, Some(0), "stderr={}", output.stderr);
-    assert!(!output.timed_out);
-    assert!(!output.killed);
-    assert!(output.succeeded());
-    assert_eq!(output.stdout.trim(), "hello");
+    assert!(
+        output.succeeded() && output.stdout.trim() == "hello",
+        "expected echo hello: {output:?}"
+    );
 }
 
 #[tokio::test]
@@ -269,11 +219,14 @@ async fn propagates_nonzero_exit_code() {
         .run_unchecked(shell_program(), &[shell_flag(), script], None)
         .await;
 
-    assert_eq!(output.exit_code, Some(42), "stderr={}", output.stderr);
-    assert!(!output.timed_out);
-    assert!(!output.killed);
-    assert_eq!(output.error_code, Some(SupervisorErrorCode::NonZeroExit));
-    assert!(!output.succeeded());
+    assert!(
+        output.exit_code == Some(42)
+            && !output.timed_out
+            && !output.killed
+            && output.error_code == Some(SupervisorErrorCode::NonZeroExit)
+            && !output.succeeded(),
+        "expected exit 42: {output:?}"
+    );
 }
 
 #[tokio::test]
@@ -299,22 +252,13 @@ async fn max_parallel_limits_concurrency() {
         results.push(h.await.expect("join task"));
     }
 
-    for (i, output) in results.iter().enumerate() {
-        assert_eq!(
-            output.exit_code,
-            Some(0),
-            "task {i} failed: stderr={}",
-            output.stderr
-        );
-    }
-
-    let peak = supervisor.peak_active();
-    assert!(peak <= 2, "peak concurrency {peak} exceeded max_parallel=2");
-    assert_eq!(
-        peak, 2,
-        "expected peak concurrency to reach 2 with 3 overlapping tasks"
+    let all_ok = results.iter().all(|output| output.exit_code == Some(0));
+    assert!(
+        all_ok && supervisor.peak_active() == 2 && supervisor.active() == 0,
+        "max-parallel mismatch peak={} active={} results={results:?}",
+        supervisor.peak_active(),
+        supervisor.active()
     );
-    assert_eq!(supervisor.active(), 0);
 }
 
 #[tokio::test]
@@ -367,19 +311,12 @@ async fn spawn_failure_is_detectable() {
         )
         .await
         .unwrap();
-    assert!(output.spawn_failed(), "stderr={}", output.stderr);
-    assert_eq!(output.error_code, Some(SupervisorErrorCode::SpawnFailed));
-    assert!(output.exit_code.is_none());
-}
-
-#[tokio::test]
-async fn run_rejects_merge_before_spawn() {
-    let supervisor = Supervisor::new(1);
-    let err = supervisor
-        .run("gh", &["pr", "merge"], None, &RunOptions::default())
-        .await
-        .unwrap_err();
-    assert_policy_code(err, PolicyCode::MergeBlocked);
+    assert!(
+        output.spawn_failed()
+            && output.error_code == Some(SupervisorErrorCode::SpawnFailed)
+            && output.exit_code.is_none(),
+        "expected spawn failure: {output:?}"
+    );
 }
 
 #[tokio::test]
@@ -405,43 +342,11 @@ async fn idle_timeout_kills_silent_hang() {
 
 #[tokio::test]
 async fn idle_timeout_does_not_fire_when_output_keeps_arriving() {
-    let supervisor = Supervisor::new(1);
-    // The idle/worker margins are platform-specific because the two shells
-    // produce output at different cadences. On Unix the script emits a line
-    // every 150ms, so a tight 400ms idle timeout still proves that a steady
-    // stream suppresses the idle detector. On Windows, cmd.exe treats `&` as
-    // a *sequential* separator (not background), and `ping -n 2` waits ~1000ms
-    // between its two requests, so there is a ~1s gap with no captured output
-    // between `echo a` and `echo b`. A 400ms idle timeout would fire during
-    // that gap, so Windows uses a 2500ms idle (comfortably above the ~1s gap)
-    // and a 15s worker timeout (well above the ~1s total runtime). Both
-    // platforms therefore verify the same property: steady output must not
-    // trip the idle timeout, and the process runs to completion.
-    #[cfg(windows)]
-    let policy = TimeoutPolicy {
-        idle: Some(Duration::from_millis(2500)),
-        worker: Some(Duration::from_secs(15)),
-        grace: Duration::ZERO,
-        progress_every: None,
-        ..TimeoutPolicy::from_worker_timeout(None)
-    };
-    #[cfg(not(windows))]
-    let policy = TimeoutPolicy {
-        idle: Some(Duration::from_millis(400)),
-        worker: Some(Duration::from_secs(5)),
-        grace: Duration::ZERO,
-        progress_every: None,
-        ..TimeoutPolicy::from_worker_timeout(None)
-    };
-    #[cfg(windows)]
-    let script = "echo a & ping -n 2 127.0.0.1 >NUL & echo b";
-    #[cfg(not(windows))]
-    let script = "echo a; sleep 0.15; echo b; sleep 0.15; echo c";
-    let output = supervisor
+    let output = Supervisor::new(1)
         .run_unchecked_with_policy(
             shell_program(),
-            &[shell_flag(), script],
-            &policy,
+            &[shell_flag(), chatting_script()],
+            &chatting_idle_policy(),
             &RunOptions::default(),
         )
         .await;
@@ -479,26 +384,6 @@ async fn progress_ticks_while_waiting() {
 }
 
 #[tokio::test]
-async fn recovery_still_rejects_merge_and_bare_force_push() {
-    let supervisor = Supervisor::new(1);
-    let policy = TimeoutPolicy {
-        idle: Some(Duration::from_millis(50)),
-        grace: Duration::from_millis(20),
-        ..TimeoutPolicy::default()
-    };
-    let merge = supervisor
-        .run_with_policy("gh", &["pr", "merge"], &policy, &RunOptions::default())
-        .await
-        .unwrap_err();
-    assert_policy_code(merge, PolicyCode::MergeBlocked);
-    let force = supervisor
-        .run_with_policy("git", &["push", "--force"], &policy, &RunOptions::default())
-        .await
-        .unwrap_err();
-    assert_policy_code(force, PolicyCode::BareForcePush);
-}
-
-#[tokio::test]
 async fn supervisor_does_not_redispatch_on_timeout() {
     let output = run_hanging(Duration::from_millis(150)).await;
     assert_timeout_outcome(&output, TimeoutClass::Hard, SupervisorErrorCode::TimedOut);
@@ -511,33 +396,15 @@ async fn wall_clock_includes_permit_wait() {
     let holder = {
         let s = Arc::clone(&supervisor);
         tokio::spawn(async move {
-            s.run_unchecked(
-                shell_program(),
-                &[shell_flag(), {
-                    #[cfg(windows)]
-                    {
-                        "ping -n 8 127.0.0.1 >NUL"
-                    }
-                    #[cfg(not(windows))]
-                    {
-                        "sleep 4"
-                    }
-                }],
-                None,
-            )
-            .await
+            s.run_unchecked(shell_program(), &[shell_flag(), occupy_script()], None)
+                .await
         })
     };
     let armed = Instant::now();
     while supervisor.active() == 0 && armed.elapsed() < Duration::from_secs(2) {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    assert_eq!(supervisor.active(), 1, "holder should own the only permit");
-
-    #[cfg(windows)]
-    let (program, args): (&str, &[&str]) = ("where.exe", &["where.exe"]);
-    #[cfg(not(windows))]
-    let (program, args): (&str, &[&str]) = ("true", &[]);
+    let (program, args) = queued_true_cmd();
     let queued = Instant::now();
     let output = supervisor
         .run(
@@ -550,7 +417,7 @@ async fn wall_clock_includes_permit_wait() {
         .unwrap();
     assert_permit_wait_timeout(&output);
     assert!(
-        queued.elapsed() < Duration::from_secs(2),
+        supervisor.active() == 1 && queued.elapsed() < Duration::from_secs(2),
         "queued run should time out without waiting for the holder"
     );
     let _ = holder.await;
@@ -595,13 +462,13 @@ async fn grace_period_sends_term_before_kill() {
             &RunOptions::default(),
         )
         .await;
-    assert!(output.timed_out, "stderr={}", output.stderr);
-    assert_eq!(output.timeout_class, Some(TimeoutClass::Hard));
-    assert_eq!(output.recovery_stage, Some(RecoveryStage::GracefulCancel));
-    assert!(!output.killed, "SIGTERM reap should not report killed");
     assert!(
-        started.elapsed() < Duration::from_secs(3),
-        "SIGTERM during grace should reap without waiting the full sleep"
+        output.timed_out
+            && output.timeout_class == Some(TimeoutClass::Hard)
+            && output.recovery_stage == Some(RecoveryStage::GracefulCancel)
+            && !output.killed
+            && started.elapsed() < Duration::from_secs(3),
+        "expected SIGTERM reap during grace: {output:?}"
     );
 }
 
@@ -613,7 +480,6 @@ async fn idle_detects_silent_child_without_wall_clock() {
         progress_every: None,
         ..TimeoutPolicy::from_worker_timeout(None)
     };
-    assert!(policy.worker.is_none());
     let started = Instant::now();
     let output = run_hanging_with_policy(&policy, &RunOptions::default()).await;
     assert_timeout_outcome(
@@ -621,8 +487,11 @@ async fn idle_detects_silent_child_without_wall_clock() {
         TimeoutClass::Idle,
         SupervisorErrorCode::IdleTimedOut,
     );
-    assert_eq!(output.recovery_stage, Some(RecoveryStage::Kill));
-    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(
+        policy.worker.is_none()
+            && output.recovery_stage == Some(RecoveryStage::Kill)
+            && started.elapsed() < Duration::from_secs(5)
+    );
 }
 
 #[tokio::test]

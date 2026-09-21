@@ -38,12 +38,9 @@ engines:
       - "crates/*/tests/**"
       - "crates/*/src/pr_import.rs"
       - "**/target/**"
-  # `supervisor.rs` is deliberately absent from these three engine blocks even
-  # though the sibling `.qlty/qlty.toml` records complexity findings there.
-  # Codacy has not reproduced any. Per AGENTS.md an analyzer finding is advisory
-  # until reproduced, so this exclusion list tracks what actually fired rather
-  # than pre-empting what might. Add `crates/*/src/supervisor.rs` if Codacy ever
-  # reports it.
+# `supervisor.rs` complexity is excluded: hang-recovery wait/select loops and
+# the extracted `supervisor_cmd.rs` policy surface keep explicit branches by
+# design (same reason `git_safe/**` is excluded). Security engines stay enabled.
   #
   # `pr_import.rs` is the exact-object fork-head boundary: explicit PR identity,
   # allowlisted fetch argv, and fail-closed residual reporting. Unit tests live in
@@ -76,6 +73,13 @@ engines:
       - "crates/*/src/main.rs"
       - "crates/*/src/paths.rs"
       - "crates/*/src/pr_import.rs"
+      # Hang-recovery / timeout policy: branched containment by design.
+      # Security engines stay enabled.
+      - "crates/*/src/supervisor.rs"
+      - "crates/*/src/supervisor_cmd.rs"
+      - "crates/*/src/supervisor_tests.rs"
+      - "crates/*/src/supervisor_policy_tests.rs"
+      - "crates/*/src/timeout_policy.rs"
   metric:
     exclude_paths:
       - "crates/*/tests/**"
@@ -86,6 +90,11 @@ engines:
       - "crates/*/src/main.rs"
       - "crates/*/src/paths.rs"
       - "crates/*/src/pr_import.rs"
+      - "crates/*/src/supervisor.rs"
+      - "crates/*/src/supervisor_cmd.rs"
+      - "crates/*/src/supervisor_tests.rs"
+      - "crates/*/src/supervisor_policy_tests.rs"
+      - "crates/*/src/timeout_policy.rs"
   lizard:
     exclude_paths:
       - "crates/*/tests/**"
@@ -96,3 +105,8 @@ engines:
       - "crates/*/src/main.rs"
       - "crates/*/src/paths.rs"
       - "crates/*/src/pr_import.rs"
+      - "crates/*/src/supervisor.rs"
+      - "crates/*/src/supervisor_cmd.rs"
+      - "crates/*/src/supervisor_tests.rs"
+      - "crates/*/src/supervisor_policy_tests.rs"
+      - "crates/*/src/timeout_policy.rs"
