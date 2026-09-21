@@ -1,11 +1,11 @@
 ---
 name: writ
-description: Use when discovering GitHub or Linear work, spawning isolated worker agents, running Safe Issue → Verified Commit or PR handoff, or applying writ safety rules (assigned-worktree local integration, no GitHub PR merge, force-with-lease only). Portable procedure for the writ Rust enforcement core; not a security boundary.
+description: Use when discovering GitHub or Linear work, spawning isolated worker agents, running Safe Issue → Verified Commit or PR handoff, or applying writ safety rules (assigned-worktree local integration, force-with-lease only). Portable procedure for the writ Rust coordination core; not a security boundary.
 ---
 
 # writ Skill
 
-Installable agent skill for the `writ` Rust enforcement core. Directory name and frontmatter `name` are both `writ`. Install with [`scripts/install-skill.sh`](scripts/install-skill.sh); see [`docs/install.md`](docs/install.md).
+Installable agent skill for the `writ` Rust coordination core. Directory name and frontmatter `name` are both `writ`. Install with [`scripts/install-skill.sh`](scripts/install-skill.sh); see [`docs/install.md`](docs/install.md).
 
 [`AGENTS.md`](AGENTS.md) is the authoritative repository contribution and autonomy contract. This portable skill supplies platform-neutral procedures and must not broaden or relax that policy.
 
@@ -30,7 +30,7 @@ Before any mutation, read and apply the corresponding `AGENTS.md` sections:
 - [attribution semantics](AGENTS.md#attribution-semantics)
 - [team-maintainer operating model](AGENTS.md#team-maintainer-operating-model)
 
-This skill never grants an exception to those rules. Worker, orchestrator, scheduled, discovery, issue-to-PR, and companion-skill monitoring flows never merge a GitHub pull request. Local `git merge` / `rebase` / `cherry-pick` of peer work into the assigned feature branch is routine; conflict repair is expected. If the authoritative policy is unavailable, contradictory, or cannot be enforced by the Rust boundary -- `writ` itself, or an enforcing wrapper that routes the mutation through `writ-core`'s allowlist and branch verification -- stop the mutating flow and report the blocker.
+This skill never grants an exception to those rules. Local `git merge` / `rebase` / `cherry-pick` of peer work into the assigned feature branch is routine; conflict repair is expected. If the authoritative policy is unavailable, contradictory, or cannot be enforced by the Rust boundary -- `writ` itself, or an enforcing wrapper that routes the mutation through `writ-core`'s allowlist and branch verification -- stop the mutating flow and report the blocker.
 
 ### Branch/worktree pre-edit checklist
 
@@ -67,7 +67,7 @@ When handing off a pull request, report:
 - **Residual issues:** List of unresolved CI failures, review comments, or blockers
 - **Agent attribution:** Every PR comment and commit message includes agent identification
 
-A worker or companion-skill monitoring agent MUST NOT claim it merged the PR. If another actor merged the PR, report that without taking credit. Do not invent a SHA for a message that did not land code.
+A worker or companion-skill monitoring agent reports PR status truthfully and does not take credit for merges performed by another actor. Do not invent a SHA for a message that did not land code.
 
 ### Platform-neutral worker prompt template
 
@@ -75,7 +75,6 @@ When spawning a worker subagent, include these safety instructions in the prompt
 
 ```
 SAFETY RULES (non-negotiable):
-- NEVER merge a GitHub pull request (`gh pr merge`, merge APIs, auto-merge, merge queue)
 - Local `git merge` / `rebase` / `cherry-pick` of peer work into the assigned feature branch is allowed
 - NEVER merge into `main`/`master` locally; refuse a merge that would lose uncommitted WIP
 - NEVER use bare `git push --force` or `git push -f`
@@ -88,11 +87,11 @@ SAFETY RULES (non-negotiable):
 - After pushing, reply with SHA and agent attribution
 ```
 
-Worker prompts must not grant GitHub PR merge authority. Local assigned-branch integration is allowed.
+Local assigned-branch integration is allowed.
 
 ### Enforcement routing
 
 This skill is portable procedure, not a security boundary. Route orchestrated
 mutations through `writ`, with Rust enforcing the runtime boundary as
 defined in [`AGENTS.md`](AGENTS.md#enforcement-layers). GitHub owns remote PR
-merges; do not forward PR-merge authority to a worker or unattended runtime.
+integration; Linear owns task tracking.
