@@ -49,18 +49,42 @@ fn classify_checks(
 ) -> bool {
     let mut failed = false;
     for check in checks {
-        let state = check.state.to_ascii_uppercase();
-        if is_failed_check(&state) {
-            failed = true;
-            blockers.push(format!("class_a:{}", sanitize_token(&check.name)));
-        } else if state == "ACTION_REQUIRED" {
-            blockers.push(format!("class_b:{}", sanitize_token(&check.name)));
-        } else if is_pending_check(&state) {
-            *pending = true;
-            blockers.push(format!("class_c:{}", sanitize_token(&check.name)));
+        match check_class(&check.state) {
+            CheckClass::Failed => {
+                failed = true;
+                blockers.push(format!("class_a:{}", sanitize_token(&check.name)));
+            }
+            CheckClass::ActionRequired => {
+                blockers.push(format!("class_b:{}", sanitize_token(&check.name)));
+            }
+            CheckClass::Pending => {
+                *pending = true;
+                blockers.push(format!("class_c:{}", sanitize_token(&check.name)));
+            }
+            CheckClass::Other => {}
         }
     }
     failed
+}
+
+enum CheckClass {
+    Failed,
+    ActionRequired,
+    Pending,
+    Other,
+}
+
+fn check_class(state: &str) -> CheckClass {
+    let state = state.to_ascii_uppercase();
+    if is_failed_check(&state) {
+        CheckClass::Failed
+    } else if state == "ACTION_REQUIRED" {
+        CheckClass::ActionRequired
+    } else if is_pending_check(&state) {
+        CheckClass::Pending
+    } else {
+        CheckClass::Other
+    }
 }
 
 fn is_failed_check(state: &str) -> bool {
@@ -94,13 +118,15 @@ fn resolve_status(
     pending: bool,
 ) -> String {
     if failed {
-        "failed".to_owned()
-    } else if pending || (snapshot.checks.is_empty() && blockers.is_empty()) {
-        "pending".to_owned()
-    } else if !blockers.is_empty() {
-        "residual".to_owned()
-    } else {
+        return "failed".to_owned();
+    }
+    if pending || snapshot.checks.is_empty() && blockers.is_empty() {
+        return "pending".to_owned();
+    }
+    if blockers.is_empty() {
         "healthy".to_owned()
+    } else {
+        "residual".to_owned()
     }
 }
 

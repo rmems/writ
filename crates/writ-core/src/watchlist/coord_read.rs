@@ -17,10 +17,20 @@ pub(crate) struct CoordSnapshot {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
-struct JobId {
-    owner: String,
-    repo_name: String,
-    job_id: String,
+pub(crate) struct JobId {
+    pub owner: String,
+    pub repo_name: String,
+    pub job_id: String,
+}
+
+impl JobId {
+    pub(crate) fn new(owner: &str, repo_name: &str, job_id: &str) -> Self {
+        Self {
+            owner: owner.to_owned(),
+            repo_name: repo_name.to_owned(),
+            job_id: job_id.to_owned(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -46,15 +56,10 @@ struct MessageRow {
 }
 
 impl CoordSnapshot {
-    pub(crate) fn overlay_for(&self, owner: &str, repo_name: &str, job_id: &str) -> CoordOverlay {
-        let key = JobId {
-            owner: owner.to_owned(),
-            repo_name: repo_name.to_owned(),
-            job_id: job_id.to_owned(),
-        };
-        let claim = self.claims.get(&key);
-        let waiting_on = waiting_on_for(&self.messages, owner, repo_name, job_id);
-        let overlaps = overlaps_for(&self.messages, owner, repo_name, job_id);
+    pub(crate) fn overlay_for(&self, key: &JobId) -> CoordOverlay {
+        let claim = self.claims.get(key);
+        let waiting_on = waiting_on_for(&self.messages, key);
+        let overlaps = overlaps_for(&self.messages, key);
         CoordOverlay {
             agent_id: claim.map(|c| c.agent_id.clone()),
             session_id: claim.and_then(|c| c.session_id.clone()),
@@ -107,25 +112,27 @@ fn load_claims(conn: &Connection) -> rusqlite::Result<BTreeMap<JobId, ClaimRow>>
                 declared_paths, owner_generation, paused_at
          FROM coord_claims",
     )?;
-    let rows = stmt.query_map([], |row| {
-        let paths_json: String = row.get(6)?;
-        Ok((
-            JobId {
-                owner: row.get(0)?,
-                repo_name: row.get(1)?,
-                job_id: row.get(2)?,
-            },
-            ClaimRow {
-                agent_id: row.get(3)?,
-                session_id: row.get(4)?,
-                intent: row.get(5)?,
-                declared_paths: parse_paths(&paths_json),
-                owner_generation: row.get(7)?,
-                paused_at: row.get(8)?,
-            },
-        ))
-    })?;
+    let rows = stmt.query_map([], claim_from_row)?;
     rows.collect()
+}
+
+fn claim_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(JobId, ClaimRow)> {
+    let paths_json: String = row.get(6)?;
+    Ok((
+        JobId {
+            owner: row.get(0)?,
+            repo_name: row.get(1)?,
+            job_id: row.get(2)?,
+        },
+        ClaimRow {
+            agent_id: row.get(3)?,
+            session_id: row.get(4)?,
+            intent: row.get(5)?,
+            declared_paths: parse_paths(&paths_json),
+            owner_generation: row.get(7)?,
+            paused_at: row.get(8)?,
+        },
+    ))
 }
 
 fn load_messages(conn: &Connection) -> rusqlite::Result<Vec<MessageRow>> {
@@ -133,33 +140,30 @@ fn load_messages(conn: &Connection) -> rusqlite::Result<Vec<MessageRow>> {
         "SELECT kind, from_agent_id, from_job_id, to_owner, to_repo_name,
                 to_job_id, body, acked_at FROM coord_messages",
     )?;
-    let rows = stmt.query_map([], |row| {
-        Ok(MessageRow {
-            kind: row.get(0)?,
-            from_agent_id: row.get(1)?,
-            from_job_id: row.get(2)?,
-            to_owner: row.get(3)?,
-            to_repo_name: row.get(4)?,
-            to_job_id: row.get(5)?,
-            body: row.get(6)?,
-            acked_at: row.get(7)?,
-        })
-    })?;
+    let rows = stmt.query_map([], message_from_row)?;
     rows.collect()
+}
+
+fn message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageRow> {
+    Ok(MessageRow {
+        kind: row.get(0)?,
+        from_agent_id: row.get(1)?,
+        from_job_id: row.get(2)?,
+        to_owner: row.get(3)?,
+        to_repo_name: row.get(4)?,
+        to_job_id: row.get(5)?,
+        body: row.get(6)?,
+        acked_at: row.get(7)?,
+    })
 }
 
 fn parse_paths(raw: &str) -> Vec<String> {
     serde_json::from_str::<Vec<String>>(raw).unwrap_or_default()
 }
 
-fn waiting_on_for(
-    messages: &[MessageRow],
-    owner: &str,
-    repo_name: &str,
-    job_id: &str,
-) -> Option<String> {
+fn waiting_on_for(messages: &[MessageRow], key: &JobId) -> Option<String> {
     messages.iter().find_map(|msg| {
-        if msg.acked_at.is_some() || !targets_job(msg, owner, repo_name, job_id) {
+        if msg.acked_at.is_some() || !msg.targets(key) {
             return None;
         }
         match msg.kind.as_str() {
@@ -172,27 +176,20 @@ fn waiting_on_for(
     })
 }
 
-fn overlaps_for(
-    messages: &[MessageRow],
-    owner: &str,
-    repo_name: &str,
-    job_id: &str,
-) -> Vec<String> {
+fn overlaps_for(messages: &[MessageRow], key: &JobId) -> Vec<String> {
     messages
         .iter()
-        .filter(|msg| {
-            msg.acked_at.is_none()
-                && msg.kind == "overlap"
-                && targets_job(msg, owner, repo_name, job_id)
-        })
+        .filter(|msg| msg.acked_at.is_none() && msg.kind == "overlap" && msg.targets(key))
         .map(|msg| format!("overlap:{}:{}", msg.from_job_id, msg.body))
         .collect()
 }
 
-fn targets_job(msg: &MessageRow, owner: &str, repo_name: &str, job_id: &str) -> bool {
-    msg.to_owner.as_deref() == Some(owner)
-        && msg.to_repo_name.as_deref() == Some(repo_name)
-        && msg.to_job_id.as_deref() == Some(job_id)
+impl MessageRow {
+    fn targets(&self, key: &JobId) -> bool {
+        self.to_owner.as_deref() == Some(key.owner.as_str())
+            && self.to_repo_name.as_deref() == Some(key.repo_name.as_str())
+            && self.to_job_id.as_deref() == Some(key.job_id.as_str())
+    }
 }
 
 #[cfg(test)]
@@ -207,7 +204,7 @@ mod tests {
         Connection::open(&path).unwrap();
         let snap = load_coord_snapshot(&path);
         assert!(!snap.available);
-        let overlay = snap.overlay_for("acme", "sample", "job-1");
+        let overlay = snap.overlay_for(&JobId::new("acme", "sample", "job-1"));
         assert!(!overlay.paused);
         assert!(overlay.agent_id.is_none());
     }
@@ -245,7 +242,7 @@ mod tests {
         drop(conn);
         let snap = load_coord_snapshot(&path);
         assert!(snap.available);
-        let overlay = snap.overlay_for("acme", "sample", "job-1");
+        let overlay = snap.overlay_for(&JobId::new("acme", "sample", "job-1"));
         assert_eq!(overlay.agent_id.as_deref(), Some("agent-a"));
         assert!(overlay.paused);
         assert_eq!(overlay.waiting_on.as_deref(), Some("help:agent-b:job-2"));

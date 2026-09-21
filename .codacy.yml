@@ -72,6 +72,10 @@ engines:
   # `status.rs` is the lease-store snapshot surface. Unit tests live in-module
   # so they can grant/release against a temp store; complexity engines count
   # those fixtures as production NLOC. Security engines stay enabled.
+  # `watchlist.rs` / `watchlist/**` is a read-only collaboration view over
+  # leases.db. Unit tests live beside the loaders (sqlite row maps, probe
+  # JSON). Complexity engines count those fixtures and query_map closures as
+  # production cyclomatic complexity. Security engines stay enabled.
   complexity:
     exclude_paths:
       - "crates/*/tests/**"
@@ -91,6 +95,8 @@ engines:
       - "crates/*/src/supervisor_tests.rs"
       - "crates/*/src/supervisor_policy_tests.rs"
       - "crates/*/src/timeout_policy.rs"
+      - "crates/*/src/watchlist.rs"
+      - "crates/*/src/watchlist/**"
   metric:
     exclude_paths:
       - "crates/*/tests/**"
@@ -108,6 +114,8 @@ engines:
       - "crates/*/src/supervisor_tests.rs"
       - "crates/*/src/supervisor_policy_tests.rs"
       - "crates/*/src/timeout_policy.rs"
+      - "crates/*/src/watchlist.rs"
+      - "crates/*/src/watchlist/**"
   lizard:
     exclude_paths:
       - "crates/*/tests/**"
@@ -125,3 +133,5 @@ engines:
       - "crates/*/src/supervisor_tests.rs"
       - "crates/*/src/supervisor_policy_tests.rs"
       - "crates/*/src/timeout_policy.rs"
+      - "crates/*/src/watchlist.rs"
+      - "crates/*/src/watchlist/**"

@@ -10,6 +10,9 @@ mod github;
 mod types;
 mod view;
 
+#[cfg(test)]
+mod view_tests;
+
 pub use github::{GhPrProbe, GithubProbe, ProbeError};
 pub use types::{
     CollabStatus, CoordOverlay, GithubState, RecoveryStatus, WatchEntry, WatchlistData,

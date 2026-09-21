@@ -36,6 +36,26 @@ pub enum ProbeError {
 }
 
 impl ProbeError {
+    fn from_policy(repo: &str, err: crate::error::Error) -> Self {
+        if err.code() == "OWNER_NOT_ALLOWED" {
+            Self::OwnerNotAllowed {
+                repo: repo.to_owned(),
+            }
+        } else {
+            Self::Gh {
+                repo: repo.to_owned(),
+                message: err.to_string(),
+            }
+        }
+    }
+
+    fn from_gh(repo: &str, message: String) -> Self {
+        Self::Gh {
+            repo: repo.to_owned(),
+            message,
+        }
+    }
+
     #[must_use]
     pub fn residual(&self) -> String {
         match self {
@@ -64,32 +84,19 @@ impl GhPrProbe {
     }
 
     fn run_json(&self, args: &[String], repo: &str) -> Result<String, ProbeError> {
-        let cmd = SafeGhCommand::with_allowlist(args, &self.allowlist).map_err(|err| {
-            if err.code() == "OWNER_NOT_ALLOWED" {
-                ProbeError::OwnerNotAllowed {
-                    repo: repo.to_owned(),
-                }
-            } else {
-                ProbeError::Gh {
-                    repo: repo.to_owned(),
-                    message: err.to_string(),
-                }
-            }
-        })?;
-        let output = cmd.run().map_err(|err| ProbeError::Gh {
-            repo: repo.to_owned(),
-            message: err.to_string(),
-        })?;
+        let cmd = SafeGhCommand::with_allowlist(args, &self.allowlist)
+            .map_err(|err| ProbeError::from_policy(repo, err))?;
+        let output = cmd
+            .run()
+            .map_err(|err| ProbeError::from_gh(repo, err.to_string()))?;
         if output.exit_code != 0 {
             let stderr = output.stderr.trim();
-            return Err(ProbeError::Gh {
-                repo: repo.to_owned(),
-                message: if stderr.is_empty() {
-                    format!("gh exited {}", output.exit_code)
-                } else {
-                    stderr.to_owned()
-                },
-            });
+            let message = if stderr.is_empty() {
+                format!("gh exited {}", output.exit_code)
+            } else {
+                stderr.to_owned()
+            };
+            return Err(ProbeError::from_gh(repo, message));
         }
         Ok(output.stdout)
     }
@@ -97,21 +104,23 @@ impl GhPrProbe {
 
 impl GithubProbe for GhPrProbe {
     fn view(&self, repo: &str, number: u64) -> Result<PrSnapshot, ProbeError> {
-        let args = pr_view_args(repo, number);
-        let stdout = self.run_json(&args, repo)?;
-        parse_pr_view(repo, &stdout).map_err(|message| ProbeError::Gh {
-            repo: repo.to_owned(),
-            message,
-        })
+        self.decode_one(repo, &pr_view_args(repo, number))
     }
 
     fn find_by_branch(&self, repo: &str, branch: &str) -> Result<Option<PrSnapshot>, ProbeError> {
-        let args = pr_list_args(repo, branch);
-        let stdout = self.run_json(&args, repo)?;
-        parse_pr_list(repo, &stdout).map_err(|message| ProbeError::Gh {
-            repo: repo.to_owned(),
-            message,
-        })
+        self.decode_list(repo, &pr_list_args(repo, branch))
+    }
+}
+
+impl GhPrProbe {
+    fn decode_one(&self, repo: &str, args: &[String]) -> Result<PrSnapshot, ProbeError> {
+        let stdout = self.run_json(args, repo)?;
+        parse_pr_view(repo, &stdout).map_err(|message| ProbeError::from_gh(repo, message))
+    }
+
+    fn decode_list(&self, repo: &str, args: &[String]) -> Result<Option<PrSnapshot>, ProbeError> {
+        let stdout = self.run_json(args, repo)?;
+        parse_pr_list(repo, &stdout).map_err(|message| ProbeError::from_gh(repo, message))
     }
 }
 

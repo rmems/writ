@@ -58,59 +58,72 @@ pub fn run(
     match action {
         WatchlistAction::Add => persist_hint("add", json, stdout),
         WatchlistAction::Remove => persist_hint("remove", json, stdout),
-        WatchlistAction::List {
-            owner,
-            repo,
-            job,
-            include_released,
-        } => render_view(
-            WatchQuery {
+        other => render_view(
+            ViewRequest {
+                action: other,
+                allowlist,
+                json,
+            },
+            stdout,
+        ),
+    }
+}
+
+struct ViewRequest<'a> {
+    action: WatchlistAction,
+    allowlist: &'a OwnerAllowlist,
+    json: bool,
+}
+
+impl ViewRequest<'_> {
+    fn command(&self) -> &'static str {
+        match self.action {
+            WatchlistAction::List { .. } => "cli.watchlist.list",
+            WatchlistAction::Check { .. } => "cli.watchlist.check",
+            WatchlistAction::CheckAll { .. } => "cli.watchlist.check_all",
+            WatchlistAction::Add | WatchlistAction::Remove => unreachable!(),
+        }
+    }
+
+    fn query(&self) -> WatchQuery {
+        match &self.action {
+            WatchlistAction::List {
                 owner,
                 repo,
-                job_id: job,
+                job,
                 include_released,
+            } => WatchQuery {
+                owner: owner.clone(),
+                repo: repo.clone(),
+                job_id: job.clone(),
+                include_released: *include_released,
                 probe_github: false,
             },
-            allowlist,
-            json,
-            "cli.watchlist.list",
-            stdout,
-        ),
-        WatchlistAction::Check {
-            owner,
-            repo,
-            job,
-            include_released,
-        } => render_view(
-            WatchQuery {
+            WatchlistAction::Check {
                 owner,
                 repo,
-                job_id: job,
+                job,
                 include_released,
+            } => WatchQuery {
+                owner: owner.clone(),
+                repo: repo.clone(),
+                job_id: job.clone(),
+                include_released: *include_released,
                 probe_github: true,
             },
-            allowlist,
-            json,
-            "cli.watchlist.check",
-            stdout,
-        ),
-        WatchlistAction::CheckAll {
-            owner,
-            repo,
-            include_released,
-        } => render_view(
-            WatchQuery {
+            WatchlistAction::CheckAll {
                 owner,
                 repo,
+                include_released,
+            } => WatchQuery {
+                owner: owner.clone(),
+                repo: repo.clone(),
                 job_id: None,
-                include_released,
+                include_released: *include_released,
                 probe_github: true,
             },
-            allowlist,
-            json,
-            "cli.watchlist.check_all",
-            stdout,
-        ),
+            WatchlistAction::Add | WatchlistAction::Remove => unreachable!(),
+        }
     }
 }
 
@@ -145,17 +158,15 @@ fn persist_hint(
 }
 
 fn render_view(
-    query: WatchQuery,
-    allowlist: &OwnerAllowlist,
-    json: bool,
-    command: &'static str,
+    request: ViewRequest<'_>,
     stdout: &mut impl Write,
 ) -> writ_core::error::Result<ExitCode> {
     let store = LeaseStore::open(lease_store_path())?;
-    let probe = GhPrProbe::new(allowlist.clone());
+    let probe = GhPrProbe::new(request.allowlist.clone());
+    let query = request.query();
     let github = query.probe_github.then_some(&probe as _);
     let data = load_view(&store, &query, github)?;
-    write_output(json, command, &data, stdout)?;
+    write_output(request.json, request.command(), &data, stdout)?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -166,10 +177,7 @@ fn write_output(
     stdout: &mut impl Write,
 ) -> io::Result<()> {
     if json {
-        let response = Response::success(command, data);
-        serde_json::to_writer(&mut *stdout, &response)?;
-        stdout.write_all(b"\n")?;
-        return Ok(());
+        return write_json(command, data, stdout);
     }
     if data.entries.is_empty() {
         writeln!(
@@ -178,6 +186,20 @@ fn write_output(
         )?;
         return Ok(());
     }
+    write_table(data, stdout)
+}
+
+fn write_json(
+    command: &'static str,
+    data: &WatchlistData,
+    stdout: &mut impl Write,
+) -> io::Result<()> {
+    let response = Response::success(command, data);
+    serde_json::to_writer(&mut *stdout, &response)?;
+    stdout.write_all(b"\n")
+}
+
+fn write_table(data: &WatchlistData, stdout: &mut impl Write) -> io::Result<()> {
     writeln!(
         stdout,
         "job\towner/repo\tbranch\tcollab\trecovery\tgithub\tblockers"
