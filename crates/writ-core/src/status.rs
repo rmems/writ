@@ -9,7 +9,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::checkout::inspect_checkout;
+use crate::checkout::{CheckoutInfo, DETACHED_BRANCH, inspect_checkout};
 use crate::contract::Response;
 use crate::lease::{AgentRecord, Lease, LeaseMode, LeaseStore};
 use crate::paths::lease_store_path;
@@ -266,19 +266,27 @@ pub fn load() -> Result<JobsData, String> {
 }
 
 /// Load collaboration status from an explicit SQLite path.
+///
+/// Only a genuinely absent file yields an empty snapshot; an unreadable store
+/// (permission denied, directory, corrupt file) is an error, not empty state.
 pub fn load_from_path(path: &Path) -> Result<JobsData, String> {
-    match LeaseStore::open_read_only(path) {
-        Ok(store) => load_from_store(&store),
-        Err(crate::error::Error::LeaseStore { message, .. }) if missing_store(&message) => {
-            Ok(JobsData::empty())
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.is_file() => {}
+        Ok(_) => {
+            return Err(format!(
+                "lease store path is not a regular file: {}",
+                path.display()
+            ));
         }
-        Err(e) => Err(e.to_string()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(JobsData::empty());
+        }
+        Err(e) => {
+            return Err(format!("stat lease store {}: {e}", path.display()));
+        }
     }
-}
-
-fn missing_store(message: &str) -> bool {
-    let lower = message.to_ascii_lowercase();
-    lower.contains("unable to open") || lower.contains("no such file")
+    let store = LeaseStore::open_read_only(path).map_err(|e| e.to_string())?;
+    load_from_store(&store)
 }
 
 /// Load collaboration status from an already-open store.
@@ -312,7 +320,7 @@ fn job_from_lease(lease: &Lease) -> JobStatus {
         last_output_ms: None,
         max_redispatch_per_item: None,
         collaboration_state: collaboration_state_from_mode(lease.mode),
-        lease_mode: Some(lease.mode.as_str().to_owned()),
+        lease_mode: Some(lease.mode_raw.clone()),
         head,
         head_source,
         lease_row_id: Some(lease.row_id),
@@ -329,13 +337,23 @@ fn job_from_lease(lease: &Lease) -> JobStatus {
 
 fn resolve_head(lease: &Lease) -> (Option<String>, Option<String>, Option<bool>) {
     match inspect_checkout(Path::new(&lease.worktree_path)) {
-        Ok(info) => (info.head_commit, Some("checkout".to_owned()), Some(false)),
-        Err(_) => (
+        Ok(info) if checkout_matches_lease(&info, lease) => {
+            (info.head_commit, Some("checkout".to_owned()), Some(false))
+        }
+        Ok(_) | Err(_) => (
             nonempty_head(&lease.start_commit),
             Some("lease".to_owned()),
             Some(lease.released_at.is_none()),
         ),
     }
+}
+
+/// The inspected checkout only supplies a live head when its recorded
+/// identity still matches the lease: same repository and same branch.
+fn checkout_matches_lease(info: &CheckoutInfo, lease: &Lease) -> bool {
+    info.owner == lease.owner
+        && info.repo_name == lease.repo_name
+        && info.branch.as_deref().unwrap_or(DETACHED_BRANCH) == lease.branch
 }
 
 fn nonempty_head(start_commit: &str) -> Option<String> {

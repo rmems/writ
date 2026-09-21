@@ -66,6 +66,8 @@ pub struct Lease {
     pub worktree_path: String,
     pub start_commit: String,
     pub mode: LeaseMode,
+    /// Stored mode text before mapping; unrecognized values survive verbatim.
+    pub mode_raw: String,
     pub ttl: Option<i64>,
     pub heartbeat: Option<i64>,
     pub max_files: Option<i64>,
@@ -338,11 +340,18 @@ impl LeaseStore {
         list_agents_on(&conn)
     }
 
-    /// Leases and agents from one lock acquisition.
+    /// Leases and agents from one read transaction.
+    ///
+    /// The mutex serializes this connection only; the transaction keeps other
+    /// processes' writes from splitting the two reads.
     pub fn snapshot(&self) -> Result<(Vec<Lease>, Vec<AgentRecord>)> {
         let conn = self.lock()?;
-        let leases = list_leases_on(&conn, "ORDER BY id", "list leases")?;
-        let agents = list_agents_on(&conn)?;
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| lease_err("snapshot transaction", e))?;
+        let leases = list_leases_on(&tx, "ORDER BY id", "list leases")?;
+        let agents = list_agents_on(&tx)?;
+        tx.commit().map_err(|e| lease_err("snapshot commit", e))?;
         Ok((leases, agents))
     }
 
@@ -465,6 +474,7 @@ fn lease_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Lease> {
         worktree_path: identity.worktree_path,
         start_commit: identity.start_commit,
         mode: identity.mode,
+        mode_raw: identity.mode_raw,
         ttl: limits.ttl,
         heartbeat: limits.heartbeat,
         max_files: limits.max_files,
@@ -512,6 +522,7 @@ struct LeaseIdentity {
     worktree_path: String,
     start_commit: String,
     mode: LeaseMode,
+    mode_raw: String,
 }
 
 struct LeaseLimits {
@@ -536,7 +547,8 @@ fn lease_identity(row: &rusqlite::Row<'_>) -> rusqlite::Result<LeaseIdentity> {
         branch_ref: refs.0,
         worktree_path: refs.1,
         start_commit: refs.2,
-        mode: refs.3,
+        mode: LeaseMode::parse(&refs.3),
+        mode_raw: refs.3,
     })
 }
 
@@ -552,13 +564,8 @@ fn lease_names(
     ))
 }
 
-fn lease_refs(row: &rusqlite::Row<'_>) -> rusqlite::Result<(String, String, String, LeaseMode)> {
-    Ok((
-        row.get(5)?,
-        row.get(6)?,
-        row.get(7)?,
-        LeaseMode::parse(&row.get::<_, String>(8)?),
-    ))
+fn lease_refs(row: &rusqlite::Row<'_>) -> rusqlite::Result<(String, String, String, String)> {
+    Ok((row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?))
 }
 
 fn lease_limits(row: &rusqlite::Row<'_>) -> rusqlite::Result<LeaseLimits> {
