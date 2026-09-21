@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
 use crate::error::{Error, PolicyCode, Result};
 
@@ -23,6 +23,8 @@ pub enum LeaseMode {
     NeedsHuman,
     Blocked,
     MergeReady,
+    /// Stored value is not one of the known modes. Not treated as released.
+    Unknown,
 }
 
 impl LeaseMode {
@@ -35,6 +37,7 @@ impl LeaseMode {
             Self::NeedsHuman => "NEEDS_HUMAN",
             Self::Blocked => "BLOCKED",
             Self::MergeReady => "MERGE_READY",
+            Self::Unknown => "UNKNOWN",
         }
     }
 
@@ -45,7 +48,8 @@ impl LeaseMode {
             "NEEDS_HUMAN" => Self::NeedsHuman,
             "BLOCKED" => Self::Blocked,
             "MERGE_READY" => Self::MergeReady,
-            _ => Self::Unassigned,
+            "UNASSIGNED" => Self::Unassigned,
+            _ => Self::Unknown,
         }
     }
 }
@@ -188,6 +192,17 @@ impl LeaseStore {
         })
     }
 
+    /// Open an existing store without creating files or applying schema.
+    pub fn open_read_only(path: impl Into<PathBuf>) -> Result<Self> {
+        let path = path.into();
+        let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|e| lease_err("open lease store read-only", e))?;
+        Ok(Self {
+            path,
+            conn: Mutex::new(conn),
+        })
+    }
+
     /// Filesystem path of this store.
     #[must_use]
     pub fn path(&self) -> &Path {
@@ -303,7 +318,9 @@ impl LeaseStore {
 
     /// All currently held (unreleased) leases, in insertion order.
     pub fn list_active(&self) -> Result<Vec<Lease>> {
-        self.list_leases(
+        let conn = self.lock()?;
+        list_leases_on(
+            &conn,
             "WHERE released_at IS NULL ORDER BY id",
             "list active leases",
         )
@@ -311,35 +328,22 @@ impl LeaseStore {
 
     /// All lease identity rows, including released ones, in insertion order.
     pub fn list_all(&self) -> Result<Vec<Lease>> {
-        self.list_leases("ORDER BY id", "list leases")
+        let conn = self.lock()?;
+        list_leases_on(&conn, "ORDER BY id", "list leases")
     }
 
     /// Agent registry rows, live first, then by start time.
     pub fn list_agents(&self) -> Result<Vec<AgentRecord>> {
         let conn = self.lock()?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT agent_id, agent_type, session_id, started_at, stopped_at
-                 FROM agents
-                 ORDER BY (stopped_at IS NOT NULL), started_at, agent_id",
-            )
-            .map_err(|e| lease_err("list agents", e))?;
-        let rows = stmt
-            .query_map([], agent_from_row)
-            .map_err(|e| lease_err("list agents", e))?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| lease_err("list agents", e))
+        list_agents_on(&conn)
     }
 
-    fn list_leases(&self, suffix: &str, context: &'static str) -> Result<Vec<Lease>> {
-        let query = format!("{LEASE_SELECT} {suffix}");
+    /// Leases and agents from one lock acquisition.
+    pub fn snapshot(&self) -> Result<(Vec<Lease>, Vec<AgentRecord>)> {
         let conn = self.lock()?;
-        let mut stmt = conn.prepare(&query).map_err(|e| lease_err(context, e))?;
-        let rows = stmt
-            .query_map([], lease_from_row)
-            .map_err(|e| lease_err(context, e))?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| lease_err(context, e))
+        let leases = list_leases_on(&conn, "ORDER BY id", "list leases")?;
+        let agents = list_agents_on(&conn)?;
+        Ok((leases, agents))
     }
 
     /// Look up a lease by worktree path.
@@ -420,6 +424,31 @@ impl LeaseStore {
             message: "lease store mutex poisoned".to_owned(),
         })
     }
+}
+
+fn list_leases_on(conn: &Connection, suffix: &str, context: &'static str) -> Result<Vec<Lease>> {
+    let query = format!("{LEASE_SELECT} {suffix}");
+    let mut stmt = conn.prepare(&query).map_err(|e| lease_err(context, e))?;
+    let rows = stmt
+        .query_map([], lease_from_row)
+        .map_err(|e| lease_err(context, e))?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| lease_err(context, e))
+}
+
+fn list_agents_on(conn: &Connection) -> Result<Vec<AgentRecord>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT agent_id, agent_type, session_id, started_at, stopped_at
+             FROM agents
+             ORDER BY (stopped_at IS NOT NULL), started_at, agent_id",
+        )
+        .map_err(|e| lease_err("list agents", e))?;
+    let rows = stmt
+        .query_map([], agent_from_row)
+        .map_err(|e| lease_err("list agents", e))?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| lease_err("list agents", e))
 }
 
 fn lease_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Lease> {
@@ -708,5 +737,39 @@ mod tests {
             )
             .unwrap();
         assert!(stopped.is_some());
+    }
+
+    #[test]
+    fn unrecognized_mode_is_unknown_not_unassigned() {
+        let tmp = tempdir().unwrap();
+        let store = LeaseStore::open(tmp.path().join("leases.db")).unwrap();
+        let repo = tmp.path().join("repo");
+        let wt = tmp.path().join("checkouts/a");
+        store
+            .grant(LeaseGrant {
+                repo: &repo,
+                owner: "acme",
+                repo_name: "sample",
+                job_id: "job-a",
+                branch: "hive/a",
+                worktree_path: &wt,
+                start_commit: "abc123",
+            })
+            .unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute("UPDATE leases SET mode = 'NOT_A_MODE'", [])
+                .unwrap();
+        }
+        let lease = store
+            .find_job(JobKey {
+                owner: "acme",
+                repo_name: "sample",
+                job_id: "job-a",
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(lease.mode, LeaseMode::Unknown);
+        assert_ne!(lease.mode, LeaseMode::Unassigned);
     }
 }

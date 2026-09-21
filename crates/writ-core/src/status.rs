@@ -256,6 +256,7 @@ pub fn collaboration_state_from_mode(mode: LeaseMode) -> CollaborationState {
         LeaseMode::Blocked => CollaborationState::Conflicted,
         LeaseMode::MergeReady => CollaborationState::ReadyForIntegration,
         LeaseMode::Unassigned => CollaborationState::Unassigned,
+        LeaseMode::Unknown => CollaborationState::Unknown,
     }
 }
 
@@ -266,17 +267,23 @@ pub fn load() -> Result<JobsData, String> {
 
 /// Load collaboration status from an explicit SQLite path.
 pub fn load_from_path(path: &Path) -> Result<JobsData, String> {
-    if !path.exists() {
-        return Ok(JobsData::empty());
+    match LeaseStore::open_read_only(path) {
+        Ok(store) => load_from_store(&store),
+        Err(crate::error::Error::LeaseStore { message, .. }) if missing_store(&message) => {
+            Ok(JobsData::empty())
+        }
+        Err(e) => Err(e.to_string()),
     }
-    let store = LeaseStore::open(path).map_err(|e| e.to_string())?;
-    load_from_store(&store)
+}
+
+fn missing_store(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("unable to open") || lower.contains("no such file")
 }
 
 /// Load collaboration status from an already-open store.
 pub fn load_from_store(store: &LeaseStore) -> Result<JobsData, String> {
-    let leases = store.list_all().map_err(|e| e.to_string())?;
-    let agents = store.list_agents().map_err(|e| e.to_string())?;
+    let (leases, agents) = store.snapshot().map_err(|e| e.to_string())?;
     Ok(JobsData {
         source: SOURCE_LEASE_STORE.to_owned(),
         jobs: leases.iter().map(job_from_lease).collect(),
@@ -735,6 +742,22 @@ mod tests {
     }
 
     #[test]
+    fn unknown_mode_is_not_reported_as_unassigned() {
+        assert_eq!(
+            collaboration_state_from_mode(LeaseMode::Unknown),
+            CollaborationState::Unknown
+        );
+        assert_eq!(
+            serde_json::to_string(&CollaborationState::Unknown).unwrap(),
+            "\"unknown\""
+        );
+        assert_ne!(
+            collaboration_state_from_mode(LeaseMode::Unknown).to_string(),
+            "unassigned"
+        );
+    }
+
+    #[test]
     fn ci_class_variants_serialize_correctly() {
         let cases = [
             (CiClass::Pass, "\"pass\""),
@@ -837,5 +860,13 @@ mod tests {
         assert!(data.jobs.is_empty());
         assert!(data.agents.is_empty());
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn load_from_path_reads_existing_store_without_write() {
+        let (_tmp, store) = seeded_store();
+        let data = load_from_path(store.path()).unwrap();
+        assert_eq!(data.jobs.len(), 2);
+        assert_eq!(data.agents.len(), 2);
     }
 }

@@ -91,7 +91,7 @@ Released or ready-for-integration is **not** GitHub merged/completed.
 | `conflicted` | `BLOCKED` | Recorded blocked. |
 | `ready_for_integration` | `MERGE_READY` | Locally marked ready to integrate. |
 | `unassigned` | `UNASSIGNED` | Identity kept after release. |
-| `unknown` | (none) | No recorded mapping. |
+| `unknown` | unrecognized / missing | No recorded mapping. |
 
 Phase 1 currently **writes** only `WRITER_LOCKED` (register/grant) and
 `UNASSIGNED` (unregister/release). Other modes are reported if present.
