@@ -215,14 +215,34 @@ impl LeaseStore {
     ///
     /// The conflict target `(owner, repo_name, job_id)` refreshes in place only
     /// when the existing row is released or names the same `worktree_path`; an
-    /// active lease held by a different checkout path is never seized — the
-    /// grant fails with [`PolicyCode::LeaseConflict`].
+    /// active lease held by a different checkout path is never seized. A
+    /// different job cannot take a checkout path that already has an unreleased
+    /// lease. Either conflict fails with [`PolicyCode::LeaseConflict`].
     pub fn grant(&self, grant: LeaseGrant<'_>) -> Result<Lease> {
         let now = now_secs();
         let repo = path_text(grant.repo);
         let worktree_path = path_text(grant.worktree_path);
         let branch_ref = format!("refs/heads/{}", grant.branch);
         let conn = self.lock()?;
+        let occupant: Option<String> = conn
+            .query_row(
+                "
+                SELECT job_id FROM leases
+                WHERE worktree_path = ?1
+                  AND released_at IS NULL
+                  AND NOT (owner = ?2 AND repo_name = ?3 AND job_id = ?4)
+                ",
+                params![worktree_path, grant.owner, grant.repo_name, grant.job_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| lease_err("grant lease", e))?;
+        if let Some(job_id) = occupant {
+            return Err(Error::PolicyViolation {
+                code: PolicyCode::LeaseConflict,
+                message: format!("checkout already holds an active lease for job `{job_id}`"),
+            });
+        }
         let changed = conn.execute(
             "
             INSERT INTO leases (
@@ -356,10 +376,19 @@ impl LeaseStore {
     }
 
     /// Look up a lease by worktree path.
+    ///
+    /// Prefers the live (unreleased) row when one exists. After sequential
+    /// jobs have reused a checkout, released identity rows may share the path;
+    /// `query_row` would fail on that ambiguity, so this returns the active
+    /// holder or else the most recently released row.
     pub fn find_by_path(&self, worktree_path: &Path) -> Result<Option<Lease>> {
         self.query_lease(
             LeaseSql {
-                where_sql: "WHERE worktree_path = ?1",
+                where_sql: "WHERE worktree_path = ?1
+                    ORDER BY CASE WHEN released_at IS NULL THEN 0 ELSE 1 END,
+                             COALESCE(released_at, 0) DESC,
+                             id DESC
+                    LIMIT 1",
                 context: "lookup lease by path",
             },
             params![path_text(worktree_path)],
@@ -711,6 +740,57 @@ mod tests {
         store.release_by_path(&wt_a).unwrap();
         let moved = store.grant(grant_for(&repo, &wt_b)).unwrap();
         assert_eq!(moved.worktree_path, wt_b);
+    }
+
+    #[test]
+    fn grant_refuses_active_path_held_by_different_job() {
+        let tmp = tempdir().unwrap();
+        let store = LeaseStore::open(tmp.path().join("leases.db")).unwrap();
+        let repo = tmp.path().join("repo");
+        let wt = tmp.path().join("checkouts/shared");
+        let grant_a = LeaseGrant {
+            repo: &repo,
+            owner: "local",
+            repo_name: "repo",
+            job_id: "job-a",
+            branch: "hive/job-a",
+            worktree_path: &wt,
+            start_commit: "abc123",
+        };
+        let grant_b = LeaseGrant {
+            job_id: "job-b",
+            branch: "hive/job-b",
+            ..grant_a
+        };
+
+        store.grant(grant_a).unwrap();
+        let err = store.grant(grant_b).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::LeaseConflict,
+                ..
+            }
+        ));
+        let active = store.list_active().unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].job_id, "job-a");
+
+        store.release_by_path(&wt).unwrap();
+        let moved = store.grant(grant_b).unwrap();
+        assert_eq!(moved.job_id, "job-b");
+        assert!(moved.released_at.is_none());
+
+        // Sequential reuse leaves a released row and an active row on the same
+        // path. Lookup must return the live holder, not fail closed on
+        // query_row's multiple-row error.
+        let found = store.find_by_path(&wt).unwrap().unwrap();
+        assert_eq!(found.job_id, "job-b");
+        assert!(found.released_at.is_none());
+
+        let released = store.release_by_path(&wt).unwrap().unwrap();
+        assert_eq!(released.job_id, "job-b");
+        assert!(released.released_at.is_some());
     }
 
     #[test]
