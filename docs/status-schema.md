@@ -5,8 +5,8 @@ from the SQLite lease store (`leases` + `agents`). Human output is formatted fro
 the same snapshot. This is not a GitHub PR/check/merge gate and does not revive
 the deleted Python orchestrator or `watched.json`.
 
-Missing lease-store files are created empty. That yields `ok: true` with empty
-`jobs` and `agents` arrays.
+Missing lease-store files are **not** an error and are **not** created: the
+command returns `ok: true` with empty `jobs` and `agents` arrays.
 
 ## Envelope
 

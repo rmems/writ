@@ -266,6 +266,9 @@ pub fn load() -> Result<JobsData, String> {
 
 /// Load collaboration status from an explicit SQLite path.
 pub fn load_from_path(path: &Path) -> Result<JobsData, String> {
+    if !path.exists() {
+        return Ok(JobsData::empty());
+    }
     let store = LeaseStore::open(path).map_err(|e| e.to_string())?;
     load_from_store(&store)
 }
@@ -757,5 +760,15 @@ mod tests {
         let text = format_human(&JobsData::empty());
         assert_eq!(text, "No collaboration participants.\n");
         assert!(!text.contains("watched"));
+    }
+
+    #[test]
+    fn missing_lease_store_is_empty_without_creating_a_file() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("missing").join("leases.db");
+        let data = load_from_path(&path).unwrap();
+        assert!(data.jobs.is_empty());
+        assert!(data.agents.is_empty());
+        assert!(!path.exists());
     }
 }
