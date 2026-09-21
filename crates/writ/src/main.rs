@@ -1287,16 +1287,17 @@ mod tests {
             panic!("expected attribution format command")
         };
         assert_eq!(body, "Looks good!");
-        assert_eq!(agent_id.as_deref(), Some("Claude Code: writ agent"));
-        assert_eq!(commit_sha.as_deref(), Some("abc1234"));
+        assert_eq!(
+            (agent_id.as_deref(), commit_sha.as_deref()),
+            (Some("Claude Code: writ agent"), Some("abc1234"))
+        );
     }
 
     #[test]
-    fn attribution_format_parser_accepts_task_branch_session() {
+    fn attribution_format_parser_accepts_task_and_branch() {
         let super::AttributionAction::Format {
             task,
             branch,
-            session,
             pr_comment: false,
             ..
         } = parsed_identity_format()
@@ -1308,6 +1309,18 @@ mod tests {
             branch.as_deref(),
             Some("cursor/reply-attribution-config-6e46")
         );
+    }
+
+    #[test]
+    fn attribution_format_parser_accepts_session() {
+        let super::AttributionAction::Format {
+            session,
+            pr_comment: false,
+            ..
+        } = parsed_identity_format()
+        else {
+            panic!("expected attribution format command")
+        };
         assert_eq!(session.as_deref(), Some("bc-fa8ed877"));
     }
 
@@ -1392,8 +1405,10 @@ mod tests {
 
     async fn format_ok(case: FormatCase) -> Vec<u8> {
         let (result, stdout) = run_format(case).await;
-        assert_eq!(result.unwrap(), ExitCode::SUCCESS);
-        stdout
+        match result {
+            Ok(code) if code == ExitCode::SUCCESS => stdout,
+            other => panic!("expected successful attribution format, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -1438,6 +1453,24 @@ mod tests {
             Some(
                 "Overlap: I own SKILL.md Reply attribution; RM-145 owns the rest.\n\n---\nwrit agent | task RM-128 | branch cursor/reply-attribution-config-6e46 | session bc-fa8ed877"
             )
+        );
+    }
+
+    #[tokio::test]
+    async fn attribution_format_collaboration_message_has_no_sha() {
+        let collab = parse_stdout_json(
+            &format_ok(FormatCase {
+                json: true,
+                body: "Overlap: I own SKILL.md Reply attribution; RM-145 owns the rest.",
+                agent_id: Some("writ agent"),
+                commit_sha: None,
+                placement: None,
+                task: Some("RM-128"),
+                branch: Some("cursor/reply-attribution-config-6e46"),
+                session: Some("bc-fa8ed877"),
+                pr_comment: false,
+            })
+            .await,
         );
         assert!(collab["data"]["commit_sha"].is_null());
     }
@@ -1493,6 +1526,24 @@ mod tests {
             with_sha["data"]["text"].as_str(),
             Some("Fixed the issue.\n\n---\nwrit agent: fixed in abc1234")
         );
+    }
+
+    #[tokio::test]
+    async fn attribution_format_json_commit_sha_field() {
+        let with_sha = parse_stdout_json(
+            &format_ok(FormatCase {
+                json: true,
+                body: "Fixed the issue.",
+                agent_id: Some("writ agent"),
+                commit_sha: Some("abc1234"),
+                placement: Some("footer"),
+                task: None,
+                branch: None,
+                session: None,
+                pr_comment: false,
+            })
+            .await,
+        );
         assert_eq!(with_sha["data"]["commit_sha"].as_str(), Some("abc1234"));
     }
 
@@ -1517,6 +1568,24 @@ mod tests {
             Some("No code change.\n\nCodex: writ agent")
         );
         assert!(omit_sha["data"]["commit_sha"].is_null());
+    }
+
+    #[tokio::test]
+    async fn attribution_format_pr_comment_is_not_thread_reply() {
+        let omit_sha = parse_stdout_json(
+            &format_ok(FormatCase {
+                json: true,
+                body: "No code change.",
+                agent_id: Some("Codex: writ agent"),
+                commit_sha: Some("  "),
+                placement: None,
+                task: None,
+                branch: None,
+                session: None,
+                pr_comment: true,
+            })
+            .await,
+        );
         assert_eq!(omit_sha["data"]["is_thread_reply"].as_bool(), Some(false));
     }
 
