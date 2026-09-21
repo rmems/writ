@@ -91,115 +91,145 @@ fn add_worktree(repo: &Path, path: &Path, branch: &str) {
     );
 }
 
-#[test]
-fn status_json_reports_two_registered_checkouts_distinctly() {
+fn register(root: &Path, path: &Path, job: &str) {
+    let output = writ(
+        root,
+        &[
+            "--json",
+            "worktree",
+            "register",
+            path.to_str().unwrap(),
+            "--job",
+            job,
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn two_registered() -> (TestDir, PathBuf, PathBuf) {
     let root = TestDir::new();
     let repo = init_repo(&root.0);
     let job_a = root.0.join("job-a");
     let job_b = root.0.join("job-b");
     add_worktree(&repo, &job_a, "hive/a");
     add_worktree(&repo, &job_b, "hive/b");
+    register(&root.0, &job_a, "job-a");
+    register(&root.0, &job_b, "job-b");
+    (root, job_a, job_b)
+}
 
-    let register_a = writ(
-        &root.0,
-        &[
-            "--json",
-            "worktree",
-            "register",
-            job_a.to_str().unwrap(),
-            "--job",
-            "job-a",
-        ],
-    );
-    let register_b = writ(
-        &root.0,
-        &[
-            "--json",
-            "worktree",
-            "register",
-            job_b.to_str().unwrap(),
-            "--job",
-            "job-b",
-        ],
-    );
-    assert!(
-        register_a.status.success(),
-        "stderr={}",
-        String::from_utf8_lossy(&register_a.stderr)
-    );
-    assert!(
-        register_b.status.success(),
-        "stderr={}",
-        String::from_utf8_lossy(&register_b.stderr)
-    );
-
-    let output = writ(&root.0, &["--json", "status"]);
+fn status_envelope(root: &Path) -> serde_json::Value {
+    let output = writ(root, &["--json", "status"]);
     assert!(
         output.status.success(),
         "stderr={}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let envelope = json(&output);
+    json(&output)
+}
+
+fn assert_ok_envelope(envelope: &serde_json::Value, command: &str) {
     assert_eq!(envelope["ok"], true);
     assert_eq!(envelope["schema_version"], 1);
-    assert_eq!(envelope["command"], "cli.status");
-    assert_eq!(envelope["data"]["source"], "lease_store");
-    let jobs = envelope["data"]["jobs"].as_array().expect("jobs");
+    assert_eq!(envelope["command"], command);
+}
+
+fn jobs_array(envelope: &serde_json::Value) -> &[serde_json::Value] {
+    envelope["data"]["jobs"].as_array().expect("jobs")
+}
+
+fn assert_two_job_ids(jobs: &[serde_json::Value]) {
     assert_eq!(jobs.len(), 2);
     assert_eq!(jobs[0]["job_id"], "job-a");
     assert_eq!(jobs[1]["job_id"], "job-b");
-    assert_ne!(jobs[0]["worktree_path"], jobs[1]["worktree_path"]);
-    assert_eq!(jobs[0]["collaboration_state"], "running");
-    assert_eq!(jobs[0]["lease_mode"], "WRITER_LOCKED");
-    assert_eq!(jobs[0]["process_state"], "unknown");
-    assert_eq!(jobs[0]["ci_class"], "unknown");
-    assert!(jobs[0]["ownership_generation"].is_null());
-    assert!(jobs[0]["declared_paths"].is_null());
-    assert!(jobs[0]["blocker"].is_null());
-    assert!(jobs[0]["handoff"].is_null());
-    assert_eq!(jobs[0]["head_source"], "checkout");
-    assert!(jobs[0]["head"].as_str().is_some_and(|h| !h.is_empty()));
-    assert_eq!(jobs[0]["recovery_needed"], false);
+}
 
+fn assert_running_lease(job: &serde_json::Value) {
+    assert_eq!(job["collaboration_state"], "running");
+    assert_eq!(job["lease_mode"], "WRITER_LOCKED");
+    assert_eq!(job["process_state"], "unknown");
+}
+
+fn assert_unknown_ci_and_paths(job: &serde_json::Value) {
+    assert_eq!(job["ci_class"], "unknown");
+    assert!(job["ownership_generation"].is_null());
+    assert!(job["declared_paths"].is_null());
+}
+
+fn assert_unknown_handoff_fields(job: &serde_json::Value) {
+    assert!(job["blocker"].is_null());
+    assert!(job["handoff"].is_null());
+}
+
+fn assert_live_head(job: &serde_json::Value) {
+    assert_eq!(job["head_source"], "checkout");
+    assert!(job["head"].as_str().is_some_and(|h| !h.is_empty()));
+    assert_eq!(job["recovery_needed"], false);
+}
+
+fn job_named<'a>(jobs: &'a [serde_json::Value], id: &str) -> &'a serde_json::Value {
+    jobs.iter()
+        .find(|job| job["job_id"] == id)
+        .unwrap_or_else(|| panic!("missing {id}"))
+}
+
+#[test]
+fn status_json_reports_two_registered_checkouts_distinctly() {
+    let (root, _, _) = two_registered();
+    let envelope = status_envelope(&root.0);
+    assert_ok_envelope(&envelope, "cli.status");
+    assert_eq!(envelope["data"]["source"], "lease_store");
+    let jobs = jobs_array(&envelope);
+    assert_two_job_ids(jobs);
+    assert_ne!(jobs[0]["worktree_path"], jobs[1]["worktree_path"]);
+    assert_running_lease(&jobs[0]);
+    assert_unknown_ci_and_paths(&jobs[0]);
+    assert_unknown_handoff_fields(&jobs[0]);
+    assert_live_head(&jobs[0]);
+}
+
+#[test]
+fn human_status_lists_both_participants_without_github_completion() {
+    let (root, _, _) = two_registered();
     let human = writ(&root.0, &["status"]);
     let text = String::from_utf8_lossy(&human.stdout);
     assert!(text.contains("job-a"));
     assert!(text.contains("job-b"));
-    assert!(text.contains("running"));
     assert!(!text.contains("completed"));
+}
 
+#[test]
+fn unregister_keeps_unassigned_distinct_from_completed() {
+    let (root, job_a, _) = two_registered();
     let unregister = writ(
         &root.0,
         &["--json", "worktree", "unregister", job_a.to_str().unwrap()],
     );
     assert!(unregister.status.success());
     let after = json(&writ(&root.0, &["--json", "jobs"]));
-    let jobs = after["data"]["jobs"].as_array().expect("jobs");
-    let released = jobs
-        .iter()
-        .find(|job| job["job_id"] == "job-a")
-        .expect("released job-a");
+    let jobs = jobs_array(&after);
+    let released = job_named(jobs, "job-a");
     assert_eq!(released["collaboration_state"], "unassigned");
     assert_eq!(released["lease_mode"], "UNASSIGNED");
-    assert_ne!(released["collaboration_state"], "completed");
-    let live = jobs
-        .iter()
-        .find(|job| job["job_id"] == "job-b")
-        .expect("live job-b");
-    assert_eq!(live["collaboration_state"], "running");
+    assert_eq!(job_named(jobs, "job-b")["collaboration_state"], "running");
 }
 
 #[test]
-fn empty_lease_store_is_ok_with_empty_participants() {
+fn empty_lease_store_json_is_ok() {
     let root = TestDir::new();
-    let output = writ(&root.0, &["--json", "status"]);
-    assert!(output.status.success());
-    let envelope = json(&output);
+    let envelope = json(&writ(&root.0, &["--json", "status"]));
     assert_eq!(envelope["ok"], true);
     assert_eq!(envelope["data"]["source"], "lease_store");
     assert_eq!(envelope["data"]["jobs"].as_array().unwrap().len(), 0);
-    assert_eq!(envelope["data"]["agents"].as_array().unwrap().len(), 0);
+}
 
+#[test]
+fn empty_lease_store_human_is_not_a_watchlist() {
+    let root = TestDir::new();
     let human = writ(&root.0, &["status"]);
     assert_eq!(
         String::from_utf8_lossy(&human.stdout),

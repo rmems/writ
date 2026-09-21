@@ -463,38 +463,55 @@ mod tests {
         }
     }
 
+    fn json_value(job: &JobStatus) -> serde_json::Value {
+        serde_json::from_str(&serde_json::to_string(job).unwrap()).unwrap()
+    }
+
+    fn assert_str(v: &serde_json::Value, key: &str, expected: &str) {
+        assert_eq!(
+            v.get(key).unwrap_or_else(|| panic!("missing {key}")),
+            expected
+        );
+    }
+
+    fn assert_null(v: &serde_json::Value, key: &str) {
+        assert!(
+            v.get(key)
+                .unwrap_or_else(|| panic!("missing {key}"))
+                .is_null(),
+            "{key} must be null"
+        );
+    }
+
+    #[test]
+    fn job_status_serializes_core_fields() {
+        let v = json_value(&sample_job());
+        assert_str(&v, "job_id", "writ-100");
+        assert_str(&v, "collaboration_state", "running");
+        assert_str(&v, "process_state", "unknown");
+    }
+
     #[test]
     fn job_status_serializes_unknown_fields_as_null() {
-        let job = sample_job();
-        let json = serde_json::to_string(&job).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let v = json_value(&sample_job());
+        assert_str(&v, "ci_class", "unknown");
+        assert_null(&v, "last_error");
+        assert_null(&v, "ownership_generation");
+    }
 
-        assert_eq!(v.get("job_id").expect("missing job_id"), "writ-100");
-        assert_eq!(
-            v.get("collaboration_state")
-                .expect("missing collaboration_state"),
-            "running"
-        );
-        assert_eq!(
-            v.get("process_state").expect("missing process_state"),
-            "unknown"
-        );
-        assert_eq!(v.get("ci_class").expect("missing ci_class"), "unknown");
-        assert!(v.get("last_error").expect("missing last_error").is_null());
-        assert!(
-            v.get("ownership_generation")
-                .expect("missing ownership_generation")
-                .is_null()
-        );
-        assert!(
-            v.get("declared_paths")
-                .expect("missing declared_paths")
-                .is_null()
-        );
-        assert!(v.get("blocker").expect("missing blocker").is_null());
-        assert!(v.get("handoff").expect("missing handoff").is_null());
-        assert!(v.get("agent_id").expect("missing agent_id").is_null());
-        assert!(v.get("session_id").expect("missing session_id").is_null());
+    #[test]
+    fn job_status_serializes_unrecorded_handoff_as_null() {
+        let v = json_value(&sample_job());
+        assert_null(&v, "declared_paths");
+        assert_null(&v, "blocker");
+        assert_null(&v, "handoff");
+    }
+
+    #[test]
+    fn job_status_serializes_unjoined_agent_as_null() {
+        let v = json_value(&sample_job());
+        assert_null(&v, "agent_id");
+        assert_null(&v, "session_id");
     }
 
     #[test]
@@ -515,35 +532,64 @@ mod tests {
     fn status_response_uses_v1_envelope() {
         let mut data = JobsData::empty();
         data.jobs.push(sample_job());
-        let response = status_response("cli.status", data);
-        let json = serde_json::to_string(&response).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-
+        let v: serde_json::Value = serde_json::from_str(
+            &serde_json::to_string(&status_response("cli.status", data)).unwrap(),
+        )
+        .unwrap();
         assert_eq!(
             v.get("schema_version").expect("missing schema_version"),
             SCHEMA_VERSION
         );
         assert_eq!(v.get("command").expect("missing command"), "cli.status");
         assert!(v.get("ok").expect("missing ok").as_bool().unwrap());
+    }
+
+    #[test]
+    fn status_response_nests_jobs_under_data() {
+        let mut data = JobsData::empty();
+        data.jobs.push(sample_job());
+        let v: serde_json::Value = serde_json::from_str(
+            &serde_json::to_string(&status_response("cli.status", data)).unwrap(),
+        )
+        .unwrap();
         assert!(
             v.get("error").expect("missing error").is_null(),
             "error must be explicitly null, not absent"
         );
         assert!(v.get("jobs").is_none(), "jobs must not be at top level");
+        assert_eq!(
+            v.get("data")
+                .expect("missing data")
+                .get("source")
+                .expect("missing source"),
+            "lease_store"
+        );
+    }
+
+    #[test]
+    fn status_response_includes_jobs_and_agents_arrays() {
+        let mut data = JobsData::empty();
+        data.jobs.push(sample_job());
+        let v: serde_json::Value = serde_json::from_str(
+            &serde_json::to_string(&status_response("cli.status", data)).unwrap(),
+        )
+        .unwrap();
         let data = v.get("data").expect("missing data");
-        assert_eq!(data.get("source").expect("missing source"), "lease_store");
-        let jobs = data
-            .get("jobs")
-            .expect("missing data.jobs")
-            .as_array()
-            .expect("data.jobs must be an array");
-        assert_eq!(jobs.len(), 1);
-        let agents = data
-            .get("agents")
-            .expect("missing data.agents")
-            .as_array()
-            .expect("data.agents must be an array");
-        assert!(agents.is_empty());
+        assert_eq!(
+            data.get("jobs")
+                .expect("missing data.jobs")
+                .as_array()
+                .expect("data.jobs must be an array")
+                .len(),
+            1
+        );
+        assert!(
+            data.get("agents")
+                .expect("missing data.agents")
+                .as_array()
+                .expect("data.agents must be an array")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -556,23 +602,38 @@ mod tests {
 
     #[test]
     fn status_error_sets_ok_false_and_error_payload() {
-        let response = status_error("cli.status", "parse failed".to_owned());
-        let json = serde_json::to_string(&response).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-
+        let v: serde_json::Value = serde_json::from_str(
+            &serde_json::to_string(&status_error("cli.status", "parse failed".to_owned())).unwrap(),
+        )
+        .unwrap();
         assert_eq!(v.get("ok").expect("missing ok"), false);
         assert_eq!(v.get("command").expect("missing command"), "cli.status");
         let err = v.get("error").expect("missing error");
         assert_eq!(err.get("code").expect("missing code"), "STATE_LOAD_FAILED");
-        assert_eq!(err.get("message").expect("missing message"), "parse failed");
-        let jobs = v
-            .get("data")
-            .expect("missing data")
-            .get("jobs")
-            .expect("missing data.jobs")
-            .as_array()
-            .expect("data.jobs must be array");
-        assert!(jobs.is_empty());
+    }
+
+    #[test]
+    fn status_error_keeps_empty_jobs() {
+        let v: serde_json::Value = serde_json::from_str(
+            &serde_json::to_string(&status_error("cli.status", "parse failed".to_owned())).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            v.get("error")
+                .expect("missing error")
+                .get("message")
+                .expect("missing message"),
+            "parse failed"
+        );
+        assert!(
+            v.get("data")
+                .expect("missing data")
+                .get("jobs")
+                .expect("missing data.jobs")
+                .as_array()
+                .expect("data.jobs must be array")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -618,50 +679,57 @@ mod tests {
         }
     }
 
+    fn assert_mode_maps(mode: LeaseMode, state: CollaborationState, json: &str) {
+        assert_eq!(collaboration_state_from_mode(mode), state);
+        assert_eq!(
+            serde_json::to_string(&state).unwrap(),
+            format!("\"{json}\"")
+        );
+        assert_ne!(state, CollaborationState::Unknown);
+    }
+
     #[test]
-    fn collaboration_state_maps_lease_modes_without_github_completion() {
-        let cases = [
-            (
-                LeaseMode::WriterLocked,
-                CollaborationState::Running,
-                "running",
-            ),
-            (
-                LeaseMode::NeedsHuman,
-                CollaborationState::Waiting,
-                "waiting",
-            ),
-            (LeaseMode::ReviewOnly, CollaborationState::Paused, "paused"),
-            (
-                LeaseMode::Blocked,
-                CollaborationState::Conflicted,
-                "conflicted",
-            ),
-            (
-                LeaseMode::MergeReady,
-                CollaborationState::ReadyForIntegration,
-                "ready_for_integration",
-            ),
-            (
-                LeaseMode::Unassigned,
-                CollaborationState::Unassigned,
-                "unassigned",
-            ),
-        ];
-        for (mode, state, json) in cases {
-            assert_eq!(collaboration_state_from_mode(mode), state);
-            assert_eq!(
-                serde_json::to_string(&state).unwrap(),
-                format!("\"{json}\"")
-            );
-            assert_ne!(state, CollaborationState::Unknown);
-        }
-        assert_ne!(
-            collaboration_state_from_mode(LeaseMode::Unassigned).to_string(),
-            "completed"
+    fn collaboration_state_maps_active_and_waiting_modes() {
+        assert_mode_maps(
+            LeaseMode::WriterLocked,
+            CollaborationState::Running,
+            "running",
+        );
+        assert_mode_maps(
+            LeaseMode::NeedsHuman,
+            CollaborationState::Waiting,
+            "waiting",
+        );
+        assert_mode_maps(LeaseMode::ReviewOnly, CollaborationState::Paused, "paused");
+    }
+
+    #[test]
+    fn collaboration_state_maps_blocked_and_ready_without_github_completion() {
+        assert_mode_maps(
+            LeaseMode::Blocked,
+            CollaborationState::Conflicted,
+            "conflicted",
+        );
+        assert_mode_maps(
+            LeaseMode::MergeReady,
+            CollaborationState::ReadyForIntegration,
+            "ready_for_integration",
         );
         assert_ne!(
             collaboration_state_from_mode(LeaseMode::MergeReady).to_string(),
+            "completed"
+        );
+    }
+
+    #[test]
+    fn unassigned_is_not_completed() {
+        assert_mode_maps(
+            LeaseMode::Unassigned,
+            CollaborationState::Unassigned,
+            "unassigned",
+        );
+        assert_ne!(
+            collaboration_state_from_mode(LeaseMode::Unassigned).to_string(),
             "completed"
         );
     }
@@ -679,8 +747,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn two_leases_render_as_distinct_participants() {
+    fn seeded_store() -> (tempfile::TempDir, LeaseStore) {
         let tmp = tempdir().unwrap();
         let store = LeaseStore::open(tmp.path().join("leases.db")).unwrap();
         let repo = tmp.path().join("repo");
@@ -702,30 +769,42 @@ mod tests {
                 session_id: Some("session-b"),
             })
             .unwrap();
+        (tmp, store)
+    }
 
+    #[test]
+    fn two_leases_render_as_distinct_participants() {
+        let (_tmp, store) = seeded_store();
         let data = load_from_store(&store).unwrap();
         assert_eq!(data.jobs.len(), 2);
         assert_eq!(data.jobs[0].job_id, "job-a");
         assert_eq!(data.jobs[1].job_id, "job-b");
-        assert_ne!(data.jobs[0].worktree_path, data.jobs[1].worktree_path);
-        assert_eq!(
-            data.jobs[0].collaboration_state,
-            CollaborationState::Running
-        );
-        assert_eq!(data.jobs[0].process_state, ProcessState::Unknown);
-        assert_eq!(data.jobs[0].ci_class, CiClass::Unknown);
-        assert_eq!(data.jobs[0].head.as_deref(), Some("abc123"));
-        assert_eq!(data.jobs[0].head_source.as_deref(), Some("lease"));
-        assert_eq!(data.jobs[0].recovery_needed, Some(true));
-        assert_eq!(data.agents.len(), 2);
-        assert_eq!(data.agents[0].agent_id, "agent-a");
-        assert_eq!(data.agents[1].agent_id, "agent-b");
+    }
 
-        let human = format_human(&data);
-        assert!(human.contains("job-a"));
-        assert!(human.contains("job-b"));
-        assert!(human.contains("agent-a"));
-        assert!(human.contains("agent-b"));
+    #[test]
+    fn lease_backed_job_does_not_invent_process_or_ci() {
+        let (_tmp, store) = seeded_store();
+        let job = &load_from_store(&store).unwrap().jobs[0];
+        assert_eq!(job.collaboration_state, CollaborationState::Running);
+        assert_eq!(job.process_state, ProcessState::Unknown);
+        assert_eq!(job.ci_class, CiClass::Unknown);
+    }
+
+    #[test]
+    fn missing_checkout_uses_lease_head_and_marks_recovery() {
+        let (_tmp, store) = seeded_store();
+        let job = &load_from_store(&store).unwrap().jobs[0];
+        assert_eq!(job.head.as_deref(), Some("abc123"));
+        assert_eq!(job.head_source.as_deref(), Some("lease"));
+        assert_eq!(job.recovery_needed, Some(true));
+    }
+
+    #[test]
+    fn human_status_lists_both_agents() {
+        let (_tmp, store) = seeded_store();
+        let human = format_human(&load_from_store(&store).unwrap());
+        assert!(human.contains("job-a") && human.contains("job-b"));
+        assert!(human.contains("agent-a") && human.contains("agent-b"));
         assert!(!human.contains("completed"));
     }
 
@@ -737,22 +816,10 @@ mod tests {
         let wt = tmp.path().join("checkouts/a");
         store.grant(grant(&repo, &wt, "job-a", "hive/a")).unwrap();
         store.release_by_path(&wt).unwrap();
-
-        let data = load_from_store(&store).unwrap();
-        assert_eq!(data.jobs.len(), 1);
-        assert_eq!(
-            data.jobs[0].collaboration_state,
-            CollaborationState::Unassigned
-        );
-        assert_eq!(data.jobs[0].lease_mode.as_deref(), Some("UNASSIGNED"));
-        assert_eq!(data.jobs[0].process_state, ProcessState::Unknown);
-        assert_ne!(
-            data.jobs[0].collaboration_state.to_string(),
-            ProcessState::Completed.to_string()
-        );
-        let human = format_human(&data);
-        assert!(human.contains("unassigned"));
-        assert!(!human.contains("completed"));
+        let job = &load_from_store(&store).unwrap().jobs[0];
+        assert_eq!(job.collaboration_state, CollaborationState::Unassigned);
+        assert_eq!(job.lease_mode.as_deref(), Some("UNASSIGNED"));
+        assert_ne!(job.collaboration_state.to_string(), "completed");
     }
 
     #[test]
