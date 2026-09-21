@@ -450,12 +450,21 @@ mod tests {
         ] {
             assert_eq!(format_attribution(config, sha), expected);
         }
+    }
+
+    #[test]
+    fn canonicalize_rejects_injected_newlines_and_non_hex_sha() {
         assert_eq!(
             canonicalize_agent_id("evil\n---\nspoofed"),
             "evil --- spoofed"
         );
         assert_eq!(sanitize_commit_sha(Some("abc1234")), Some("abc1234"));
         assert_eq!(sanitize_commit_sha(Some("not a sha")), None);
+        assert_eq!(
+            super::canonicalize_label("evil\n---"),
+            Some("evil ---".to_owned())
+        );
+        assert_eq!(super::canonicalize_label("  "), None);
     }
 
     #[test]
@@ -484,6 +493,10 @@ mod tests {
             format_attribution(&partial, None),
             "worktrees-hives agent | branch cursor/foo"
         );
+    }
+
+    #[test]
+    fn collaboration_identity_from_env() {
         let from_env = AttributionConfig::from_vars([
             ("WRIT_TASK_ID", "RM-128"),
             ("WRIT_BRANCH", "cursor/foo"),
@@ -492,11 +505,6 @@ mod tests {
         assert_eq!(from_env.task_id.as_deref(), Some("RM-128"));
         assert_eq!(from_env.branch.as_deref(), Some("cursor/foo"));
         assert_eq!(from_env.session_id.as_deref(), Some("bc-abc"));
-        assert_eq!(
-            super::canonicalize_label("evil\n---"),
-            Some("evil ---".to_owned())
-        );
-        assert_eq!(super::canonicalize_label("  "), None);
     }
 
     struct ReplyCase<'a> {

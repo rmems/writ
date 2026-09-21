@@ -1157,18 +1157,8 @@ mod tests {
         action
     }
 
-    #[test]
-    fn attribution_format_parser_accepts_identity_and_sha() {
-        let super::AttributionAction::Format {
-            body,
-            agent_id,
-            commit_sha,
-            task,
-            branch,
-            session,
-            pr_comment: false,
-            ..
-        } = parse_format(&[
+    fn parsed_identity_format() -> super::AttributionAction {
+        parse_format(&[
             "writ",
             "attribution",
             "format",
@@ -1185,23 +1175,33 @@ mod tests {
             "--session",
             "bc-fa8ed877",
         ])
+    }
+
+    #[test]
+    fn attribution_format_parser_accepts_identity_and_sha() {
+        let super::AttributionAction::Format {
+            body,
+            agent_id,
+            commit_sha,
+            task,
+            branch,
+            session,
+            pr_comment: false,
+            ..
+        } = parsed_identity_format()
         else {
             panic!("expected attribution format command")
         };
+        assert_eq!(body, "Looks good!");
         assert_eq!(
+            agent_id.as_deref(),
+            Some("Claude Code: worktrees-hives agent")
+        );
+        assert_eq!(commit_sha.as_deref(), Some("abc1234"));
+        assert_eq!(task.as_deref(), Some("RM-128"));
+        assert_eq!(
+            (branch.as_deref(), session.as_deref()),
             (
-                body.as_str(),
-                agent_id.as_deref(),
-                commit_sha.as_deref(),
-                task.as_deref(),
-                branch.as_deref(),
-                session.as_deref()
-            ),
-            (
-                "Looks good!",
-                Some("Claude Code: worktrees-hives agent"),
-                Some("abc1234"),
-                Some("RM-128"),
                 Some("cursor/reply-attribution-config-6e46"),
                 Some("bc-fa8ed877")
             )
