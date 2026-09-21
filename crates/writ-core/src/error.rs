@@ -51,6 +51,39 @@ pub struct WorktreePostconditionFailure {
     pub reason: String,
 }
 
+/// Fail-closed interrupted registration that must not be cleaned up automatically.
+#[derive(Debug)]
+pub struct LeaseAttentionFailure {
+    pub operation_id: String,
+    pub allocation_state: String,
+    pub classification: String,
+    pub conflicts: Vec<String>,
+    pub path: PathBuf,
+    pub path_exists: bool,
+    pub branch_commit: Option<String>,
+    pub head_commit: Option<String>,
+    pub worktree_registered: bool,
+}
+
+impl Display for LeaseAttentionFailure {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "lease allocation `{}` needs attention (state={} class={}): {}; \
+             residual_state path_exists={} registered={} branch_commit={} head_commit={}; \
+             automatic cleanup skipped because concurrent adoption cannot be disproven",
+            self.operation_id,
+            self.allocation_state,
+            self.classification,
+            self.conflicts.join("; "),
+            self.path_exists,
+            self.worktree_registered,
+            self.branch_commit.as_deref().unwrap_or("<absent>"),
+            self.head_commit.as_deref().unwrap_or("<absent>")
+        )
+    }
+}
+
 /// Residual state after a failed exact-object PR-head import.
 #[derive(Debug)]
 pub struct PrImportFailure {
@@ -161,6 +194,8 @@ pub enum Error {
         context: &'static str,
         message: String,
     },
+    /// Interrupted registration evidence is partial or conflicting.
+    LeaseAttention(Box<LeaseAttentionFailure>),
 }
 
 /// Machine-readable error codes for policy violations.
@@ -190,6 +225,18 @@ pub enum PolicyCode {
     UnauthorizedSource,
     /// A job's active lease is held by a different worktree path.
     LeaseConflict,
+    /// Reconciliation found partial or conflicting git/lease evidence.
+    LeaseNeedsAttention,
+    /// A released lease cannot be resurrected by reconcile or prepare.
+    LeaseReleased,
+    /// A tombstoned lease cannot be resurrected by reconcile or prepare.
+    LeaseTombstoned,
+    /// No live lease exists for the requested coordination claim.
+    CoordClaimMissing,
+    /// Another agent already owns this job claim; pause is not a seize.
+    CoordClaimHeld,
+    /// A handoff ACK named a stale owner generation.
+    CoordStaleGeneration,
 }
 
 impl PolicyCode {
@@ -209,6 +256,12 @@ impl PolicyCode {
             Self::OwnerNotAllowed => "OWNER_NOT_ALLOWED",
             Self::UnauthorizedSource => "UNAUTHORIZED_SOURCE",
             Self::LeaseConflict => "LEASE_CONFLICT",
+            Self::LeaseNeedsAttention => "LEASE_NEEDS_ATTENTION",
+            Self::LeaseReleased => "LEASE_RELEASED",
+            Self::LeaseTombstoned => "LEASE_TOMBSTONED",
+            Self::CoordClaimMissing => "COORD_CLAIM_MISSING",
+            Self::CoordClaimHeld => "COORD_CLAIM_HELD",
+            Self::CoordStaleGeneration => "COORD_STALE_GENERATION",
         }
     }
 }
@@ -283,6 +336,7 @@ impl Display for Error {
             Self::LeaseStore { context, message } => {
                 write!(f, "{context}: {message}")
             }
+            Self::LeaseAttention(failure) => Display::fmt(failure.as_ref(), f),
         }
     }
 }
@@ -314,6 +368,7 @@ impl Error {
             Self::PrImportFailed(_) => "PR_IMPORT_FAILED",
             Self::PolicyViolation { code, .. } => code.as_str(),
             Self::LeaseStore { .. } => "LEASE_STORE_FAILED",
+            Self::LeaseAttention(_) => "LEASE_NEEDS_ATTENTION",
         }
     }
 

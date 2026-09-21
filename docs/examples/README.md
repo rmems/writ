@@ -24,6 +24,8 @@ All of them, under `--json`:
 | `git-safe` / `gh-safe` | `git.safe` / `gh.safe` |
 | `worktree register\|unregister\|inspect\|list` | `worktree.register` etc. |
 | `worktree create\|remove\|prune` | `worktree.create` etc. (deprecated) |
+| `lease inspect\|reconcile` | `lease.inspect` / `lease.reconcile` |
+| `coord announce\|show\|list\|inbox\|send\|ack\|pause\|handoff` | `coord.announce` etc. |
 | `install` | `cli.install` |
 | `hook` | no envelope even under `--json`: PreToolUse is allow/block via exit code; a WorktreeCreate event prints the registered checkout path only when the path is an existing git checkout — missing, nonexistent, or non-git paths produce no stdout |
 

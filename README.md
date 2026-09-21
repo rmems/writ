@@ -145,7 +145,7 @@ Two layers, one binary.
 | **Coordination state** (cross-repo) *(planned, M1)* | Agents, leases with path scopes, ownership, blockers, freeze modes. SQLite, single file, derived from `git`/`gh`/disk. Not implemented yet | Task decomposition or scheduling |
 | `git`, `gh`, OS | Version-control, GitHub, and process primitives, invoked through allowlists | Policy |
 
-Leases are the join: coordination state that the enforcement layer checks at write time. Phase 1 ships a SQLite skeleton (`leases.db`) so create/remove is not a Markdown-only control plane. Budget columns are reserved and unused; enforcement is [#167](https://github.com/rmems/writ/issues/167).
+Leases are the join: coordination state that the enforcement layer checks at write time. Phase 1 ships SQLite (`leases.db`, `WRIT_LEASE_PATH`) with a prepare/inspect/reconcile protocol so a crash between checkout registration and the lease row can be classified without adopting unproven ownership. Budget columns are reserved; `fix_cycles` is the only accumulated counter and uses the same prepare/commit journal. Enforcement of budgets is [#167](https://github.com/rmems/writ/issues/167).
 
 ```text
                     ┌─────────────────────────┐
@@ -211,6 +211,8 @@ Implemented `writ` surface (`writ --help` is authoritative):
 | `writ gh-safe …` | Implemented | Run a `gh` command after the allowlist. GitHub PR merge operations are rejected. |
 | `writ supervisor run --timeout <secs> …` | Implemented | Spawn a child with wall-clock timeout. Unix kills the process group; Windows kills only the direct child (grandchildren may survive). |
 | `writ worktree register\|unregister\|inspect\|list` | Implemented | Coordination records for harness-owned checkouts. Register/unregister never touch files or branches. |
+| `writ lease inspect\|reconcile` | Implemented | Read-only identity report and crash recovery for interrupted registration. Never deletes unproven checkouts. |
+| `writ coord announce\|inbox\|send\|ack\|pause\|handoff` | Implemented | Same-host claims/messages on `leases.db`. Path overlap is advisory; pause does not seize WIP. |
 | `writ worktree create\|remove\|prune` | Deprecated | Managed lifecycle kept for caller compatibility during the transition. `create` requires `--schema-version 2` and `--start-point`. |
 | `writ --json` | Implemented | Version-1 JSON envelopes on stdout; diagnostics on stderr. Fixtures: [`docs/examples/`](docs/examples/). |
 | `writ install` / hook dispatcher | **Planned (M1)** | Register unbypassable hooks. Not a command today. |

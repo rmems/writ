@@ -11,7 +11,10 @@ use std::process::Output;
 
 use crate::error::{Error, PolicyCode, Result};
 use crate::git_cmd::git_in;
-use crate::lease::{Lease, LeaseGrant, LeaseStore};
+use crate::lease::{
+    AllocateRequest, AllocationState, JobKey, Lease, LeaseGrant, LeaseStore, ReconcileOutcome,
+    attention_error,
+};
 
 /// Sentinel branch value recorded for a checkout on a detached HEAD.
 ///
@@ -81,15 +84,87 @@ impl CheckoutRegistry {
     /// common dir with other worktrees, or may be a standalone clone.
     pub fn register(&self, path: &Path, job_id: &str) -> Result<CheckoutInfo> {
         let info = inspect_checkout(path)?;
-        self.leases.grant(LeaseGrant {
+        let branch = info.branch.as_deref().unwrap_or(DETACHED_BRANCH);
+        let start_commit = info.head_commit.as_deref().unwrap_or("");
+        let requested_start_point = info
+            .branch
+            .as_deref()
+            .map(|name| format!("refs/heads/{name}"))
+            .unwrap_or_else(|| "HEAD".to_owned());
+        let key = JobKey {
+            owner: &info.owner,
+            repo_name: &info.repo_name,
+            job_id,
+        };
+        let grant = LeaseGrant {
             repo: &info.common_dir,
             owner: &info.owner,
             repo_name: &info.repo_name,
             job_id,
-            branch: info.branch.as_deref().unwrap_or(DETACHED_BRANCH),
+            branch,
             worktree_path: &info.path,
-            start_commit: info.head_commit.as_deref().unwrap_or(""),
+            start_commit,
+        };
+
+        if let Some(existing) = self.leases.find_job(key)? {
+            match existing.allocation_state {
+                AllocationState::Active | AllocationState::Released => {
+                    self.leases.grant(grant)?;
+                    return Ok(info);
+                }
+                AllocationState::Tombstoned => {
+                    return Err(crate::error::Error::PolicyViolation {
+                        code: crate::error::PolicyCode::LeaseTombstoned,
+                        message: format!(
+                            "refusing to resurrect tombstoned lease for {}/{}/{job_id}",
+                            info.owner, info.repo_name
+                        ),
+                    });
+                }
+                AllocationState::Prepared
+                | AllocationState::Mutating
+                | AllocationState::NeedsAttention
+                | AllocationState::Aborted => {
+                    if let Some(outcome) = self.leases.reconcile(key, &info.common_dir)? {
+                        match outcome {
+                            ReconcileOutcome::Promoted { .. }
+                            | ReconcileOutcome::AlreadyActive { .. } => return Ok(info),
+                            ReconcileOutcome::Retry { .. } => {}
+                            ReconcileOutcome::NeedsAttention { lease, inspection } => {
+                                return Err(attention_error(&lease, &inspection));
+                            }
+                            ReconcileOutcome::Released { .. } => {
+                                self.leases.grant(grant)?;
+                                return Ok(info);
+                            }
+                            ReconcileOutcome::Tombstoned { lease, .. } => {
+                                return Err(crate::error::Error::PolicyViolation {
+                                    code: crate::error::PolicyCode::LeaseTombstoned,
+                                    message: format!(
+                                        "refusing to resurrect tombstoned lease {}",
+                                        lease.operation_id
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let prepared = self.leases.prepare_allocate(AllocateRequest {
+            repo: &info.common_dir,
+            owner: &info.owner,
+            repo_name: &info.repo_name,
+            job_id,
+            branch,
+            worktree_path: &info.path,
+            requested_start_point: &requested_start_point,
+            start_commit,
+            ttl: None,
         })?;
+        self.leases.mark_mutating(&prepared.operation_id)?;
+        self.leases.commit_allocate(&prepared.operation_id)?;
         Ok(info)
     }
 
