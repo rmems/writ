@@ -41,7 +41,7 @@ treat JSON `null` as unknown rather than inferring a value.
 
 When the lease store cannot be opened or queried:
 
-1. **Stdout** still receives a v1 envelope with `ok: false`, empty `jobs` /
+1. **Stdout** still receives a v2 envelope with `ok: false`, empty `jobs` /
    `agents`, `source: "lease_store"`, and
    `error: { "code": "STATE_LOAD_FAILED", "message": "..." }`.
 2. **Process exit code is non-zero**.

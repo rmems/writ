@@ -257,7 +257,7 @@ Implemented `writ` surface (`writ --help` is authoritative):
 | `writ worktree register\|unregister\|inspect\|list` | Implemented | Coordination records for harness-owned checkouts. Register/unregister never touch files or branches. |
 | `writ worktree create\|remove\|prune` | Deprecated | Managed lifecycle kept for caller compatibility during the transition. `create` requires `--schema-version 2` and `--start-point`. |
 | `writ attribution format` | Implemented | Render review and collaboration replies with real agent/task/branch/session identity. Include a SHA only when one exists; never invent one. |
-| `writ --json` | Implemented | Version-1 JSON envelopes on stdout; diagnostics on stderr. Fixtures: [`docs/examples/`](docs/examples/). |
+| `writ --json` | Implemented | Envelope-producing commands emit versioned JSON on stdout (generic v1; status/jobs v2); diagnostics on stderr. Exceptions: `hook --json` has no envelope; `git-safe`/`gh-safe` validation failures and `install` failures emit stderr only. See the [`CLI contract`](docs/cli-contract.md) and [`fixtures`](docs/examples/). |
 | `writ install` / hook dispatcher | Implemented | Registers `writ hook` into `.claude/settings.json`; burn-in outstanding ([#124](https://github.com/rmems/writ/issues/124)). |
 
 JSON envelopes look like:
@@ -414,6 +414,7 @@ criteria checkboxes, and the Linear footer documented in
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — issue templates and canonical labels
 - [`SKILL.md`](SKILL.md) — portable agent procedure (guidance, not a security boundary)
 - [`docs/install.md`](docs/install.md) — clone + symlink skill install, cross-agent roots, uninstall
+- [`docs/cli-contract.md`](docs/cli-contract.md) — command, JSON envelope, exit-code, persistence, and lifecycle compatibility matrix
 - [`REVIEW.md`](REVIEW.md) — pull-request lifecycle and review checklist
 - [`docs/adr/0001-rust-only-v1-runtime-and-babysit-pr-boundary.md`](docs/adr/0001-rust-only-v1-runtime-and-babysit-pr-boundary.md) — v1 Rust-only runtime and Codex `babysit-pr` boundary
 - [`docs/workflows/safe-issue-verified-commit.md`](docs/workflows/safe-issue-verified-commit.md) — issue → verified push
