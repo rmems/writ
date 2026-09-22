@@ -257,7 +257,7 @@ Implemented `writ` surface (`writ --help` is authoritative):
 | `writ worktree register\|unregister\|inspect\|list` | Implemented | Coordination records for harness-owned checkouts. Register/unregister never touch files or branches. |
 | `writ worktree create\|remove\|prune` | Deprecated | Managed lifecycle kept for caller compatibility during the transition. `create` requires `--schema-version 2` and `--start-point`. |
 | `writ attribution format` | Implemented | Render review and collaboration replies with real agent/task/branch/session identity. Include a SHA only when one exists; never invent one. |
-| `writ --json` | Implemented | Versioned JSON envelopes on stdout (generic v1; status/jobs v2); diagnostics on stderr. See the [`CLI contract`](docs/cli-contract.md) and [`fixtures`](docs/examples/). |
+| `writ --json` | Implemented | Envelope-producing commands emit versioned JSON on stdout (generic v1; status/jobs v2); diagnostics on stderr. Exceptions: `hook --json` has no envelope; `git-safe`/`gh-safe` validation failures and `install` failures emit stderr only. See the [`CLI contract`](docs/cli-contract.md) and [`fixtures`](docs/examples/). |
 | `writ install` / hook dispatcher | Implemented | Registers `writ hook` into `.claude/settings.json`; burn-in outstanding ([#124](https://github.com/rmems/writ/issues/124)). |
 
 JSON envelopes look like:
