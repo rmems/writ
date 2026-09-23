@@ -34,28 +34,20 @@ pub(super) const LIVE_PATH_LOOKUP: &str = "WHERE worktree_path = ?1
                 id DESC
                 LIMIT 1";
 
-pub(super) fn query_lease_locked(
-    conn: &Connection,
-    where_sql: &str,
-    sql_params: impl rusqlite::Params,
-    context: &'static str,
-) -> Result<Option<Lease>> {
-    let query = format!("{} {where_sql}", lease_select_sql(conn)?);
-    conn.query_row(&query, sql_params, lease_from_row)
-        .optional()
-        .map_err(|e| lease_err(context, e))
+pub(super) struct LeaseLookup<'a, P> {
+    pub where_sql: &'a str,
+    pub sql_params: P,
+    pub context: &'static str,
 }
 
-pub(crate) fn query_lease_tx(
-    tx: &rusqlite::Transaction<'_>,
-    where_sql: &str,
-    sql_params: impl rusqlite::Params,
-    context: &'static str,
+pub(super) fn lookup_lease<P: rusqlite::Params>(
+    conn: &Connection,
+    lookup: LeaseLookup<'_, P>,
 ) -> Result<Option<Lease>> {
-    let query = format!("{} {where_sql}", lease_select_sql(tx)?);
-    tx.query_row(&query, sql_params, lease_from_row)
+    let query = format!("{} {}", lease_select_sql(conn)?, lookup.where_sql);
+    conn.query_row(&query, lookup.sql_params, lease_from_row)
         .optional()
-        .map_err(|e| lease_err(context, e))
+        .map_err(|e| lease_err(lookup.context, e))
 }
 
 pub(super) fn list_leases_on(

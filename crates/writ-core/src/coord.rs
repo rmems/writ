@@ -171,6 +171,14 @@ pub struct SendRequest<'a> {
     pub ack_of: Option<i64>,
 }
 
+/// Pause the current owner and emit help without deleting WIP.
+#[derive(Debug, Clone, Copy)]
+pub struct PauseRequest<'a> {
+    pub key: JobKey<'a>,
+    pub agent_id: &'a str,
+    pub body: Option<&'a str>,
+}
+
 const CLAIM_SELECT: &str = "SELECT c.owner, c.repo_name, c.job_id, c.branch, c.worktree_path, \
      c.agent_id, c.session_id, c.intent, c.declared_paths, c.owner_generation, \
      c.paused_at, l.allocation_state \
@@ -259,17 +267,10 @@ impl LeaseStore {
         {
             return Err(held_error(existing));
         }
-        let generation = match existing.as_ref() {
-            None => 1,
-            Some(claim) if claim.session_id.as_deref() != request.session_id => {
-                claim.owner_generation + 1
-            }
-            Some(claim) => claim.owner_generation,
-        };
+        let generation = next_owner_generation(existing.as_ref(), request.session_id);
         let paused_at = existing.as_ref().and_then(|claim| claim.paused_at);
         let (intent, overlaps) = persist_announce_tx(
             &tx,
-            key,
             AnnouncePersist {
                 request: &request,
                 lease: &lease,
@@ -339,28 +340,7 @@ impl LeaseStore {
 
     /// Append a mailbox message. `handoff` must use [`Self::propose_handoff`].
     pub fn send_message(&self, request: SendRequest<'_>) -> Result<CoordMessage> {
-        if request.kind == MessageKind::Handoff {
-            return Err(Error::LeaseStore {
-                context: "send coord message",
-                message: "handoff requires propose_handoff so owner_generation is bound".to_owned(),
-            });
-        }
-        if request.kind == MessageKind::Ack {
-            let Some(message_id) = request.ack_of else {
-                return Err(Error::LeaseStore {
-                    context: "send coord message",
-                    message: "ack requires --ack-of so coord ack can update the original message"
-                        .to_owned(),
-                });
-            };
-            let (ack, _) = self.ack_message(AckRequest {
-                message_id,
-                owner: request.owner,
-                repo_name: request.repo_name,
-                job_id: request.job_id,
-                agent_id: request.agent_id,
-                session_id: None,
-            })?;
+        if let Some(ack) = route_generic_ack(self, request)? {
             return Ok(ack);
         }
         require_complete_recipient(request)?;
@@ -378,34 +358,21 @@ impl LeaseStore {
             .map_err(|e| coord_err("begin coord send", e))?;
         let message = insert_message(
             &tx,
-            NewMessage {
-                kind: request.kind,
-                from_agent_id: request.agent_id,
-                from_owner: request.owner,
-                from_repo_name: request.repo_name,
-                from_job_id: request.job_id,
-                to_agent_id: request.to_agent_id,
-                to_owner: request.to_owner,
-                to_repo_name: request.to_repo_name,
-                to_job_id: request.to_job_id,
+            mailbox_from_send(MailboxDraft {
+                request: &request,
                 owner_generation: claim.owner_generation,
-                body: request.body,
                 paths: &paths,
-                ack_of: request.ack_of,
                 now,
-            },
+            }),
         )?;
         tx.commit().map_err(|e| coord_err("commit coord send", e))?;
         Ok(message)
     }
 
     /// Mark the current owner paused and emit help. Never deletes WIP.
-    pub fn pause_claim(
-        &self,
-        key: JobKey<'_>,
-        agent_id: &str,
-        body: Option<&str>,
-    ) -> Result<(CoordClaim, CoordMessage)> {
+    pub fn pause_claim(&self, request: PauseRequest<'_>) -> Result<(CoordClaim, CoordMessage)> {
+        let key = request.key;
+        let agent_id = request.agent_id;
         let lease = live_lease(self, key)?;
         let claim = require_agent_claim(self, key, agent_id)?;
         let now = now_secs();
@@ -438,7 +405,9 @@ impl LeaseStore {
                 to_repo_name: None,
                 to_job_id: None,
                 owner_generation: claim.owner_generation,
-                body: body.unwrap_or("owner paused; help needed without seizing WIP"),
+                body: request
+                    .body
+                    .unwrap_or("owner paused; help needed without seizing WIP"),
                 paths: &[],
                 ack_of: None,
                 now,
@@ -639,27 +608,22 @@ fn require_ack_recipient(
     if claim.agent_id != request.agent_id {
         return Err(held_error(&claim));
     }
-    if let Some(to_owner) = message.to_owner.as_deref()
-        && to_owner != request.owner
-    {
-        return Err(ack_recipient_error(request));
+    if ack_targets_request(message, request) {
+        Ok(())
+    } else {
+        Err(ack_recipient_error(request))
     }
-    if let Some(to_repo) = message.to_repo_name.as_deref()
-        && to_repo != request.repo_name
-    {
-        return Err(ack_recipient_error(request));
-    }
-    if let Some(to_job) = message.to_job_id.as_deref()
-        && to_job != request.job_id
-    {
-        return Err(ack_recipient_error(request));
-    }
-    if let Some(to_agent) = message.to_agent_id.as_deref()
-        && to_agent != request.agent_id
-    {
-        return Err(ack_recipient_error(request));
-    }
-    Ok(())
+}
+
+fn ack_targets_request(message: &CoordMessage, request: AckRequest<'_>) -> bool {
+    field_matches(message.to_owner.as_deref(), request.owner)
+        && field_matches(message.to_repo_name.as_deref(), request.repo_name)
+        && field_matches(message.to_job_id.as_deref(), request.job_id)
+        && field_matches(message.to_agent_id.as_deref(), request.agent_id)
+}
+
+fn field_matches(expected: Option<&str>, actual: &str) -> bool {
+    expected.is_none_or(|value| value == actual)
 }
 
 fn ack_recipient_error(request: AckRequest<'_>) -> Error {
@@ -847,14 +811,7 @@ fn load_claim_locked(conn: &Connection, key: JobKey<'_>) -> Result<Option<CoordC
 }
 
 fn load_claim_tx(tx: &rusqlite::Transaction<'_>, key: JobKey<'_>) -> Result<Option<CoordClaim>> {
-    let query = format!("{CLAIM_SELECT} WHERE c.owner = ?1 AND c.repo_name = ?2 AND c.job_id = ?3");
-    tx.query_row(
-        &query,
-        params![key.owner, key.repo_name, key.job_id],
-        claim_from_row,
-    )
-    .optional()
-    .map_err(|e| coord_err("lookup coord claim", e))
+    load_claim_locked(tx, key)
 }
 
 fn list_other_claims_tx(
@@ -1020,7 +977,6 @@ fn persist_announce_claim(tx: &rusqlite::Transaction<'_>, row: &AnnouncePersist<
 
 fn persist_announce_tx(
     tx: &rusqlite::Transaction<'_>,
-    key: JobKey<'_>,
     row: AnnouncePersist<'_>,
 ) -> Result<(CoordMessage, Vec<PathOverlap>)> {
     persist_announce_claim(tx, &row)?;
@@ -1033,7 +989,14 @@ fn persist_announce_tx(
             now: row.now,
         },
     )?;
-    let others = list_other_claims_tx(tx, key)?;
+    let others = list_other_claims_tx(
+        tx,
+        JobKey {
+            owner: row.request.owner,
+            repo_name: row.request.repo_name,
+            job_id: row.request.job_id,
+        },
+    )?;
     let overlaps = record_advisory_overlaps(
         tx,
         OverlapScan {
@@ -1231,6 +1194,69 @@ fn now_secs() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
         .unwrap_or(0)
+}
+
+fn next_owner_generation(existing: Option<&CoordClaim>, session_id: Option<&str>) -> i64 {
+    match existing {
+        None => 1,
+        Some(claim) if claim.session_id.as_deref() != session_id => claim.owner_generation + 1,
+        Some(claim) => claim.owner_generation,
+    }
+}
+
+fn route_generic_ack(store: &LeaseStore, request: SendRequest<'_>) -> Result<Option<CoordMessage>> {
+    if request.kind == MessageKind::Handoff {
+        return Err(Error::LeaseStore {
+            context: "send coord message",
+            message: "handoff requires propose_handoff so owner_generation is bound".to_owned(),
+        });
+    }
+    if request.kind != MessageKind::Ack {
+        return Ok(None);
+    }
+    let Some(message_id) = request.ack_of else {
+        return Err(Error::LeaseStore {
+            context: "send coord message",
+            message: "ack requires --ack-of so coord ack can update the original message"
+                .to_owned(),
+        });
+    };
+    let (ack, _) = store.ack_message(AckRequest {
+        message_id,
+        owner: request.owner,
+        repo_name: request.repo_name,
+        job_id: request.job_id,
+        agent_id: request.agent_id,
+        session_id: None,
+    })?;
+    Ok(Some(ack))
+}
+
+struct MailboxDraft<'a> {
+    request: &'a SendRequest<'a>,
+    owner_generation: i64,
+    paths: &'a [String],
+    now: i64,
+}
+
+fn mailbox_from_send(draft: MailboxDraft<'_>) -> NewMessage<'_> {
+    let request = draft.request;
+    NewMessage {
+        kind: request.kind,
+        from_agent_id: request.agent_id,
+        from_owner: request.owner,
+        from_repo_name: request.repo_name,
+        from_job_id: request.job_id,
+        to_agent_id: request.to_agent_id,
+        to_owner: request.to_owner,
+        to_repo_name: request.to_repo_name,
+        to_job_id: request.to_job_id,
+        owner_generation: draft.owner_generation,
+        body: request.body,
+        paths: draft.paths,
+        ack_of: request.ack_of,
+        now: draft.now,
+    }
 }
 
 #[cfg(test)]
@@ -1484,7 +1510,11 @@ mod tests {
         let peer = LeaseStore::open(&harness.path).unwrap();
         let (paused, help) = harness
             .store
-            .pause_claim(job_key_a(), "agent-a", Some("owner crashed"))
+            .pause_claim(PauseRequest {
+                key: job_key_a(),
+                agent_id: "agent-a",
+                body: Some("owner crashed"),
+            })
             .unwrap();
         assert!(paused.paused_at.is_some() && help.kind == MessageKind::Help);
         assert_eq!(fs::read_to_string(&wip).unwrap(), "keep me");

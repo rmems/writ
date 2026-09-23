@@ -2,7 +2,7 @@
 
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
-use super::query::query_lease_tx;
+use super::query::{LeaseLookup, lookup_lease};
 use super::{
     AllocationState, Error, FixCycleReconcile, FixCycleToken, JobKey, Lease, LeaseStore, Result,
     lease_err, new_operation_id, now_secs, schema, terminal_error,
@@ -17,11 +17,13 @@ impl LeaseStore {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| lease_err("begin fix-cycle prepare", e))?;
-        let lease = query_lease_tx(
+        let lease = lookup_lease(
             &tx,
-            "WHERE owner = ?1 AND repo_name = ?2 AND job_id = ?3",
-            params![key.owner, key.repo_name, key.job_id],
-            "lookup lease for fix-cycle",
+            LeaseLookup {
+                where_sql: "WHERE owner = ?1 AND repo_name = ?2 AND job_id = ?3",
+                sql_params: params![key.owner, key.repo_name, key.job_id],
+                context: "lookup lease for fix-cycle",
+            },
         )?
         .ok_or_else(|| Error::LeaseStore {
             context: "prepare fix-cycle",
@@ -270,11 +272,13 @@ fn pending_fix_lease(
     operation_id: &str,
     context: &'static str,
 ) -> Result<Lease> {
-    query_lease_tx(
+    lookup_lease(
         tx,
-        "WHERE pending_fix_op_id = ?1",
-        params![operation_id],
-        "lookup pending fix-cycle",
+        LeaseLookup {
+            where_sql: "WHERE pending_fix_op_id = ?1",
+            sql_params: params![operation_id],
+            context: "lookup pending fix-cycle",
+        },
     )?
     .ok_or_else(|| Error::LeaseStore {
         context,

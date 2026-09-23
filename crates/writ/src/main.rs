@@ -6,6 +6,7 @@ use std::time::Duration;
 use clap::{Args, Parser, Subcommand};
 
 mod coord;
+mod lease;
 mod watchlist;
 
 /// Manage isolated issue-to-PR jobs and their durable state.
@@ -71,7 +72,7 @@ enum Command {
     /// Crash-consistent lease inspection and reconciliation.
     Lease {
         #[command(subcommand)]
-        action: LeaseAction,
+        action: lease::LeaseAction,
     },
 
     /// Same-host coordination claims and overlap/help/handoff messages.
@@ -296,40 +297,6 @@ enum AttributionAction {
 }
 
 #[derive(Debug, Subcommand)]
-enum LeaseAction {
-    /// Report git and lease identity without mutating or adopting anything.
-    Inspect {
-        /// Repository root used to inspect branch, HEAD, and registration.
-        #[arg(long)]
-        repo: PathBuf,
-        /// GitHub-style owner segment.
-        owner: String,
-        /// Repository name segment.
-        repo_name: String,
-        /// Job id segment (e.g. gh-42).
-        job_id: String,
-        /// Branch name used when no lease row exists.
-        #[arg(long)]
-        branch: Option<String>,
-        /// Checkout path when no lease row exists (harness-owned location).
-        #[arg(long)]
-        path: Option<PathBuf>,
-    },
-    /// Reconcile an interrupted registration without destructive cleanup.
-    Reconcile {
-        /// Repository root used to inspect branch, HEAD, and registration.
-        #[arg(long)]
-        repo: PathBuf,
-        /// GitHub-style owner segment.
-        owner: String,
-        /// Repository name segment.
-        repo_name: String,
-        /// Job id segment (e.g. gh-42).
-        job_id: String,
-    },
-}
-
-#[derive(Debug, Subcommand)]
 enum SupervisorAction {
     /// Run a command under supervision.
     Run {
@@ -541,8 +508,8 @@ fn worktree_command_name(cli: &Cli) -> Option<&'static str> {
             WorktreeAction::Prune { .. } => "worktree.prune",
         }),
         Some(Command::Lease { action }) => Some(match action {
-            LeaseAction::Inspect { .. } => "lease.inspect",
-            LeaseAction::Reconcile { .. } => "lease.reconcile",
+            lease::LeaseAction::Inspect { .. } => "lease.inspect",
+            lease::LeaseAction::Reconcile { .. } => "lease.reconcile",
         }),
         Some(Command::Coord { action }) => Some(action.envelope_command()),
         _ => None,
@@ -774,152 +741,6 @@ fn worktree_response(
     }
 }
 
-fn lease_response(
-    action: LeaseAction,
-    allowlist: &writ_core::owners::OwnerAllowlist,
-) -> writ_core::error::Result<writ_core::contract::Response<serde_json::Value>> {
-    use writ_core::contract::Response;
-    use writ_core::lease::{InspectRequest, JobKey, LeaseStore};
-    use writ_core::paths::lease_store_path;
-
-    match action {
-        LeaseAction::Inspect {
-            repo,
-            owner,
-            repo_name,
-            job_id,
-            branch,
-            path,
-        } => {
-            allowlist.enforce_owner(&owner)?;
-            let store = open_inspect_store()?;
-            let worktree_path = inspect_worktree_path(
-                store.as_ref(),
-                &owner,
-                &repo_name,
-                &job_id,
-                path.as_deref(),
-            )?;
-            let inspection = match store.as_ref() {
-                Some(store) => store.inspect(InspectRequest {
-                    repo_root: &repo,
-                    owner: &owner,
-                    repo_name: &repo_name,
-                    job_id: &job_id,
-                    worktree_path: &worktree_path,
-                    branch: branch.as_deref(),
-                })?,
-                None => writ_core::lease::LeaseStore::inspect_without_store(InspectRequest {
-                    repo_root: &repo,
-                    owner: &owner,
-                    repo_name: &repo_name,
-                    job_id: &job_id,
-                    worktree_path: &worktree_path,
-                    branch: branch.as_deref(),
-                }),
-            };
-            Ok(Response::success(
-                "lease.inspect",
-                serde_json::to_value(&inspection).map_err(std::io::Error::other)?,
-            ))
-        }
-        LeaseAction::Reconcile {
-            repo,
-            owner,
-            repo_name,
-            job_id,
-        } => {
-            allowlist.enforce_owner(&owner)?;
-            let store = LeaseStore::open(lease_store_path())?;
-            let key = JobKey {
-                owner: &owner,
-                repo_name: &repo_name,
-                job_id: &job_id,
-            };
-            match store.reconcile(key, &repo)? {
-                None => Ok(Response::success(
-                    "lease.reconcile",
-                    serde_json::json!({
-                        "outcome": "absent",
-                    }),
-                )),
-                Some(outcome) => {
-                    if let writ_core::lease::ReconcileOutcome::NeedsAttention {
-                        lease,
-                        inspection,
-                    } = &outcome
-                    {
-                        return Err(writ_core::lease::attention_error(lease, inspection));
-                    }
-                    Ok(Response::success(
-                        "lease.reconcile",
-                        serde_json::json!({
-                            "outcome": outcome.as_str(),
-                        }),
-                    ))
-                }
-            }
-        }
-    }
-}
-
-fn open_inspect_store() -> writ_core::error::Result<Option<writ_core::lease::LeaseStore>> {
-    use writ_core::lease::LeaseStore;
-    use writ_core::paths::lease_store_path;
-
-    let path = lease_store_path();
-    match std::fs::metadata(&path) {
-        Ok(meta) if meta.is_file() => Ok(Some(LeaseStore::open_read_only(path)?)),
-        Ok(_) => Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("lease store path is not a regular file: {}", path.display()),
-        )
-        .into()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.into()),
-    }
-}
-
-fn inspect_worktree_path(
-    store: Option<&writ_core::lease::LeaseStore>,
-    owner: &str,
-    repo_name: &str,
-    job_id: &str,
-    path: Option<&Path>,
-) -> writ_core::error::Result<std::path::PathBuf> {
-    use writ_core::lease::JobKey;
-    use writ_core::paths::{derive_worktree_path, worktree_base_path};
-
-    if let Some(store) = store
-        && let Some(lease) = store.find_job(JobKey {
-            owner,
-            repo_name,
-            job_id,
-        })?
-    {
-        return Ok(std::path::PathBuf::from(lease.worktree_path));
-    }
-    if let Some(path) = path {
-        return Ok(path.to_path_buf());
-    }
-    derive_worktree_path(&worktree_base_path()?, owner, repo_name, job_id)
-}
-
-fn run_lease(
-    action: LeaseAction,
-    allowlist: &writ_core::owners::OwnerAllowlist,
-    json: bool,
-    stdout: &mut impl Write,
-) -> writ_core::error::Result<ExitCode> {
-    let response = lease_response(action, allowlist)?;
-    if json {
-        write_json_line(stdout, &response)?;
-    } else {
-        writeln!(stdout, "ok={} command={}", response.ok, response.command)?;
-    }
-    Ok(ExitCode::SUCCESS)
-}
-
 fn run_worktree(
     action: WorktreeAction,
     allowlist: &writ_core::owners::OwnerAllowlist,
@@ -1106,7 +927,10 @@ fn emit_install_output(
     )
 }
 
-fn write_json_line(stdout: &mut impl Write, value: &impl serde::Serialize) -> io::Result<()> {
+pub(crate) fn write_json_line(
+    stdout: &mut (impl Write + ?Sized),
+    value: &impl serde::Serialize,
+) -> io::Result<()> {
     serde_json::to_writer(&mut *stdout, value).map_err(io::Error::other)?;
     stdout.write_all(b"\n")
 }
@@ -1124,68 +948,108 @@ fn writ_command(writ_bin: Option<PathBuf>) -> String {
 }
 
 async fn run(cli: Cli, stdout: &mut impl Write) -> writ_core::error::Result<ExitCode> {
+    let json = cli.json;
     let allowlist =
         writ_core::owners::OwnerAllowlist::from_cli_or_env(cli.allowed_owners.as_deref());
     match cli.command {
-        Some(Command::Status) => {
-            run_status(cli.json, "cli.status", writ_core::status::load(), stdout)?;
-            Ok(ExitCode::SUCCESS)
-        }
-        Some(Command::Jobs) => {
-            run_status(cli.json, "cli.jobs", writ_core::status::load(), stdout)?;
-            Ok(ExitCode::SUCCESS)
-        }
+        Some(Command::Status) => run_snapshot("cli.status", json, stdout),
+        Some(Command::Jobs) => run_snapshot("cli.jobs", json, stdout),
         Some(Command::GitSafe {
             expected_branch,
             repo,
             args,
-        }) => run_git_safe(&args, expected_branch.as_deref(), repo, cli.json, stdout),
-        Some(Command::GhSafe { args }) => run_gh_safe(&args, &allowlist, cli.json, stdout),
-        Some(Command::Supervisor { action }) => match action {
-            SupervisorAction::Run {
-                timeouts,
-                expected_branch,
-                repo,
-                max_parallel,
-                cmd,
-            } => {
-                run_supervisor(
-                    cli.json,
-                    &timeouts,
-                    max_parallel,
-                    cmd,
-                    writ_core::supervisor::RunOptions {
-                        expected_branch,
-                        repo,
-                        allowlist: Some(allowlist),
-                        ..Default::default()
-                    },
+        }) => run_git_safe(&args, expected_branch.as_deref(), repo, json, stdout),
+        Some(Command::GhSafe { args }) => run_gh_safe(&args, &allowlist, json, stdout),
+        Some(Command::Supervisor { action }) => {
+            run_supervisor_action(
+                action,
+                SupervisorCli {
+                    allowlist,
+                    json,
                     stdout,
-                )
-                .await
-            }
-        },
-        Some(Command::Worktree { action }) => run_worktree(action, &allowlist, cli.json, stdout),
-        Some(Command::Lease { action }) => run_lease(action, &allowlist, cli.json, stdout),
-        Some(Command::Coord { action }) => coord::run(action, &allowlist, cli.json, stdout),
-        Some(Command::Attribution { action }) => run_attribution(action, cli.json, stdout),
+                },
+            )
+            .await
+        }
+        Some(Command::Worktree { action }) => run_worktree(action, &allowlist, json, stdout),
+        Some(Command::Lease { action }) => lease::run(
+            action,
+            lease::LeaseCli {
+                allowlist: &allowlist,
+                json,
+                stdout,
+            },
+        ),
+        Some(Command::Coord { action }) => coord::run(
+            action,
+            coord::CoordCli {
+                allowlist: &allowlist,
+                json,
+                stdout,
+            },
+        ),
+        Some(Command::Attribution { action }) => run_attribution(action, json, stdout),
         Some(Command::Hook) => run_hook(stdout),
         Some(Command::Install { settings, writ_bin }) => {
-            run_install(settings, writ_bin, cli.json, stdout)
+            run_install(settings, writ_bin, json, stdout)
         }
-        Some(Command::Watchlist { action }) => watchlist::run(action, &allowlist, cli.json, stdout),
-        None => {
-            if cli.json {
-                serde_json::to_writer(
-                    &mut *stdout,
-                    &writ_core::contract::Response::bootstrap_success(),
-                )
-                .map_err(io::Error::other)?;
-                stdout.write_all(b"\n")?;
-            }
-            Ok(ExitCode::SUCCESS)
-        }
+        Some(Command::Watchlist { action }) => watchlist::run(action, &allowlist, json, stdout),
+        None => run_bootstrap(json, stdout),
     }
+}
+
+fn run_snapshot(
+    command: &'static str,
+    json: bool,
+    stdout: &mut impl Write,
+) -> writ_core::error::Result<ExitCode> {
+    run_status(json, command, writ_core::status::load(), stdout)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+fn run_bootstrap(json: bool, stdout: &mut impl Write) -> writ_core::error::Result<ExitCode> {
+    if json {
+        serde_json::to_writer(
+            &mut *stdout,
+            &writ_core::contract::Response::bootstrap_success(),
+        )
+        .map_err(io::Error::other)?;
+        stdout.write_all(b"\n")?;
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+struct SupervisorCli<'a> {
+    allowlist: writ_core::owners::OwnerAllowlist,
+    json: bool,
+    stdout: &'a mut dyn Write,
+}
+
+async fn run_supervisor_action(
+    action: SupervisorAction,
+    ctx: SupervisorCli<'_>,
+) -> writ_core::error::Result<ExitCode> {
+    let SupervisorAction::Run {
+        timeouts,
+        expected_branch,
+        repo,
+        max_parallel,
+        cmd,
+    } = action;
+    run_supervisor(
+        ctx.json,
+        &timeouts,
+        max_parallel,
+        cmd,
+        writ_core::supervisor::RunOptions {
+            expected_branch,
+            repo,
+            allowlist: Some(ctx.allowlist),
+            ..Default::default()
+        },
+        ctx.stdout,
+    )
+    .await
 }
 
 fn secs_opt(secs: u64) -> Option<Duration> {
@@ -1199,7 +1063,7 @@ async fn run_supervisor(
     max_parallel: usize,
     cmd: Vec<String>,
     mut options: writ_core::supervisor::RunOptions,
-    stdout: &mut impl Write,
+    stdout: &mut (impl Write + ?Sized),
 ) -> writ_core::error::Result<ExitCode> {
     let program = match cmd.first() {
         Some(p) => p.as_str(),
@@ -1246,7 +1110,7 @@ async fn run_supervisor(
 fn write_supervisor_result(
     json: bool,
     result: Result<&writ_core::supervisor::SupervisedOutput, &writ_core::error::Error>,
-    stdout: &mut impl Write,
+    stdout: &mut (impl Write + ?Sized),
 ) -> io::Result<()> {
     if !json {
         if let Ok(output) = result {
@@ -2077,7 +1941,7 @@ mod tests {
         ])
         .unwrap();
         let Some(super::Command::Lease {
-            action: super::LeaseAction::Inspect { job_id, .. },
+            action: super::lease::LeaseAction::Inspect { job_id, .. },
         }) = inspect.command
         else {
             panic!("expected lease inspect")
@@ -2098,7 +1962,7 @@ mod tests {
         assert!(matches!(
             reconcile.command,
             Some(super::Command::Lease {
-                action: super::LeaseAction::Reconcile { .. },
+                action: super::lease::LeaseAction::Reconcile { .. },
             })
         ));
     }

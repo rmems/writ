@@ -13,6 +13,21 @@ fn allowlist() -> OwnerAllowlist {
     OwnerAllowlist::parse(ACME)
 }
 
+fn view(
+    store: &LeaseStore,
+    query: &WatchQuery,
+    probe: Option<&dyn GithubProbe>,
+    allowlist: &OwnerAllowlist,
+) -> WatchlistData {
+    load_view(ViewLoad {
+        store,
+        query,
+        probe,
+        allowlist,
+    })
+    .unwrap()
+}
+
 struct NoGithub;
 
 impl GithubProbe for NoGithub {
@@ -105,7 +120,7 @@ fn exec_sql(store: &LeaseStore, sql: &str) {
 #[test]
 fn list_reads_leases_without_coord_or_github() {
     let seeded = seed_job();
-    let data = load_view(&seeded.store, &WatchQuery::default(), None, &allowlist()).unwrap();
+    let data = view(&seeded.store, &WatchQuery::default(), None, &allowlist());
     assert!(data.coord_available);
     assert!(!data.github_probed);
     assert_eq!(data.entries.len(), 1);
@@ -131,7 +146,7 @@ fn paused_claim_and_help_message_shape_waiting_and_paused() {
             );
         ",
     );
-    let data = load_view(&seeded.store, &WatchQuery::default(), None, &allowlist()).unwrap();
+    let data = view(&seeded.store, &WatchQuery::default(), None, &allowlist());
     assert!(data.coord_available);
     assert_eq!(data.entries[0].collab_status, CollabStatus::Paused);
     assert!(data.entries[0].coord.paused);
@@ -144,7 +159,7 @@ fn github_conflict_marks_conflicted_without_merge_gate() {
         probe_github: true,
         ..WatchQuery::default()
     };
-    let data = load_view(&seeded.store, &query, Some(&FakePr), &allowlist()).unwrap();
+    let data = view(&seeded.store, &query, Some(&FakePr), &allowlist());
     assert!(data.github_probed);
     assert_eq!(data.entries[0].collab_status, CollabStatus::Conflicted);
     let github = data.entries[0].github.as_ref().unwrap();
@@ -159,7 +174,7 @@ fn github_probe_failure_stays_on_lease_view() {
         probe_github: true,
         ..WatchQuery::default()
     };
-    let data = load_view(&seeded.store, &query, Some(&NoGithub), &allowlist()).unwrap();
+    let data = view(&seeded.store, &query, Some(&NoGithub), &allowlist());
     assert_eq!(data.entries[0].collab_status, CollabStatus::Running);
     assert!(
         data.entries[0]
@@ -194,7 +209,7 @@ fn unacked_help_without_pause_is_waiting() {
             );
         ",
     );
-    let data = load_view(&seeded.store, &WatchQuery::default(), None, &allowlist()).unwrap();
+    let data = view(&seeded.store, &WatchQuery::default(), None, &allowlist());
     assert_eq!(data.entries[0].collab_status, CollabStatus::Waiting);
     assert_eq!(
         data.entries[0].coord.waiting_on.as_deref(),
@@ -209,13 +224,13 @@ fn owner_filter_is_case_insensitive() {
         owner: Some("ACME".to_owned()),
         ..WatchQuery::default()
     };
-    let data = load_view(&seeded.store, &query, None, &allowlist()).unwrap();
+    let data = view(&seeded.store, &query, None, &allowlist());
     assert_eq!(data.entries.len(), 1);
     let query = WatchQuery {
         owner: Some("other".to_owned()),
         ..WatchQuery::default()
     };
-    let data = load_view(&seeded.store, &query, None, &allowlist()).unwrap();
+    let data = view(&seeded.store, &query, None, &allowlist());
     assert!(data.entries.is_empty());
 }
 
@@ -223,7 +238,7 @@ fn owner_filter_is_case_insensitive() {
 fn merge_ready_lease_is_ready_for_integration() {
     let seeded = seed_job();
     exec_sql(&seeded.store, "UPDATE leases SET mode = 'MERGE_READY'");
-    let data = load_view(&seeded.store, &WatchQuery::default(), None, &allowlist()).unwrap();
+    let data = view(&seeded.store, &WatchQuery::default(), None, &allowlist());
     assert_eq!(
         data.entries[0].collab_status,
         CollabStatus::ReadyForIntegration
@@ -238,25 +253,25 @@ fn repo_and_job_filters() {
         job_id: Some("job-1".to_owned()),
         ..WatchQuery::default()
     };
-    let data = load_view(&seeded.store, &query, None, &allowlist()).unwrap();
+    let data = view(&seeded.store, &query, None, &allowlist());
     assert_eq!(data.entries.len(), 1);
     let query = WatchQuery {
         repo: Some("sample".to_owned()),
         ..WatchQuery::default()
     };
-    let data = load_view(&seeded.store, &query, None, &allowlist()).unwrap();
+    let data = view(&seeded.store, &query, None, &allowlist());
     assert_eq!(data.entries.len(), 1);
     let query = WatchQuery {
         repo: Some("other/repo".to_owned()),
         ..WatchQuery::default()
     };
-    let data = load_view(&seeded.store, &query, None, &allowlist()).unwrap();
+    let data = view(&seeded.store, &query, None, &allowlist());
     assert!(data.entries.is_empty());
     let query = WatchQuery {
         job_id: Some("missing".to_owned()),
         ..WatchQuery::default()
     };
-    let data = load_view(&seeded.store, &query, None, &allowlist()).unwrap();
+    let data = view(&seeded.store, &query, None, &allowlist());
     assert!(data.entries.is_empty());
 }
 
@@ -267,13 +282,13 @@ fn include_released_lists_unassigned_rows() {
         &seeded.store,
         "UPDATE leases SET mode = 'UNASSIGNED', released_at = 99",
     );
-    let hidden = load_view(&seeded.store, &WatchQuery::default(), None, &allowlist()).unwrap();
+    let hidden = view(&seeded.store, &WatchQuery::default(), None, &allowlist());
     assert!(hidden.entries.is_empty());
     let query = WatchQuery {
         include_released: true,
         ..WatchQuery::default()
     };
-    let data = load_view(&seeded.store, &query, None, &allowlist()).unwrap();
+    let data = view(&seeded.store, &query, None, &allowlist());
     assert_eq!(data.entries.len(), 1);
     assert_eq!(data.entries[0].recovery_status, RecoveryStatus::Released);
     assert_eq!(data.entries[0].collab_status, CollabStatus::Released);
@@ -286,7 +301,7 @@ fn missing_checkout_is_recovery_blocker() {
         &seeded.store,
         "UPDATE leases SET worktree_path = '/tmp/writ-missing-checkout-does-not-exist'",
     );
-    let data = load_view(&seeded.store, &WatchQuery::default(), None, &allowlist()).unwrap();
+    let data = view(&seeded.store, &WatchQuery::default(), None, &allowlist());
     assert_eq!(
         data.entries[0].recovery_status,
         RecoveryStatus::MissingCheckout
@@ -303,7 +318,7 @@ fn missing_checkout_is_recovery_blocker() {
 fn stale_heartbeat_is_recovery_blocker() {
     let seeded = seed_job();
     exec_sql(&seeded.store, "UPDATE leases SET ttl = 1, heartbeat = 1");
-    let data = load_view(&seeded.store, &WatchQuery::default(), None, &allowlist()).unwrap();
+    let data = view(&seeded.store, &WatchQuery::default(), None, &allowlist());
     assert_eq!(
         data.entries[0].recovery_status,
         RecoveryStatus::StaleHeartbeat
@@ -314,10 +329,10 @@ fn stale_heartbeat_is_recovery_blocker() {
 fn blocked_and_review_only_are_waiting() {
     let seeded = seed_job();
     exec_sql(&seeded.store, "UPDATE leases SET mode = 'BLOCKED'");
-    let data = load_view(&seeded.store, &WatchQuery::default(), None, &allowlist()).unwrap();
+    let data = view(&seeded.store, &WatchQuery::default(), None, &allowlist());
     assert_eq!(data.entries[0].collab_status, CollabStatus::Waiting);
     exec_sql(&seeded.store, "UPDATE leases SET mode = 'REVIEW_ONLY'");
-    let data = load_view(&seeded.store, &WatchQuery::default(), None, &allowlist()).unwrap();
+    let data = view(&seeded.store, &WatchQuery::default(), None, &allowlist());
     assert_eq!(data.entries[0].collab_status, CollabStatus::Waiting);
 }
 
@@ -325,7 +340,7 @@ fn blocked_and_review_only_are_waiting() {
 fn needs_human_is_conflicted() {
     let seeded = seed_job();
     exec_sql(&seeded.store, "UPDATE leases SET mode = 'NEEDS_HUMAN'");
-    let data = load_view(&seeded.store, &WatchQuery::default(), None, &allowlist()).unwrap();
+    let data = view(&seeded.store, &WatchQuery::default(), None, &allowlist());
     assert_eq!(data.entries[0].collab_status, CollabStatus::Conflicted);
 }
 
@@ -336,7 +351,7 @@ fn github_none_leaves_github_overlay_empty() {
         probe_github: true,
         ..WatchQuery::default()
     };
-    let data = load_view(&seeded.store, &query, Some(&NoPr), &allowlist()).unwrap();
+    let data = view(&seeded.store, &query, Some(&NoPr), &allowlist());
     assert!(data.entries[0].github.is_none());
     assert_eq!(data.entries[0].collab_status, CollabStatus::Running);
 }
@@ -345,16 +360,15 @@ fn github_none_leaves_github_overlay_empty() {
 fn disallowed_owner_is_filtered_from_entries() {
     let seeded = seed_job();
     let deny = OwnerAllowlist::parse("other");
-    let data = load_view(&seeded.store, &WatchQuery::default(), None, &deny).unwrap();
+    let data = view(&seeded.store, &WatchQuery::default(), None, &deny);
     assert!(data.entries.is_empty());
     let empty_allowlist = OwnerAllowlist::default();
-    let data = load_view(
+    let data = view(
         &seeded.store,
         &WatchQuery::default(),
         None,
         &empty_allowlist,
-    )
-    .unwrap();
+    );
     assert!(data.entries.is_empty());
 }
 
@@ -365,7 +379,7 @@ fn coord_read_failure_surfaces_residual() {
         &seeded.store,
         "DROP TABLE coord_claims; CREATE TABLE coord_claims (broken INTEGER);",
     );
-    let data = load_view(&seeded.store, &WatchQuery::default(), None, &allowlist()).unwrap();
+    let data = view(&seeded.store, &WatchQuery::default(), None, &allowlist());
     assert!(
         data.entries[0]
             .residual_blockers
@@ -408,7 +422,7 @@ fn stale_closed_pr_is_skipped_for_open_match() {
         probe_github: true,
         ..WatchQuery::default()
     };
-    let data = load_view(&seeded.store, &query, Some(&ReusedBranch), &allowlist()).unwrap();
+    let data = view(&seeded.store, &query, Some(&ReusedBranch), &allowlist());
     let github = data.entries[0].github.as_ref().unwrap();
     assert_eq!(github.number, 31);
 }

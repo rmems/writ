@@ -33,7 +33,7 @@ pub use types::*;
 pub use util::attention_error;
 pub(super) use util::*;
 
-use query::{LIVE_PATH_LOOKUP, list_leases_on, query_lease_locked};
+use query::{LIVE_PATH_LOOKUP, LeaseLookup, list_leases_on, lookup_lease};
 
 pub(super) static OPERATION_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -160,7 +160,14 @@ impl LeaseStore {
         context: &'static str,
     ) -> Result<Option<Lease>> {
         let conn = self.lock()?;
-        query_lease_locked(&conn, where_sql, sql_params, context)
+        lookup_lease(
+            &conn,
+            LeaseLookup {
+                where_sql,
+                sql_params,
+                context,
+            },
+        )
     }
 
     pub(crate) fn lock(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {

@@ -4,7 +4,7 @@ use std::path::Path;
 
 use rusqlite::{TransactionBehavior, params};
 
-use super::query::{LIVE_PATH_LOOKUP, query_lease_tx};
+use super::query::{LIVE_PATH_LOOKUP, LeaseLookup, lookup_lease};
 use super::{
     AllocationState, Error, JobKey, Lease, LeaseGrant, LeaseMode, LeaseStore, PolicyCode, Result,
     lease_err, new_operation_id, now_secs, occupant, path_text, schema, terminal_error,
@@ -21,17 +21,15 @@ impl LeaseStore {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| lease_err("begin grant", e))?;
-        let existing = query_lease_tx(
+        let existing = lookup_lease(
             &tx,
-            "WHERE owner = ?1 AND repo_name = ?2 AND job_id = ?3",
-            params![grant.owner, grant.repo_name, grant.job_id],
-            "lookup lease before grant",
+            LeaseLookup {
+                where_sql: "WHERE owner = ?1 AND repo_name = ?2 AND job_id = ?3",
+                sql_params: params![grant.owner, grant.repo_name, grant.job_id],
+                context: "lookup lease before grant",
+            },
         )?;
-        if let Some(existing) = existing.as_ref()
-            && existing.allocation_state == AllocationState::Tombstoned
-        {
-            return Err(terminal_error(existing));
-        }
+        reject_tombstoned(existing.as_ref())?;
         occupant::reject_live_path_occupant(
             &tx,
             occupant::LivePathClaim {
@@ -42,45 +40,18 @@ impl LeaseStore {
             },
             "grant lease",
         )?;
-        if existing
-            .as_ref()
-            .is_some_and(|lease| lease.allocation_state == AllocationState::Released)
-        {
-            tx.execute(
-                "DELETE FROM coord_claims WHERE owner = ?1 AND repo_name = ?2 AND job_id = ?3",
-                params![grant.owner, grant.repo_name, grant.job_id],
-            )
-            .map_err(|e| lease_err("clear stale coord claim on regrant", e))?;
-        }
-        let changed = tx
-            .execute(
-                schema::GRANT_UPSERT,
-                params![
-                    repo,
-                    grant.owner,
-                    grant.repo_name,
-                    grant.job_id,
-                    grant.branch,
-                    branch_ref,
-                    worktree_path,
-                    branch_ref,
-                    grant.start_commit,
-                    operation_id,
-                    AllocationState::Active.as_str(),
-                    LeaseMode::WriterLocked.as_str(),
-                    now,
-                ],
-            )
-            .map_err(|e| occupant::map_live_path_constraint(e, "grant lease"))?;
-        if changed == 0 {
-            return Err(Error::PolicyViolation {
-                code: PolicyCode::LeaseConflict,
-                message: format!(
-                    "job `{}` already holds an active lease for a different worktree path",
-                    grant.job_id
-                ),
-            });
-        }
+        clear_released_claim(&tx, &grant, existing.as_ref())?;
+        apply_grant_upsert(
+            &tx,
+            GrantRow {
+                grant: &grant,
+                repo: &repo,
+                branch_ref: &branch_ref,
+                worktree_path: &worktree_path,
+                operation_id: &operation_id,
+                now,
+            },
+        )?;
         tx.commit().map_err(|e| lease_err("commit grant", e))?;
         drop(conn);
         self.find_job(JobKey {
@@ -115,8 +86,14 @@ impl LeaseStore {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| lease_err("begin lease finalize", e))?;
-        let existing =
-            query_lease_tx(&tx, LIVE_PATH_LOOKUP, params![path], "lookup lease by path")?;
+        let existing = lookup_lease(
+            &tx,
+            LeaseLookup {
+                where_sql: LIVE_PATH_LOOKUP,
+                sql_params: params![path],
+                context: "lookup lease by path",
+            },
+        )?;
         let Some(lease) = existing else {
             tx.commit()
                 .map_err(|e| lease_err("commit lease finalize", e))?;
@@ -134,35 +111,14 @@ impl LeaseStore {
         } else {
             (Some(now), None, "RELEASE")
         };
-        tx.execute(
-            "
-            UPDATE leases
-            SET allocation_state = ?1, mode = ?2, released_at = ?3, tombstoned_at = ?4,
-                updated_at = ?5
-            WHERE id = ?6 AND tombstoned_at IS NULL
-            ",
-            params![
-                state.as_str(),
-                LeaseMode::Unassigned.as_str(),
+        write_finalize(
+            &tx,
+            FinalizeWrite {
+                lease: &lease,
+                state,
                 released_at,
                 tombstoned_at,
-                now,
-                lease.row_id,
-            ],
-        )
-        .map_err(|e| lease_err("finalize lease", e))?;
-        schema::insert_op(
-            &tx,
-            schema::OpRecord {
-                operation_id: &format!("{}-{}", lease.operation_id, kind.to_ascii_lowercase()),
-                owner: &lease.owner,
-                repo_name: &lease.repo_name,
-                job_id: &lease.job_id,
                 kind,
-                phase: "COMMIT",
-                requested_start_point: Some(&lease.requested_start_point),
-                resolved_start_commit: Some(&lease.start_commit),
-                status: "COMMITTED",
                 now,
             },
         )?;
@@ -171,4 +127,120 @@ impl LeaseStore {
         drop(conn);
         self.find_by_path(worktree_path)
     }
+}
+
+struct FinalizeWrite<'a> {
+    lease: &'a Lease,
+    state: AllocationState,
+    released_at: Option<i64>,
+    tombstoned_at: Option<i64>,
+    kind: &'static str,
+    now: i64,
+}
+
+fn write_finalize(tx: &rusqlite::Transaction<'_>, row: FinalizeWrite<'_>) -> Result<()> {
+    tx.execute(
+        "
+            UPDATE leases
+            SET allocation_state = ?1, mode = ?2, released_at = ?3, tombstoned_at = ?4,
+                updated_at = ?5
+            WHERE id = ?6 AND tombstoned_at IS NULL
+            ",
+        params![
+            row.state.as_str(),
+            LeaseMode::Unassigned.as_str(),
+            row.released_at,
+            row.tombstoned_at,
+            row.now,
+            row.lease.row_id,
+        ],
+    )
+    .map_err(|e| lease_err("finalize lease", e))?;
+    schema::insert_op(
+        tx,
+        schema::OpRecord {
+            operation_id: &format!(
+                "{}-{}",
+                row.lease.operation_id,
+                row.kind.to_ascii_lowercase()
+            ),
+            owner: &row.lease.owner,
+            repo_name: &row.lease.repo_name,
+            job_id: &row.lease.job_id,
+            kind: row.kind,
+            phase: "COMMIT",
+            requested_start_point: Some(&row.lease.requested_start_point),
+            resolved_start_commit: Some(&row.lease.start_commit),
+            status: "COMMITTED",
+            now: row.now,
+        },
+    )
+}
+
+fn reject_tombstoned(existing: Option<&Lease>) -> Result<()> {
+    if let Some(existing) = existing
+        && existing.allocation_state == AllocationState::Tombstoned
+    {
+        return Err(terminal_error(existing));
+    }
+    Ok(())
+}
+
+fn clear_released_claim(
+    tx: &rusqlite::Transaction<'_>,
+    grant: &LeaseGrant<'_>,
+    existing: Option<&Lease>,
+) -> Result<()> {
+    if !existing.is_some_and(|lease| lease.allocation_state == AllocationState::Released) {
+        return Ok(());
+    }
+    tx.execute(
+        "DELETE FROM coord_claims WHERE owner = ?1 AND repo_name = ?2 AND job_id = ?3",
+        params![grant.owner, grant.repo_name, grant.job_id],
+    )
+    .map_err(|e| lease_err("clear stale coord claim on regrant", e))?;
+    Ok(())
+}
+
+struct GrantRow<'a> {
+    grant: &'a LeaseGrant<'a>,
+    repo: &'a str,
+    branch_ref: &'a str,
+    worktree_path: &'a str,
+    operation_id: &'a str,
+    now: i64,
+}
+
+fn apply_grant_upsert(tx: &rusqlite::Transaction<'_>, row: GrantRow<'_>) -> Result<()> {
+    let grant = row.grant;
+    let changed = tx
+        .execute(
+            schema::GRANT_UPSERT,
+            params![
+                row.repo,
+                grant.owner,
+                grant.repo_name,
+                grant.job_id,
+                grant.branch,
+                row.branch_ref,
+                row.worktree_path,
+                row.branch_ref,
+                grant.start_commit,
+                row.operation_id,
+                AllocationState::Active.as_str(),
+                LeaseMode::WriterLocked.as_str(),
+                row.now,
+            ],
+        )
+        .map_err(|e| occupant::map_live_path_constraint(e, "grant lease"))?;
+    if changed == 0 {
+        return Err(Error::PolicyViolation {
+            code: PolicyCode::LeaseConflict,
+            message: format!(
+                "job `{}` already holds an active lease for a different worktree path",
+                grant.job_id
+            ),
+        });
+    }
+    Ok(())
 }

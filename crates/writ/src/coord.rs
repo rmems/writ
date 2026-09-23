@@ -6,7 +6,9 @@ use std::process::ExitCode;
 use clap::Subcommand;
 use serde::Serialize;
 use writ_core::contract::Response;
-use writ_core::coord::{AckRequest, AnnounceRequest, HandoffRequest, MessageKind, SendRequest};
+use writ_core::coord::{
+    AckRequest, AnnounceRequest, HandoffRequest, MessageKind, PauseRequest, SendRequest,
+};
 use writ_core::lease::{JobKey, LeaseStore};
 use writ_core::owners::OwnerAllowlist;
 use writ_core::paths::lease_store_path;
@@ -132,23 +134,22 @@ impl CoordAction {
     }
 }
 
-pub(crate) fn run(
-    action: CoordAction,
-    allowlist: &OwnerAllowlist,
-    json: bool,
-    stdout: &mut impl Write,
-) -> writ_core::error::Result<ExitCode> {
-    let response = dispatch(action, allowlist)?;
-    if json {
+pub(crate) fn run(action: CoordAction, ctx: CoordCli<'_>) -> writ_core::error::Result<ExitCode> {
+    let response = dispatch(action, ctx.allowlist)?;
+    if ctx.json {
         writeln!(
-            stdout,
+            ctx.stdout,
             "{}",
             serde_json::to_string(&response).map_err(io::Error::other)?
         )?;
     } else {
-        writeln!(stdout, "ok={} command={}", response.ok, response.command)?;
         writeln!(
-            stdout,
+            ctx.stdout,
+            "ok={} command={}",
+            response.ok, response.command
+        )?;
+        writeln!(
+            ctx.stdout,
             "{}",
             serde_json::to_string_pretty(&response.data).map_err(io::Error::other)?
         )?;
@@ -156,106 +157,139 @@ pub(crate) fn run(
     Ok(ExitCode::SUCCESS)
 }
 
+pub(crate) struct CoordCli<'a> {
+    pub allowlist: &'a OwnerAllowlist,
+    pub json: bool,
+    pub stdout: &'a mut dyn Write,
+}
+
 fn dispatch(
     action: CoordAction,
     allowlist: &OwnerAllowlist,
 ) -> writ_core::error::Result<Response<serde_json::Value>> {
-    let store = LeaseStore::open(lease_store_path())?;
+    enforce_coord_owners(&action, allowlist)?;
+    execute(Execute {
+        store: LeaseStore::open(lease_store_path())?,
+        action,
+        allowlist,
+    })
+}
+
+fn enforce_coord_owners(
+    action: &CoordAction,
+    allowlist: &OwnerAllowlist,
+) -> writ_core::error::Result<()> {
     match action {
-        CoordAction::Announce { ref owner, .. } => {
+        CoordAction::List => allowlist.enforce_discovery(),
+        CoordAction::Send {
+            owner, to_owner, ..
+        } => {
             allowlist.enforce_owner(owner)?;
-            announce(&store, action)
+            to_owner
+                .as_deref()
+                .map(|owner| allowlist.enforce_owner(owner))
+                .transpose()?;
+            Ok(())
         }
+        CoordAction::Announce { owner, .. }
+        | CoordAction::Show { owner, .. }
+        | CoordAction::Inbox { owner, .. }
+        | CoordAction::Ack { owner, .. }
+        | CoordAction::Pause { owner, .. }
+        | CoordAction::Handoff { owner, .. } => allowlist.enforce_owner(owner),
+    }
+}
+
+struct Execute<'a> {
+    store: LeaseStore,
+    action: CoordAction,
+    allowlist: &'a OwnerAllowlist,
+}
+
+fn execute(ctx: Execute<'_>) -> writ_core::error::Result<Response<serde_json::Value>> {
+    match ctx.action {
+        CoordAction::Announce { .. }
+        | CoordAction::Send { .. }
+        | CoordAction::Ack { .. }
+        | CoordAction::Pause { .. }
+        | CoordAction::Handoff { .. } => execute_write(&ctx.store, ctx.action),
+        other => execute_read(ReadCmd {
+            store: &ctx.store,
+            action: other,
+            allowlist: ctx.allowlist,
+        }),
+    }
+}
+
+struct ReadCmd<'a> {
+    store: &'a LeaseStore,
+    action: CoordAction,
+    allowlist: &'a OwnerAllowlist,
+}
+
+fn execute_read(cmd: ReadCmd<'_>) -> writ_core::error::Result<Response<serde_json::Value>> {
+    match cmd.action {
         CoordAction::Show {
             owner,
             repo_name,
             job_id,
-        } => {
-            allowlist.enforce_owner(&owner)?;
-            job_field(
-                job_key(&owner, &repo_name, &job_id),
-                JobField {
-                    command: "coord.show",
-                    name: "claim",
-                },
-                |key| store.find_claim(key),
-            )
-        }
-        CoordAction::List => {
-            allowlist.enforce_discovery()?;
-            let claims = store
-                .list_claims()?
-                .into_iter()
-                .filter(|claim| allowlist.allows(&claim.owner))
-                .collect::<Vec<_>>();
-            ok("coord.list", serde_json::json!({ "claims": claims }))
-        }
+        } => job_field(
+            JobKey {
+                owner: &owner,
+                repo_name: &repo_name,
+                job_id: &job_id,
+            },
+            JobField {
+                command: "coord.show",
+                name: "claim",
+            },
+            |key| cmd.store.find_claim(key),
+        ),
+        CoordAction::List => list_allowed(cmd.store, cmd.allowlist),
         CoordAction::Inbox {
             owner,
             repo_name,
             job_id,
-        } => {
-            allowlist.enforce_owner(&owner)?;
-            job_field(
-                job_key(&owner, &repo_name, &job_id),
-                JobField {
-                    command: "coord.inbox",
-                    name: "messages",
-                },
-                |key| store.inbox(key),
-            )
-        }
-        CoordAction::Send {
-            ref owner,
-            ref to_owner,
-            ..
-        } => {
-            allowlist.enforce_owner(owner)?;
-            if let Some(to_owner) = to_owner.as_deref() {
-                allowlist.enforce_owner(to_owner)?;
-            }
-            send(&store, action)
-        }
-        CoordAction::Ack { ref owner, .. } => {
-            allowlist.enforce_owner(owner)?;
-            ack(&store, action)
-        }
-        CoordAction::Pause { ref owner, .. } => {
-            allowlist.enforce_owner(owner)?;
-            pause(&store, action)
-        }
-        CoordAction::Handoff {
-            owner,
-            repo_name,
-            job_id,
-            agent,
-            to_agent,
-            to_job,
-            generation,
-            body,
-        } => {
-            allowlist.enforce_owner(&owner)?;
-            let message = store.propose_handoff(HandoffRequest {
+        } => job_field(
+            JobKey {
                 owner: &owner,
                 repo_name: &repo_name,
                 job_id: &job_id,
-                from_agent_id: &agent,
-                to_agent_id: &to_agent,
-                to_job_id: to_job.as_deref(),
-                expected_generation: generation,
-                body: &body,
-            })?;
-            value("coord.handoff", &message)
-        }
+            },
+            JobField {
+                command: "coord.inbox",
+                name: "messages",
+            },
+            |key| cmd.store.inbox(key),
+        ),
+        _ => unreachable!("execute_read only handles show/list/inbox"),
     }
 }
 
-fn job_key<'a>(owner: &'a str, repo_name: &'a str, job_id: &'a str) -> JobKey<'a> {
-    JobKey {
-        owner,
-        repo_name,
-        job_id,
+fn execute_write(
+    store: &LeaseStore,
+    action: CoordAction,
+) -> writ_core::error::Result<Response<serde_json::Value>> {
+    match action {
+        CoordAction::Announce { .. } => announce(store, action),
+        CoordAction::Send { .. } => send(store, action),
+        CoordAction::Ack { .. } => ack(store, action),
+        CoordAction::Pause { .. } => pause(store, action),
+        CoordAction::Handoff { .. } => handoff(store, action),
+        _ => unreachable!("execute_write only handles mutating coord commands"),
     }
+}
+
+fn list_allowed(
+    store: &LeaseStore,
+    allowlist: &OwnerAllowlist,
+) -> writ_core::error::Result<Response<serde_json::Value>> {
+    let claims = store
+        .list_claims()?
+        .into_iter()
+        .filter(|claim| allowlist.allows(&claim.owner))
+        .collect::<Vec<_>>();
+    ok("coord.list", serde_json::json!({ "claims": claims }))
 }
 
 fn ok(
@@ -402,11 +436,15 @@ fn pause(
     else {
         unreachable!("dispatch only forwards Pause");
     };
-    let (claim, help) = store.pause_claim(
-        job_key(&owner, &repo_name, &job_id),
-        &agent,
-        body.as_deref(),
-    )?;
+    let (claim, help) = store.pause_claim(PauseRequest {
+        key: JobKey {
+            owner: &owner,
+            repo_name: &repo_name,
+            job_id: &job_id,
+        },
+        agent_id: &agent,
+        body: body.as_deref(),
+    })?;
     ok(
         "coord.pause",
         serde_json::json!({
@@ -414,4 +452,34 @@ fn pause(
             "help": help,
         }),
     )
+}
+
+fn handoff(
+    store: &LeaseStore,
+    action: CoordAction,
+) -> writ_core::error::Result<Response<serde_json::Value>> {
+    let CoordAction::Handoff {
+        owner,
+        repo_name,
+        job_id,
+        agent,
+        to_agent,
+        to_job,
+        generation,
+        body,
+    } = action
+    else {
+        unreachable!("dispatch only forwards Handoff");
+    };
+    let message = store.propose_handoff(HandoffRequest {
+        owner: &owner,
+        repo_name: &repo_name,
+        job_id: &job_id,
+        from_agent_id: &agent,
+        to_agent_id: &to_agent,
+        to_job_id: to_job.as_deref(),
+        expected_generation: generation,
+        body: &body,
+    })?;
+    value("coord.handoff", &message)
 }

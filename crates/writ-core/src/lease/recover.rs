@@ -4,7 +4,7 @@ use std::ops::ControlFlow;
 
 use rusqlite::{Transaction, TransactionBehavior, params};
 
-use super::query::query_lease_tx;
+use super::query::{LeaseLookup, lookup_lease};
 use super::{
     AllocationInspection, AllocationState, Error, EvidenceClass, InspectRequest, JobKey, Lease,
     LeaseMode, LeaseStore, ReconcileOutcome, Result, classify, lease_err, now_secs, schema,
@@ -265,15 +265,22 @@ fn load_open_lease(
         RecoverLookup::Operation => ("WHERE operation_id = ?1", "re-read lease before recover"),
     };
     let current = match lookup {
-        RecoverLookup::Job => query_lease_tx(
+        RecoverLookup::Job => lookup_lease(
             tx,
-            where_sql,
-            params![expected.owner, expected.repo_name, expected.job_id],
-            ctx,
+            LeaseLookup {
+                where_sql,
+                sql_params: params![expected.owner, expected.repo_name, expected.job_id],
+                context: ctx,
+            },
         )?,
-        RecoverLookup::Operation => {
-            query_lease_tx(tx, where_sql, params![expected.operation_id], ctx)?
-        }
+        RecoverLookup::Operation => lookup_lease(
+            tx,
+            LeaseLookup {
+                where_sql,
+                sql_params: params![expected.operation_id],
+                context: ctx,
+            },
+        )?,
     };
     Ok(match current {
         None => ControlFlow::Break(ReconcileOutcome::Retry {
