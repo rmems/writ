@@ -10,7 +10,6 @@
 //! tombstoned rows are never resurrected by reconcile.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -19,6 +18,10 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, pa
 use serde::Serialize;
 
 use crate::error::{Error, LeaseAttentionFailure, PolicyCode, Result};
+
+mod classify;
+mod occupant;
+mod schema;
 
 static OPERATION_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -104,7 +107,7 @@ impl AllocationState {
         matches!(self, Self::Released | Self::Tombstoned)
     }
 
-    fn is_in_progress(self) -> bool {
+    pub(crate) fn is_in_progress(self) -> bool {
         matches!(self, Self::Prepared | Self::Mutating | Self::NeedsAttention)
     }
 }
@@ -363,68 +366,7 @@ impl LeaseStore {
             })?;
         }
         let conn = Connection::open(&path).map_err(|e| lease_err("open lease store", e))?;
-        conn.execute_batch(
-            "
-            PRAGMA foreign_keys = ON;
-            PRAGMA journal_mode = WAL;
-            PRAGMA busy_timeout = 5000;
-            CREATE TABLE IF NOT EXISTS leases (
-                id INTEGER PRIMARY KEY,
-                repo TEXT NOT NULL,
-                owner TEXT NOT NULL,
-                repo_name TEXT NOT NULL,
-                job_id TEXT NOT NULL,
-                branch TEXT NOT NULL,
-                branch_ref TEXT NOT NULL,
-                worktree_path TEXT NOT NULL,
-                requested_start_point TEXT NOT NULL,
-                start_commit TEXT NOT NULL,
-                operation_id TEXT NOT NULL,
-                allocation_state TEXT NOT NULL,
-                mode TEXT NOT NULL,
-                ttl INTEGER,
-                heartbeat INTEGER,
-                max_files INTEGER,
-                max_churn INTEGER,
-                max_fix_cycles INTEGER,
-                fix_cycles INTEGER,
-                pending_fix_cycles INTEGER,
-                pending_fix_op_id TEXT,
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL,
-                released_at INTEGER,
-                tombstoned_at INTEGER,
-                UNIQUE(owner, repo_name, job_id)
-            );
-            CREATE TABLE IF NOT EXISTS allocation_ops (
-                operation_id TEXT PRIMARY KEY,
-                owner TEXT NOT NULL,
-                repo_name TEXT NOT NULL,
-                job_id TEXT NOT NULL,
-                kind TEXT NOT NULL,
-                phase TEXT NOT NULL,
-                requested_start_point TEXT,
-                resolved_start_commit TEXT,
-                status TEXT NOT NULL,
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS agents (
-                agent_id TEXT PRIMARY KEY,
-                agent_type TEXT NOT NULL,
-                session_id TEXT,
-                started_at INTEGER NOT NULL,
-                stopped_at INTEGER
-            );
-            CREATE UNIQUE INDEX IF NOT EXISTS leases_live_worktree_path
-                ON leases(worktree_path)
-                WHERE released_at IS NULL AND tombstoned_at IS NULL;
-            ",
-        )
-        .map_err(|e| lease_err("initialize lease schema", e))?;
-        ensure_crash_consistency_columns(&conn)?;
-        ensure_live_path_unique_index(&conn)?;
-        crate::coord::ensure_schema(&conn)?;
+        schema::apply(&conn)?;
         Ok(Self {
             path,
             conn: Mutex::new(conn),
@@ -475,9 +417,9 @@ impl LeaseStore {
         {
             return Err(terminal_error(&existing));
         }
-        reject_live_path_occupant(
+        occupant::reject_live_path_occupant(
             &tx,
-            LivePathClaim {
+            occupant::LivePathClaim {
                 worktree_path: &worktree_path,
                 owner: grant.owner,
                 repo_name: grant.repo_name,
@@ -487,45 +429,7 @@ impl LeaseStore {
         )?;
         let changed = tx
             .execute(
-                "
-            INSERT INTO leases (
-                repo, owner, repo_name, job_id, branch, branch_ref, worktree_path,
-                requested_start_point, start_commit, operation_id, allocation_state,
-                mode, ttl, heartbeat, max_files, max_churn, max_fix_cycles, fix_cycles,
-                pending_fix_cycles, pending_fix_op_id, created_at, updated_at,
-                released_at, tombstoned_at
-            ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9, ?10, ?11, NULL, ?12,
-                NULL, NULL, NULL, 0, NULL, NULL, ?12, ?12, NULL, NULL
-            )
-            ON CONFLICT(owner, repo_name, job_id) DO UPDATE SET
-                repo = excluded.repo,
-                branch = excluded.branch,
-                branch_ref = excluded.branch_ref,
-                worktree_path = excluded.worktree_path,
-                start_commit = excluded.start_commit,
-                requested_start_point = CASE
-                    WHEN leases.released_at IS NOT NULL
-                        OR leases.requested_start_point = ''
-                    THEN excluded.requested_start_point
-                    ELSE leases.requested_start_point
-                END,
-                operation_id = CASE
-                    WHEN leases.released_at IS NOT NULL OR leases.operation_id = ''
-                    THEN excluded.operation_id
-                    ELSE leases.operation_id
-                END,
-                allocation_state = excluded.allocation_state,
-                mode = excluded.mode,
-                heartbeat = excluded.heartbeat,
-                updated_at = excluded.updated_at,
-                released_at = NULL
-            WHERE leases.tombstoned_at IS NULL
-                AND (
-                    leases.released_at IS NOT NULL
-                    OR leases.worktree_path = excluded.worktree_path
-                )
-            ",
+                schema::GRANT_UPSERT,
                 params![
                     repo,
                     grant.owner,
@@ -541,7 +445,7 @@ impl LeaseStore {
                     now,
                 ],
             )
-            .map_err(|e| map_live_path_constraint(e, "grant lease"))?;
+            .map_err(|e| occupant::map_live_path_constraint(e, "grant lease"))?;
         if changed == 0 {
             return Err(Error::PolicyViolation {
                 code: PolicyCode::LeaseConflict,
@@ -651,7 +555,7 @@ impl LeaseStore {
     /// True when the `leases` table has the reserved nullable budget columns.
     pub fn has_budget_columns(&self) -> Result<bool> {
         let conn = self.lock()?;
-        let names = table_column_names(&conn)?;
+        let names = schema::table_column_names(&conn)?;
         Ok(["max_files", "max_churn", "max_fix_cycles", "fix_cycles"]
             .into_iter()
             .all(|col| names.iter().any(|name| name == col)))
@@ -675,9 +579,9 @@ impl LeaseStore {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| lease_err("begin allocate prepare", e))?;
-        reject_live_path_occupant(
+        occupant::reject_live_path_occupant(
             &tx,
-            LivePathClaim {
+            occupant::LivePathClaim {
                 worktree_path: &worktree_path,
                 owner: request.owner,
                 repo_name: request.repo_name,
@@ -686,18 +590,7 @@ impl LeaseStore {
             "prepare allocate",
         )?;
         tx.execute(
-            "
-            INSERT INTO leases (
-                repo, owner, repo_name, job_id, branch, branch_ref, worktree_path,
-                requested_start_point, start_commit, operation_id, allocation_state,
-                mode, ttl, heartbeat, max_files, max_churn, max_fix_cycles, fix_cycles,
-                pending_fix_cycles, pending_fix_op_id, created_at, updated_at,
-                released_at, tombstoned_at
-            ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                NULL, NULL, NULL, 0, NULL, NULL, ?14, ?14, NULL, NULL
-            )
-            ",
+            schema::PREPARE_INSERT,
             params![
                 path_text(request.repo),
                 request.owner,
@@ -715,10 +608,10 @@ impl LeaseStore {
                 now,
             ],
         )
-        .map_err(|e| map_live_path_constraint(e, "prepare allocate"))?;
-        insert_op(
+        .map_err(|e| occupant::map_live_path_constraint(e, "prepare allocate"))?;
+        schema::insert_op(
             &tx,
-            OpRecord {
+            schema::OpRecord {
                 operation_id: &operation_id,
                 owner: request.owner,
                 repo_name: request.repo_name,
@@ -799,7 +692,15 @@ impl LeaseStore {
                 message: "released or tombstoned lease cannot be advanced".to_owned(),
             });
         }
-        update_op_phase(&tx, operation_id, phase, status, now)?;
+        schema::update_op_phase(
+            &tx,
+            schema::OpPhase {
+                operation_id,
+                phase,
+                status,
+                now,
+            },
+        )?;
         tx.commit()
             .map_err(|e| lease_err("commit allocate advance", e))?;
         drop(conn);
@@ -866,9 +767,9 @@ impl LeaseStore {
             ],
         )
         .map_err(|e| lease_err("finalize lease", e))?;
-        insert_op(
+        schema::insert_op(
             &tx,
-            OpRecord {
+            schema::OpRecord {
                 operation_id: &format!("{}-{}", lease.operation_id, kind.to_ascii_lowercase()),
                 owner: &lease.owner,
                 repo_name: &lease.repo_name,
@@ -939,7 +840,7 @@ impl LeaseStore {
             repo_name: request.repo_name,
             job_id: request.job_id,
         })?;
-        Ok(inspect_now(&lease, request))
+        Ok(classify::inspect_now(&lease, request))
     }
 
     /// Reconcile an interrupted allocation without destructive cleanup.
@@ -955,7 +856,7 @@ impl LeaseStore {
             worktree_path: Path::new(&lease.worktree_path),
             branch: Some(&lease.branch),
         };
-        let inspection = inspect_now(&Some(lease.clone()), request);
+        let inspection = classify::inspect_now(&Some(lease.clone()), request);
         if lease.allocation_state == AllocationState::Tombstoned {
             return Ok(Some(ReconcileOutcome::Tombstoned { lease, inspection }));
         }
@@ -1031,7 +932,15 @@ impl LeaseStore {
             tx.commit().map_err(|e| lease_err("commit promote", e))?;
             return Ok(terminal_outcome(current, inspection));
         }
-        update_op_phase(&tx, &expected.operation_id, "COMMIT", "COMMITTED", now)?;
+        schema::update_op_phase(
+            &tx,
+            schema::OpPhase {
+                operation_id: &expected.operation_id,
+                phase: "COMMIT",
+                status: "COMMITTED",
+                now,
+            },
+        )?;
         tx.commit().map_err(|e| lease_err("commit promote", e))?;
         drop(conn);
         let lease = self
@@ -1084,7 +993,15 @@ impl LeaseStore {
             tx.commit().map_err(|e| lease_err("commit abort", e))?;
             return Ok(terminal_outcome(current, inspection));
         }
-        update_op_phase(&tx, &expected.operation_id, "PREPARE", "ABORTED", now)?;
+        schema::update_op_phase(
+            &tx,
+            schema::OpPhase {
+                operation_id: &expected.operation_id,
+                phase: "PREPARE",
+                status: "ABORTED",
+                now,
+            },
+        )?;
         tx.commit().map_err(|e| lease_err("commit abort", e))?;
         Ok(ReconcileOutcome::Retry {
             operation_id: expected.operation_id.clone(),
@@ -1137,12 +1054,14 @@ impl LeaseStore {
             tx.commit().map_err(|e| lease_err("commit attention", e))?;
             return Ok(terminal_outcome(current, inspection));
         }
-        update_op_phase(
+        schema::update_op_phase(
             &tx,
-            &expected.operation_id,
-            "MUTATE",
-            "NEEDS_ATTENTION",
-            now,
+            schema::OpPhase {
+                operation_id: &expected.operation_id,
+                phase: "MUTATE",
+                status: "NEEDS_ATTENTION",
+                now,
+            },
         )?;
         tx.commit().map_err(|e| lease_err("commit attention", e))?;
         drop(conn);
@@ -1173,22 +1092,7 @@ impl LeaseStore {
             context: "prepare fix-cycle",
             message: "lease not found".to_owned(),
         })?;
-        if lease.allocation_state != AllocationState::Active {
-            return Err(Error::LeaseStore {
-                context: "prepare fix-cycle",
-                message: format!(
-                    "fix_cycles increment requires ACTIVE lease, found {}",
-                    lease.allocation_state.as_str()
-                ),
-            });
-        }
-        if lease.pending_fix_op_id.is_some() {
-            return Err(Error::LeaseStore {
-                context: "prepare fix-cycle",
-                message: "a pending fix_cycles increment already exists; reconcile it first"
-                    .to_owned(),
-            });
-        }
+        require_active_fix_cycle(&lease)?;
         let authorized = lease.fix_cycles.unwrap_or(0) + 1;
         tx.execute(
             "
@@ -1213,9 +1117,9 @@ impl LeaseStore {
                 message: "released or tombstoned lease cannot increment fix_cycles".to_owned(),
             });
         }
-        insert_op(
+        schema::insert_op(
             &tx,
-            OpRecord {
+            schema::OpRecord {
                 operation_id: &operation_id,
                 owner: key.owner,
                 repo_name: key.repo_name,
@@ -1280,7 +1184,15 @@ impl LeaseStore {
                 message: "released or tombstoned lease cannot commit fix_cycles".to_owned(),
             });
         }
-        update_op_phase(&tx, operation_id, "COMMIT", "COMMITTED", now)?;
+        schema::update_op_phase(
+            &tx,
+            schema::OpPhase {
+                operation_id,
+                phase: "COMMIT",
+                status: "COMMITTED",
+                now,
+            },
+        )?;
         tx.commit()
             .map_err(|e| lease_err("commit fix-cycle commit", e))?;
         Ok(committed)
@@ -1305,7 +1217,15 @@ impl LeaseStore {
         if lease.allocation_state.is_terminal() {
             return Err(terminal_error(&lease));
         }
-        update_op_phase(&tx, operation_id, phase, "IN_PROGRESS", now)?;
+        schema::update_op_phase(
+            &tx,
+            schema::OpPhase {
+                operation_id,
+                phase,
+                status: "IN_PROGRESS",
+                now,
+            },
+        )?;
         tx.commit()
             .map_err(|e| lease_err("commit fix-cycle phase", e))?;
         Ok(())
@@ -1366,7 +1286,15 @@ impl LeaseStore {
             params![now, operation_id],
         )
         .map_err(|e| lease_err("abort fix-cycle", e))?;
-        update_op_phase(&tx, operation_id, "PREPARE", "ABORTED", now)?;
+        schema::update_op_phase(
+            &tx,
+            schema::OpPhase {
+                operation_id,
+                phase: "PREPARE",
+                status: "ABORTED",
+                now,
+            },
+        )?;
         tx.commit()
             .map_err(|e| lease_err("commit fix-cycle abort", e))?;
         Ok(())
@@ -1389,144 +1317,6 @@ impl LeaseStore {
             message: "lease store mutex poisoned".to_owned(),
         })
     }
-}
-
-fn table_column_names(conn: &Connection) -> Result<Vec<String>> {
-    let mut stmt = conn
-        .prepare("PRAGMA table_info(leases)")
-        .map_err(|e| lease_err("inspect lease schema", e))?;
-    stmt.query_map([], |row| row.get::<_, String>(1))
-        .map_err(|e| lease_err("inspect lease schema", e))?
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|e| lease_err("inspect lease schema", e))
-}
-
-fn ensure_crash_consistency_columns(conn: &Connection) -> Result<()> {
-    let names = table_column_names(conn)?;
-    let additions = [
-        (
-            "requested_start_point",
-            "requested_start_point TEXT NOT NULL DEFAULT ''",
-        ),
-        ("operation_id", "operation_id TEXT NOT NULL DEFAULT ''"),
-        (
-            "allocation_state",
-            "allocation_state TEXT NOT NULL DEFAULT 'ACTIVE'",
-        ),
-        ("pending_fix_cycles", "pending_fix_cycles INTEGER"),
-        ("pending_fix_op_id", "pending_fix_op_id TEXT"),
-        ("tombstoned_at", "tombstoned_at INTEGER"),
-    ];
-    for (column, ddl) in additions {
-        if !names.iter().any(|name| name == column) {
-            conn.execute(&format!("ALTER TABLE leases ADD COLUMN {ddl}"), [])
-                .map_err(|e| lease_err("migrate lease schema", e))?;
-        }
-    }
-    conn.execute(
-        "
-        UPDATE leases
-        SET requested_start_point = start_commit
-        WHERE requested_start_point = ''
-        ",
-        [],
-    )
-    .map_err(|e| lease_err("backfill requested_start_point", e))?;
-    conn.execute(
-        "
-        UPDATE leases
-        SET operation_id = 'legacy-' || id
-        WHERE operation_id = ''
-        ",
-        [],
-    )
-    .map_err(|e| lease_err("backfill operation_id", e))?;
-    conn.execute(
-        "
-        UPDATE leases
-        SET allocation_state = CASE
-            WHEN tombstoned_at IS NOT NULL THEN 'TOMBSTONED'
-            WHEN released_at IS NOT NULL THEN 'RELEASED'
-            ELSE 'ACTIVE'
-        END
-        WHERE allocation_state = '' OR (
-            allocation_state = 'ACTIVE' AND released_at IS NOT NULL
-        )
-        ",
-        [],
-    )
-    .map_err(|e| lease_err("backfill allocation_state", e))?;
-    Ok(())
-}
-
-fn ensure_live_path_unique_index(conn: &Connection) -> Result<()> {
-    conn.execute(
-        "
-        CREATE UNIQUE INDEX IF NOT EXISTS leases_live_worktree_path
-            ON leases(worktree_path)
-            WHERE released_at IS NULL AND tombstoned_at IS NULL
-        ",
-        [],
-    )
-    .map_err(|e| lease_err("ensure live worktree path uniqueness", e))?;
-    Ok(())
-}
-
-struct OpRecord<'a> {
-    operation_id: &'a str,
-    owner: &'a str,
-    repo_name: &'a str,
-    job_id: &'a str,
-    kind: &'a str,
-    phase: &'a str,
-    requested_start_point: Option<&'a str>,
-    resolved_start_commit: Option<&'a str>,
-    status: &'a str,
-    now: i64,
-}
-
-fn insert_op(tx: &rusqlite::Transaction<'_>, op: OpRecord<'_>) -> Result<()> {
-    tx.execute(
-        "
-        INSERT INTO allocation_ops (
-            operation_id, owner, repo_name, job_id, kind, phase,
-            requested_start_point, resolved_start_commit, status, created_at, updated_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)
-        ",
-        params![
-            op.operation_id,
-            op.owner,
-            op.repo_name,
-            op.job_id,
-            op.kind,
-            op.phase,
-            op.requested_start_point,
-            op.resolved_start_commit,
-            op.status,
-            op.now,
-        ],
-    )
-    .map_err(|e| lease_err("insert allocation op", e))?;
-    Ok(())
-}
-
-fn update_op_phase(
-    tx: &rusqlite::Transaction<'_>,
-    operation_id: &str,
-    phase: &str,
-    status: &str,
-    now: i64,
-) -> Result<()> {
-    tx.execute(
-        "
-        UPDATE allocation_ops
-        SET phase = ?1, status = ?2, updated_at = ?3
-        WHERE operation_id = ?4
-        ",
-        params![phase, status, now, operation_id],
-    )
-    .map_err(|e| lease_err("update allocation op", e))?;
-    Ok(())
 }
 
 fn query_lease_locked(
@@ -1620,222 +1410,23 @@ fn agent_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRecord> {
     })
 }
 
-fn inspect_now(lease: &Option<Lease>, request: InspectRequest<'_>) -> AllocationInspection {
-    let branch = lease
-        .as_ref()
-        .map(|row| row.branch.as_str())
-        .or(request.branch)
-        .unwrap_or("");
-    let branch_ref = if branch.is_empty() {
-        String::new()
-    } else {
-        format!("refs/heads/{branch}")
-    };
-    let evidence = inspect_git(request.repo_root, request.worktree_path, branch);
-    let ttl_expired = lease.as_ref().is_some_and(ttl_is_expired);
-    let (classification, conflicts) =
-        classify(lease, &evidence, request.worktree_path, ttl_expired);
-    AllocationInspection {
-        operation_id: lease.as_ref().map(|row| row.operation_id.clone()),
-        allocation_state: lease
-            .as_ref()
-            .map(|row| row.allocation_state.as_str().to_owned()),
-        requested_start_point: lease.as_ref().map(|row| row.requested_start_point.clone()),
-        resolved_start_commit: lease.as_ref().map(|row| row.start_commit.clone()),
-        derived_path: request.worktree_path.to_path_buf(),
-        path_exists: evidence.path_exists,
-        branch_ref: if evidence.branch_ref.is_empty() {
-            branch_ref
-        } else {
-            evidence.branch_ref
-        },
-        branch_commit: evidence.branch_commit,
-        head_commit: evidence.head_commit,
-        worktree_registered: evidence.worktree_registered,
-        repo_identity: path_text(request.repo_root),
-        lease_present: lease.is_some(),
-        ttl_expired,
-        classification,
-        conflicts,
+fn require_active_fix_cycle(lease: &Lease) -> Result<()> {
+    if lease.allocation_state != AllocationState::Active {
+        return Err(Error::LeaseStore {
+            context: "prepare fix-cycle",
+            message: format!(
+                "fix_cycles increment requires ACTIVE lease, found {}",
+                lease.allocation_state.as_str()
+            ),
+        });
     }
-}
-
-struct GitEvidence {
-    path_exists: bool,
-    branch_ref: String,
-    branch_commit: Option<String>,
-    head_commit: Option<String>,
-    worktree_registered: bool,
-}
-
-/// Match a `git worktree list --porcelain` dump against a stored path.
-///
-/// Git may spell the same directory with different separators, casing, or a
-/// canonical prefix than `Path::to_string_lossy`, so callers must not use
-/// substring `contains`.
-fn porcelain_lists_worktree(listing: &str, worktree_path: &Path) -> bool {
-    listing.lines().any(|line| {
-        line.strip_prefix("worktree ")
-            .is_some_and(|path| crate::paths::same_existing_path(Path::new(path), worktree_path))
-    })
-}
-
-fn inspect_git(repo_root: &Path, worktree_path: &Path, branch: &str) -> GitEvidence {
-    let branch_ref = if branch.is_empty() {
-        String::new()
-    } else {
-        format!("refs/heads/{branch}")
-    };
-    let branch_commit = if branch_ref.is_empty() {
-        None
-    } else {
-        optional_git_stdout(
-            repo_root,
-            &[
-                "rev-parse",
-                "--verify",
-                "--end-of-options",
-                &format!("{branch_ref}^{{commit}}"),
-            ],
-        )
-    };
-    let head_commit = optional_git_stdout(
-        worktree_path,
-        &["rev-parse", "--verify", "--end-of-options", "HEAD^{commit}"],
-    );
-    let listed = optional_git_stdout(repo_root, &["worktree", "list", "--porcelain"])
-        .is_some_and(|listing| porcelain_lists_worktree(&listing, worktree_path));
-    // Harness-owned standalone clones are not in another repo's `worktree list`.
-    let worktree_registered = listed || worktree_path.join(".git").exists();
-    GitEvidence {
-        path_exists: worktree_path.exists(),
-        branch_ref,
-        branch_commit,
-        head_commit,
-        worktree_registered,
+    if lease.pending_fix_op_id.is_some() {
+        return Err(Error::LeaseStore {
+            context: "prepare fix-cycle",
+            message: "a pending fix_cycles increment already exists; reconcile it first".to_owned(),
+        });
     }
-}
-
-fn classify(
-    lease: &Option<Lease>,
-    evidence: &GitEvidence,
-    _path: &Path,
-    ttl_expired: bool,
-) -> (EvidenceClass, Vec<String>) {
-    match lease {
-        None => classify_missing_lease(evidence),
-        Some(lease) => classify_existing(lease, evidence, ttl_expired),
-    }
-}
-
-fn classify_missing_lease(evidence: &GitEvidence) -> (EvidenceClass, Vec<String>) {
-    if evidence.path_exists || evidence.branch_commit.is_some() || evidence.worktree_registered {
-        (
-            EvidenceClass::MissingLease,
-            vec!["live worktree or branch with no lease row".to_owned()],
-        )
-    } else {
-        (EvidenceClass::Absent, Vec::new())
-    }
-}
-
-fn classify_existing(
-    lease: &Lease,
-    evidence: &GitEvidence,
-    ttl_expired: bool,
-) -> (EvidenceClass, Vec<String>) {
-    if let Some(class) = classify_terminal_or_retryable(lease, evidence, ttl_expired) {
-        return (class, Vec::new());
-    }
-    if lease.allocation_state == AllocationState::Active && ttl_expired && evidence.path_exists {
-        return (
-            EvidenceClass::OrphanedLease,
-            vec!["lease heartbeat/ttl expired while worktree is still live".to_owned()],
-        );
-    }
-    let conflicts = identity_conflicts(lease, evidence);
-    if conflicts.is_empty() {
-        (EvidenceClass::Matching, conflicts)
-    } else {
-        (EvidenceClass::NeedsAttention, conflicts)
-    }
-}
-
-fn classify_terminal_or_retryable(
-    lease: &Lease,
-    evidence: &GitEvidence,
-    _ttl_expired: bool,
-) -> Option<EvidenceClass> {
-    match lease.allocation_state {
-        AllocationState::Tombstoned => Some(EvidenceClass::Tombstoned),
-        AllocationState::Released => Some(EvidenceClass::Released),
-        _ if no_git_mutation(evidence) && lease.allocation_state.is_in_progress() => {
-            Some(EvidenceClass::Retryable)
-        }
-        _ => None,
-    }
-}
-
-fn no_git_mutation(evidence: &GitEvidence) -> bool {
-    !evidence.path_exists
-        && evidence.branch_commit.is_none()
-        && evidence.head_commit.is_none()
-        && !evidence.worktree_registered
-}
-
-fn identity_conflicts(lease: &Lease, evidence: &GitEvidence) -> Vec<String> {
-    let mut conflicts = Vec::new();
-    if !evidence.path_exists {
-        conflicts.push("derived path is missing".to_owned());
-    }
-    if !evidence.worktree_registered {
-        conflicts.push("worktree is not registered".to_owned());
-    }
-    if named_git_branch(&lease.branch)
-        && let Some(conflict) = commit_conflict(
-            evidence.branch_commit.as_deref(),
-            &lease.start_commit,
-            "branch commit",
-            "branch commit is absent",
-        )
-    {
-        conflicts.push(conflict);
-    }
-    if let Some(conflict) = commit_conflict(
-        evidence.head_commit.as_deref(),
-        &lease.start_commit,
-        "worker HEAD",
-        "worker HEAD is absent",
-    ) {
-        conflicts.push(conflict);
-    }
-    conflicts
-}
-
-fn commit_conflict(
-    observed: Option<&str>,
-    expected: &str,
-    present_label: &str,
-    absent: &str,
-) -> Option<String> {
-    match observed {
-        Some(commit) if commit == expected => None,
-        Some(commit) => Some(format!(
-            "{present_label} {commit} != resolved start {expected}"
-        )),
-        None => Some(absent.to_owned()),
-    }
-}
-
-fn named_git_branch(branch: &str) -> bool {
-    !branch.is_empty() && branch != "(detached)"
-}
-
-fn ttl_is_expired(lease: &Lease) -> bool {
-    let (Some(ttl), Some(heartbeat)) = (lease.ttl, lease.heartbeat) else {
-        return false;
-    };
-    now_secs().saturating_sub(heartbeat) > ttl
+    Ok(())
 }
 
 fn prepare_blocked(existing: Lease) -> Error {
@@ -1905,87 +1496,14 @@ pub fn attention_error(lease: &Lease, inspection: &AllocationInspection) -> Erro
     }))
 }
 
-fn optional_git_stdout(repo: &Path, args: &[&str]) -> Option<String> {
-    Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
-        .filter(|text| !text.is_empty())
-}
-
-fn lease_err(context: &'static str, err: rusqlite::Error) -> Error {
+pub(super) fn lease_err(context: &'static str, err: rusqlite::Error) -> Error {
     Error::LeaseStore {
         context,
         message: err.to_string(),
     }
 }
 
-fn live_path_held_error(job_id: &str) -> Error {
-    Error::PolicyViolation {
-        code: PolicyCode::LeaseConflict,
-        message: format!("checkout already holds an active lease for job `{job_id}`"),
-    }
-}
-
-fn is_live_path_unique_violation(err: &rusqlite::Error) -> bool {
-    let text = err.to_string();
-    text.contains("UNIQUE constraint failed")
-        && (text.contains("leases_live_worktree_path") || text.contains("leases.worktree_path"))
-}
-
-fn map_live_path_constraint(err: rusqlite::Error, context: &'static str) -> Error {
-    if is_live_path_unique_violation(&err) {
-        Error::PolicyViolation {
-            code: PolicyCode::LeaseConflict,
-            message: "checkout already holds an active lease for another job".to_owned(),
-        }
-    } else {
-        lease_err(context, err)
-    }
-}
-
-fn reject_live_path_occupant(
-    conn: &Connection,
-    claim: LivePathClaim<'_>,
-    context: &'static str,
-) -> Result<()> {
-    let occupant: Option<String> = conn
-        .query_row(
-            "
-            SELECT job_id FROM leases
-            WHERE worktree_path = ?1
-              AND released_at IS NULL
-              AND tombstoned_at IS NULL
-              AND NOT (owner = ?2 AND repo_name = ?3 AND job_id = ?4)
-            ",
-            params![
-                claim.worktree_path,
-                claim.owner,
-                claim.repo_name,
-                claim.job_id
-            ],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|e| lease_err(context, e))?;
-    if let Some(held_by) = occupant {
-        return Err(live_path_held_error(&held_by));
-    }
-    Ok(())
-}
-
-struct LivePathClaim<'a> {
-    worktree_path: &'a str,
-    owner: &'a str,
-    repo_name: &'a str,
-    job_id: &'a str,
-}
-
-fn now_secs() -> i64 {
+pub(super) fn now_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
@@ -2004,863 +1522,9 @@ fn new_operation_id() -> String {
     )
 }
 
-fn path_text(path: &Path) -> String {
+pub(super) fn path_text(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs;
-    use tempfile::tempdir;
-
-    struct RepoHarness {
-        _temp: tempfile::TempDir,
-        repo: PathBuf,
-        store: LeaseStore,
-        worktree: PathBuf,
-        start: String,
-    }
-
-    impl RepoHarness {
-        fn new() -> Self {
-            let temp = tempdir().unwrap();
-            let repo = temp.path().join("repo");
-            fs::create_dir(&repo).unwrap();
-            git(&repo, &["init", "-b", "main"]);
-            git(&repo, &["config", "user.email", "test@example.com"]);
-            git(&repo, &["config", "user.name", "Test User"]);
-            git(&repo, &["commit", "--allow-empty", "-m", "initial"]);
-            let start = git(&repo, &["rev-parse", "HEAD"]);
-            let store = LeaseStore::open(temp.path().join("leases.db")).unwrap();
-            let worktree = temp.path().join("worktrees/acme/sample/job-1");
-            Self {
-                _temp: temp,
-                repo,
-                store,
-                worktree,
-                start,
-            }
-        }
-
-        fn request(&self) -> AllocateRequest<'_> {
-            AllocateRequest {
-                repo: &self.repo,
-                owner: "acme",
-                repo_name: "sample",
-                job_id: "job-1",
-                branch: "hive/job-1",
-                worktree_path: &self.worktree,
-                requested_start_point: "refs/heads/main",
-                start_commit: &self.start,
-                ttl: None,
-            }
-        }
-
-        fn key(&self) -> JobKey<'_> {
-            JobKey {
-                owner: "acme",
-                repo_name: "sample",
-                job_id: "job-1",
-            }
-        }
-
-        fn inspect_req(&self) -> InspectRequest<'_> {
-            InspectRequest {
-                repo_root: &self.repo,
-                owner: "acme",
-                repo_name: "sample",
-                job_id: "job-1",
-                worktree_path: &self.worktree,
-                branch: Some("hive/job-1"),
-            }
-        }
-    }
-
-    fn git(repo: &Path, args: &[&str]) -> String {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(repo)
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8_lossy(&output.stdout).trim().to_owned()
-    }
-
-    fn later_commit(repo: &Path) -> String {
-        git(repo, &["commit", "--allow-empty", "-m", "later"]);
-        git(repo, &["rev-parse", "HEAD"])
-    }
-
-    #[test]
-    fn crash_before_mutation_is_retryable_without_reserving_identity() {
-        let harness = RepoHarness::new();
-        let prepared = harness.store.prepare_allocate(harness.request()).unwrap();
-        assert_eq!(prepared.allocation_state, AllocationState::Prepared);
-        assert_eq!(prepared.requested_start_point, "refs/heads/main");
-        assert_eq!(prepared.start_commit, harness.start);
-        assert_ne!(prepared.requested_start_point, prepared.start_commit);
-
-        let outcome = harness
-            .store
-            .reconcile(harness.key(), &harness.repo)
-            .unwrap()
-            .unwrap();
-        assert_eq!(outcome.as_str(), "retry");
-        assert!(harness.store.find_job(harness.key()).unwrap().is_none());
-
-        let again = harness.store.prepare_allocate(harness.request()).unwrap();
-        assert_ne!(again.operation_id, prepared.operation_id);
-    }
-
-    #[test]
-    fn crash_after_branch_creation_is_fail_closed_without_cleanup() {
-        let harness = RepoHarness::new();
-        harness.store.prepare_allocate(harness.request()).unwrap();
-        harness
-            .store
-            .mark_mutating(
-                &harness
-                    .store
-                    .find_job(harness.key())
-                    .unwrap()
-                    .unwrap()
-                    .operation_id,
-            )
-            .unwrap();
-        git(&harness.repo, &["branch", "hive/job-1", &harness.start]);
-
-        let outcome = harness
-            .store
-            .reconcile(harness.key(), &harness.repo)
-            .unwrap()
-            .unwrap();
-        assert_eq!(outcome.as_str(), "needs_attention");
-        assert_eq!(
-            git(&harness.repo, &["rev-parse", "refs/heads/hive/job-1"]),
-            harness.start
-        );
-        assert!(!harness.worktree.exists());
-        let lease = harness.store.find_job(harness.key()).unwrap().unwrap();
-        assert_eq!(lease.allocation_state, AllocationState::NeedsAttention);
-    }
-
-    #[test]
-    fn crash_after_filesystem_creation_is_fail_closed_without_cleanup() {
-        let harness = RepoHarness::new();
-        harness.store.prepare_allocate(harness.request()).unwrap();
-        fs::create_dir_all(&harness.worktree).unwrap();
-        fs::write(harness.worktree.join("occupied"), "partial\n").unwrap();
-
-        let outcome = harness
-            .store
-            .reconcile(harness.key(), &harness.repo)
-            .unwrap()
-            .unwrap();
-        assert_eq!(outcome.as_str(), "needs_attention");
-        assert_eq!(
-            fs::read_to_string(harness.worktree.join("occupied")).unwrap(),
-            "partial\n"
-        );
-    }
-
-    #[test]
-    fn crash_after_registration_is_fail_closed_when_head_is_absent() {
-        let harness = RepoHarness::new();
-        harness.store.prepare_allocate(harness.request()).unwrap();
-        git(
-            &harness.repo,
-            &[
-                "worktree",
-                "add",
-                "--detach",
-                "--",
-                harness.worktree.to_str().unwrap(),
-                &harness.start,
-            ],
-        );
-
-        let outcome = harness
-            .store
-            .reconcile(harness.key(), &harness.repo)
-            .unwrap()
-            .unwrap();
-        assert_eq!(outcome.as_str(), "needs_attention");
-        assert!(harness.worktree.exists());
-        let listing = git(&harness.repo, &["worktree", "list", "--porcelain"]);
-        assert!(
-            porcelain_lists_worktree(&listing, &harness.worktree),
-            "fail-closed reconcile must keep the registered worktree; listing={listing:?} expected={:?}",
-            harness.worktree
-        );
-    }
-
-    #[test]
-    fn matching_interrupted_allocation_is_promoted_with_canonical_commit() {
-        let harness = RepoHarness::new();
-        let prepared = harness.store.prepare_allocate(harness.request()).unwrap();
-        harness.store.mark_mutating(&prepared.operation_id).unwrap();
-        git(
-            &harness.repo,
-            &[
-                "worktree",
-                "add",
-                "-b",
-                "hive/job-1",
-                "--",
-                harness.worktree.to_str().unwrap(),
-                &harness.start,
-            ],
-        );
-
-        let outcome = harness
-            .store
-            .reconcile(harness.key(), &harness.repo)
-            .unwrap()
-            .unwrap();
-        let ReconcileOutcome::Promoted { lease, inspection } = outcome else {
-            panic!("expected promote, got {outcome:?}");
-        };
-        assert_eq!(lease.start_commit, harness.start);
-        assert_eq!(lease.requested_start_point, "refs/heads/main");
-        assert_eq!(lease.allocation_state, AllocationState::Active);
-        assert_eq!(lease.mode, LeaseMode::WriterLocked);
-        assert_eq!(
-            inspection.head_commit.as_deref(),
-            Some(harness.start.as_str())
-        );
-        assert_eq!(inspection.classification, EvidenceClass::Matching);
-        assert!(!inspection.ttl_expired);
-    }
-
-    #[test]
-    fn conflicting_head_stays_fail_closed() {
-        let harness = RepoHarness::new();
-        let prepared = harness.store.prepare_allocate(harness.request()).unwrap();
-        harness.store.mark_mutating(&prepared.operation_id).unwrap();
-        git(
-            &harness.repo,
-            &[
-                "worktree",
-                "add",
-                "-b",
-                "hive/job-1",
-                "--",
-                harness.worktree.to_str().unwrap(),
-                &harness.start,
-            ],
-        );
-        let moved = later_commit(&harness.repo);
-        git(
-            &harness.repo,
-            &["update-ref", "refs/heads/hive/job-1", &moved],
-        );
-
-        let outcome = harness
-            .store
-            .reconcile(harness.key(), &harness.repo)
-            .unwrap()
-            .unwrap();
-        assert_eq!(outcome.as_str(), "needs_attention");
-        assert_eq!(
-            git(&harness.repo, &["rev-parse", "refs/heads/hive/job-1"]),
-            moved
-        );
-        assert!(harness.worktree.exists());
-    }
-
-    #[test]
-    fn persisted_record_distinguishes_symbolic_resolved_and_operation() {
-        let harness = RepoHarness::new();
-        let lease = harness.store.prepare_allocate(harness.request()).unwrap();
-        let inspection = harness.store.inspect(harness.inspect_req()).unwrap();
-        assert_eq!(
-            inspection.requested_start_point.as_deref(),
-            Some("refs/heads/main")
-        );
-        assert_eq!(
-            inspection.resolved_start_commit.as_deref(),
-            Some(harness.start.as_str())
-        );
-        assert_eq!(
-            inspection.operation_id.as_deref(),
-            Some(lease.operation_id.as_str())
-        );
-        assert_ne!(
-            inspection.requested_start_point.as_deref(),
-            inspection.resolved_start_commit.as_deref()
-        );
-    }
-
-    #[test]
-    fn concurrent_reconcile_cannot_resurrect_tombstoned_lease() {
-        let harness = RepoHarness::new();
-        let prepared = harness.store.prepare_allocate(harness.request()).unwrap();
-        harness.store.mark_mutating(&prepared.operation_id).unwrap();
-        git(
-            &harness.repo,
-            &[
-                "worktree",
-                "add",
-                "-b",
-                "hive/job-1",
-                "--",
-                harness.worktree.to_str().unwrap(),
-                &harness.start,
-            ],
-        );
-        let other = LeaseStore::open(harness.store.path()).unwrap();
-        other.tombstone_by_path(&harness.worktree).unwrap();
-
-        let outcome = harness
-            .store
-            .reconcile(harness.key(), &harness.repo)
-            .unwrap()
-            .unwrap();
-        assert_eq!(outcome.as_str(), "tombstoned");
-        let lease = harness.store.find_job(harness.key()).unwrap().unwrap();
-        assert_eq!(lease.allocation_state, AllocationState::Tombstoned);
-        assert!(matches!(
-            harness.store.prepare_allocate(harness.request()),
-            Err(Error::PolicyViolation {
-                code: PolicyCode::LeaseTombstoned,
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn concurrent_reconcile_cannot_resurrect_released_lease() {
-        let harness = RepoHarness::new();
-        let prepared = harness.store.prepare_allocate(harness.request()).unwrap();
-        harness.store.mark_mutating(&prepared.operation_id).unwrap();
-        git(
-            &harness.repo,
-            &[
-                "worktree",
-                "add",
-                "-b",
-                "hive/job-1",
-                "--",
-                harness.worktree.to_str().unwrap(),
-                &harness.start,
-            ],
-        );
-        harness
-            .store
-            .commit_allocate(&prepared.operation_id)
-            .unwrap();
-        let other = LeaseStore::open(harness.store.path()).unwrap();
-        other.release_by_path(&harness.worktree).unwrap();
-
-        let outcome = harness
-            .store
-            .reconcile(harness.key(), &harness.repo)
-            .unwrap()
-            .unwrap();
-        assert_eq!(outcome.as_str(), "released");
-        assert!(matches!(
-            harness.store.prepare_allocate(harness.request()),
-            Err(Error::PolicyViolation {
-                code: PolicyCode::LeaseReleased,
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn ttl_expiry_and_missing_lease_are_distinct() {
-        let harness = RepoHarness::new();
-        let mut request = harness.request();
-        request.ttl = Some(1);
-        let prepared = harness.store.prepare_allocate(request).unwrap();
-        harness.store.mark_mutating(&prepared.operation_id).unwrap();
-        git(
-            &harness.repo,
-            &[
-                "worktree",
-                "add",
-                "-b",
-                "hive/job-1",
-                "--",
-                harness.worktree.to_str().unwrap(),
-                &harness.start,
-            ],
-        );
-        harness
-            .store
-            .commit_allocate(&prepared.operation_id)
-            .unwrap();
-        {
-            let conn = harness.store.conn.lock().unwrap();
-            conn.execute(
-                "UPDATE leases SET heartbeat = 1, ttl = 1 WHERE job_id = 'job-1'",
-                [],
-            )
-            .unwrap();
-        }
-        let orphaned = harness.store.inspect(harness.inspect_req()).unwrap();
-        assert_eq!(orphaned.classification, EvidenceClass::OrphanedLease);
-        assert!(orphaned.lease_present);
-        assert!(orphaned.ttl_expired);
-        assert!(orphaned.path_exists);
-
-        let missing_store =
-            LeaseStore::open(harness.store.path().with_file_name("other.db")).unwrap();
-        let missing = missing_store.inspect(harness.inspect_req()).unwrap();
-        assert_eq!(missing.classification, EvidenceClass::MissingLease);
-        assert!(!missing.lease_present);
-        assert!(missing.path_exists);
-        assert!(!missing.ttl_expired);
-    }
-
-    #[test]
-    fn inspect_does_not_mutate_or_adopt() {
-        let harness = RepoHarness::new();
-        harness.store.prepare_allocate(harness.request()).unwrap();
-        git(&harness.repo, &["branch", "hive/job-1", &harness.start]);
-        let before = git(&harness.repo, &["rev-parse", "refs/heads/hive/job-1"]);
-        let _ = harness.store.inspect(harness.inspect_req()).unwrap();
-        assert_eq!(
-            git(&harness.repo, &["rev-parse", "refs/heads/hive/job-1"]),
-            before
-        );
-        assert!(!harness.worktree.exists());
-        assert_eq!(
-            harness
-                .store
-                .find_job(harness.key())
-                .unwrap()
-                .unwrap()
-                .allocation_state,
-            AllocationState::Prepared
-        );
-    }
-
-    #[test]
-    fn fix_cycles_crash_before_mutation_does_not_count() {
-        let harness = RepoHarness::new();
-        let prepared = harness.store.prepare_allocate(harness.request()).unwrap();
-        harness.store.mark_mutating(&prepared.operation_id).unwrap();
-        git(
-            &harness.repo,
-            &[
-                "worktree",
-                "add",
-                "-b",
-                "hive/job-1",
-                "--",
-                harness.worktree.to_str().unwrap(),
-                &harness.start,
-            ],
-        );
-        harness
-            .store
-            .commit_allocate(&prepared.operation_id)
-            .unwrap();
-
-        let token = harness.store.prepare_fix_cycle(harness.key()).unwrap();
-        assert_eq!(token.authorized, 1);
-        let recovered = harness
-            .store
-            .reconcile_fix_cycle(harness.key(), None)
-            .unwrap();
-        assert_eq!(recovered, FixCycleReconcile::Aborted { fix_cycles: 0 });
-        assert_eq!(
-            harness
-                .store
-                .find_job(harness.key())
-                .unwrap()
-                .unwrap()
-                .fix_cycles,
-            Some(0)
-        );
-    }
-
-    #[test]
-    fn fix_cycles_crash_after_proven_mutation_is_not_lost() {
-        let harness = RepoHarness::new();
-        let prepared = harness.store.prepare_allocate(harness.request()).unwrap();
-        harness.store.mark_mutating(&prepared.operation_id).unwrap();
-        git(
-            &harness.repo,
-            &[
-                "worktree",
-                "add",
-                "-b",
-                "hive/job-1",
-                "--",
-                harness.worktree.to_str().unwrap(),
-                &harness.start,
-            ],
-        );
-        harness
-            .store
-            .commit_allocate(&prepared.operation_id)
-            .unwrap();
-
-        let token = harness.store.prepare_fix_cycle(harness.key()).unwrap();
-        harness
-            .store
-            .mark_fix_cycle_mutating(&token.operation_id)
-            .unwrap();
-        let recovered = harness
-            .store
-            .reconcile_fix_cycle(harness.key(), Some(true))
-            .unwrap();
-        assert_eq!(recovered, FixCycleReconcile::Committed { fix_cycles: 1 });
-        let again = harness
-            .store
-            .reconcile_fix_cycle(harness.key(), Some(true))
-            .unwrap();
-        assert_eq!(again, FixCycleReconcile::Idle { fix_cycles: 1 });
-    }
-
-    #[test]
-    fn fix_cycles_mutate_without_proof_stays_needs_attention() {
-        let harness = RepoHarness::new();
-        let prepared = harness.store.prepare_allocate(harness.request()).unwrap();
-        harness.store.mark_mutating(&prepared.operation_id).unwrap();
-        git(
-            &harness.repo,
-            &[
-                "worktree",
-                "add",
-                "-b",
-                "hive/job-1",
-                "--",
-                harness.worktree.to_str().unwrap(),
-                &harness.start,
-            ],
-        );
-        harness
-            .store
-            .commit_allocate(&prepared.operation_id)
-            .unwrap();
-        let token = harness.store.prepare_fix_cycle(harness.key()).unwrap();
-        harness
-            .store
-            .mark_fix_cycle_mutating(&token.operation_id)
-            .unwrap();
-        let recovered = harness
-            .store
-            .reconcile_fix_cycle(harness.key(), None)
-            .unwrap();
-        assert!(matches!(
-            recovered,
-            FixCycleReconcile::NeedsAttention { pending: 1, .. }
-        ));
-        assert_eq!(
-            harness
-                .store
-                .find_job(harness.key())
-                .unwrap()
-                .unwrap()
-                .fix_cycles,
-            Some(0)
-        );
-    }
-
-    // Exercises the `same_existing_path` tolerance inside `inspect_git`'s
-    // `worktree_registered` check (the path-equality fix from this PR). git
-    // reports the OS-canonical real worktree path, while the stored lease path
-    // reaches the same directory through a symlinked prefix (the macOS
-    // `/var -> /private/var` situation). Under the old exact-string comparison
-    // these differ and the worktree would be reported unregistered, wrongly
-    // classifying a clean allocation as `NeedsAttention`. This asserts the
-    // integration-level behaviour, not just the helper.
-    #[cfg(unix)]
-    #[test]
-    fn worktree_registered_tolerates_symlinked_stored_path() {
-        let harness = RepoHarness::new();
-
-        // Create and register the worktree at its real (non-symlinked) path.
-        fs::create_dir_all(harness.worktree.parent().unwrap()).unwrap();
-        git(
-            &harness.repo,
-            &[
-                "worktree",
-                "add",
-                "-b",
-                "hive/job-1",
-                "--",
-                harness.worktree.to_str().unwrap(),
-                &harness.start,
-            ],
-        );
-
-        // Build an alias that reaches the same directory via a symlink, so the
-        // stored path differs from git's reported path only by canonicalization.
-        let real_parent = harness.worktree.parent().unwrap();
-        let alias_parent = harness._temp.path().join("aliased-worktrees");
-        std::os::unix::fs::symlink(real_parent, &alias_parent).unwrap();
-        let aliased_worktree = alias_parent.join("job-1");
-        assert_ne!(aliased_worktree, harness.worktree);
-
-        let evidence = inspect_git(&harness.repo, &aliased_worktree, "hive/job-1");
-        assert!(
-            evidence.worktree_registered,
-            "symlinked stored path should still match git's canonical worktree path"
-        );
-
-        // And the full inspection should classify the allocation as Matching,
-        // proving the tolerance flows through to the reconcile decision.
-        harness.store.prepare_allocate(harness.request()).unwrap();
-        let inspection = harness
-            .store
-            .inspect(InspectRequest {
-                repo_root: &harness.repo,
-                owner: "acme",
-                repo_name: "sample",
-                job_id: "job-1",
-                worktree_path: &aliased_worktree,
-                branch: Some("hive/job-1"),
-            })
-            .unwrap();
-        assert!(inspection.worktree_registered);
-        assert_eq!(inspection.classification, EvidenceClass::Matching);
-    }
-
-    #[test]
-    fn grant_release_preserves_identity_and_budget_columns() {
-        let tmp = tempdir().unwrap();
-        let store = LeaseStore::open(tmp.path().join("leases.db")).unwrap();
-        assert!(store.has_budget_columns().unwrap());
-
-        let repo = tmp.path().join("repo");
-        let wt = tmp.path().join("worktrees/acme/sample/gh-42");
-        let grant = LeaseGrant {
-            repo: &repo,
-            owner: "acme",
-            repo_name: "sample",
-            job_id: "gh-42",
-            branch: "hive/gh-42",
-            worktree_path: &wt,
-            start_commit: "abc123",
-        };
-        let held = store.grant(grant).unwrap();
-        assert_eq!(held.mode, LeaseMode::WriterLocked);
-        assert_eq!(held.allocation_state, AllocationState::Active);
-        assert_eq!(held.max_files, None);
-        assert_eq!(held.fix_cycles, Some(0));
-        assert!(held.released_at.is_none());
-        assert!(held.row_id > 0);
-        assert!(held.created_at > 0);
-
-        let released = store.release_by_path(&wt).unwrap().unwrap();
-        assert_eq!(released.mode, LeaseMode::Unassigned);
-        assert!(released.released_at.is_some());
-
-        let active = store.list_active().unwrap();
-        assert!(active.is_empty(), "released lease must not list as active");
-        let all = store.list_all().unwrap();
-        assert_eq!(all.len(), 1);
-        assert_eq!(all[0].mode, LeaseMode::Unassigned);
-        let all = store.list_all().unwrap();
-        assert_eq!(all.len(), 1);
-        assert!(all[0].released_at.is_some());
-
-        let resume = store
-            .find_resume(ResumeKey {
-                owner: "acme",
-                repo_name: "sample",
-                job_id: "gh-42",
-                branch: "hive/gh-42",
-            })
-            .unwrap()
-            .unwrap();
-        assert_eq!(resume.start_commit, "abc123");
-        assert_eq!(resume.branch_ref, "refs/heads/hive/gh-42");
-    }
-
-    #[test]
-    fn grant_refuses_active_lease_held_by_different_path() {
-        let tmp = tempdir().unwrap();
-        let store = LeaseStore::open(tmp.path().join("leases.db")).unwrap();
-        let repo = tmp.path().join("repo");
-        let wt_a = tmp.path().join("checkouts/a");
-        let wt_b = tmp.path().join("checkouts/b");
-        fn grant_for<'a>(repo: &'a Path, wt: &'a Path) -> LeaseGrant<'a> {
-            LeaseGrant {
-                repo,
-                owner: "local",
-                repo_name: "repo",
-                job_id: "job-1",
-                branch: "hive/job-1",
-                worktree_path: wt,
-                start_commit: "abc123",
-            }
-        }
-
-        store.grant(grant_for(&repo, &wt_a)).unwrap();
-
-        let err = store.grant(grant_for(&repo, &wt_b)).unwrap_err();
-        assert!(matches!(
-            err,
-            Error::PolicyViolation {
-                code: PolicyCode::LeaseConflict,
-                ..
-            }
-        ));
-
-        let refreshed = store.grant(grant_for(&repo, &wt_a)).unwrap();
-        assert!(refreshed.released_at.is_none());
-        assert_eq!(refreshed.worktree_path, path_text(&wt_a));
-
-        store.release_by_path(&wt_a).unwrap();
-        let moved = store.grant(grant_for(&repo, &wt_b)).unwrap();
-        assert_eq!(moved.worktree_path, path_text(&wt_b));
-        assert_eq!(moved.allocation_state, AllocationState::Active);
-    }
-
-    #[test]
-    fn grant_refuses_active_path_held_by_different_job() {
-        let tmp = tempdir().unwrap();
-        let store = LeaseStore::open(tmp.path().join("leases.db")).unwrap();
-        let repo = tmp.path().join("repo");
-        let wt = tmp.path().join("checkouts/shared");
-        let grant_a = LeaseGrant {
-            repo: &repo,
-            owner: "local",
-            repo_name: "repo",
-            job_id: "job-a",
-            branch: "hive/job-a",
-            worktree_path: &wt,
-            start_commit: "abc123",
-        };
-        let grant_b = LeaseGrant {
-            job_id: "job-b",
-            branch: "hive/job-b",
-            ..grant_a
-        };
-
-        store.grant(grant_a).unwrap();
-        let err = store.grant(grant_b).unwrap_err();
-        assert!(matches!(
-            err,
-            Error::PolicyViolation {
-                code: PolicyCode::LeaseConflict,
-                ..
-            }
-        ));
-        let active = store.list_active().unwrap();
-        assert_eq!(active.len(), 1);
-        assert_eq!(active[0].job_id, "job-a");
-
-        store.release_by_path(&wt).unwrap();
-        let moved = store.grant(grant_b).unwrap();
-        assert_eq!(moved.job_id, "job-b");
-        assert!(moved.released_at.is_none());
-
-        // Sequential reuse leaves a released row and an active row on the same
-        // path. Lookup must return the live holder, not fail closed on
-        // query_row's multiple-row error.
-        let found = store.find_by_path(&wt).unwrap().unwrap();
-        assert_eq!(found.job_id, "job-b");
-        assert!(found.released_at.is_none());
-
-        let released = store.release_by_path(&wt).unwrap().unwrap();
-        assert_eq!(released.job_id, "job-b");
-        assert!(released.released_at.is_some());
-    }
-
-    #[test]
-    fn agent_upsert_and_retire() {
-        let tmp = tempdir().unwrap();
-        let store = LeaseStore::open(tmp.path().join("leases.db")).unwrap();
-        store
-            .upsert_agent(AgentIdentity {
-                agent_id: "agent-1",
-                agent_type: "Explore",
-                session_id: Some("session-1"),
-            })
-            .unwrap();
-        store
-            .upsert_agent(AgentIdentity {
-                agent_id: "agent-2",
-                agent_type: "Worker",
-                session_id: None,
-            })
-            .unwrap();
-        store.retire_agent("agent-1").unwrap();
-        let agents = store.list_agents().unwrap();
-        assert_eq!(agents.len(), 2);
-        assert_eq!(agents[0].agent_id, "agent-2");
-        assert!(agents[0].stopped_at.is_none());
-        assert_eq!(agents[1].agent_id, "agent-1");
-        assert!(agents[1].stopped_at.is_some());
-        let conn = store.conn.lock().unwrap();
-        let stopped: Option<i64> = conn
-            .query_row(
-                "SELECT stopped_at FROM agents WHERE agent_id = ?1",
-                params!["agent-1"],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(stopped.is_some());
-    }
-
-    #[test]
-    fn standalone_clone_counts_as_registered_without_parent_worktree_list() {
-        let temp = tempdir().unwrap();
-        let origin = temp.path().join("origin");
-        fs::create_dir(&origin).unwrap();
-        git(&origin, &["init", "-b", "main"]);
-        git(&origin, &["config", "user.email", "test@example.com"]);
-        git(&origin, &["config", "user.name", "Test User"]);
-        git(&origin, &["commit", "--allow-empty", "-m", "initial"]);
-        let start = git(&origin, &["rev-parse", "HEAD"]);
-        let clone = temp.path().join("standalone");
-        git(
-            temp.path(),
-            &["clone", origin.to_str().unwrap(), clone.to_str().unwrap()],
-        );
-
-        let evidence = inspect_git(&origin, &clone, "main");
-        assert!(
-            evidence.worktree_registered,
-            "a standalone clone is a live checkout even when absent from origin's worktree list"
-        );
-        assert_eq!(evidence.head_commit.as_deref(), Some(start.as_str()));
-    }
-
-    #[test]
-    fn unrecognized_mode_is_unknown_not_unassigned() {
-        let tmp = tempdir().unwrap();
-        let store = LeaseStore::open(tmp.path().join("leases.db")).unwrap();
-        let repo = tmp.path().join("repo");
-        let wt = tmp.path().join("checkouts/a");
-        store
-            .grant(LeaseGrant {
-                repo: &repo,
-                owner: "acme",
-                repo_name: "sample",
-                job_id: "job-a",
-                branch: "hive/a",
-                worktree_path: &wt,
-                start_commit: "abc123",
-            })
-            .unwrap();
-        {
-            let conn = store.conn.lock().unwrap();
-            conn.execute("UPDATE leases SET mode = 'NOT_A_MODE'", [])
-                .unwrap();
-        }
-        let lease = store
-            .find_job(JobKey {
-                owner: "acme",
-                repo_name: "sample",
-                job_id: "job-a",
-            })
-            .unwrap()
-            .unwrap();
-        assert_eq!(lease.mode, LeaseMode::Unknown);
-        assert_eq!(lease.mode_raw, "NOT_A_MODE");
-        assert_ne!(lease.mode, LeaseMode::Unassigned);
-    }
-}
+mod tests;

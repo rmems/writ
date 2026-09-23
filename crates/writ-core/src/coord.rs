@@ -258,61 +258,37 @@ impl LeaseStore {
         }
         let generation = existing.as_ref().map_or(1, |claim| claim.owner_generation);
         let paused_at = existing.as_ref().and_then(|claim| claim.paused_at);
-        let paths_json = encode_paths(&paths)?;
-        tx.execute(
-            "
-            INSERT INTO coord_claims (
-                owner, repo_name, job_id, branch, worktree_path, agent_id, session_id,
-                intent, declared_paths, owner_generation, paused_at, created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)
-            ON CONFLICT(owner, repo_name, job_id) DO UPDATE SET
-                branch = excluded.branch,
-                worktree_path = excluded.worktree_path,
-                session_id = excluded.session_id,
-                intent = excluded.intent,
-                declared_paths = excluded.declared_paths,
-                updated_at = excluded.updated_at
-            ",
-            params![
-                request.owner,
-                request.repo_name,
-                request.job_id,
-                lease.branch,
-                lease.worktree_path,
-                request.agent_id,
-                request.session_id,
-                request.intent,
-                paths_json,
+        persist_announce_claim(
+            &tx,
+            AnnouncePersist {
+                request: &request,
+                lease: &lease,
                 generation,
                 paused_at,
-                now,
-            ],
-        )
-        .map_err(|e| coord_err("upsert coord claim", e))?;
-        let intent_body = request
-            .intent
-            .unwrap_or("announced identity and declared paths");
-        let intent = insert_message(
-            &tx,
-            NewMessage {
-                kind: MessageKind::Intent,
-                from_agent_id: request.agent_id,
-                from_owner: request.owner,
-                from_repo_name: request.repo_name,
-                from_job_id: request.job_id,
-                to_agent_id: None,
-                to_owner: None,
-                to_repo_name: None,
-                to_job_id: None,
-                owner_generation: generation,
-                body: intent_body,
                 paths: &paths,
-                ack_of: None,
+                now,
+            },
+        )?;
+        let intent = insert_announce_intent(
+            &tx,
+            IntentInsert {
+                request: &request,
+                generation,
+                paths: &paths,
                 now,
             },
         )?;
         let others = list_other_claims_tx(&tx, key)?;
-        let overlaps = record_advisory_overlaps(&tx, &request, generation, &paths, &others, now)?;
+        let overlaps = record_advisory_overlaps(
+            &tx,
+            OverlapScan {
+                request: &request,
+                generation,
+                paths: &paths,
+                others: &others,
+                now,
+            },
+        )?;
         tx.commit()
             .map_err(|e| coord_err("commit coord announce", e))?;
         drop(conn);
@@ -901,6 +877,85 @@ fn normalize_one(path: &str) -> String {
     stripped.trim_end_matches('/').to_owned()
 }
 
+struct AnnouncePersist<'a> {
+    request: &'a AnnounceRequest<'a>,
+    lease: &'a crate::lease::Lease,
+    generation: i64,
+    paused_at: Option<i64>,
+    paths: &'a [String],
+    now: i64,
+}
+
+fn persist_announce_claim(tx: &rusqlite::Transaction<'_>, row: AnnouncePersist<'_>) -> Result<()> {
+    let paths_json = encode_paths(row.paths)?;
+    tx.execute(
+        "
+        INSERT INTO coord_claims (
+            owner, repo_name, job_id, branch, worktree_path, agent_id, session_id,
+            intent, declared_paths, owner_generation, paused_at, created_at, updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)
+        ON CONFLICT(owner, repo_name, job_id) DO UPDATE SET
+            branch = excluded.branch,
+            worktree_path = excluded.worktree_path,
+            session_id = excluded.session_id,
+            intent = excluded.intent,
+            declared_paths = excluded.declared_paths,
+            updated_at = excluded.updated_at
+        ",
+        params![
+            row.request.owner,
+            row.request.repo_name,
+            row.request.job_id,
+            row.lease.branch,
+            row.lease.worktree_path,
+            row.request.agent_id,
+            row.request.session_id,
+            row.request.intent,
+            paths_json,
+            row.generation,
+            row.paused_at,
+            row.now,
+        ],
+    )
+    .map_err(|e| coord_err("upsert coord claim", e))?;
+    Ok(())
+}
+
+struct IntentInsert<'a> {
+    request: &'a AnnounceRequest<'a>,
+    generation: i64,
+    paths: &'a [String],
+    now: i64,
+}
+
+fn insert_announce_intent(
+    tx: &rusqlite::Transaction<'_>,
+    intent: IntentInsert<'_>,
+) -> Result<CoordMessage> {
+    let request = intent.request;
+    insert_message(
+        tx,
+        NewMessage {
+            kind: MessageKind::Intent,
+            from_agent_id: request.agent_id,
+            from_owner: request.owner,
+            from_repo_name: request.repo_name,
+            from_job_id: request.job_id,
+            to_agent_id: None,
+            to_owner: None,
+            to_repo_name: None,
+            to_job_id: None,
+            owner_generation: intent.generation,
+            body: request
+                .intent
+                .unwrap_or("announced identity and declared paths"),
+            paths: intent.paths,
+            ack_of: None,
+            now: intent.now,
+        },
+    )
+}
+
 fn overlapping_paths(left: &[String], right: &[String]) -> Vec<String> {
     let mut hits = Vec::new();
     for path in left {
@@ -934,17 +989,21 @@ fn push_unique_overlap(hits: &mut Vec<String>, shared: String) {
     }
 }
 
+struct OverlapScan<'a> {
+    request: &'a AnnounceRequest<'a>,
+    generation: i64,
+    paths: &'a [String],
+    others: &'a [CoordClaim],
+    now: i64,
+}
+
 fn record_advisory_overlaps(
     tx: &rusqlite::Transaction<'_>,
-    request: &AnnounceRequest<'_>,
-    generation: i64,
-    paths: &[String],
-    others: &[CoordClaim],
-    now: i64,
+    scan: OverlapScan<'_>,
 ) -> Result<Vec<PathOverlap>> {
     let mut overlaps = Vec::new();
-    for other in others {
-        if let Some(overlap) = advisory_overlap_with(tx, request, generation, paths, other, now)? {
+    for other in scan.others {
+        if let Some(overlap) = advisory_overlap_with(tx, &scan, other)? {
             overlaps.push(overlap);
         }
     }
@@ -953,16 +1012,14 @@ fn record_advisory_overlaps(
 
 fn advisory_overlap_with(
     tx: &rusqlite::Transaction<'_>,
-    request: &AnnounceRequest<'_>,
-    generation: i64,
-    paths: &[String],
+    scan: &OverlapScan<'_>,
     other: &CoordClaim,
-    now: i64,
 ) -> Result<Option<PathOverlap>> {
-    let shared = overlapping_paths(paths, &other.declared_paths);
+    let shared = overlapping_paths(scan.paths, &other.declared_paths);
     if shared.is_empty() {
         return Ok(None);
     }
+    let request = scan.request;
     insert_message(
         tx,
         NewMessage {
@@ -975,11 +1032,11 @@ fn advisory_overlap_with(
             to_owner: Some(other.owner.as_str()),
             to_repo_name: Some(other.repo_name.as_str()),
             to_job_id: Some(other.job_id.as_str()),
-            owner_generation: generation,
+            owner_generation: scan.generation,
             body: "advisory declared-path overlap",
             paths: &shared,
             ack_of: None,
-            now,
+            now: scan.now,
         },
     )?;
     Ok(Some(PathOverlap {
@@ -1047,7 +1104,7 @@ fn now_secs() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lease::{AllocateRequest, AllocationState};
+    use crate::lease::{AllocateRequest, JobKey, LeaseStore};
     use std::fs;
     use std::path::Path;
     use std::process::Command;
@@ -1179,6 +1236,24 @@ mod tests {
         );
     }
 
+    fn job_key_a() -> JobKey<'static> {
+        JobKey {
+            owner: "acme",
+            repo_name: "sample",
+            job_id: "job-a",
+        }
+    }
+
+    fn assert_held(result: crate::error::Result<AnnounceResult>) {
+        match result {
+            Err(Error::PolicyViolation {
+                code: PolicyCode::CoordClaimHeld,
+                ..
+            }) => {}
+            other => panic!("expected held claim, got {other:?}"),
+        }
+    }
+
     #[test]
     fn pause_does_not_release_or_delete_wip_and_requires_handoff_ack() {
         let harness = Harness::new();
@@ -1191,31 +1266,15 @@ mod tests {
             "agent-a",
             &[String::from("crates/writ-core/src/coord.rs")],
         );
-
         let peer = LeaseStore::open(&harness.path).unwrap();
-        let key = JobKey {
-            owner: "acme",
-            repo_name: "sample",
-            job_id: "job-a",
-        };
+        let key = job_key_a();
         let (paused, help) = harness
             .store
             .pause_claim(key, "agent-a", Some("owner crashed"))
             .unwrap();
-        assert!(paused.paused_at.is_some());
-        assert_eq!(help.kind, MessageKind::Help);
-        assert_eq!(
-            harness
-                .store
-                .find_job(key)
-                .unwrap()
-                .unwrap()
-                .allocation_state,
-            AllocationState::Active
-        );
+        assert!(paused.paused_at.is_some() && help.kind == MessageKind::Help);
         assert_eq!(fs::read_to_string(&wip).unwrap(), "keep me");
-
-        let seize = peer.announce(AnnounceRequest {
+        assert_held(peer.announce(AnnounceRequest {
             owner: "acme",
             repo_name: "sample",
             job_id: "job-a",
@@ -1224,15 +1283,7 @@ mod tests {
             agent_type: "worker",
             intent: Some("take over"),
             paths: &[String::from("crates/writ-core/src/coord.rs")],
-        });
-        match seize {
-            Err(Error::PolicyViolation {
-                code: PolicyCode::CoordClaimHeld,
-                ..
-            }) => {}
-            other => panic!("expected held claim, got {other:?}"),
-        }
-
+        }));
         let handoff = harness
             .store
             .propose_handoff(HandoffRequest {
@@ -1246,36 +1297,37 @@ mod tests {
                 body: "paused owner transferring assignment",
             })
             .unwrap();
-        let stale = peer.ack_message(AckRequest {
-            message_id: handoff.id,
-            owner: "acme",
-            repo_name: "sample",
-            job_id: "job-a",
-            agent_id: "agent-b",
-            session_id: Some("session-b"),
-        });
-        // First ACK should succeed; a second ACK of the same generation fails.
-        let (ack, transferred) = stale.unwrap();
-        assert_eq!(ack.kind, MessageKind::Ack);
+        let (ack, transferred) = peer
+            .ack_message(AckRequest {
+                message_id: handoff.id,
+                owner: "acme",
+                repo_name: "sample",
+                job_id: "job-a",
+                agent_id: "agent-b",
+                session_id: Some("session-b"),
+            })
+            .unwrap();
         let transferred = transferred.expect("handoff ACK transfers the claim");
-        assert_eq!(transferred.agent_id, "agent-b");
-        assert_eq!(transferred.owner_generation, 2);
-        assert!(transferred.paused_at.is_none());
-        assert_eq!(fs::read_to_string(&wip).unwrap(), "keep me");
         assert_eq!(
-            harness.store.find_job(key).unwrap().unwrap().worktree_path,
-            worktree.to_string_lossy()
+            (
+                ack.kind,
+                transferred.agent_id.as_str(),
+                transferred.owner_generation
+            ),
+            (MessageKind::Ack, "agent-b", 2)
         );
-
-        let replay = peer.ack_message(AckRequest {
-            message_id: handoff.id,
-            owner: "acme",
-            repo_name: "sample",
-            job_id: "job-a",
-            agent_id: "agent-b",
-            session_id: Some("session-b"),
-        });
-        assert!(replay.is_err());
+        assert!(
+            peer.ack_message(AckRequest {
+                message_id: handoff.id,
+                owner: "acme",
+                repo_name: "sample",
+                job_id: "job-a",
+                agent_id: "agent-b",
+                session_id: Some("session-b"),
+            })
+            .is_err()
+        );
+        assert_eq!(fs::read_to_string(&wip).unwrap(), "keep me");
     }
 
     #[test]

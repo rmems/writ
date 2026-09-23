@@ -1,114 +1,45 @@
+mod common;
+
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::Path;
+use std::process::Output;
 
-static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+use common::{TestDir, add_origin, git, init_repo, json, writ};
 
-struct TestDir(PathBuf);
-
-impl TestDir {
-    fn new() -> Self {
-        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("writ-lease-cli-{}-{id}", std::process::id()));
-        fs::create_dir_all(&path).unwrap();
-        Self(path)
-    }
-}
-
-impl Drop for TestDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
-fn git(repo: &Path, args: &[&str]) -> String {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "git {args:?} failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8_lossy(&output.stdout).trim().to_owned()
-}
-
-fn init_repo(root: &Path) -> PathBuf {
-    let repo = root.join("repo");
-    fs::create_dir(&repo).unwrap();
-    git(&repo, &["init", "-b", "trunk"]);
-    git(&repo, &["config", "user.email", "test@example.com"]);
-    git(&repo, &["config", "user.name", "Test User"]);
-    git(&repo, &["commit", "--allow-empty", "-m", "initial"]);
-    repo
-}
-
-fn writ(root: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_writ"))
-        .env("WRIT_WORKTREE_BASE", root.join("worktrees"))
-        .env("WRIT_LEASE_PATH", root.join("leases.db"))
-        .args(args)
-        .output()
-        .unwrap()
-}
-
-fn json(output: &Output) -> serde_json::Value {
-    serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
-        panic!(
-            "stdout was not a JSON envelope: {error}; stdout={:?}; stderr={:?}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        )
-    })
-}
-
-#[test]
-fn inspect_reports_identity_without_mutating_after_register() {
-    let root = TestDir::new();
-    let repo = init_repo(&root.0);
-    git(
-        &repo,
-        &[
-            "remote",
-            "add",
-            "origin",
-            "https://github.com/acme/sample.git",
-        ],
-    );
-    let start = git(&repo, &["rev-parse", "HEAD"]);
-    let path = root.0.join("checkouts/job-inspect");
+fn add_worktree(repo: &Path, path: &Path, branch: &str) {
+    let start = git(repo, &["rev-parse", "HEAD"]);
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     git(
-        &repo,
+        repo,
         &[
             "worktree",
             "add",
             "-b",
-            "hive/job-inspect",
+            branch,
             "--",
             path.to_str().unwrap(),
             &start,
         ],
     );
-    let registered = writ(
-        &root.0,
+}
+
+fn register_job(root: &Path, path: &Path, job: &str) -> Output {
+    writ(
+        root,
         &[
             "--json",
             "worktree",
             "register",
             path.to_str().unwrap(),
             "--job",
-            "job-inspect",
+            job,
         ],
-    );
-    assert!(registered.status.success(), "{:?}", registered.stderr);
+    )
+}
 
-    let inspected = writ(
-        &root.0,
+fn inspect_job(root: &Path, repo: &Path, branch: &str, job: &str) -> Output {
+    writ(
+        root,
         &[
             "--json",
             "lease",
@@ -116,26 +47,48 @@ fn inspect_reports_identity_without_mutating_after_register() {
             "--repo",
             repo.to_str().unwrap(),
             "--branch",
-            "hive/job-inspect",
+            branch,
             "acme",
             "sample",
-            "job-inspect",
+            job,
         ],
+    )
+}
+
+#[test]
+fn inspect_reports_identity_without_mutating_after_register() {
+    let root = TestDir::new("lease-cli");
+    let repo = init_repo(&root.path);
+    add_origin(&repo);
+    let start = git(&repo, &["rev-parse", "HEAD"]);
+    let path = root.path.join("checkouts/job-inspect");
+    add_worktree(&repo, &path, "hive/job-inspect");
+    assert!(
+        register_job(&root.path, &path, "job-inspect")
+            .status
+            .success()
     );
+
+    let inspected = inspect_job(&root.path, &repo, "hive/job-inspect", "job-inspect");
     let envelope = json(&inspected);
     assert!(inspected.status.success());
-    assert_eq!(envelope["command"], "lease.inspect");
     assert_eq!(
-        envelope["data"]["requested_start_point"],
-        "refs/heads/hive/job-inspect"
-    );
-    assert_eq!(envelope["data"]["resolved_start_commit"], start);
-    assert_eq!(envelope["data"]["classification"], "matching");
-    assert_eq!(envelope["data"]["lease_present"], true);
-    assert_eq!(envelope["data"]["worktree_registered"], true);
-    assert_ne!(
-        envelope["data"]["requested_start_point"],
-        envelope["data"]["resolved_start_commit"]
+        (
+            envelope["command"].as_str(),
+            envelope["data"]["requested_start_point"].as_str(),
+            envelope["data"]["resolved_start_commit"].as_str(),
+            envelope["data"]["classification"].as_str(),
+            envelope["data"]["lease_present"].as_bool(),
+            envelope["data"]["worktree_registered"].as_bool(),
+        ),
+        (
+            Some("lease.inspect"),
+            Some("refs/heads/hive/job-inspect"),
+            Some(start.as_str()),
+            Some("matching"),
+            Some(true),
+            Some(true),
+        )
     );
     assert_eq!(
         git(&repo, &["rev-parse", "refs/heads/hive/job-inspect"]),
@@ -143,7 +96,7 @@ fn inspect_reports_identity_without_mutating_after_register() {
     );
 
     let reconciled = writ(
-        &root.0,
+        &root.path,
         &[
             "--json",
             "lease",
@@ -155,33 +108,18 @@ fn inspect_reports_identity_without_mutating_after_register() {
             "job-inspect",
         ],
     );
-    let outcome = json(&reconciled);
-    assert!(reconciled.status.success());
-    assert_eq!(outcome["data"]["outcome"], "already_active");
+    assert_eq!(json(&reconciled)["data"]["outcome"], "already_active");
 }
 
 #[test]
 fn inspect_distinguishes_missing_lease_from_live_worktree() {
-    let root = TestDir::new();
-    let repo = init_repo(&root.0);
-    let start = git(&repo, &["rev-parse", "HEAD"]);
-    let path = root.0.join("worktrees/acme/sample/foreign");
-    fs::create_dir_all(path.parent().unwrap()).unwrap();
-    git(
-        &repo,
-        &[
-            "worktree",
-            "add",
-            "-b",
-            "hive/foreign",
-            "--",
-            path.to_str().unwrap(),
-            &start,
-        ],
-    );
+    let root = TestDir::new("lease-cli");
+    let repo = init_repo(&root.path);
+    let path = root.path.join("worktrees/acme/sample/foreign");
+    add_worktree(&repo, &path, "hive/foreign");
 
     let inspected = writ(
-        &root.0,
+        &root.path,
         &[
             "--json",
             "lease",
@@ -198,9 +136,13 @@ fn inspect_distinguishes_missing_lease_from_live_worktree() {
         ],
     );
     let envelope = json(&inspected);
-    assert!(inspected.status.success());
-    assert_eq!(envelope["data"]["classification"], "missing_lease");
-    assert_eq!(envelope["data"]["lease_present"], false);
-    assert_eq!(envelope["data"]["path_exists"], true);
+    assert_eq!(
+        (
+            envelope["data"]["classification"].as_str(),
+            envelope["data"]["lease_present"].as_bool(),
+            envelope["data"]["path_exists"].as_bool(),
+        ),
+        (Some("missing_lease"), Some(false), Some(true))
+    );
     assert!(path.exists());
 }

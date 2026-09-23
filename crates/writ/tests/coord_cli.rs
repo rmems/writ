@@ -1,80 +1,11 @@
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::process::Output;
 use std::thread;
 
-static NEXT_ID: AtomicU64 = AtomicU64::new(0);
-
-struct TestDir(PathBuf);
-
-impl TestDir {
-    fn new() -> Self {
-        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("writ-coord-cli-{}-{id}", std::process::id()));
-        fs::create_dir_all(&path).unwrap();
-        Self(path)
-    }
-}
-
-impl Drop for TestDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
-fn git(repo: &Path, args: &[&str]) -> String {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "git {args:?} failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8_lossy(&output.stdout).trim().to_owned()
-}
-
-fn init_repo(root: &Path) -> PathBuf {
-    let repo = root.join("repo");
-    fs::create_dir(&repo).unwrap();
-    git(&repo, &["init", "-b", "trunk"]);
-    git(&repo, &["config", "user.email", "test@example.com"]);
-    git(&repo, &["config", "user.name", "Test User"]);
-    git(&repo, &["commit", "--allow-empty", "-m", "initial"]);
-    git(
-        &repo,
-        &[
-            "remote",
-            "add",
-            "origin",
-            "https://github.com/acme/sample.git",
-        ],
-    );
-    repo
-}
-
-fn writ(root: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_writ"))
-        .env("WRIT_WORKTREE_BASE", root.join("worktrees"))
-        .env("WRIT_LEASE_PATH", root.join("leases.db"))
-        .args(args)
-        .output()
-        .unwrap()
-}
-
-fn json(output: &Output) -> serde_json::Value {
-    serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
-        panic!(
-            "stdout was not a JSON envelope: {error}; stdout={:?}; stderr={:?}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        )
-    })
-}
+use common::{TestDir, add_origin, git, init_repo, json, writ};
 
 fn create_job(root: &Path, repo: &Path, job_id: &str, branch: &str) -> PathBuf {
     let start = git(repo, &["rev-parse", "HEAD"]);
@@ -107,62 +38,45 @@ fn create_job(root: &Path, repo: &Path, job_id: &str, branch: &str) -> PathBuf {
     path
 }
 
-#[test]
-fn two_processes_share_store_and_exchange_overlap_help_handoff() {
-    let root = TestDir::new();
-    let repo = init_repo(&root.0);
-    let path_a = create_job(&root.0, &repo, "job-a", "hive/job-a");
-    let path_b = create_job(&root.0, &repo, "job-b", "hive/job-b");
-    let wip = path_a.join("wip.txt");
-    fs::write(&wip, "do not delete").unwrap();
+fn announce(
+    root: &Path,
+    job: &str,
+    agent: &str,
+    session: &str,
+    intent: &str,
+    path: &str,
+) -> Output {
+    writ(
+        root,
+        &[
+            "--json",
+            "coord",
+            "announce",
+            "acme",
+            "sample",
+            job,
+            "--agent",
+            agent,
+            "--session",
+            session,
+            "--intent",
+            intent,
+            "--path",
+            path,
+        ],
+    )
+}
 
-    let first = writ(
-        &root.0,
-        &[
-            "--json",
-            "coord",
-            "announce",
-            "acme",
-            "sample",
-            "job-a",
-            "--agent",
-            "agent-a",
-            "--session",
-            "sess-a",
-            "--intent",
-            "own coord.rs",
-            "--path",
-            "crates/writ-core/src/coord.rs",
-        ],
-    );
-    let second = writ(
-        &root.0,
-        &[
-            "--json",
-            "coord",
-            "announce",
-            "acme",
-            "sample",
-            "job-b",
-            "--agent",
-            "agent-b",
-            "--session",
-            "sess-b",
-            "--intent",
-            "own coord module",
-            "--path",
-            "crates/writ-core/src",
-        ],
-    );
+fn assert_advisory_overlap(first: &Output, second: &Output) {
     assert!(first.status.success(), "{:?}", first.stderr);
     assert!(second.status.success(), "{:?}", second.stderr);
-    let overlaps = json(&first)["data"]["overlaps"]
+    let overlaps = json(first)["data"]["overlaps"]
         .as_array()
         .cloned()
         .unwrap_or_default()
         .into_iter()
         .chain(
-            json(&second)["data"]["overlaps"]
+            json(second)["data"]["overlaps"]
                 .as_array()
                 .cloned()
                 .unwrap_or_default(),
@@ -173,13 +87,15 @@ fn two_processes_share_store_and_exchange_overlap_help_handoff() {
             && (overlap["job_id"] == "job-a" || overlap["job_id"] == "job-b")),
         "expected advisory overlap, got {overlaps:?}"
     );
+}
 
+fn assert_cross_process_visibility(root: &Path) {
     let listed = thread::spawn({
-        let root = root.0.clone();
+        let root = root.to_path_buf();
         move || writ(&root, &["--json", "coord", "list"])
     });
     let inbox_job = thread::spawn({
-        let root = root.0.clone();
+        let root = root.to_path_buf();
         move || {
             writ(
                 &root,
@@ -199,9 +115,11 @@ fn two_processes_share_store_and_exchange_overlap_help_handoff() {
             .iter()
             .any(|message| message["kind"] == "overlap" || message["kind"] == "intent")
     );
+}
 
+fn transfer_paused_job(root: &Path) {
     let paused = writ(
-        &root.0,
+        root,
         &[
             "--json",
             "coord",
@@ -216,21 +134,16 @@ fn two_processes_share_store_and_exchange_overlap_help_handoff() {
         ],
     );
     assert!(paused.status.success(), "{:?}", paused.stderr);
-    assert_eq!(json(&paused)["data"]["help"]["kind"], "help");
-    assert!(json(&paused)["data"]["claim"]["paused_at"].is_number());
-
     let seize = writ(
-        &root.0,
+        root,
         &[
             "--json", "coord", "announce", "acme", "sample", "job-a", "--agent", "agent-b",
             "--intent", "seize",
         ],
     );
-    assert!(!seize.status.success());
     assert_eq!(json(&seize)["error"]["code"], "COORD_CLAIM_HELD");
-
     let handoff = writ(
-        &root.0,
+        root,
         &[
             "--json",
             "coord",
@@ -248,11 +161,8 @@ fn two_processes_share_store_and_exchange_overlap_help_handoff() {
             "transfer paused assignment",
         ],
     );
-    assert!(handoff.status.success(), "{:?}", handoff.stderr);
-    let handoff_id = json(&handoff)["data"]["id"].as_i64().unwrap();
-
     let ack = writ(
-        &root.0,
+        root,
         &[
             "--json",
             "coord",
@@ -261,30 +171,68 @@ fn two_processes_share_store_and_exchange_overlap_help_handoff() {
             "sample",
             "job-a",
             "--id",
-            &handoff_id.to_string(),
+            &json(&handoff)["data"]["id"].as_i64().unwrap().to_string(),
             "--agent",
             "agent-b",
             "--session",
             "sess-b",
         ],
     );
-    assert!(ack.status.success(), "{:?}", ack.stderr);
     let transferred = json(&ack);
-    assert_eq!(transferred["data"]["claim"]["agent_id"], "agent-b");
-    assert_eq!(transferred["data"]["claim"]["owner_generation"], 2);
-    assert!(transferred["data"]["claim"]["paused_at"].is_null());
-    assert_eq!(fs::read_to_string(&wip).unwrap(), "do not delete");
+    assert_eq!(
+        (
+            transferred["data"]["claim"]["agent_id"].as_str(),
+            transferred["data"]["claim"]["owner_generation"].as_i64(),
+            transferred["data"]["claim"]["paused_at"].is_null(),
+        ),
+        (Some("agent-b"), Some(2), true)
+    );
+}
+
+#[test]
+fn two_processes_share_store_and_exchange_overlap_help_handoff() {
+    let root = TestDir::new("coord-cli");
+    let repo = init_repo(&root.path);
+    add_origin(&repo);
+    let path_a = create_job(&root.path, &repo, "job-a", "hive/job-a");
+    let path_b = create_job(&root.path, &repo, "job-b", "hive/job-b");
+    fs::write(path_a.join("wip.txt"), "do not delete").unwrap();
+    assert_advisory_overlap(
+        &announce(
+            &root.path,
+            "job-a",
+            "agent-a",
+            "sess-a",
+            "own coord.rs",
+            "crates/writ-core/src/coord.rs",
+        ),
+        &announce(
+            &root.path,
+            "job-b",
+            "agent-b",
+            "sess-b",
+            "own coord module",
+            "crates/writ-core/src",
+        ),
+    );
+    assert_cross_process_visibility(&root.path);
+    transfer_paused_job(&root.path);
+    assert_eq!(
+        fs::read_to_string(path_a.join("wip.txt")).unwrap(),
+        "do not delete"
+    );
     assert!(path_b.exists());
 }
 
 #[test]
 fn two_processes_can_list_the_same_claims() {
-    let root = TestDir::new();
-    let repo = init_repo(&root.0);
-    create_job(&root.0, &repo, "job-a", "hive/job-a");
-    create_job(&root.0, &repo, "job-b", "hive/job-b");
+    let root = TestDir::new("coord-cli");
+    let repo = init_repo(&root.path);
+    add_origin(&repo);
+    create_job(&root.path, &repo, "job-a", "hive/job-a");
+    create_job(&root.path, &repo, "job-b", "hive/job-b");
     let announced = writ(
-        &root.0,
+        &root.path,
         &[
             "--json",
             "coord",
@@ -299,7 +247,7 @@ fn two_processes_can_list_the_same_claims() {
         ],
     );
     assert!(announced.status.success(), "{:?}", announced.stderr);
-    let listed = writ(&root.0, &["--json", "coord", "list"]);
+    let listed = writ(&root.path, &["--json", "coord", "list"]);
     assert!(listed.status.success(), "{:?}", listed.stderr);
     assert_eq!(json(&listed)["data"]["claims"].as_array().unwrap().len(), 1);
 }

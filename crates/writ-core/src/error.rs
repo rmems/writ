@@ -23,17 +23,11 @@ impl Display for WorktreeCreationFailure {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "worktree creation failed for branch `{}` at `{}`: {}; ",
+            "worktree creation failed for branch `{}` at `{}`: {}; {}",
             self.branch,
             self.path.display(),
             self.stderr.trim(),
-        )?;
-        write_git_residual(
-            f,
-            self.path_exists,
-            self.worktree_registered,
-            self.branch_commit.as_deref(),
-            self.head_commit.as_deref(),
+            GitResidual::from(self),
         )
     }
 }
@@ -68,20 +62,14 @@ pub struct LeaseAttentionFailure {
 
 impl Display for LeaseAttentionFailure {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let residual = GitResidual::from(self);
         write!(
             f,
-            "lease allocation `{}` needs attention (state={} class={}): {}; ",
+            "lease allocation `{}` needs attention (state={} class={}): {}; {residual}",
             self.operation_id,
             self.allocation_state,
             self.classification,
             self.conflicts.join("; "),
-        )?;
-        write_git_residual(
-            f,
-            self.path_exists,
-            self.worktree_registered,
-            self.branch_commit.as_deref(),
-            self.head_commit.as_deref(),
         )
     }
 }
@@ -123,38 +111,83 @@ impl Display for WorktreePostconditionFailure {
         write!(
             f,
             "worktree postcondition failed for branch `{}` at `{}`: expected_commit={} \
-             actual_branch={} reason={}; ",
+             actual_branch={} reason={}; {}",
             self.branch,
             self.path.display(),
             self.expected_commit,
             self.actual_branch.as_deref().unwrap_or("<unavailable>"),
             self.reason,
-        )?;
-        write_git_residual(
-            f,
-            self.path_exists,
-            self.worktree_registered,
-            self.branch_commit.as_deref(),
-            self.head_commit.as_deref(),
+            GitResidual::from(self),
         )
     }
 }
 
-fn write_git_residual(
-    f: &mut Formatter<'_>,
+struct GitResidual {
     path_exists: bool,
     registered: bool,
-    branch_commit: Option<&str>,
-    head_commit: Option<&str>,
-) -> std::fmt::Result {
-    write!(
-        f,
-        "residual_state path_exists={path_exists} registered={registered} \
-         branch_commit={} head_commit={}; automatic cleanup skipped because \
-         concurrent adoption cannot be disproven",
-        branch_commit.unwrap_or("<absent>"),
-        head_commit.unwrap_or("<absent>"),
-    )
+    branch_commit: String,
+    head_commit: String,
+}
+
+impl GitResidual {
+    fn new(
+        path_exists: bool,
+        registered: bool,
+        branch_commit: Option<&str>,
+        head_commit: Option<&str>,
+    ) -> Self {
+        Self {
+            path_exists,
+            registered,
+            branch_commit: branch_commit.unwrap_or("<absent>").to_owned(),
+            head_commit: head_commit.unwrap_or("<absent>").to_owned(),
+        }
+    }
+}
+
+impl From<&WorktreeCreationFailure> for GitResidual {
+    fn from(failure: &WorktreeCreationFailure) -> Self {
+        Self::new(
+            failure.path_exists,
+            failure.worktree_registered,
+            failure.branch_commit.as_deref(),
+            failure.head_commit.as_deref(),
+        )
+    }
+}
+
+impl From<&LeaseAttentionFailure> for GitResidual {
+    fn from(failure: &LeaseAttentionFailure) -> Self {
+        Self::new(
+            failure.path_exists,
+            failure.worktree_registered,
+            failure.branch_commit.as_deref(),
+            failure.head_commit.as_deref(),
+        )
+    }
+}
+
+impl From<&WorktreePostconditionFailure> for GitResidual {
+    fn from(failure: &WorktreePostconditionFailure) -> Self {
+        Self::new(
+            failure.path_exists,
+            failure.worktree_registered,
+            failure.branch_commit.as_deref(),
+            failure.head_commit.as_deref(),
+        )
+    }
+}
+
+impl Display for GitResidual {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "residual_state path_exists={} registered={} branch_commit={} \
+             head_commit={}; automatic cleanup skipped because concurrent \
+             adoption cannot be disproven",
+            self.path_exists, self.registered, self.branch_commit, self.head_commit,
+        )
+    }
 }
 
 /// One fully qualified ref that collided with an unqualified start point.

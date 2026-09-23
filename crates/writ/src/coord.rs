@@ -157,9 +157,14 @@ fn dispatch(action: CoordAction) -> writ_core::error::Result<Response<serde_json
             owner,
             repo_name,
             job_id,
-        } => job_field(&owner, &repo_name, &job_id, "coord.show", "claim", |key| {
-            store.find_claim(key)
-        }),
+        } => job_field(
+            job_key(&owner, &repo_name, &job_id),
+            JobField {
+                command: "coord.show",
+                name: "claim",
+            },
+            |key| store.find_claim(key),
+        ),
         CoordAction::List => {
             let claims = store.list_claims()?;
             ok("coord.list", serde_json::json!({ "claims": claims }))
@@ -169,17 +174,38 @@ fn dispatch(action: CoordAction) -> writ_core::error::Result<Response<serde_json
             repo_name,
             job_id,
         } => job_field(
-            &owner,
-            &repo_name,
-            &job_id,
-            "coord.inbox",
-            "messages",
+            job_key(&owner, &repo_name, &job_id),
+            JobField {
+                command: "coord.inbox",
+                name: "messages",
+            },
             |key| store.inbox(key),
         ),
         CoordAction::Send { .. } => send(&store, action),
         CoordAction::Ack { .. } => ack(&store, action),
         CoordAction::Pause { .. } => pause(&store, action),
-        CoordAction::Handoff { .. } => handoff(&store, action),
+        CoordAction::Handoff {
+            owner,
+            repo_name,
+            job_id,
+            agent,
+            to_agent,
+            to_job,
+            generation,
+            body,
+        } => {
+            let message = store.propose_handoff(HandoffRequest {
+                owner: &owner,
+                repo_name: &repo_name,
+                job_id: &job_id,
+                from_agent_id: &agent,
+                to_agent_id: &to_agent,
+                to_job_id: to_job.as_deref(),
+                expected_generation: generation,
+                body: &body,
+            })?;
+            value("coord.handoff", &message)
+        }
     }
 }
 
@@ -208,16 +234,18 @@ fn value<T: Serialize>(
     )
 }
 
-fn job_field<T: Serialize>(
-    owner: &str,
-    repo_name: &str,
-    job_id: &str,
+struct JobField {
     command: &'static str,
-    field: &'static str,
+    name: &'static str,
+}
+
+fn job_field<T: Serialize>(
+    key: JobKey<'_>,
+    field: JobField,
     load: impl FnOnce(JobKey<'_>) -> writ_core::error::Result<T>,
 ) -> writ_core::error::Result<Response<serde_json::Value>> {
-    let payload = load(job_key(owner, repo_name, job_id))?;
-    ok(command, serde_json::json!({ field: payload }))
+    let payload = load(key)?;
+    ok(field.command, serde_json::json!({ field.name: payload }))
 }
 
 fn announce(
@@ -345,34 +373,4 @@ fn pause(
             "help": help,
         }),
     )
-}
-
-fn handoff(
-    store: &LeaseStore,
-    action: CoordAction,
-) -> writ_core::error::Result<Response<serde_json::Value>> {
-    let CoordAction::Handoff {
-        owner,
-        repo_name,
-        job_id,
-        agent,
-        to_agent,
-        to_job,
-        generation,
-        body,
-    } = action
-    else {
-        unreachable!("dispatch only forwards Handoff");
-    };
-    let message = store.propose_handoff(HandoffRequest {
-        owner: &owner,
-        repo_name: &repo_name,
-        job_id: &job_id,
-        from_agent_id: &agent,
-        to_agent_id: &to_agent,
-        to_job_id: to_job.as_deref(),
-        expected_generation: generation,
-        body: &body,
-    })?;
-    value("coord.handoff", &message)
 }

@@ -1,0 +1,262 @@
+//! Lease SQLite schema, migrations, and allocation-op journal.
+
+use rusqlite::{Connection, params};
+
+use super::{Result, lease_err};
+
+pub(super) const INITIAL_SCHEMA: &str = r"
+            PRAGMA foreign_keys = ON;
+            PRAGMA journal_mode = WAL;
+            PRAGMA busy_timeout = 5000;
+            CREATE TABLE IF NOT EXISTS leases (
+                id INTEGER PRIMARY KEY,
+                repo TEXT NOT NULL,
+                owner TEXT NOT NULL,
+                repo_name TEXT NOT NULL,
+                job_id TEXT NOT NULL,
+                branch TEXT NOT NULL,
+                branch_ref TEXT NOT NULL,
+                worktree_path TEXT NOT NULL,
+                requested_start_point TEXT NOT NULL,
+                start_commit TEXT NOT NULL,
+                operation_id TEXT NOT NULL,
+                allocation_state TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                ttl INTEGER,
+                heartbeat INTEGER,
+                max_files INTEGER,
+                max_churn INTEGER,
+                max_fix_cycles INTEGER,
+                fix_cycles INTEGER,
+                pending_fix_cycles INTEGER,
+                pending_fix_op_id TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                released_at INTEGER,
+                tombstoned_at INTEGER,
+                UNIQUE(owner, repo_name, job_id)
+            );
+            CREATE TABLE IF NOT EXISTS allocation_ops (
+                operation_id TEXT PRIMARY KEY,
+                owner TEXT NOT NULL,
+                repo_name TEXT NOT NULL,
+                job_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                phase TEXT NOT NULL,
+                requested_start_point TEXT,
+                resolved_start_commit TEXT,
+                status TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS agents (
+                agent_id TEXT PRIMARY KEY,
+                agent_type TEXT NOT NULL,
+                session_id TEXT,
+                started_at INTEGER NOT NULL,
+                stopped_at INTEGER
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS leases_live_worktree_path
+                ON leases(worktree_path)
+                WHERE released_at IS NULL AND tombstoned_at IS NULL;
+            ";
+
+pub(super) const GRANT_UPSERT: &str = r"
+            INSERT INTO leases (
+                repo, owner, repo_name, job_id, branch, branch_ref, worktree_path,
+                requested_start_point, start_commit, operation_id, allocation_state,
+                mode, ttl, heartbeat, max_files, max_churn, max_fix_cycles, fix_cycles,
+                pending_fix_cycles, pending_fix_op_id, created_at, updated_at,
+                released_at, tombstoned_at
+            ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9, ?10, ?11, NULL, ?12,
+                NULL, NULL, NULL, 0, NULL, NULL, ?12, ?12, NULL, NULL
+            )
+            ON CONFLICT(owner, repo_name, job_id) DO UPDATE SET
+                repo = excluded.repo,
+                branch = excluded.branch,
+                branch_ref = excluded.branch_ref,
+                worktree_path = excluded.worktree_path,
+                start_commit = excluded.start_commit,
+                requested_start_point = CASE
+                    WHEN leases.released_at IS NOT NULL
+                        OR leases.requested_start_point = ''
+                    THEN excluded.requested_start_point
+                    ELSE leases.requested_start_point
+                END,
+                operation_id = CASE
+                    WHEN leases.released_at IS NOT NULL OR leases.operation_id = ''
+                    THEN excluded.operation_id
+                    ELSE leases.operation_id
+                END,
+                allocation_state = excluded.allocation_state,
+                mode = excluded.mode,
+                heartbeat = excluded.heartbeat,
+                updated_at = excluded.updated_at,
+                released_at = NULL
+            WHERE leases.tombstoned_at IS NULL
+                AND (
+                    leases.released_at IS NOT NULL
+                    OR leases.worktree_path = excluded.worktree_path
+                )
+            ";
+
+pub(super) const PREPARE_INSERT: &str = r"
+            INSERT INTO leases (
+                repo, owner, repo_name, job_id, branch, branch_ref, worktree_path,
+                requested_start_point, start_commit, operation_id, allocation_state,
+                mode, ttl, heartbeat, max_files, max_churn, max_fix_cycles, fix_cycles,
+                pending_fix_cycles, pending_fix_op_id, created_at, updated_at,
+                released_at, tombstoned_at
+            ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                NULL, NULL, NULL, 0, NULL, NULL, ?14, ?14, NULL, NULL
+            )
+            ";
+
+pub(super) fn apply(conn: &Connection) -> Result<()> {
+    conn.execute_batch(INITIAL_SCHEMA)
+        .map_err(|e| lease_err("initialize lease schema", e))?;
+    ensure_crash_consistency_columns(conn)?;
+    ensure_live_path_unique_index(conn)?;
+    crate::coord::ensure_schema(conn)
+}
+
+pub(super) fn table_column_names(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn
+        .prepare("PRAGMA table_info(leases)")
+        .map_err(|e| lease_err("inspect lease schema", e))?;
+    stmt.query_map([], |row| row.get::<_, String>(1))
+        .map_err(|e| lease_err("inspect lease schema", e))?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| lease_err("inspect lease schema", e))
+}
+
+fn ensure_crash_consistency_columns(conn: &Connection) -> Result<()> {
+    let names = table_column_names(conn)?;
+    let additions = [
+        (
+            "requested_start_point",
+            "requested_start_point TEXT NOT NULL DEFAULT ''",
+        ),
+        ("operation_id", "operation_id TEXT NOT NULL DEFAULT ''"),
+        (
+            "allocation_state",
+            "allocation_state TEXT NOT NULL DEFAULT 'ACTIVE'",
+        ),
+        ("pending_fix_cycles", "pending_fix_cycles INTEGER"),
+        ("pending_fix_op_id", "pending_fix_op_id TEXT"),
+        ("tombstoned_at", "tombstoned_at INTEGER"),
+    ];
+    for (column, ddl) in additions {
+        if !names.iter().any(|name| name == column) {
+            conn.execute(&format!("ALTER TABLE leases ADD COLUMN {ddl}"), [])
+                .map_err(|e| lease_err("migrate lease schema", e))?;
+        }
+    }
+    conn.execute(
+        "
+        UPDATE leases
+        SET requested_start_point = start_commit
+        WHERE requested_start_point = ''
+        ",
+        [],
+    )
+    .map_err(|e| lease_err("backfill requested_start_point", e))?;
+    conn.execute(
+        "
+        UPDATE leases
+        SET operation_id = 'legacy-' || id
+        WHERE operation_id = ''
+        ",
+        [],
+    )
+    .map_err(|e| lease_err("backfill operation_id", e))?;
+    conn.execute(
+        "
+        UPDATE leases
+        SET allocation_state = CASE
+            WHEN tombstoned_at IS NOT NULL THEN 'TOMBSTONED'
+            WHEN released_at IS NOT NULL THEN 'RELEASED'
+            ELSE 'ACTIVE'
+        END
+        WHERE allocation_state = '' OR (
+            allocation_state = 'ACTIVE' AND released_at IS NOT NULL
+        )
+        ",
+        [],
+    )
+    .map_err(|e| lease_err("backfill allocation_state", e))?;
+    Ok(())
+}
+
+fn ensure_live_path_unique_index(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "
+        CREATE UNIQUE INDEX IF NOT EXISTS leases_live_worktree_path
+            ON leases(worktree_path)
+            WHERE released_at IS NULL AND tombstoned_at IS NULL
+        ",
+        [],
+    )
+    .map_err(|e| lease_err("ensure live worktree path uniqueness", e))?;
+    Ok(())
+}
+
+pub(super) struct OpRecord<'a> {
+    pub operation_id: &'a str,
+    pub owner: &'a str,
+    pub repo_name: &'a str,
+    pub job_id: &'a str,
+    pub kind: &'a str,
+    pub phase: &'a str,
+    pub requested_start_point: Option<&'a str>,
+    pub resolved_start_commit: Option<&'a str>,
+    pub status: &'a str,
+    pub now: i64,
+}
+
+pub(super) fn insert_op(tx: &rusqlite::Transaction<'_>, op: OpRecord<'_>) -> Result<()> {
+    tx.execute(
+        "
+        INSERT INTO allocation_ops (
+            operation_id, owner, repo_name, job_id, kind, phase,
+            requested_start_point, resolved_start_commit, status, created_at, updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)
+        ",
+        params![
+            op.operation_id,
+            op.owner,
+            op.repo_name,
+            op.job_id,
+            op.kind,
+            op.phase,
+            op.requested_start_point,
+            op.resolved_start_commit,
+            op.status,
+            op.now,
+        ],
+    )
+    .map_err(|e| lease_err("insert allocation op", e))?;
+    Ok(())
+}
+
+pub(super) struct OpPhase<'a> {
+    pub operation_id: &'a str,
+    pub phase: &'a str,
+    pub status: &'a str,
+    pub now: i64,
+}
+
+pub(super) fn update_op_phase(tx: &rusqlite::Transaction<'_>, phase: OpPhase<'_>) -> Result<()> {
+    tx.execute(
+        "
+        UPDATE allocation_ops
+        SET phase = ?1, status = ?2, updated_at = ?3
+        WHERE operation_id = ?4
+        ",
+        params![phase.phase, phase.status, phase.now, phase.operation_id],
+    )
+    .map_err(|e| lease_err("update allocation op", e))?;
+    Ok(())
+}
