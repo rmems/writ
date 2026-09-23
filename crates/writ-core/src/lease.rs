@@ -7,9 +7,9 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 
 use crate::error::{Error, PolicyCode, Result};
 
@@ -153,41 +153,7 @@ impl LeaseStore {
             })?;
         }
         let conn = Connection::open(&path).map_err(|e| lease_err("open lease store", e))?;
-        conn.execute_batch(
-            "
-            PRAGMA foreign_keys = ON;
-            CREATE TABLE IF NOT EXISTS leases (
-                id INTEGER PRIMARY KEY,
-                repo TEXT NOT NULL,
-                owner TEXT NOT NULL,
-                repo_name TEXT NOT NULL,
-                job_id TEXT NOT NULL,
-                branch TEXT NOT NULL,
-                branch_ref TEXT NOT NULL,
-                worktree_path TEXT NOT NULL,
-                start_commit TEXT NOT NULL,
-                mode TEXT NOT NULL,
-                ttl INTEGER,
-                heartbeat INTEGER,
-                max_files INTEGER,
-                max_churn INTEGER,
-                max_fix_cycles INTEGER,
-                fix_cycles INTEGER,
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL,
-                released_at INTEGER,
-                UNIQUE(owner, repo_name, job_id)
-            );
-            CREATE TABLE IF NOT EXISTS agents (
-                agent_id TEXT PRIMARY KEY,
-                agent_type TEXT NOT NULL,
-                session_id TEXT,
-                started_at INTEGER NOT NULL,
-                stopped_at INTEGER
-            );
-            ",
-        )
-        .map_err(|e| lease_err("initialize lease schema", e))?;
+        configure_writer_connection(&conn)?;
         Ok(Self {
             path,
             conn: Mutex::new(conn),
@@ -214,79 +180,18 @@ impl LeaseStore {
     /// Grant or refresh a writer lock, keeping reserved budget columns null.
     ///
     /// The conflict target `(owner, repo_name, job_id)` refreshes in place only
-    /// when the existing row is released or names the same `worktree_path`; an
+    /// when the existing row is released or names the same `worktree_path`. An
     /// active lease held by a different checkout path is never seized. A
     /// different job cannot take a checkout path that already has an unreleased
-    /// lease. Either conflict fails with [`PolicyCode::LeaseConflict`].
+    /// lease. Either conflict is [`PolicyCode::LeaseConflict`].
+    ///
+    /// Live-path uniqueness is enforced in one `BEGIN IMMEDIATE` transaction
+    /// plus a partial unique index, so two independent connections cannot both
+    /// become the live owner. The store mutex only serializes this process.
     pub fn grant(&self, grant: LeaseGrant<'_>) -> Result<Lease> {
-        let now = now_secs();
-        let repo = path_text(grant.repo);
-        let worktree_path = path_text(grant.worktree_path);
-        let branch_ref = format!("refs/heads/{}", grant.branch);
-        let conn = self.lock()?;
-        let occupant: Option<String> = conn
-            .query_row(
-                "
-                SELECT job_id FROM leases
-                WHERE worktree_path = ?1
-                  AND released_at IS NULL
-                  AND NOT (owner = ?2 AND repo_name = ?3 AND job_id = ?4)
-                ",
-                params![worktree_path, grant.owner, grant.repo_name, grant.job_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|e| lease_err("grant lease", e))?;
-        if let Some(job_id) = occupant {
-            return Err(Error::PolicyViolation {
-                code: PolicyCode::LeaseConflict,
-                message: format!("checkout already holds an active lease for job `{job_id}`"),
-            });
-        }
-        let changed = conn.execute(
-            "
-            INSERT INTO leases (
-                repo, owner, repo_name, job_id, branch, branch_ref, worktree_path,
-                start_commit, mode, ttl, heartbeat, max_files, max_churn,
-                max_fix_cycles, fix_cycles, created_at, updated_at, released_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, NULL, NULL, NULL, NULL, ?10, ?10, NULL)
-            ON CONFLICT(owner, repo_name, job_id) DO UPDATE SET
-                repo = excluded.repo,
-                branch = excluded.branch,
-                branch_ref = excluded.branch_ref,
-                worktree_path = excluded.worktree_path,
-                start_commit = excluded.start_commit,
-                mode = excluded.mode,
-                heartbeat = excluded.heartbeat,
-                updated_at = excluded.updated_at,
-                released_at = NULL
-            WHERE leases.released_at IS NOT NULL
-                OR leases.worktree_path = excluded.worktree_path
-            ",
-            params![
-                repo,
-                grant.owner,
-                grant.repo_name,
-                grant.job_id,
-                grant.branch,
-                branch_ref,
-                worktree_path,
-                grant.start_commit,
-                LeaseMode::WriterLocked.as_str(),
-                now,
-            ],
-        )
-        .map_err(|e| lease_err("grant lease", e))?;
+        let mut conn = self.lock()?;
+        grant_on(&mut conn, grant)?;
         drop(conn);
-        if changed == 0 {
-            return Err(Error::PolicyViolation {
-                code: PolicyCode::LeaseConflict,
-                message: format!(
-                    "job `{}` already holds an active lease for a different worktree path",
-                    grant.job_id
-                ),
-            });
-        }
         self.find_job(JobKey {
             owner: grant.owner,
             repo_name: grant.repo_name,
@@ -378,9 +283,10 @@ impl LeaseStore {
     /// Look up a lease by worktree path.
     ///
     /// Prefers the live (unreleased) row when one exists. After sequential
-    /// jobs have reused a checkout, released identity rows may share the path;
-    /// `query_row` would fail on that ambiguity, so this returns the active
-    /// holder or else the most recently released row.
+    /// jobs have reused a checkout, released identity rows may share the path.
+    /// rusqlite `query_row` returns the first row and ignores the rest;
+    /// `query_one` is the API that errors on extra rows. `ORDER BY` + `LIMIT 1`
+    /// picks the live holder, else the most recently released identity.
     pub fn find_by_path(&self, worktree_path: &Path) -> Result<Option<Lease>> {
         self.query_lease(
             LeaseSql {
@@ -461,6 +367,156 @@ impl LeaseStore {
             context: "lease store",
             message: "lease store mutex poisoned".to_owned(),
         })
+    }
+}
+
+const WRITER_SCHEMA: &str = "
+            PRAGMA foreign_keys = ON;
+            CREATE TABLE IF NOT EXISTS leases (
+                id INTEGER PRIMARY KEY,
+                repo TEXT NOT NULL,
+                owner TEXT NOT NULL,
+                repo_name TEXT NOT NULL,
+                job_id TEXT NOT NULL,
+                branch TEXT NOT NULL,
+                branch_ref TEXT NOT NULL,
+                worktree_path TEXT NOT NULL,
+                start_commit TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                ttl INTEGER,
+                heartbeat INTEGER,
+                max_files INTEGER,
+                max_churn INTEGER,
+                max_fix_cycles INTEGER,
+                fix_cycles INTEGER,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                released_at INTEGER,
+                UNIQUE(owner, repo_name, job_id)
+            );
+            CREATE TABLE IF NOT EXISTS agents (
+                agent_id TEXT PRIMARY KEY,
+                agent_type TEXT NOT NULL,
+                session_id TEXT,
+                started_at INTEGER NOT NULL,
+                stopped_at INTEGER
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS leases_live_worktree_path
+                ON leases(worktree_path) WHERE released_at IS NULL;
+            ";
+
+const GRANT_INSERT_SQL: &str = "
+            INSERT INTO leases (
+                repo, owner, repo_name, job_id, branch, branch_ref, worktree_path,
+                start_commit, mode, ttl, heartbeat, max_files, max_churn,
+                max_fix_cycles, fix_cycles, created_at, updated_at, released_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, NULL, NULL, NULL, NULL, ?10, ?10, NULL)
+            ON CONFLICT(owner, repo_name, job_id) DO UPDATE SET
+                repo = excluded.repo,
+                branch = excluded.branch,
+                branch_ref = excluded.branch_ref,
+                worktree_path = excluded.worktree_path,
+                start_commit = excluded.start_commit,
+                mode = excluded.mode,
+                heartbeat = excluded.heartbeat,
+                updated_at = excluded.updated_at,
+                released_at = NULL
+            WHERE leases.released_at IS NOT NULL
+                OR leases.worktree_path = excluded.worktree_path
+            ";
+
+fn configure_writer_connection(conn: &Connection) -> Result<()> {
+    conn.busy_timeout(Duration::from_millis(5_000))
+        .map_err(|e| lease_err("open lease store", e))?;
+    conn.execute_batch(WRITER_SCHEMA)
+        .map_err(|e| lease_err("initialize lease schema", e))?;
+    Ok(())
+}
+
+fn grant_on(conn: &mut Connection, grant: LeaseGrant<'_>) -> Result<()> {
+    let now = now_secs();
+    let repo = path_text(grant.repo);
+    let worktree_path = path_text(grant.worktree_path);
+    let branch_ref = format!("refs/heads/{}", grant.branch);
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|e| lease_err("grant lease", e))?;
+    if let Some(job_id) = live_path_occupant(&tx, &worktree_path, grant)? {
+        return Err(path_held_conflict(&job_id));
+    }
+    let changed = insert_or_refresh_writer(&tx, grant, now, &repo, &worktree_path, &branch_ref)?;
+    if changed == 0 {
+        return Err(Error::PolicyViolation {
+            code: PolicyCode::LeaseConflict,
+            message: format!(
+                "job `{}` already holds an active lease for a different worktree path",
+                grant.job_id
+            ),
+        });
+    }
+    tx.commit().map_err(|e| lease_err("grant lease", e))?;
+    Ok(())
+}
+
+fn live_path_occupant(
+    conn: &Connection,
+    worktree_path: &str,
+    grant: LeaseGrant<'_>,
+) -> Result<Option<String>> {
+    conn.query_row(
+        "
+                SELECT job_id FROM leases
+                WHERE worktree_path = ?1
+                  AND released_at IS NULL
+                  AND NOT (owner = ?2 AND repo_name = ?3 AND job_id = ?4)
+                ",
+        params![worktree_path, grant.owner, grant.repo_name, grant.job_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(|e| lease_err("grant lease", e))
+}
+
+fn insert_or_refresh_writer(
+    conn: &Connection,
+    grant: LeaseGrant<'_>,
+    now: i64,
+    repo: &str,
+    worktree_path: &str,
+    branch_ref: &str,
+) -> Result<usize> {
+    match conn.execute(
+        GRANT_INSERT_SQL,
+        params![
+            repo,
+            grant.owner,
+            grant.repo_name,
+            grant.job_id,
+            grant.branch,
+            branch_ref,
+            worktree_path,
+            grant.start_commit,
+            LeaseMode::WriterLocked.as_str(),
+            now,
+        ],
+    ) {
+        Ok(changed) => Ok(changed),
+        Err(err) if is_unique_constraint(&err) => {
+            let occupant = live_path_occupant(conn, worktree_path, grant)?;
+            Err(path_held_conflict(occupant.as_deref().unwrap_or("unknown")))
+        }
+        Err(err) => Err(lease_err("grant lease", err)),
+    }
+}
+
+fn is_unique_constraint(err: &rusqlite::Error) -> bool {
+    err.sqlite_error_code() == Some(rusqlite::ErrorCode::ConstraintViolation)
+}
+
+fn path_held_conflict(job_id: &str) -> Error {
+    Error::PolicyViolation {
+        code: PolicyCode::LeaseConflict,
+        message: format!("checkout already holds an active lease for job `{job_id}`"),
     }
 }
 
@@ -647,6 +703,8 @@ fn path_text(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
     use tempfile::tempdir;
 
     #[test]
@@ -782,8 +840,9 @@ mod tests {
         assert!(moved.released_at.is_none());
 
         // Sequential reuse leaves a released row and an active row on the same
-        // path. Lookup must return the live holder, not fail closed on
-        // query_row's multiple-row error.
+        // path. Lookup must return the live holder. rusqlite `query_row` would
+        // silently keep the first (older) row; ORDER BY/LIMIT 1 is the
+        // preference, not a workaround for QueryReturnedMoreThanOneRow.
         let found = store.find_by_path(&wt).unwrap().unwrap();
         assert_eq!(found.job_id, "job-b");
         assert!(found.released_at.is_none());
@@ -791,6 +850,158 @@ mod tests {
         let released = store.release_by_path(&wt).unwrap().unwrap();
         assert_eq!(released.job_id, "job-b");
         assert!(released.released_at.is_some());
+    }
+
+    #[test]
+    fn query_row_keeps_first_row_query_one_rejects_extras() {
+        let tmp = tempdir().unwrap();
+        let store = LeaseStore::open(tmp.path().join("leases.db")).unwrap();
+        let repo = tmp.path().join("repo");
+        let wt = tmp.path().join("checkouts/shared");
+        let grant_a = LeaseGrant {
+            repo: &repo,
+            owner: "local",
+            repo_name: "repo",
+            job_id: "job-a",
+            branch: "hive/job-a",
+            worktree_path: &wt,
+            start_commit: "abc123",
+        };
+        let grant_b = LeaseGrant {
+            job_id: "job-b",
+            branch: "hive/job-b",
+            ..grant_a
+        };
+        store.grant(grant_a).unwrap();
+        store.release_by_path(&wt).unwrap();
+        store.grant(grant_b).unwrap();
+
+        let conn = store.conn.lock().unwrap();
+        let sql = "SELECT job_id FROM leases WHERE worktree_path = ?1 ORDER BY id";
+        let first: String = conn
+            .query_row(sql, params![path_text(&wt)], |row| row.get(0))
+            .unwrap();
+        assert_eq!(first, "job-a");
+        let extra = conn.query_one(sql, params![path_text(&wt)], |row| row.get::<_, String>(0));
+        assert!(matches!(
+            extra,
+            Err(rusqlite::Error::QueryReturnedMoreThanOneRow)
+        ));
+    }
+
+    #[test]
+    fn select_then_insert_without_constraint_admits_two_live_owners() {
+        let tmp = tempdir().unwrap();
+        let db = tmp.path().join("race.db");
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE leases (
+                    id INTEGER PRIMARY KEY,
+                    job_id TEXT NOT NULL,
+                    worktree_path TEXT NOT NULL,
+                    released_at INTEGER
+                );",
+            )
+            .unwrap();
+        }
+        let barrier = Arc::new(Barrier::new(2));
+        let spawn = |job: &'static str| {
+            let db = db.clone();
+            let barrier = barrier.clone();
+            thread::spawn(move || {
+                let conn = Connection::open(db).unwrap();
+                let occupant: Option<String> = conn
+                    .query_row(
+                        "SELECT job_id FROM leases WHERE worktree_path = 'p' AND released_at IS NULL",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .unwrap();
+                assert!(
+                    occupant.is_none(),
+                    "both connections must observe an empty path"
+                );
+                barrier.wait();
+                conn.execute(
+                    "INSERT INTO leases (job_id, worktree_path, released_at) VALUES (?1, 'p', NULL)",
+                    [job],
+                )
+                .unwrap();
+            })
+        };
+        let a = spawn("job-a");
+        let b = spawn("job-b");
+        a.join().unwrap();
+        b.join().unwrap();
+        let conn = Connection::open(&db).unwrap();
+        let live: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM leases WHERE released_at IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            live, 2,
+            "occupant SELECT then INSERT without a live-path constraint is not atomic"
+        );
+    }
+
+    #[test]
+    fn concurrent_grants_admit_one_live_owner() {
+        let tmp = tempdir().unwrap();
+        let db = tmp.path().join("leases.db");
+        let repo = tmp.path().join("repo");
+        let wt = tmp.path().join("checkouts/shared");
+        drop(LeaseStore::open(&db).unwrap());
+
+        let start = Arc::new(Barrier::new(2));
+        let spawn = |job: &'static str, branch: &'static str| {
+            let db = db.clone();
+            let repo = repo.clone();
+            let wt = wt.clone();
+            let start = start.clone();
+            thread::spawn(move || {
+                let store = LeaseStore::open(db).unwrap();
+                start.wait();
+                store.grant(LeaseGrant {
+                    repo: &repo,
+                    owner: "local",
+                    repo_name: "repo",
+                    job_id: job,
+                    branch,
+                    worktree_path: &wt,
+                    start_commit: "abc123",
+                })
+            })
+        };
+        let a = spawn("job-a", "hive/job-a");
+        let b = spawn("job-b", "hive/job-b");
+        let ra = a.join().expect("job-a thread");
+        let rb = b.join().expect("job-b thread");
+        let wins = [&ra, &rb].iter().filter(|r| r.is_ok()).count();
+        let losses = [&ra, &rb]
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r,
+                    Err(Error::PolicyViolation {
+                        code: PolicyCode::LeaseConflict,
+                        ..
+                    })
+                )
+            })
+            .count();
+        assert_eq!(wins, 1, "exactly one grant must become the live owner");
+        assert_eq!(losses, 1, "the other grant must be a typed LEASE_CONFLICT");
+
+        let store = LeaseStore::open(&db).unwrap();
+        let active = store.list_active().unwrap();
+        assert_eq!(active.len(), 1);
+        assert!(active[0].released_at.is_none());
+        assert!(active[0].job_id == "job-a" || active[0].job_id == "job-b");
     }
 
     #[test]
