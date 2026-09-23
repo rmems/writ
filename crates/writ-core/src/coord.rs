@@ -757,7 +757,7 @@ fn list_other_claims_tx(
 ) -> Result<Vec<CoordClaim>> {
     let query = format!(
         "{CLAIM_SELECT} WHERE l.released_at IS NULL AND l.tombstoned_at IS NULL \
-         AND NOT (c.owner = ?1 AND c.repo_name = ?2 AND c.job_id = ?3)"
+         AND c.owner = ?1 AND c.repo_name = ?2 AND c.job_id != ?3"
     );
     let mut stmt = tx
         .prepare(&query)
@@ -1150,14 +1150,30 @@ mod tests {
         }
 
         fn seed_job(&self, job_id: &str, branch: &str) -> std::path::PathBuf {
-            let worktree = self._temp.path().join("worktrees/acme/sample").join(job_id);
+            self.seed_job_in("acme", "sample", job_id, branch)
+        }
+
+        fn seed_job_in(
+            &self,
+            owner: &str,
+            repo_name: &str,
+            job_id: &str,
+            branch: &str,
+        ) -> std::path::PathBuf {
+            let worktree = self
+                ._temp
+                .path()
+                .join("worktrees")
+                .join(owner)
+                .join(repo_name)
+                .join(job_id);
             fs::create_dir_all(&worktree).unwrap();
             let prepared = self
                 .store
                 .prepare_allocate(AllocateRequest {
                     repo: &self.repo,
-                    owner: "acme",
-                    repo_name: "sample",
+                    owner,
+                    repo_name,
                     job_id,
                     branch,
                     worktree_path: &worktree,
@@ -1193,10 +1209,21 @@ mod tests {
         agent: &'a str,
         paths: &'a [String],
     ) -> AnnounceResult {
+        announce_in(store, "acme", "sample", job_id, agent, paths)
+    }
+
+    fn announce_in<'a>(
+        store: &'a LeaseStore,
+        owner: &'a str,
+        repo_name: &'a str,
+        job_id: &'a str,
+        agent: &'a str,
+        paths: &'a [String],
+    ) -> AnnounceResult {
         store
             .announce(AnnounceRequest {
-                owner: "acme",
-                repo_name: "sample",
+                owner,
+                repo_name,
                 job_id,
                 agent_id: agent,
                 session_id: Some("session-a"),
@@ -1244,6 +1271,33 @@ mod tests {
                 .any(|message| message.kind == MessageKind::Overlap
                     && message.from_job_id == "job-b")
         );
+    }
+
+    #[test]
+    fn overlap_scan_is_scoped_to_the_current_owner_and_repo() {
+        let harness = Harness::new();
+        harness.seed_job("job-a", "hive/job-a");
+        harness.seed_job("job-b", "hive/job-b");
+        harness.seed_job_in("other", "sample", "job-c", "hive/job-c");
+        harness.seed_job_in("acme", "other", "job-d", "hive/job-d");
+        let paths = [String::from("crates/writ-core/src")];
+
+        announce(&harness.store, "job-b", "agent-b", &paths);
+        announce_in(
+            &harness.store,
+            "other",
+            "sample",
+            "job-c",
+            "agent-c",
+            &paths,
+        );
+        announce_in(&harness.store, "acme", "other", "job-d", "agent-d", &paths);
+
+        let result = announce(&harness.store, "job-a", "agent-a", &paths);
+        assert_eq!(result.overlaps.len(), 1);
+        assert_eq!(result.overlaps[0].owner, "acme");
+        assert_eq!(result.overlaps[0].repo_name, "sample");
+        assert_eq!(result.overlaps[0].job_id, "job-b");
     }
 
     fn job_key_a() -> JobKey<'static> {

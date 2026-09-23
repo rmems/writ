@@ -115,6 +115,34 @@ fn grant_release_preserves_identity_and_budget_columns() {
 }
 
 #[test]
+fn released_lease_can_be_tombstoned_and_cannot_be_granted_again() {
+    let tmp = tempdir().unwrap();
+    let store = LeaseStore::open(tmp.path().join("leases.db")).unwrap();
+    let repo = tmp.path().join("repo");
+    let wt = tmp.path().join("worktrees/acme/sample/gh-42");
+    let grant = LeaseGrant {
+        repo: &repo,
+        owner: "acme",
+        repo_name: "sample",
+        job_id: "gh-42",
+        branch: "hive/gh-42",
+        worktree_path: &wt,
+        start_commit: "abc123",
+    };
+
+    store.grant(grant).unwrap();
+    let released = store.release_by_path(&wt).unwrap().unwrap();
+    assert_eq!(released.allocation_state, AllocationState::Released);
+
+    let tombstoned = store.tombstone_by_path(&wt).unwrap().unwrap();
+    assert_eq!(tombstoned.allocation_state, AllocationState::Tombstoned);
+    assert!(tombstoned.released_at.is_some());
+    assert!(tombstoned.tombstoned_at.is_some());
+
+    assert_policy(store.grant(grant).unwrap_err(), PolicyCode::LeaseTombstoned);
+}
+
+#[test]
 fn grant_refuses_active_lease_held_by_different_path() {
     let tmp = tempdir().unwrap();
     let store = LeaseStore::open(tmp.path().join("leases.db")).unwrap();

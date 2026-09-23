@@ -109,7 +109,8 @@ impl LeaseStore {
                 .map_err(|e| lease_err("commit lease finalize", e))?;
             return Ok(None);
         };
-        if lease.allocation_state.is_terminal() {
+        if lease.allocation_state == AllocationState::Tombstoned || lease.allocation_state == state
+        {
             tx.commit()
                 .map_err(|e| lease_err("commit lease finalize", e))?;
             drop(conn);

@@ -105,7 +105,8 @@ impl CheckoutRegistry {
             AllocationState::Prepared
             | AllocationState::Mutating
             | AllocationState::NeedsAttention
-            | AllocationState::Aborted => self.resume_interrupted(info, job_id),
+            | AllocationState::Aborted
+            | AllocationState::Unknown => self.resume_interrupted(info, job_id),
         }
     }
 
@@ -712,6 +713,36 @@ mod tests {
         // After release, the job id can move to the other path.
         registry.unregister(&wt1).unwrap();
         registry.register(&wt2, "shared-job").unwrap();
+    }
+
+    #[test]
+    fn register_keeps_unknown_allocation_state_non_retryable() {
+        let (tmp, repo) = init_repo();
+        let store_path = tmp.path().join("leases.db");
+        let registry =
+            CheckoutRegistry::with_store(LeaseStore::open(&store_path).unwrap()).unwrap();
+        registry.register(&repo, "job-a").unwrap();
+        let conn = rusqlite::Connection::open(&store_path).unwrap();
+        conn.execute(
+            "UPDATE leases SET allocation_state = 'FUTURE_STATE' WHERE job_id = 'job-a'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(matches!(
+            registry.register(&repo, "job-a"),
+            Err(Error::LeaseAttention(_))
+        ));
+        let conn = rusqlite::Connection::open(&store_path).unwrap();
+        let stored: String = conn
+            .query_row(
+                "SELECT allocation_state FROM leases WHERE job_id = 'job-a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, "FUTURE_STATE");
     }
 
     #[test]

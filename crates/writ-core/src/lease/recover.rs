@@ -54,7 +54,10 @@ impl LeaseStore {
         )?;
         if !changed {
             tx.commit().map_err(|e| lease_err("commit promote", e))?;
-            return Ok(terminal_outcome(current, inspection));
+            return Ok(ReconcileOutcome::NeedsAttention {
+                lease: current,
+                inspection,
+            });
         }
         schema::update_op_phase(
             &tx,
@@ -117,6 +120,9 @@ impl LeaseStore {
                 operation_id: lease.operation_id,
                 inspection,
             }));
+        }
+        if lease.allocation_state == AllocationState::Unknown {
+            return Ok(Some(ReconcileOutcome::NeedsAttention { lease, inspection }));
         }
 
         match inspection.classification {
@@ -187,7 +193,10 @@ fn finish_open_recover(store: &LeaseStore, step: RecoverStep<'_>) -> Result<Reco
     if !changed {
         tx.commit()
             .map_err(|e| lease_err(commit_ctx(step.label), e))?;
-        return Ok(terminal_outcome(current, step.inspection));
+        return Ok(ReconcileOutcome::NeedsAttention {
+            lease: current,
+            inspection: step.inspection,
+        });
     }
     write_recover_op(&tx, &step, now)?;
     tx.commit()
@@ -316,7 +325,7 @@ fn apply_abort(tx: &Transaction<'_>, expected: &Lease) -> Result<bool> {
         "
             DELETE FROM leases
             WHERE operation_id = ?1
-              AND allocation_state IN ('PREPARED', 'MUTATING', 'ABORTED')
+              AND allocation_state IN ('PREPARED', 'MUTATING', 'NEEDS_ATTENTION', 'ABORTED')
               AND released_at IS NULL AND tombstoned_at IS NULL
             ",
         params![expected.operation_id],

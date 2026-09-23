@@ -89,6 +89,20 @@ impl LeaseStore {
         if current.allocation_state.is_terminal() {
             return Err(terminal_error(&current));
         }
+        let expected = match (current.allocation_state, next) {
+            (AllocationState::Prepared, AllocationState::Mutating) => AllocationState::Prepared,
+            (AllocationState::Mutating, AllocationState::Active) => AllocationState::Mutating,
+            _ => {
+                return Err(Error::LeaseStore {
+                    context: "advance allocate",
+                    message: format!(
+                        "invalid allocation transition {} -> {}",
+                        current.allocation_state.as_str(),
+                        next.as_str()
+                    ),
+                });
+            }
+        };
         let mode = if next == AllocationState::Active {
             LeaseMode::WriterLocked.as_str()
         } else {
@@ -103,9 +117,10 @@ impl LeaseStore {
             "
             UPDATE leases
             SET allocation_state = ?1, mode = ?2, heartbeat = ?3, updated_at = ?3
-            WHERE operation_id = ?4 AND tombstoned_at IS NULL AND released_at IS NULL
+            WHERE operation_id = ?4 AND allocation_state = ?5
+              AND tombstoned_at IS NULL AND released_at IS NULL
             ",
-            params![next.as_str(), mode, now, operation_id],
+            params![next.as_str(), mode, now, operation_id, expected.as_str()],
         )
         .map_err(|e| lease_err("advance allocate", e))?;
         if tx.changes() != 1 {

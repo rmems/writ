@@ -17,6 +17,109 @@ fn crash_before_mutation_is_retryable_without_reserving_identity() {
 }
 
 #[test]
+fn allocate_advance_rejects_invalid_source_states() {
+    let harness = RepoHarness::new();
+    let prepared = harness.store.prepare_allocate(harness.request()).unwrap();
+
+    let err = harness
+        .store
+        .commit_allocate(&prepared.operation_id)
+        .unwrap_err();
+    assert!(err.to_string().contains("PREPARED -> ACTIVE"));
+    assert_eq!(
+        harness
+            .store
+            .find_by_operation(&prepared.operation_id)
+            .unwrap()
+            .unwrap()
+            .allocation_state,
+        AllocationState::Prepared
+    );
+
+    harness.store.mark_mutating(&prepared.operation_id).unwrap();
+    harness
+        .store
+        .commit_allocate(&prepared.operation_id)
+        .unwrap();
+    let err = harness
+        .store
+        .mark_mutating(&prepared.operation_id)
+        .unwrap_err();
+    assert!(err.to_string().contains("ACTIVE -> MUTATING"));
+
+    {
+        let conn = harness.store.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE leases SET allocation_state = 'NEEDS_ATTENTION' WHERE operation_id = ?1",
+            [&prepared.operation_id],
+        )
+        .unwrap();
+    }
+    let err = harness
+        .store
+        .mark_mutating(&prepared.operation_id)
+        .unwrap_err();
+    assert!(err.to_string().contains("NEEDS_ATTENTION -> MUTATING"));
+}
+
+#[test]
+fn needs_attention_can_abort_after_residual_state_is_removed() {
+    let harness = RepoHarness::new();
+    harness.store.prepare_allocate(harness.request()).unwrap();
+    fs::create_dir_all(&harness.worktree).unwrap();
+    fs::write(harness.worktree.join("occupied"), "partial\n").unwrap();
+    assert_outcome(
+        &harness.store,
+        harness.key(),
+        &harness.repo,
+        "needs_attention",
+    );
+
+    fs::remove_dir_all(&harness.worktree).unwrap();
+    assert_outcome(&harness.store, harness.key(), &harness.repo, "retry");
+    assert!(harness.store.find_job(harness.key()).unwrap().is_none());
+}
+
+#[test]
+fn unknown_allocation_state_stays_needs_attention_without_mutation() {
+    let harness = RepoHarness::new();
+    let prepared = harness.store.prepare_allocate(harness.request()).unwrap();
+    {
+        let conn = harness.store.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE leases SET allocation_state = 'FUTURE_STATE' WHERE operation_id = ?1",
+            [&prepared.operation_id],
+        )
+        .unwrap();
+    }
+
+    let outcome = assert_outcome(
+        &harness.store,
+        harness.key(),
+        &harness.repo,
+        "needs_attention",
+    );
+    let ReconcileOutcome::NeedsAttention { lease, inspection } = outcome else {
+        panic!("expected needs attention, got {outcome:?}");
+    };
+    assert_eq!(lease.allocation_state, AllocationState::Unknown);
+    assert_eq!(inspection.allocation_state.as_deref(), Some("UNKNOWN"));
+    let stored: String = harness
+        .store
+        .conn
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT allocation_state FROM leases WHERE operation_id = ?1",
+            [&prepared.operation_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored, "FUTURE_STATE");
+    assert_eq!(AllocationState::parse("ABORTED"), AllocationState::Aborted);
+}
+
+#[test]
 fn crash_after_branch_creation_is_fail_closed_without_cleanup() {
     let harness = RepoHarness::new();
     harness.store.prepare_allocate(harness.request()).unwrap();

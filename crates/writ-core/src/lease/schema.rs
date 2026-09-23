@@ -1,8 +1,8 @@
 //! Lease SQLite schema, migrations, and allocation-op journal.
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
-use super::{Result, lease_err};
+use super::{Error, Result, lease_err};
 
 pub(super) const INITIAL_SCHEMA: &str = r"
             PRAGMA foreign_keys = ON;
@@ -56,9 +56,6 @@ pub(super) const INITIAL_SCHEMA: &str = r"
                 started_at INTEGER NOT NULL,
                 stopped_at INTEGER
             );
-            CREATE UNIQUE INDEX IF NOT EXISTS leases_live_worktree_path
-                ON leases(worktree_path)
-                WHERE released_at IS NULL AND tombstoned_at IS NULL;
             ";
 
 pub(super) const GRANT_UPSERT: &str = r"
@@ -191,6 +188,28 @@ fn ensure_crash_consistency_columns(conn: &Connection) -> Result<()> {
 }
 
 fn ensure_live_path_unique_index(conn: &Connection) -> Result<()> {
+    let duplicate = conn
+        .query_row(
+            "
+            SELECT worktree_path
+            FROM leases
+            WHERE released_at IS NULL AND tombstoned_at IS NULL
+            GROUP BY worktree_path
+            HAVING COUNT(*) > 1
+            ORDER BY worktree_path
+            LIMIT 1
+            ",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|e| lease_err("inspect live worktree path uniqueness", e))?;
+    if let Some(path) = duplicate {
+        return Err(Error::LeaseStore {
+            context: "ensure live worktree path uniqueness",
+            message: format!("duplicate live worktree_path `{path}`"),
+        });
+    }
     conn.execute(
         "
         CREATE UNIQUE INDEX IF NOT EXISTS leases_live_worktree_path
@@ -259,4 +278,92 @@ pub(super) fn update_op_phase(tx: &rusqlite::Transaction<'_>, phase: OpPhase<'_>
     )
     .map_err(|e| lease_err("update allocation op", e))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn create_legacy_leases(conn: &Connection) {
+        conn.execute_batch(
+            "
+            CREATE TABLE leases (
+                id INTEGER PRIMARY KEY,
+                repo TEXT NOT NULL,
+                owner TEXT NOT NULL,
+                repo_name TEXT NOT NULL,
+                job_id TEXT NOT NULL,
+                branch TEXT NOT NULL,
+                branch_ref TEXT NOT NULL,
+                worktree_path TEXT NOT NULL,
+                start_commit TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                ttl INTEGER,
+                heartbeat INTEGER,
+                max_files INTEGER,
+                max_churn INTEGER,
+                max_fix_cycles INTEGER,
+                fix_cycles INTEGER,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                released_at INTEGER,
+                UNIQUE(owner, repo_name, job_id)
+            );
+            ",
+        )
+        .unwrap();
+    }
+
+    fn insert_legacy_lease(conn: &Connection, job_id: &str, path: &str) {
+        conn.execute(
+            "
+            INSERT INTO leases (
+                repo, owner, repo_name, job_id, branch, branch_ref, worktree_path,
+                start_commit, mode, fix_cycles, created_at, updated_at, released_at
+            ) VALUES (
+                '/repo', 'acme', 'sample', ?1, 'branch', 'refs/heads/branch', ?2,
+                'abc123', 'WRITER_LOCKED', 0, 1, 1, NULL
+            )
+            ",
+            params![job_id, path],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn legacy_schema_migrates_before_live_path_index_is_created() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_legacy_leases(&conn);
+        insert_legacy_lease(&conn, "job-a", "/worktrees/a");
+
+        apply(&conn).unwrap();
+
+        let columns = table_column_names(&conn).unwrap();
+        assert!(columns.iter().any(|column| column == "tombstoned_at"));
+        let index_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'leases_live_worktree_path')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(index_exists);
+    }
+
+    #[test]
+    fn duplicate_live_paths_report_the_conflicting_path() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_legacy_leases(&conn);
+        insert_legacy_lease(&conn, "job-a", "/worktrees/shared");
+        insert_legacy_lease(&conn, "job-b", "/worktrees/shared");
+
+        let err = apply(&conn).unwrap_err();
+        match err {
+            Error::LeaseStore { context, message } => {
+                assert_eq!(context, "ensure live worktree path uniqueness");
+                assert!(message.contains("/worktrees/shared"));
+            }
+            other => panic!("expected lease-store error, got {other:?}"),
+        }
+    }
 }

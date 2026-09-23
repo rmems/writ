@@ -54,6 +54,8 @@ pub enum AllocationState {
     Released,
     Tombstoned,
     Aborted,
+    /// Stored value is not one of the known allocation states.
+    Unknown,
 }
 
 impl AllocationState {
@@ -67,6 +69,7 @@ impl AllocationState {
             Self::Released => "RELEASED",
             Self::Tombstoned => "TOMBSTONED",
             Self::Aborted => "ABORTED",
+            Self::Unknown => "UNKNOWN",
         }
     }
 
@@ -78,7 +81,8 @@ impl AllocationState {
             "NEEDS_ATTENTION" => Self::NeedsAttention,
             "RELEASED" => Self::Released,
             "TOMBSTONED" => Self::Tombstoned,
-            _ => Self::Aborted,
+            "ABORTED" => Self::Aborted,
+            _ => Self::Unknown,
         }
     }
 
