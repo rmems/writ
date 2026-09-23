@@ -188,7 +188,7 @@ pub enum PolicyCode {
     OwnerNotAllowed,
     /// The import source is not the configured base-repository remote.
     UnauthorizedSource,
-    /// A job's active lease is held by a different worktree path.
+    /// An active lease already occupies this job id or checkout path.
     LeaseConflict,
 }
 
