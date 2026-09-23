@@ -1,5 +1,10 @@
 //! Process supervisor with timeouts, process-group isolation, and max-parallel enforcement.
 //!
+//! Hang recovery lives here (RM-15 remaining supervisor contract): hard wall-clock,
+//! idle (no-output) detection, lost-child classification, soft-cancel then kill,
+//! and stderr progress ticks. The supervisor **never retries**, never merges, and
+//! never force-pushes. Named defaults: [`crate::timeout_policy`].
+//!
 //! # Concurrency model
 //!
 //! `--max-parallel` / [`Supervisor::new`] limits concurrent supervised children **within a
@@ -9,16 +14,22 @@
 //!
 //! # Platform notes
 //!
-//! On **Unix**, timeout and kill paths send `SIGKILL` to the entire process group
-//! (`kill(-pid, SIGKILL)` after spawning with `process_group(0)`), so descendants
-//! started by the child are cleaned up with the supervised process.
+//! On **Unix**, timeout recovery sends `SIGTERM` to the process group, waits
+//! [`crate::timeout_policy::TimeoutPolicy::grace`], then `SIGKILL`
+//! (`kill(-pid, SIGTERM|SIGKILL)` after spawning with `process_group(0)`).
+//! `grace == 0` skips straight to `SIGKILL`. Descendants started by the child
+//! are cleaned up with the supervised process.
 //!
-//! On **Windows**, only the direct child process is killed (`kill_on_drop` + `child.kill()`).
+//! On **Windows**, there is no process-group SIGTERM. Recovery waits `grace`
+//! then kills only the direct child (`kill_on_drop` + `child.kill()`).
 //! There is **no kill-tree / job-object** yet: grandchild processes may outlive the
 //! supervisor. Tracking full Windows job-object support is deferred (documented limitation).
+//! Hosts whose subagent API cannot kill should stop waiting, mark a
+//! `timeout:lost_child` residual, and warn the operator — they must not invent a SHA.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use serde::Serialize;
@@ -29,11 +40,148 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 use crate::error::{Error, PolicyCode, Result};
-use crate::git_safe::{SafeGhCommand, SafeGitCommand};
 use crate::owners::OwnerAllowlist;
+
+#[path = "supervisor_cmd.rs"]
+mod cmd;
+use crate::timeout_policy::{
+    ProgressCallback, ProgressSnapshot, RecoveryStage, SupervisorStep, TimeoutClass, TimeoutPolicy,
+    TimeoutResidual,
+};
+pub use cmd::check_command_policy;
+use cmd::{CommandRequest, prepare_supervised_command, verify_repo_branch};
+
+/// Normalize an executable path to a basename without platform extensions.
+#[must_use]
+pub fn normalize_program_name(program: &str) -> String {
+    // Accept both Unix and Windows separators even when running on Linux (tests / cross config).
+    let base = program
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(program);
+    let lower = base.to_ascii_lowercase();
+    lower
+        .strip_suffix(".exe")
+        .or_else(|| lower.strip_suffix(".cmd"))
+        .or_else(|| lower.strip_suffix(".bat"))
+        .unwrap_or(&lower)
+        .to_owned()
+}
+
+const FORBIDDEN_WRAPPERS: &[&str] = &[
+    "bash",
+    "bun",
+    "chroot",
+    "cmd",
+    "curl",
+    "dash",
+    "deno",
+    "doas",
+    "env",
+    "fish",
+    "http",
+    "httpie",
+    "ipython",
+    "ipython3",
+    "lua",
+    "nc",
+    "ncat",
+    "netcat",
+    "nice",
+    "node",
+    "nodejs",
+    "nohup",
+    "nsenter",
+    "open",
+    "perl",
+    "php",
+    "powershell",
+    "pwsh",
+    "py",
+    "python",
+    "python2",
+    "python3",
+    "rscript",
+    "ruby",
+    "script",
+    "setsid",
+    "sh",
+    "socat",
+    "stdbuf",
+    "su",
+    "sudo",
+    "time",
+    "timeout",
+    "unshare",
+    "wget",
+    "xargs",
+    "xdg-open",
+    "zsh",
+];
+
+const VERSIONED_WRAPPER_PREFIXES: &[&str] = &[
+    "python", "python2", "python3", "perl", "ruby", "node", "nodejs", "php", "lua", "ipython",
+];
+
+pub(super) fn program_is_path_qualified(program: &str) -> bool {
+    if program.contains('/') {
+        return true;
+    }
+    if program.contains('\\') {
+        return true;
+    }
+    if program.starts_with('.') {
+        return true;
+    }
+    if program.len() <= 2 {
+        return false;
+    }
+    program.as_bytes().get(1) == Some(&b':')
+}
+
+pub(super) fn reject_mismatched_checkout(expected: Option<&str>, args: &[String]) -> Result<()> {
+    let Some(exp) = expected else {
+        return Ok(());
+    };
+    let Some(target) = crate::git_safe::checkout_or_switch_target(args) else {
+        return Ok(());
+    };
+    if target == exp {
+        return Ok(());
+    }
+    if target == "HEAD" {
+        return Ok(());
+    }
+    Err(Error::PolicyViolation {
+        code: PolicyCode::BranchMismatch,
+        message: format!(
+            "git checkout/switch target `{target}` must equal --expected-branch `{exp}`"
+        ),
+    })
+}
+
+pub(super) fn is_forbidden_wrapper(name: &str) -> bool {
+    FORBIDDEN_WRAPPERS.contains(&name) || versioned_wrapper_name(name)
+}
+
+fn versioned_wrapper_name(name: &str) -> bool {
+    VERSIONED_WRAPPER_PREFIXES.iter().any(|prefix| {
+        let Some(rest) = name.strip_prefix(prefix) else {
+            return false;
+        };
+        rest.is_empty()
+            || rest.starts_with('.')
+            || rest.chars().next().is_some_and(|c| c.is_ascii_digit())
+    })
+}
 
 /// How long to wait for the child to exit after a timeout kill.
 const POST_KILL_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Bound pipe drain when no wall-clock deadline is set, so inherited pipes from
+/// background descendants cannot hang the supervisor forever.
+const ORPHAN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Cap captured stdout/stderr per stream to avoid memory exhaustion.
 const MAX_CAPTURE_BYTES: usize = 1_048_576;
@@ -44,10 +192,15 @@ const MAX_CAPTURE_BYTES: usize = 1_048_576;
 pub enum SupervisorErrorCode {
     /// Process could not be started.
     SpawnFailed,
-    /// Waiting on the child failed after spawn.
+    /// Waiting on the child failed after spawn. Prefer [`Self::LostChild`] for
+    /// hang residuals; retained so v1 JSON stays additive.
     WaitFailed,
     /// Wall-clock timeout fired (process group / child kill attempted).
     TimedOut,
+    /// Idle (no-output) hang detector fired; recovery kill attempted.
+    IdleTimedOut,
+    /// Child PID/handle gone without a terminal status.
+    LostChild,
     /// Child terminated by signal / kill without a classified timeout.
     Killed,
     /// Child exited with a non-zero status.
@@ -55,7 +208,7 @@ pub enum SupervisorErrorCode {
 }
 
 /// Outcome of a supervised process execution.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Default)]
 pub struct SupervisedOutput {
     /// Process exit code, or `None` if terminated by signal / timeout / spawn failure.
     pub exit_code: Option<i32>,
@@ -76,6 +229,27 @@ pub struct SupervisedOutput {
     /// Structured failure code when the run is not a clean success.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_code: Option<SupervisorErrorCode>,
+    /// Stuck classification when the run timed out or the child was lost.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_class: Option<TimeoutClass>,
+    /// Wall-clock milliseconds from `run` start through this outcome (includes permit wait).
+    #[serde(default)]
+    pub elapsed_ms: u64,
+    /// Always `0` from this supervisor: it never re-dispatches.
+    #[serde(default)]
+    pub redispatch_count: u32,
+    /// Configured host redispatch cap from the active [`TimeoutPolicy`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_redispatch_per_item: Option<u32>,
+    /// Last recovery action when a hang residual is present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery_stage: Option<RecoveryStage>,
+    /// Milliseconds from spawn to last captured child byte, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_output_ms: Option<u64>,
+    /// Additive hang residual (no SHA / commit / head fields).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub residual: Option<TimeoutResidual>,
 }
 
 impl SupervisedOutput {
@@ -95,17 +269,63 @@ impl SupervisedOutput {
         self.error_code = Some(code);
         self
     }
+
+    fn with_elapsed(mut self, started: Instant) -> Self {
+        self.elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        if let Some(residual) = &mut self.residual {
+            residual.elapsed_ms = self.elapsed_ms;
+        }
+        self
+    }
+
+    fn with_hang_residual(
+        mut self,
+        policy: &TimeoutPolicy,
+        class: TimeoutClass,
+        stage: RecoveryStage,
+        last_output_ms: Option<u64>,
+        started: Instant,
+    ) -> Self {
+        let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.timeout_class = Some(class);
+        self.recovery_stage = Some(stage);
+        self.last_output_ms = last_output_ms;
+        self.max_redispatch_per_item = Some(policy.max_redispatch_per_item);
+        self.elapsed_ms = elapsed_ms;
+        self.residual = Some(TimeoutResidual {
+            timeout_class: class,
+            recovery_stage: stage,
+            redispatch_count: 0,
+            max_redispatch_per_item: policy.max_redispatch_per_item,
+            elapsed_ms,
+            last_output_ms,
+        });
+        self
+    }
 }
 
 /// Options for a policy-checked supervised run.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct RunOptions {
     /// When supervising `git` mutations, require this branch (verified before spawn).
     pub expected_branch: Option<String>,
     /// Repository working tree for git branch verification and `git -C` (default: `.`).
     pub repo: Option<PathBuf>,
+    /// Optional progress sink (stderr diagnostics). Never writes JSON stdout.
+    pub on_progress: Option<ProgressCallback>,
     /// Explicit owner allowlist. `None` reads `WRIT_ALLOWED_OWNERS` / `WH_ALLOWED_OWNERS`.
     pub allowlist: Option<OwnerAllowlist>,
+}
+
+impl std::fmt::Debug for RunOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunOptions")
+            .field("expected_branch", &self.expected_branch)
+            .field("repo", &self.repo)
+            .field("on_progress", &self.on_progress.is_some())
+            .field("allowlist", &self.allowlist.is_some())
+            .finish()
+    }
 }
 
 /// Configuration for the process supervisor.
@@ -179,7 +399,7 @@ impl Supervisor {
     /// Run a command under supervision after applying safety policy.
     ///
     /// - Validates git/gh (including path-qualified names like `/usr/bin/git`) via
-    ///   [`SafeGitCommand`] / [`SafeGhCommand`].
+    ///   [`crate::git_safe::SafeGitCommand`] / [`crate::git_safe::SafeGhCommand`].
     /// - **Rejects shells and launchers** (`sh`, `bash`, `cmd`, `env`, `xargs`, …) so policy
     ///   cannot be bypassed by quoting or wrappers; invoke binaries directly.
     /// - For mutating git, requires [`RunOptions::expected_branch`], verifies the branch
@@ -188,6 +408,9 @@ impl Supervisor {
     /// - Spawns with process-group isolation where the OS allows; Drop/timeout kill the group.
     /// - Enforces wall-clock timeout; kills the process group on expiry (Unix).
     /// - Acquires a permit from the **process-local** max-parallel semaphore before spawning.
+    ///
+    /// Equivalent to [`Self::run_with_policy`] with [`TimeoutPolicy::from_worker_timeout`]
+    /// (immediate kill, no idle detector, no progress ticks).
     pub async fn run(
         &self,
         program: &str,
@@ -195,56 +418,40 @@ impl Supervisor {
         timeout: Option<Duration>,
         options: &RunOptions,
     ) -> Result<SupervisedOutput> {
+        self.run_with_policy(
+            program,
+            args,
+            &TimeoutPolicy::from_worker_timeout(timeout),
+            options,
+        )
+        .await
+    }
+
+    /// Run a command under [`TimeoutPolicy`] (hard/idle/grace/progress).
+    ///
+    /// Recovery never merges, never bare-force-pushes, and never retries
+    /// (`redispatch_count` is always `0`).
+    pub async fn run_with_policy(
+        &self,
+        program: &str,
+        args: &[&str],
+        policy: &TimeoutPolicy,
+        options: &RunOptions,
+    ) -> Result<SupervisedOutput> {
         // Allowlist / structural validation only (no branch TOCTOU window before queue).
-        let prepared = prepare_supervised_command(program, args, options)?;
+        let prepared = prepare_supervised_command(&CommandRequest {
+            program,
+            args,
+            options,
+        })?;
         let started = Instant::now();
-
-        // Wall-clock timeout includes permit wait so saturated pools still time out.
-        let permit = match timeout {
-            Some(limit) => match tokio::time::timeout(limit, self.semaphore.acquire()).await {
-                Ok(Ok(p)) => p,
-                Ok(Err(_)) => panic!("supervisor semaphore closed"),
-                Err(_) => {
-                    return Ok(SupervisedOutput {
-                        exit_code: None,
-                        timed_out: true,
-                        killed: false,
-                        stdout: String::new(),
-                        stderr: "timed out waiting for max-parallel permit".to_owned(),
-                        stdout_truncated: false,
-                        stderr_truncated: false,
-                        error_code: Some(SupervisorErrorCode::TimedOut),
-                    });
-                }
-            },
-            None => self
-                .semaphore
-                .acquire()
-                .await
-                .expect("supervisor semaphore closed"),
+        let _permit = match acquire_run_permit(self, policy, options, started).await {
+            Ok(permit) => permit,
+            Err(timeout) => return Ok(timeout),
         };
-        let _permit = permit;
-
-        // Remaining time for the child after queueing (if any).
-        let child_timeout = timeout.map(|limit| {
-            let elapsed = started.elapsed();
-            if elapsed >= limit {
-                return Duration::from_millis(0);
-            }
-            limit.saturating_sub(elapsed)
-        });
-        if child_timeout == Some(Duration::from_millis(0)) {
-            return Ok(SupervisedOutput {
-                exit_code: None,
-                timed_out: true,
-                killed: false,
-                stdout: String::new(),
-                stderr: "timed out waiting for max-parallel permit".to_owned(),
-                stdout_truncated: false,
-                stderr_truncated: false,
-                error_code: Some(SupervisorErrorCode::TimedOut),
-            });
-        }
+        let Some(child_policy) = child_policy_after_permit(policy, started.elapsed()) else {
+            return Ok(permit_wait_timeout(started, policy));
+        };
 
         // Branch check immediately before spawn, while holding the permit.
         // Always verify via git HEAD, for both supervised git and mutating gh.
@@ -258,7 +465,9 @@ impl Supervisor {
                 &prepared.program,
                 &prepared.args,
                 prepared.cwd.as_deref(),
-                child_timeout,
+                &child_policy,
+                options.on_progress.as_ref(),
+                started,
             )
             .await;
         guard.defuse();
@@ -273,14 +482,41 @@ impl Supervisor {
         args: &[&str],
         timeout: Option<Duration>,
     ) -> SupervisedOutput {
+        self.run_unchecked_with_policy(
+            program,
+            args,
+            &TimeoutPolicy::from_worker_timeout(timeout),
+            &RunOptions::default(),
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    async fn run_unchecked_with_policy(
+        &self,
+        program: &str,
+        args: &[&str],
+        policy: &TimeoutPolicy,
+        options: &RunOptions,
+    ) -> SupervisedOutput {
         let owned: Vec<String> = args.iter().map(|s| (*s).to_owned()).collect();
+        let started = Instant::now();
         let _permit = self
             .semaphore
             .acquire()
             .await
             .expect("supervisor semaphore closed");
         let guard = ActiveGuard::arm(self);
-        let output = self.run_with_permit(program, &owned, None, timeout).await;
+        let output = self
+            .run_with_permit(
+                program,
+                &owned,
+                None,
+                policy,
+                options.on_progress.as_ref(),
+                started,
+            )
+            .await;
         guard.defuse();
         output
     }
@@ -290,107 +526,538 @@ impl Supervisor {
         program: &str,
         args: &[String],
         cwd: Option<&std::path::Path>,
-        timeout: Option<Duration>,
+        policy: &TimeoutPolicy,
+        on_progress: Option<&ProgressCallback>,
+        run_started: Instant,
     ) -> SupervisedOutput {
-        let mut cmd = Command::new(program);
-        cmd.args(args);
-        if let Some(dir) = cwd {
-            cmd.current_dir(dir);
-        }
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
-        cmd.kill_on_drop(true);
-
-        #[cfg(unix)]
-        set_process_group(&mut cmd);
-
-        let child = match cmd.spawn() {
-            Ok(child) => child,
+        let mut spawned = match spawn_supervised_child(program, args, cwd) {
+            Ok(spawned) => spawned,
             Err(e) => {
                 return SupervisedOutput {
-                    exit_code: None,
-                    timed_out: false,
-                    killed: false,
-                    stdout: String::new(),
                     stderr: format!("failed to spawn: {e}"),
-                    stdout_truncated: false,
-                    stderr_truncated: false,
                     error_code: Some(SupervisorErrorCode::SpawnFailed),
-                };
+                    ..SupervisedOutput::default()
+                }
+                .with_elapsed(run_started);
             }
         };
+        await_supervised_child(
+            self,
+            &mut spawned.child,
+            spawned.stdout_handle,
+            spawned.stderr_handle,
+            ChildWait {
+                policy,
+                on_progress,
+                run_started,
+                spawn_at: spawned.spawn_at,
+                last_activity_ms: spawned.last_activity_ms,
+                pid: spawned.pid,
+            },
+        )
+        .await
+        .with_elapsed(run_started)
+    }
+}
 
-        // Ensure process-group kill if this future is dropped mid-run (Unix).
-        let pid = child.id();
-        let mut child = ProcessGroupChild { child, pid };
+struct SpawnedChild {
+    child: ProcessGroupChild,
+    pid: Option<u32>,
+    spawn_at: Instant,
+    last_activity_ms: Arc<AtomicU64>,
+    stdout_handle: JoinHandle<Vec<u8>>,
+    stderr_handle: JoinHandle<Vec<u8>>,
+}
 
-        // Start reading pipes concurrently to prevent deadlock when
-        // the child fills the OS pipe buffer before exiting.
-        let mut child_stdout = child.child.stdout.take();
-        let mut child_stderr = child.child.stderr.take();
-        let stdout_handle: JoinHandle<Vec<u8>> =
-            tokio::spawn(async move { read_pipe(&mut child_stdout).await });
-        let stderr_handle: JoinHandle<Vec<u8>> =
-            tokio::spawn(async move { read_pipe(&mut child_stderr).await });
+fn spawn_supervised_child(
+    program: &str,
+    args: &[String],
+    cwd: Option<&std::path::Path>,
+) -> std::io::Result<SpawnedChild> {
+    let mut cmd = Command::new(program);
+    cmd.args(args);
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    cmd.kill_on_drop(true);
+    #[cfg(unix)]
+    set_process_group(&mut cmd);
+    let child = cmd.spawn()?;
+    let pid = child.id();
+    let mut child = ProcessGroupChild {
+        child,
+        pid,
+        reaped: false,
+    };
+    let spawn_at = Instant::now();
+    let last_activity_ms = Arc::new(AtomicU64::new(0));
+    let mut child_stdout = child.child.stdout.take();
+    let mut child_stderr = child.child.stderr.take();
+    let stdout_last = Arc::clone(&last_activity_ms);
+    let stderr_last = Arc::clone(&last_activity_ms);
+    Ok(SpawnedChild {
+        child,
+        pid,
+        spawn_at,
+        last_activity_ms,
+        stdout_handle: tokio::spawn(async move {
+            read_pipe_probed(&mut child_stdout, spawn_at, stdout_last).await
+        }),
+        stderr_handle: tokio::spawn(async move {
+            read_pipe_probed(&mut child_stderr, spawn_at, stderr_last).await
+        }),
+    })
+}
 
-        if let Some(timeout) = timeout {
-            let deadline_at = Instant::now() + timeout;
-            let deadline = tokio::time::sleep_until(deadline_at);
-            tokio::pin!(deadline);
+async fn acquire_run_permit<'a>(
+    supervisor: &'a Supervisor,
+    policy: &TimeoutPolicy,
+    options: &RunOptions,
+    started: Instant,
+) -> std::result::Result<tokio::sync::SemaphorePermit<'a>, SupervisedOutput> {
+    match policy.wall_clock_limit() {
+        Some(limit) => acquire_permit_with_progress(
+            supervisor,
+            limit,
+            policy,
+            options.on_progress.as_ref(),
+            started,
+        )
+        .await
+        .map_err(|()| permit_wait_timeout(started, policy)),
+        None => Ok(supervisor
+            .semaphore
+            .acquire()
+            .await
+            .expect("supervisor semaphore closed")),
+    }
+}
 
-            tokio::select! {
-                biased;
-                _ = &mut deadline => {
-                    timeout_output(&mut child, stdout_handle, stderr_handle).await
-                }
-                status = child.wait() => {
-                    match status {
-                        Ok(s) => {
-                            match drain_pipes_until(deadline_at, pid, stdout_handle, stderr_handle).await {
-                                Ok((stdout, stderr)) => output_to_supervised(s, &stdout, &stderr),
-                                Err((stdout, stderr)) => SupervisedOutput {
-                                    exit_code: None,
-                                    timed_out: true,
-                                    killed: true,
-                                    stdout: String::from_utf8_lossy(&stdout).into_owned(),
-                                    stderr: String::from_utf8_lossy(&stderr).into_owned(),
-                                    stdout_truncated: stdout.len() >= MAX_CAPTURE_BYTES,
-                                    stderr_truncated: stderr.len() >= MAX_CAPTURE_BYTES,
-                                    error_code: Some(SupervisorErrorCode::TimedOut),
-                                },
-                            }
-                        }
-                        Err(e) => SupervisedOutput {
-                            exit_code: None,
-                            timed_out: false,
-                            killed: false,
-                            stdout: String::new(),
-                            stderr: format!("process error: {e}"),
-                            stdout_truncated: false,
-                            stderr_truncated: false,
-                            error_code: Some(SupervisorErrorCode::WaitFailed),
-                        },
-                    }
-                }
+fn child_policy_after_permit(policy: &TimeoutPolicy, elapsed: Duration) -> Option<TimeoutPolicy> {
+    let child_timeout = policy.child_limit(elapsed);
+    if child_timeout == Some(Duration::ZERO) {
+        return None;
+    }
+    let mut child_policy = policy.clone();
+    child_policy.worker = child_timeout;
+    child_policy.orchestrator = None;
+    // Step already applied inside child_limit; do not double-min.
+    child_policy.step = None;
+    Some(child_policy)
+}
+
+async fn acquire_permit_with_progress<'a>(
+    supervisor: &'a Supervisor,
+    limit: Duration,
+    policy: &TimeoutPolicy,
+    on_progress: Option<&ProgressCallback>,
+    started: Instant,
+) -> std::result::Result<tokio::sync::SemaphorePermit<'a>, ()> {
+    let acquire = supervisor.semaphore.acquire();
+    tokio::pin!(acquire);
+    let deadline = started + limit;
+    loop {
+        let progress_at = on_progress
+            .and(policy.progress_every)
+            .map(|every| Instant::now() + every);
+        tokio::select! {
+            biased;
+            result = &mut acquire => {
+                return Ok(result.expect("supervisor semaphore closed"));
             }
-        } else {
-            match child.wait().await {
-                Ok(status) => {
-                    let stdout = stdout_handle.await.unwrap_or_default();
-                    let stderr = stderr_handle.await.unwrap_or_default();
-                    output_to_supervised(status, &stdout, &stderr)
-                }
-                Err(e) => SupervisedOutput {
-                    exit_code: None,
-                    timed_out: false,
-                    killed: false,
-                    stdout: String::new(),
-                    stderr: format!("process error: {e}"),
-                    stdout_truncated: false,
-                    stderr_truncated: false,
-                    error_code: Some(SupervisorErrorCode::WaitFailed),
-                },
+            _ = tokio::time::sleep_until(deadline) => {
+                return Err(());
             }
+            _ = sleep_until_opt(progress_at) => {
+                emit_progress(
+                    supervisor,
+                    on_progress,
+                    started,
+                    Duration::ZERO,
+                    SupervisorStep::PermitWait,
+                );
+            }
+        }
+    }
+}
+
+fn permit_wait_timeout(started: Instant, policy: &TimeoutPolicy) -> SupervisedOutput {
+    SupervisedOutput {
+        timed_out: true,
+        stderr: "timed out waiting for max-parallel permit".to_owned(),
+        error_code: Some(SupervisorErrorCode::TimedOut),
+        ..SupervisedOutput::default()
+    }
+    .with_hang_residual(
+        policy,
+        TimeoutClass::PermitWait,
+        RecoveryStage::None,
+        None,
+        started,
+    )
+}
+
+fn emit_progress(
+    supervisor: &Supervisor,
+    on_progress: Option<&ProgressCallback>,
+    started: Instant,
+    idle_for: Duration,
+    step: SupervisorStep,
+) {
+    let Some(cb) = on_progress else {
+        return;
+    };
+    let snap = ProgressSnapshot {
+        active: supervisor.active(),
+        max_parallel: supervisor.max_parallel(),
+        elapsed: started.elapsed(),
+        idle_for,
+        step,
+    };
+    let cb = Arc::clone(cb);
+    // Host callbacks must not freeze hang recovery. Run them off the wait loop.
+    tokio::task::spawn_blocking(move || cb(&snap));
+}
+
+async fn sleep_until_opt(deadline: Option<Instant>) {
+    match deadline {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
+}
+
+fn idle_for_since(spawn_at: Instant, last_activity_ms: &AtomicU64) -> Duration {
+    let last = last_activity_ms.load(Ordering::Relaxed);
+    spawn_at
+        .elapsed()
+        .saturating_sub(Duration::from_millis(last))
+}
+
+struct ChildWait<'a> {
+    policy: &'a TimeoutPolicy,
+    on_progress: Option<&'a ProgressCallback>,
+    run_started: Instant,
+    spawn_at: Instant,
+    last_activity_ms: Arc<AtomicU64>,
+    pid: Option<u32>,
+}
+
+impl ChildWait<'_> {
+    fn idle_for(&self) -> Duration {
+        idle_for_since(self.spawn_at, &self.last_activity_ms)
+    }
+
+    fn idle_deadline(&self) -> Option<Instant> {
+        self.policy.idle.map(|idle| {
+            let last = self.last_activity_ms.load(Ordering::Relaxed);
+            self.spawn_at + Duration::from_millis(last) + idle
+        })
+    }
+
+    fn progress_deadline(&self) -> Option<Instant> {
+        self.on_progress
+            .and(self.policy.progress_every)
+            .map(|every| Instant::now() + every)
+    }
+
+    fn idle_expired(&self) -> bool {
+        self.policy.idle.is_some_and(|idle| self.idle_for() >= idle)
+    }
+
+    fn emit(&self, supervisor: &Supervisor, step: SupervisorStep) {
+        emit_progress(
+            supervisor,
+            self.on_progress,
+            self.run_started,
+            self.idle_for(),
+            step,
+        );
+    }
+}
+
+enum WaitTick {
+    Recover(TimeoutClass),
+    Progress,
+    Continue,
+    Finished(std::io::Result<std::process::ExitStatus>),
+}
+
+async fn next_wait_tick(
+    child: &mut ProcessGroupChild,
+    wait: &ChildWait<'_>,
+    hard_deadline: Option<Instant>,
+) -> WaitTick {
+    tokio::select! {
+        biased;
+        _ = sleep_until_opt(hard_deadline) => WaitTick::Recover(TimeoutClass::Hard),
+        _ = sleep_until_opt(wait.idle_deadline()) => {
+            if wait.idle_expired() {
+                WaitTick::Recover(TimeoutClass::Idle)
+            } else {
+                WaitTick::Continue
+            }
+        }
+        _ = sleep_until_opt(wait.progress_deadline()) => WaitTick::Progress,
+        status = child.wait() => WaitTick::Finished(status),
+    }
+}
+
+async fn await_supervised_child(
+    supervisor: &Supervisor,
+    child: &mut ProcessGroupChild,
+    stdout_handle: JoinHandle<Vec<u8>>,
+    stderr_handle: JoinHandle<Vec<u8>>,
+    wait: ChildWait<'_>,
+) -> SupervisedOutput {
+    let hard_deadline = wait.policy.worker.map(|limit| Instant::now() + limit);
+    let pipes = PipePair {
+        stdout: stdout_handle,
+        stderr: stderr_handle,
+    };
+    loop {
+        match next_wait_tick(child, &wait, hard_deadline).await {
+            WaitTick::Recover(class) => {
+                return recover_classified(
+                    ChildFinish {
+                        supervisor,
+                        child,
+                        pipes,
+                        wait: &wait,
+                    },
+                    class,
+                )
+                .await;
+            }
+            WaitTick::Progress => wait.emit(supervisor, SupervisorStep::Running),
+            WaitTick::Continue => {}
+            WaitTick::Finished(status) => {
+                if status.is_ok() {
+                    child.disarm();
+                }
+                return complete_child_wait(
+                    ChildFinish {
+                        supervisor,
+                        child,
+                        pipes,
+                        wait: &wait,
+                    },
+                    hard_deadline,
+                    status,
+                )
+                .await;
+            }
+        }
+    }
+}
+
+struct PipePair {
+    stdout: JoinHandle<Vec<u8>>,
+    stderr: JoinHandle<Vec<u8>>,
+}
+
+struct ChildFinish<'a> {
+    supervisor: &'a Supervisor,
+    child: &'a mut ProcessGroupChild,
+    pipes: PipePair,
+    wait: &'a ChildWait<'a>,
+}
+
+async fn recover_classified(finish: ChildFinish<'_>, class: TimeoutClass) -> SupervisedOutput {
+    finish
+        .wait
+        .emit(finish.supervisor, SupervisorStep::Recovering);
+    recover_child(
+        finish.child,
+        RecoverIo::from_wait(finish.pipes, finish.wait),
+        class,
+    )
+    .await
+}
+
+async fn complete_child_wait(
+    finish: ChildFinish<'_>,
+    hard_deadline: Option<Instant>,
+    status: std::io::Result<std::process::ExitStatus>,
+) -> SupervisedOutput {
+    match status {
+        Ok(s) => {
+            finish
+                .wait
+                .emit(finish.supervisor, SupervisorStep::Draining);
+            drain_exited_child(
+                s,
+                hard_deadline,
+                finish.wait.pid,
+                finish.pipes,
+                finish.wait.policy,
+                finish.wait.run_started,
+                &finish.wait.last_activity_ms,
+            )
+            .await
+        }
+        Err(e) => {
+            finish
+                .wait
+                .emit(finish.supervisor, SupervisorStep::Recovering);
+            recover_lost_child(
+                finish.child,
+                RecoverIo::from_wait(finish.pipes, finish.wait),
+                &e,
+            )
+            .await
+        }
+    }
+}
+
+/// Drain a normally-exited child's output pipes with a bounded wait.
+///
+/// Drain is always capped: remaining wall-clock, or [`ORPHAN_DRAIN_TIMEOUT`].
+/// If leftover group members hold the pipes, recovery kills that group and
+/// records a hard residual. Captured bytes are kept. The harness checkout is
+/// not deleted.
+async fn drain_exited_child(
+    status: std::process::ExitStatus,
+    hard_deadline: Option<Instant>,
+    pid: Option<u32>,
+    pipes: PipePair,
+    policy: &TimeoutPolicy,
+    run_started: Instant,
+    last_activity_ms: &AtomicU64,
+) -> SupervisedOutput {
+    let PipePair {
+        stdout: stdout_handle,
+        stderr: stderr_handle,
+    } = pipes;
+    let deadline_at = hard_deadline.unwrap_or_else(|| Instant::now() + ORPHAN_DRAIN_TIMEOUT);
+    match drain_pipes_until(deadline_at, pid, stdout_handle, stderr_handle).await {
+        Ok((stdout, stderr)) => output_to_supervised(status, &stdout, &stderr),
+        Err((stdout, stderr)) => {
+            // Direct child already exited; leftover group members held the pipes.
+            // Kill is process containment only — the harness checkout is left intact.
+            SupervisedOutput {
+                timed_out: true,
+                killed: true,
+                stdout: String::from_utf8_lossy(&stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&stderr).into_owned(),
+                stdout_truncated: stdout.len() >= MAX_CAPTURE_BYTES,
+                stderr_truncated: stderr.len() >= MAX_CAPTURE_BYTES,
+                error_code: Some(SupervisorErrorCode::TimedOut),
+                ..SupervisedOutput::default()
+            }
+            .with_hang_residual(
+                policy,
+                TimeoutClass::Hard,
+                RecoveryStage::Kill,
+                nonzero_ms(last_activity_ms),
+                run_started,
+            )
+        }
+    }
+}
+
+/// Recover a child whose `wait()` failed (a lost/errored process), attaching the
+/// process error to stderr when no captured stderr is available.
+struct RecoverIo<'a> {
+    stdout_handle: JoinHandle<Vec<u8>>,
+    stderr_handle: JoinHandle<Vec<u8>>,
+    policy: &'a TimeoutPolicy,
+    pid: Option<u32>,
+    run_started: Instant,
+    last_activity_ms: Arc<AtomicU64>,
+}
+
+impl<'a> RecoverIo<'a> {
+    fn from_wait(pipes: PipePair, wait: &'a ChildWait<'a>) -> Self {
+        Self {
+            stdout_handle: pipes.stdout,
+            stderr_handle: pipes.stderr,
+            policy: wait.policy,
+            pid: wait.pid,
+            run_started: wait.run_started,
+            last_activity_ms: Arc::clone(&wait.last_activity_ms),
+        }
+    }
+}
+
+async fn recover_lost_child(
+    child: &mut ProcessGroupChild,
+    io: RecoverIo<'_>,
+    error: &std::io::Error,
+) -> SupervisedOutput {
+    let mut recovered = recover_child(child, io, TimeoutClass::LostChild).await;
+    if recovered.stderr.is_empty() {
+        recovered.stderr = format!("process error: {error}");
+    }
+    recovered
+}
+
+async fn recover_child(
+    child: &mut ProcessGroupChild,
+    io: RecoverIo<'_>,
+    class: TimeoutClass,
+) -> SupervisedOutput {
+    let RecoverIo {
+        stdout_handle,
+        stderr_handle,
+        policy,
+        pid,
+        run_started,
+        last_activity_ms,
+    } = io;
+    let error_code = match class {
+        TimeoutClass::Idle => SupervisorErrorCode::IdleTimedOut,
+        TimeoutClass::LostChild => SupervisorErrorCode::LostChild,
+        TimeoutClass::Hard | TimeoutClass::PermitWait | TimeoutClass::RedispatchExhausted => {
+            SupervisorErrorCode::TimedOut
+        }
+    };
+
+    let stage = cancel_supervised_child(child, pid, policy.grace).await;
+    child.disarm();
+
+    let stdout = join_with_timeout(stdout_handle).await;
+    let stderr = join_with_timeout(stderr_handle).await;
+    let last_output_ms = nonzero_ms(&last_activity_ms);
+    let timed_out = class != TimeoutClass::LostChild;
+    let killed = stage == RecoveryStage::Kill;
+    SupervisedOutput {
+        timed_out,
+        killed,
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        stdout_truncated: stdout.len() >= MAX_CAPTURE_BYTES,
+        stderr_truncated: stderr.len() >= MAX_CAPTURE_BYTES,
+        error_code: Some(error_code),
+        ..SupervisedOutput::default()
+    }
+    .with_hang_residual(policy, class, stage, last_output_ms, run_started)
+}
+
+async fn cancel_supervised_child(
+    child: &mut ProcessGroupChild,
+    pid: Option<u32>,
+    grace: Duration,
+) -> RecoveryStage {
+    if grace == Duration::ZERO {
+        let _ = child.kill().await;
+        let _ = tokio::time::timeout(POST_KILL_JOIN_TIMEOUT, child.wait()).await;
+        return RecoveryStage::Kill;
+    }
+    terminate_process_group(pid);
+    match tokio::time::timeout(grace, child.wait()).await {
+        Ok(Ok(_)) => {
+            // Parent exited after SIGTERM; SIGKILL remaining group members
+            // while the original pgid is still this pid, then disarm so Drop
+            // cannot SIGKILL a reused PID.
+            kill_process_group(pid);
+            RecoveryStage::GracefulCancel
+        }
+        Ok(Err(_)) | Err(_) => {
+            let _ = child.kill().await;
+            let _ = tokio::time::timeout(POST_KILL_JOIN_TIMEOUT, child.wait()).await;
+            RecoveryStage::Kill
         }
     }
 }
@@ -399,14 +1066,25 @@ impl Supervisor {
 struct ProcessGroupChild {
     child: tokio::process::Child,
     pid: Option<u32>,
+    reaped: bool,
 }
 
 impl ProcessGroupChild {
     async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
-        self.child.wait().await
+        let status = self.child.wait().await?;
+        self.disarm();
+        Ok(status)
+    }
+
+    fn disarm(&mut self) {
+        self.reaped = true;
+        self.pid = None;
     }
 
     async fn kill(&mut self) -> std::io::Result<()> {
+        if self.reaped {
+            return Ok(());
+        }
         kill_process_group(self.pid);
         self.child.kill().await
     }
@@ -414,375 +1092,16 @@ impl ProcessGroupChild {
 
 impl Drop for ProcessGroupChild {
     fn drop(&mut self) {
-        kill_process_group(self.pid);
-        let _ = self.child.start_kill();
-    }
-}
-
-/// Deferred branch verification performed after the concurrency permit is held.
-struct BranchCheck {
-    expected_branch: String,
-    repo: PathBuf,
-}
-
-/// Normalized program + args ready to spawn after policy checks.
-struct PreparedCommand {
-    program: String,
-    args: Vec<String>,
-    /// Working directory for the child (verified git repo when applicable).
-    cwd: Option<PathBuf>,
-    /// When set, re-verify branch immediately before spawn (post-permit).
-    branch_check: Option<BranchCheck>,
-}
-
-/// Normalize an executable path to a basename without platform extensions.
-#[must_use]
-pub fn normalize_program_name(program: &str) -> String {
-    // Accept both Unix and Windows separators even when running on Linux (tests / cross config).
-    let base = program
-        .rsplit(['/', '\\'])
-        .next()
-        .filter(|s| !s.is_empty())
-        .unwrap_or(program);
-    let lower = base.to_ascii_lowercase();
-    lower
-        .strip_suffix(".exe")
-        .or_else(|| lower.strip_suffix(".cmd"))
-        .or_else(|| lower.strip_suffix(".bat"))
-        .unwrap_or(&lower)
-        .to_owned()
-}
-
-/// Enforce safety policy for a supervised command (used by CLI and core).
-pub fn check_command_policy(program: &str, args: &[&str], options: &RunOptions) -> Result<()> {
-    prepare_supervised_command(program, args, options).map(|_| ())
-}
-
-fn prepare_supervised_command(
-    program: &str,
-    args: &[&str],
-    options: &RunOptions,
-) -> Result<PreparedCommand> {
-    let name = normalize_program_name(program);
-    let owned_args: Vec<String> = args.iter().map(|s| (*s).to_owned()).collect();
-
-    // Shells, interpreters, launchers, and direct network clients are never policy-safe
-    // under substring checks; require direct allowlisted binaries for sensitive actions.
-    if is_forbidden_wrapper(&name) {
-        return Err(Error::PolicyViolation {
-            code: PolicyCode::SubcommandNotAllowed,
-            message: format!(
-                "supervised program `{name}` can launch or tunnel unreviewed commands and is not allowed; invoke git, gh, or another binary directly"
-            ),
-        });
-    }
-
-    match name.as_str() {
-        "git" => prepare_git_command(owned_args, options),
-        "gh" => prepare_gh_command(owned_args, options),
-        _ => {
-            // Fail closed on path-qualified / relative scripts (./tools/run, tools/run).
-            // Basename-only PATH lookups remain for non-sensitive tooling; git/gh above are
-            // always PATH-forced. Shebang wrappers in the worktree cannot be invoked by path.
-            if program_is_path_qualified(program) {
-                return Err(Error::PolicyViolation {
-                    code: PolicyCode::SubcommandNotAllowed,
-                    message: format!(
-                        "supervised program `{program}` is path-qualified; invoke a PATH binary by basename only (git, gh, …)"
-                    ),
-                });
-            }
-            Ok(PreparedCommand {
-                program: program.to_owned(),
-                args: owned_args,
-                cwd: None,
-                branch_check: None,
-            })
+        if !self.reaped {
+            kill_process_group(self.pid);
+            let _ = self.child.start_kill();
         }
     }
 }
 
-/// Prepare a supervised `git` command: enforce argv policy, resolve the required
-/// expected-branch for mutating commands, bind checkout/switch and push targets
-/// to that branch, and PATH-force the `git` binary.
-fn prepare_git_command(owned_args: Vec<String>, options: &RunOptions) -> Result<PreparedCommand> {
-    let safe = SafeGitCommand::new(&owned_args)?;
-    let expected = if safe.requires_branch_check() {
-        Some(
-            options
-                .expected_branch
-                .clone()
-                .ok_or_else(|| Error::PolicyViolation {
-                    code: PolicyCode::BranchMismatch,
-                    message: "mutating git commands require --expected-branch under supervisor"
-                        .to_owned(),
-                })?,
-        )
-    } else {
-        None
-    };
-    reject_supervised_checkout_mismatch(expected.as_deref(), &owned_args)?;
-    if let Some(exp) = expected.as_deref() {
-        crate::git_safe::reject_push_outside_expected_branch(&owned_args, exp)?;
-    }
-    // Always spawn PATH `git`, never a user-supplied path-qualified binary.
-    let repo = resolve_supervised_repo(options.repo.as_deref())?;
-    let branch_check = expected.map(|expected_branch| BranchCheck {
-        expected_branch,
-        repo: repo.clone(),
-    });
-    Ok(PreparedCommand {
-        program: "git".to_owned(),
-        args: owned_args,
-        cwd: Some(repo),
-        branch_check,
-    })
-}
-
-/// Prepare a supervised `gh` command: enforce argv/allowlist policy and, for
-/// mutating `gh pr` commands, require an expected branch and bind the effective
-/// repo selector (explicit `-R` or implicit `GH_REPO`) to the verified local
-/// origin before PATH-forcing the `gh` binary.
-fn prepare_gh_command(owned_args: Vec<String>, options: &RunOptions) -> Result<PreparedCommand> {
-    let allowlist = options
-        .allowlist
-        .clone()
-        .unwrap_or_else(OwnerAllowlist::from_env);
-    let _safe = SafeGhCommand::with_allowlist(&owned_args, &allowlist)?;
-    // Always spawn PATH `gh`, never a user-supplied path-qualified binary.
-    let (cwd, branch_check, owned_args) = if crate::git_safe::gh_requires_branch_check(&owned_args)
-    {
-        let expected = options
-            .expected_branch
-            .clone()
-            .ok_or_else(|| Error::PolicyViolation {
-                code: PolicyCode::BranchMismatch,
-                message: "mutating gh pr commands require --expected-branch under supervisor"
-                    .to_owned(),
-            })?;
-        let repo = resolve_supervised_repo(options.repo.as_deref())?;
-        // Bind the effective repo selector to the verified local checkout so jobs
-        // cannot mutate a different GitHub repository after the branch gate. An
-        // explicit `-R/--repo` wins; otherwise gh reads the implicit `GH_REPO`
-        // environment selector, so bind that too.
-        let env_selector = crate::git_safe::gh_repo_env_target();
-        let local = crate::git_safe::origin_github_slug(&repo)?;
-        crate::git_safe::bind_gh_repo_selector_to_origin(
-            &owned_args,
-            env_selector.as_deref(),
-            &local,
-        )?;
-        // Pin the validated slug before any later permit wait so a TOCTOU
-        // origin rewrite cannot retarget `gh`.
-        let owned_args = if env_selector.is_some() {
-            owned_args
-        } else {
-            crate::git_safe::pin_gh_repo_selector(owned_args, &local)
-        };
-        (
-            Some(repo.clone()),
-            Some(BranchCheck {
-                expected_branch: expected,
-                repo,
-            }),
-            owned_args,
-        )
-    } else {
-        (None, None, owned_args)
-    };
-    Ok(PreparedCommand {
-        program: "gh".to_owned(),
-        args: owned_args,
-        cwd,
-        branch_check,
-    })
-}
-
-fn reject_supervised_checkout_mismatch(expected: Option<&str>, args: &[String]) -> Result<()> {
-    let (Some(exp), Some(target)) = (expected, crate::git_safe::checkout_or_switch_target(args))
-    else {
-        return Ok(());
-    };
-    if target == exp || target == "HEAD" {
-        return Ok(());
-    }
-    Err(Error::PolicyViolation {
-        code: PolicyCode::BranchMismatch,
-        message: format!(
-            "git checkout/switch target `{target}` must equal --expected-branch `{exp}`"
-        ),
-    })
-}
-
-fn program_is_path_qualified(program: &str) -> bool {
-    program.contains('/')
-        || program.contains('\\')
-        || program.starts_with('.')
-        || (program.len() > 2 && program.as_bytes().get(1) == Some(&b':'))
-}
-
-pub(crate) fn is_forbidden_wrapper(name: &str) -> bool {
-    if matches!(
-        name,
-        "sh" | "bash"
-            | "zsh"
-            | "dash"
-            | "fish"
-            | "cmd"
-            | "powershell"
-            | "pwsh"
-            | "env"
-            | "xargs"
-            | "nice"
-            | "nohup"
-            | "stdbuf"
-            | "timeout"
-            | "time"
-            | "setsid"
-            | "open"
-            | "xdg-open"
-            | "script"
-            | "unshare"
-            | "nsenter"
-            | "chroot"
-            | "sudo"
-            | "doas"
-            | "su"
-            | "python"
-            | "python2"
-            | "python3"
-            | "py"
-            | "perl"
-            | "ruby"
-            | "node"
-            | "nodejs"
-            | "deno"
-            | "bun"
-            | "php"
-            | "lua"
-            | "rscript"
-            | "ipython"
-            | "ipython3"
-            | "curl"
-            | "wget"
-            | "http"
-            | "httpie"
-            | "nc"
-            | "ncat"
-            | "netcat"
-            | "socat"
-    ) {
-        return true;
-    }
-    for p in [
-        "python", "python2", "python3", "perl", "ruby", "node", "nodejs", "php", "lua", "ipython",
-    ] {
-        if let Some(rest) = name.strip_prefix(p) {
-            if rest.is_empty() {
-                return true;
-            }
-            if rest.starts_with('.') || rest.chars().next().is_some_and(|c| c.is_ascii_digit()) {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-/// Resolve and validate `--repo` for supervised git (cwd + branch checks).
-///
-/// - Rejects `..` path components in the input.
-/// - Canonicalizes to an existing directory.
-/// - Requires the path to stay under `WRIT_WORKTREE_BASE` when set, otherwise under
-///   the documented default `{user_data_dir}/writ/worktrees` root.
-fn verify_repo_branch(repo: &std::path::Path, expected_branch: &str) -> Result<()> {
-    let cmd = SafeGitCommand::new(&["rev-parse".to_owned(), "HEAD".to_owned()])?;
-    cmd.verify_branch(repo, expected_branch)
-}
-
-fn resolve_supervised_repo(repo: Option<&std::path::Path>) -> Result<PathBuf> {
-    use std::path::{Component, Path};
-
-    let worktree_base = crate::paths::worktree_base_path()?;
-
-    let raw = repo.unwrap_or_else(|| Path::new("."));
-    if raw.components().any(|c| matches!(c, Component::ParentDir)) {
-        return Err(Error::PolicyViolation {
-            code: PolicyCode::PathNotAllowed,
-            message: "parent-directory components are not allowed in --repo".to_owned(),
-        });
-    }
-
-    let canon = crate::paths::canonicalize_for_tools(raw).map_err(|e| Error::Io {
-        context: "canonicalize supervised --repo",
-        source: e,
-    })?;
-    if !canon.is_dir() {
-        return Err(Error::PolicyViolation {
-            code: PolicyCode::PathNotAllowed,
-            message: format!(
-                "supervised --repo must be an existing directory: {}",
-                canon.display()
-            ),
-        });
-    }
-
-    let base = normalize_existing_or_future_dir(&worktree_base)?;
-    if !canon.starts_with(&base) {
-        return Err(Error::PolicyViolation {
-            code: PolicyCode::PathNotAllowed,
-            message: format!(
-                "supervised --repo `{}` escapes worktree base `{}`",
-                canon.display(),
-                base.display()
-            ),
-        });
-    }
-
-    Ok(canon)
-}
-
-fn normalize_existing_or_future_dir(path: &std::path::Path) -> Result<PathBuf> {
-    if path.exists() {
-        return crate::paths::canonicalize_for_tools(path).map_err(|e| Error::Io {
-            context: "canonicalize worktree base",
-            source: e,
-        });
-    }
-    if path.is_absolute() {
-        Ok(path.to_path_buf())
-    } else {
-        std::env::current_dir()
-            .map(|cwd| cwd.join(path))
-            .map_err(|e| Error::Io {
-                context: "resolve worktree base",
-                source: e,
-            })
-    }
-}
-
-async fn timeout_output(
-    child: &mut ProcessGroupChild,
-    stdout_handle: JoinHandle<Vec<u8>>,
-    stderr_handle: JoinHandle<Vec<u8>>,
-) -> SupervisedOutput {
-    let _ = child.kill().await;
-    // Bound how long we wait for the killed child and pipe readers.
-    // Prefer letting readers finish after pipes close so partial output is preserved.
-    let _ = tokio::time::timeout(POST_KILL_JOIN_TIMEOUT, child.wait()).await;
-    let stdout = join_with_timeout(stdout_handle).await;
-    let stderr = join_with_timeout(stderr_handle).await;
-    SupervisedOutput {
-        exit_code: None,
-        timed_out: true,
-        killed: true,
-        stdout: String::from_utf8_lossy(&stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&stderr).into_owned(),
-        // Same capture-cap heuristic as successful completions / drain timeout path.
-        stdout_truncated: stdout.len() >= MAX_CAPTURE_BYTES,
-        stderr_truncated: stderr.len() >= MAX_CAPTURE_BYTES,
-        error_code: Some(SupervisorErrorCode::TimedOut),
-    }
+fn nonzero_ms(stamp: &AtomicU64) -> Option<u64> {
+    let v = stamp.load(Ordering::Relaxed);
+    (v > 0).then_some(v)
 }
 
 async fn drain_pipes_until(
@@ -822,7 +1141,11 @@ async fn join_with_timeout(handle: JoinHandle<Vec<u8>>) -> Vec<u8> {
     }
 }
 
-async fn read_pipe<R: AsyncReadExt + Unpin>(pipe: &mut Option<R>) -> Vec<u8> {
+async fn read_pipe_probed<R: AsyncReadExt + Unpin>(
+    pipe: &mut Option<R>,
+    spawn_at: Instant,
+    last_activity_ms: Arc<AtomicU64>,
+) -> Vec<u8> {
     match pipe.as_mut() {
         Some(reader) => {
             let mut buf = Vec::new();
@@ -832,6 +1155,9 @@ async fn read_pipe<R: AsyncReadExt + Unpin>(pipe: &mut Option<R>) -> Vec<u8> {
                 match reader.read(&mut chunk).await {
                     Ok(0) => break,
                     Ok(n) => {
+                        let elapsed =
+                            u64::try_from(spawn_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+                        last_activity_ms.store(elapsed, Ordering::Relaxed);
                         if !capped {
                             let room = MAX_CAPTURE_BYTES.saturating_sub(buf.len());
                             if room > 0 {
@@ -882,6 +1208,13 @@ fn output_to_supervised(
         stdout_truncated: stdout.len() >= MAX_CAPTURE_BYTES,
         stderr_truncated: stderr.len() >= MAX_CAPTURE_BYTES,
         error_code: None,
+        timeout_class: None,
+        elapsed_ms: 0,
+        redispatch_count: 0,
+        max_redispatch_per_item: None,
+        recovery_stage: None,
+        last_output_ms: None,
+        residual: None,
     };
     if killed {
         out = out.with_error(SupervisorErrorCode::Killed);
@@ -893,14 +1226,28 @@ fn output_to_supervised(
 
 #[cfg(unix)]
 #[allow(unsafe_code)]
-fn kill_process_group(pid: Option<u32>) {
+fn signal_process_group(pid: Option<u32>, signal: i32) {
     if let Some(pid) = pid {
-        // Send SIGKILL to the process group (negative PID) via libc.
-        // SAFETY: kill(2) is async-signal-safe and only sends a signal.
+        // SAFETY: kill(2) is async-signal-safe and only sends a signal to the group.
         unsafe {
-            libc::kill(-(pid as i32), libc::SIGKILL);
+            libc::kill(-(pid as i32), signal);
         }
     }
+}
+
+#[cfg(unix)]
+fn terminate_process_group(pid: Option<u32>) {
+    signal_process_group(pid, libc::SIGTERM);
+}
+
+#[cfg(not(unix))]
+fn terminate_process_group(_pid: Option<u32>) {
+    // Windows: no SIGTERM process-group. recover_child waits grace then child.kill().
+}
+
+#[cfg(unix)]
+fn kill_process_group(pid: Option<u32>) {
+    signal_process_group(pid, libc::SIGKILL);
 }
 
 #[cfg(not(unix))]
@@ -910,481 +1257,9 @@ fn kill_process_group(_pid: Option<u32>) {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::sync::Arc;
+#[path = "supervisor_tests.rs"]
+mod tests;
 
-    use super::*;
-
-    /// Portable shell invocation for tests (`sh -c` / `cmd /C`).
-    fn shell_program() -> &'static str {
-        #[cfg(windows)]
-        {
-            "cmd"
-        }
-        #[cfg(not(windows))]
-        {
-            "sh"
-        }
-    }
-
-    fn shell_flag() -> &'static str {
-        #[cfg(windows)]
-        {
-            "/C"
-        }
-        #[cfg(not(windows))]
-        {
-            "-c"
-        }
-    }
-
-    #[test]
-    fn normalize_strips_path_and_exe() {
-        assert_eq!(normalize_program_name("/usr/bin/git"), "git");
-        assert_eq!(normalize_program_name("C:\\Program Files\\git.exe"), "git");
-        assert_eq!(normalize_program_name("./gh"), "gh");
-        assert_eq!(normalize_program_name("GH.EXE"), "gh");
-    }
-
-    #[test]
-    fn policy_blocks_path_qualified_force_push() {
-        let err =
-            check_command_policy("/usr/bin/git", &["push", "--force"], &RunOptions::default())
-                .unwrap_err();
-        assert!(matches!(
-            err,
-            Error::PolicyViolation {
-                code: PolicyCode::BareForcePush,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn policy_blocks_gh_pr_merge() {
-        let err = check_command_policy("gh", &["pr", "merge"], &RunOptions::default()).unwrap_err();
-        assert!(matches!(
-            err,
-            Error::PolicyViolation {
-                code: PolicyCode::MergeBlocked,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn policy_blocks_gh_repo_selector_outside_allowlist() {
-        let err = check_command_policy(
-            "gh",
-            &["pr", "view", "-R", "other/repo", "1"],
-            &RunOptions {
-                allowlist: Some(OwnerAllowlist::from_owners(["acme"])),
-                ..RunOptions::default()
-            },
-        )
-        .unwrap_err();
-        assert!(matches!(
-            err,
-            Error::PolicyViolation {
-                code: PolicyCode::OwnerNotAllowed,
-                ..
-            }
-        ));
-        let clustered = check_command_policy(
-            "gh",
-            &["pr", "view", "-R=other/repo", "1"],
-            &RunOptions {
-                allowlist: Some(OwnerAllowlist::from_owners(["acme"])),
-                ..RunOptions::default()
-            },
-        )
-        .unwrap_err();
-        assert!(matches!(
-            clustered,
-            Error::PolicyViolation {
-                code: PolicyCode::OwnerNotAllowed,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn policy_rejects_path_qualified_script() {
-        let err = check_command_policy("./tools/run", &[], &RunOptions::default()).unwrap_err();
-        assert!(matches!(
-            err,
-            Error::PolicyViolation {
-                code: PolicyCode::SubcommandNotAllowed,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn policy_rejects_shell_wrappers() {
-        let err = check_command_policy("sh", &["-c", "gh pr merge 1"], &RunOptions::default())
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            Error::PolicyViolation {
-                code: PolicyCode::SubcommandNotAllowed,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn policy_rejects_setsid_launcher() {
-        let err = check_command_policy("setsid", &["gh", "pr", "merge"], &RunOptions::default())
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            Error::PolicyViolation {
-                code: PolicyCode::SubcommandNotAllowed,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn policy_rejects_env_launcher() {
-        let err = check_command_policy("env", &["gh", "pr", "merge"], &RunOptions::default())
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            Error::PolicyViolation {
-                code: PolicyCode::SubcommandNotAllowed,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn policy_rejects_versioned_python() {
-        let err = check_command_policy("python3.11", &["-c", "print(1)"], &RunOptions::default())
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            Error::PolicyViolation {
-                code: PolicyCode::SubcommandNotAllowed,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn policy_rejects_interpreter_launchers() {
-        let err = check_command_policy(
-            "python3",
-            &[
-                "-c",
-                "import subprocess; subprocess.run(['gh','pr','merge','1'])",
-            ],
-            &RunOptions::default(),
-        )
-        .unwrap_err();
-        assert!(matches!(
-            err,
-            Error::PolicyViolation {
-                code: PolicyCode::SubcommandNotAllowed,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn policy_rejects_direct_rest_clients() {
-        let err = check_command_policy(
-            "curl",
-            &[
-                "-X",
-                "PUT",
-                "https://api.github.com/repos/o/r/pulls/1/merge",
-            ],
-            &RunOptions::default(),
-        )
-        .unwrap_err();
-        assert!(matches!(
-            err,
-            Error::PolicyViolation {
-                code: PolicyCode::SubcommandNotAllowed,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn mutating_git_rejects_repo_outside_default_worktree_base() {
-        let repo = std::env::temp_dir();
-        let err = check_command_policy(
-            "git",
-            &["commit", "-m", "x"],
-            &RunOptions {
-                expected_branch: Some("feature".to_owned()),
-                repo: Some(repo),
-                allowlist: None,
-            },
-        )
-        .unwrap_err();
-        assert!(matches!(
-            err,
-            Error::PolicyViolation {
-                code: PolicyCode::PathNotAllowed,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn mutating_git_requires_expected_branch() {
-        let err = check_command_policy("git", &["commit", "-m", "x"], &RunOptions::default())
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            Error::PolicyViolation {
-                code: PolicyCode::BranchMismatch,
-                ..
-            }
-        ));
-    }
-
-    #[tokio::test]
-    async fn runs_command_to_completion() {
-        let supervisor = Supervisor::new(4);
-        let output = supervisor
-            .run_unchecked(shell_program(), &[shell_flag(), "echo hello"], None)
-            .await;
-
-        assert_eq!(output.exit_code, Some(0), "stderr={}", output.stderr);
-        assert!(!output.timed_out);
-        assert!(!output.killed);
-        assert!(output.succeeded());
-        assert_eq!(output.stdout.trim(), "hello");
-    }
-
-    #[tokio::test]
-    async fn captures_stderr() {
-        let supervisor = Supervisor::new(4);
-        #[cfg(windows)]
-        let script = "echo err 1>&2";
-        #[cfg(not(windows))]
-        let script = "echo err >&2";
-        let output = supervisor
-            .run_unchecked(shell_program(), &[shell_flag(), script], None)
-            .await;
-
-        assert_eq!(output.exit_code, Some(0), "stderr={}", output.stderr);
-        assert_eq!(output.stderr.trim(), "err");
-    }
-
-    #[tokio::test]
-    async fn timeout_kills_process_group() {
-        let supervisor = Supervisor::new(4);
-        #[cfg(windows)]
-        let script = "ping -n 60 127.0.0.1 >NUL";
-        #[cfg(not(windows))]
-        let script = "sleep 60";
-        let output = supervisor
-            .run_unchecked(
-                shell_program(),
-                &[shell_flag(), script],
-                Some(Duration::from_millis(200)),
-            )
-            .await;
-
-        assert!(output.timed_out, "stderr={}", output.stderr);
-        assert!(output.killed);
-        assert!(output.exit_code.is_none());
-        assert_eq!(output.error_code, Some(SupervisorErrorCode::TimedOut));
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn timeout_leaves_no_live_untracked_child() {
-        let dir = tempfile::tempdir().unwrap();
-        let pidfile = dir.path().join("child.pid");
-        let script = format!("echo $$ > '{}'; exec sleep 60", pidfile.display());
-        let supervisor = Supervisor::new(1);
-        let output = supervisor
-            .run_unchecked(
-                shell_program(),
-                &[shell_flag(), &script],
-                Some(Duration::from_millis(300)),
-            )
-            .await;
-        assert!(output.timed_out, "stderr={}", output.stderr);
-        assert!(output.killed);
-        let mut pid_text = String::new();
-        for _ in 0..20 {
-            if let Ok(text) = std::fs::read_to_string(&pidfile) {
-                pid_text = text;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        let pid = pid_text.trim();
-        assert!(!pid.is_empty(), "child did not record its pid");
-        let proc = std::path::PathBuf::from(format!("/proc/{pid}"));
-        assert!(
-            !proc.exists(),
-            "timed-out child {pid} is still live at {}",
-            proc.display()
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn timeout_remains_active_while_draining_inherited_pipes() {
-        let supervisor = Supervisor::new(1);
-        let started = Instant::now();
-        let output = supervisor
-            .run_unchecked(
-                shell_program(),
-                &[shell_flag(), "sleep 60 &"],
-                Some(Duration::from_millis(200)),
-            )
-            .await;
-
-        assert!(output.timed_out, "output={output:?}");
-        assert!(output.killed, "output={output:?}");
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "supervisor hung while draining inherited pipes"
-        );
-    }
-
-    #[tokio::test]
-    async fn propagates_nonzero_exit_code() {
-        let supervisor = Supervisor::new(4);
-        #[cfg(windows)]
-        let script = "exit /B 42";
-        #[cfg(not(windows))]
-        let script = "exit 42";
-        let output = supervisor
-            .run_unchecked(shell_program(), &[shell_flag(), script], None)
-            .await;
-
-        assert_eq!(output.exit_code, Some(42), "stderr={}", output.stderr);
-        assert!(!output.timed_out);
-        assert!(!output.killed);
-        assert_eq!(output.error_code, Some(SupervisorErrorCode::NonZeroExit));
-        assert!(!output.succeeded());
-    }
-
-    #[tokio::test]
-    async fn max_parallel_limits_concurrency() {
-        let supervisor = Arc::new(Supervisor::new(2));
-
-        #[cfg(windows)]
-        let script = "ping -n 2 127.0.0.1 >NUL";
-        #[cfg(not(windows))]
-        let script = "sleep 0.4";
-
-        let mut handles = Vec::new();
-        for _ in 0..3 {
-            let s = Arc::clone(&supervisor);
-            handles.push(tokio::spawn(async move {
-                s.run_unchecked(shell_program(), &[shell_flag(), script], None)
-                    .await
-            }));
-        }
-
-        let mut results = Vec::new();
-        for h in handles {
-            results.push(h.await.expect("join task"));
-        }
-
-        for (i, output) in results.iter().enumerate() {
-            assert_eq!(
-                output.exit_code,
-                Some(0),
-                "task {i} failed: stderr={}",
-                output.stderr
-            );
-        }
-
-        let peak = supervisor.peak_active();
-        assert!(peak <= 2, "peak concurrency {peak} exceeded max_parallel=2");
-        assert_eq!(
-            peak, 2,
-            "expected peak concurrency to reach 2 with 3 overlapping tasks"
-        );
-        assert_eq!(supervisor.active(), 0);
-    }
-
-    #[tokio::test]
-    async fn serializes_to_json_with_all_fields() {
-        let output = SupervisedOutput {
-            exit_code: Some(0),
-            timed_out: false,
-            killed: false,
-            stdout: "hello\n".to_string(),
-            stderr: String::new(),
-            stdout_truncated: false,
-            stderr_truncated: false,
-            error_code: None,
-        };
-
-        let json = serde_json::to_string(&output).unwrap();
-        assert!(json.contains("\"exit_code\":0"));
-        assert!(json.contains("\"timed_out\":false"));
-        assert!(json.contains("\"killed\":false"));
-        assert!(json.contains("\"stdout\":\"hello\\n\""));
-        assert!(json.contains("\"stderr\":\"\""));
-    }
-
-    #[tokio::test]
-    async fn timeout_output_serializes_correctly() {
-        let supervisor = Supervisor::new(4);
-        #[cfg(windows)]
-        let script = "ping -n 60 127.0.0.1 >NUL";
-        #[cfg(not(windows))]
-        let script = "sleep 60";
-        let output = supervisor
-            .run_unchecked(
-                shell_program(),
-                &[shell_flag(), script],
-                Some(Duration::from_millis(200)),
-            )
-            .await;
-
-        let json = serde_json::to_string(&output).unwrap();
-        assert!(json.contains("\"timed_out\":true"), "{json}");
-        assert!(json.contains("\"killed\":true"), "{json}");
-        assert!(json.contains("\"exit_code\":null"), "{json}");
-        assert!(json.contains("TIMED_OUT"), "{json}");
-    }
-
-    #[tokio::test]
-    async fn spawn_failure_is_detectable() {
-        let supervisor = Supervisor::new(1);
-        let output = supervisor
-            .run(
-                "writ-nonexistent-binary-xyz",
-                &[],
-                None,
-                &RunOptions::default(),
-            )
-            .await
-            .unwrap();
-        assert!(output.spawn_failed(), "stderr={}", output.stderr);
-        assert_eq!(output.error_code, Some(SupervisorErrorCode::SpawnFailed));
-        assert!(output.exit_code.is_none());
-    }
-
-    #[tokio::test]
-    async fn run_rejects_merge_before_spawn() {
-        let supervisor = Supervisor::new(1);
-        let err = supervisor
-            .run("gh", &["pr", "merge"], None, &RunOptions::default())
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            Error::PolicyViolation {
-                code: PolicyCode::MergeBlocked,
-                ..
-            }
-        ));
-    }
-}
+#[cfg(test)]
+#[path = "supervisor_policy_tests.rs"]
+mod policy_tests;

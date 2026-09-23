@@ -94,7 +94,7 @@ Before treating the PR as handed off, validate **all** of the following via GitH
 
 Abort the handoff and report a residual (do **not** merge, do not claim handoff complete) if any check fails — including a closed/merged PR, auto-merge or merge-queue enabled, a GitHub issue reference that is missing or points elsewhere, or a remote SHA that differs from `head_sha`.
 
-Comment on the GitHub issue with PR URL, the **validated** pushed commit SHA, residuals, and agent name. Mention the Linear twin only if it already exists.
+Comment on the GitHub issue with PR URL, the **validated** pushed commit SHA, residuals, and agent name using the [reply attribution](../../SKILL.md#reply-attribution) templates. Mention the Linear twin only if it already exists.
 
 If interactive monitoring is needed after handoff, invoke the installed companion `babysit-pr` skill. This workflow itself only creates or updates the PR and hands it off.
 

@@ -1,51 +1,94 @@
 # writ
 
-A Rust safety core for coding-agent fleets: isolated git worktrees, `git`/`gh` mutation allowlists, path sandboxing, process containment, and **no GitHub PR merge path**. Local feature-branch integration is allowlisted.
+A **Rust-first, provider-neutral coordination layer for parallel coding agents**.
 
-Workers run in one worktree each. The portable [`SKILL.md`](SKILL.md) tells an agent host how to spawn them. The installed companion `babysit-pr` skill can watch a pull request until it is merge-ready. **A human still merges the pull request on GitHub** — `writ` exposes no `gh pr merge` path, auto-merge, or merge queue.
+Cursor, Claude Code, Codex, and similar harnesses already spawn workers and give each one an isolated checkout. What they don't share is coordination: who owns which task, branch, and worktree; what paths each worker intends to touch; who is blocked on whom; and how to hand work off without losing WIP. `writ` supplies that shared coordination layer so parallel workers can see each other, avoid duplicate work, negotiate overlapping edits early, and recover cleanly from pauses, crashes, and timeouts.
 
-> [!IMPORTANT]
-> **This repository is mid-pivot.** It is becoming **`writ`** — the enforcement and admission-control layer for agent fleets. See [#1](https://github.com/rmems/writ/issues/1) for the product epic and [#124](https://github.com/rmems/writ/issues/124) for the current phase. The crate rename and the GitHub repository rename have both landed under milestone M2.
+## What writ does
+
+- **Identity and ownership.** Registers tasks, agents/sessions, repositories, checkouts, branches, and heads in a shared SQLite store, and tracks which worker owns what via leases.
+- **Visibility.** Declared paths and live status let workers see overlap before it becomes a merge conflict — overlap on separate branches is advisory and negotiated, not a fleet-wide freeze.
+- **Communication.** Intent, dependency, blocker, help-request, and handoff messages so workers coordinate directly instead of through a human relay.
+- **Recovery.** Pauses, timeouts, and stale leases are handoff events that preserve WIP and branch history — never permission to seize a live worktree or erase changes.
+- **Local integration.** `git merge`, `rebase`, and `cherry-pick` of peer work into an assigned feature branch are normal collaboration tools.
+
+## What writ does not do
+
+- **Does not own worker lifecycles.** Harnesses (Cursor, Claude Code, Codex, plain `git worktree add`) create and isolate checkouts. `writ worktree register` records them; it never creates, moves, fetches, resets, or deletes a checkout.
+- **Does not assign work.** Task decomposition and scheduling belong to the manager agent and the tracker.
+- **Does not replace GitHub or Linear.** Linear is the task tracker for teams that use it. GitHub is the source, PR, review, checks, and protected-branch merge authority.
+- **Does not silently allow duplicate ownership.** Two live owners of the same task is a detected collision, not a race.
+- **Local only.** SQLite coordination is same-host. Other transports are out of scope until implemented and tested.
+
+## How it fits with Cursor / Claude / Codex
+
+```text
+        Cursor / Claude Code / Codex / other harness
+        owns worker spawn + checkout/worktree lifecycle
+                          │
+                          │ register existing checkouts
+                          ▼
+        ┌──────────────────────────────────────────┐
+        │ writ (Rust binary → writ-core)           │
+        │ SQLite coordination store, same host     │
+        │                                          │
+        │  tasks/agents · checkouts/branches/heads │
+        │  ownership leases · declared paths       │
+        │  intent/dependency/blocker/help/handoff  │
+        │  pause/timeout/recovery · status         │
+        └──────────────────────────────────────────┘
+                          │
+                          ▼
+                  git / gh / OS primitives
+                          │
+                          ▼
+              GitHub (source, PRs, reviews, checks)
+              Linear (task tracking)
+```
+
+Workers keep their harness-native isolation. `writ` is the shared memory and message bus between them — the part none of the harnesses provide.
+
+## One end-to-end example
+
+1. The harness creates a checkout for a Linear task and registers it:
+
+   ```bash
+   git -C /path/to/repo worktree add /path/to/job-42 -b task/RM-42-example origin/main
+   writ --json worktree register /path/to/job-42 --job RM-42
+   ```
+
+   Registration is coordination-state only — any path works, including a standalone clone; a branch ahead of its base registers as-is.
+
+2. The worker declares its intended paths and picks up a lease. A second worker whose paths overlap sees the collision, identifies the owner, and negotiates a split or a handoff instead of silently diverging.
+
+3. Work proceeds in the assigned checkout. Compatible peer work can be integrated locally (`git merge` / `cherry-pick` into the assigned branch). Commands routed through the safety boundary are checked first:
+
+   ```bash
+   writ git-safe --expected-branch task/RM-42-example --repo <worktree> status
+   writ gh-safe -R acme/example-org pr view 1
+   ```
+
+4. On a pause, crash, or timeout, the lease plus declared state let another worker resume or take over without losing WIP.
+
+5. The worker opens a PR; GitHub checks and reviews run; Linear tracks the task. Shared status stays truthful for managers and workers throughout.
 
 ## Status
 
-> [!NOTE]
-> **The enforcement core and the Phase 1 hook dispatcher are real; live burn-in is outstanding.**
-> Shipping today are the `git`/`gh` allowlists, path sandboxing, process supervision, checkout registration (`writ worktree register`), local feature-branch merge admission, and a hard block on GitHub PR merges — reachable through the `writ` CLI. The managed lifecycle (`worktree create`/`remove`/`prune`) is deprecated: the agent harness or plain `git` owns checkout creation and physical cleanup.
-> Enforcement still applies only to commands routed through `writ` deliberately — it is **opt-in, not unbypassable** — until the remaining **M1** burn-in lands ([#124](https://github.com/rmems/writ/issues/124)).
-
-
-| Area | Today | Later |
+| Area | Today | Next |
 | --- | --- | --- |
-| Repo, license, [`SKILL.md`](SKILL.md), this README | Done | Living docs; update as milestones close |
-| `writ` CLI (`git-safe`, `gh-safe`, `worktree`, `supervisor`, `status`) | Implemented | Envelope-compatible additions only |
-| Claude Code hook dispatcher / `writ install` | Implemented | Live burn-in outstanding ([#124](https://github.com/rmems/writ/issues/124), install narrative [#18](https://github.com/rmems/writ/issues/18)) |
-| SQLite lease store, path scopes, budgets | Skeleton (grant/release + registration) | M1 then M3/M4 ([#1](https://github.com/rmems/writ/issues/1), [#167](https://github.com/rmems/writ/issues/167)) |
+| `writ` CLI (`git-safe`, `gh-safe`, `worktree`, `supervisor`, `status`, `attribution`) | Implemented | Envelope-compatible additions only |
+| Checkout registration (`worktree register/unregister/inspect/list`) | Implemented | Managed lifecycle (`create`/`remove`/`prune`) is deprecated |
+| Claude Code hook dispatcher / `writ install` | Implemented | Live burn-in outstanding ([#124](https://github.com/rmems/writ/issues/124)) |
+| SQLite lease store, agent registry | Skeleton (grant/release + registration) | Crash-consistency + same-host claims/messages/handoff (in flight) |
+| Declared paths / overlap visibility, handoff protocol | Planned | Reuses the lease store — no second database |
+| Path-scoped admission, lease budgets | Planned | [#167](https://github.com/rmems/writ/issues/167) |
 | Owner-allowlist enforcement | Enforced in `writ-core` | [#146](https://github.com/rmems/writ/issues/146) |
-| Hive verbs `discover` / `add` / `check` / `check-all` | **Removed** | Do not expect them; see [Commands](#commands) |
 
 Canonical command names live in [`SKILL.md`](SKILL.md) and `writ --help`. This README summarizes them.
 
-## What this is for
-
-Coordination is commoditized. Claude Code agent teams, `/batch`, Cursor `/multitask`, and Codex all already decompose work and hand each agent an isolated worktree. What none of them enforce is **safe concurrent writing**.
-
-Measured on 33,596 agent pull requests across 2,807 repositories ([arXiv:2607.04697](https://arxiv.org/abs/2607.04697)):
-
-- **41.7%** cross-agent textual conflict rate, versus 19.8% intra-agent (non-overlapping confidence intervals)
-- **79.4%** of agent PRs were open concurrently with another agent's
-- **84.4%** of conflicts were in source code, and largely *structural* — agents disagreeing about whether a file should exist at all
-
-Claude Code agent teams have real coordination and [documented zero isolation](https://code.claude.com/docs/en/agent-teams): "two teammates editing the same file leads to overwrites." `/batch` and Cursor have real isolation and no coordination. The two never co-occur, and nothing in either column enforces safe integration.
-
-`writ` fills that gap. It does not assign work. It **admits writes**.
-
-> [!NOTE]
-> **Status: Phase 1 hook dispatcher is in this tree.** `writ hook` admits `PreToolUse` (Bash `git`/`gh` only) and answers `SubagentStart`/`SubagentStop` plus `WorktreeCreate`/`WorktreeRemove` as coordination-only events — it never creates or deletes a checkout. `writ install` writes the hook block (PreToolUse + subagent registry only). The SQLite lease store is a skeleton: grant/release plus reserved budget columns, not MCP or budget enforcement. Live Claude Code end-to-end burn-in is still outstanding on [#124](https://github.com/rmems/writ/issues/124).
-
 ## Install
 
-Two pieces: the **binary** (enforcement) and the **skill** (portable agent procedure). Install both. Neither is a substitute for the other.
+Two pieces: the **binary** (coordination + safety core) and the **skill** (portable agent procedure). Install both. Neither is a substitute for the other.
 
 ### Prerequisites
 
@@ -99,6 +142,7 @@ Then confirm the agent host lists a `writ` skill (the exact UI depends on the ho
 
 Skill directories are not standardized. Common roots include `~/.agents/skills`, `~/.claude/skills`, and a project-local skills folder. Cursor, Cline, Codex, and Claude Code each resolve skills differently. This README documents the `~/.agents/skills/writ` primary path only. Point a copy or symlink of this repository at whichever root your host actually scans. A full install matrix is out of scope here ([#18](https://github.com/rmems/writ/issues/18)).
 
+
 ## Quick start
 
 Until M1 hooks land, git and GitHub commands that `writ` can admit must go through `writ` on purpose. Local `git merge` on an assigned feature branch is allowlisted; `gh pr merge`, auto-merge, and merge queues are not. GitHub owns remote PR merges ([`AGENTS.md`](AGENTS.md#remote-github-merges)).
@@ -126,7 +170,7 @@ Until M1 hooks land, git and GitHub commands that `writ` can admit must go throu
    writ gh-safe -R acme/example-org pr view 1
    ```
 
-4. Inspect watched jobs (usually empty today — nothing in this repo writes the state file):
+4. Inspect collaboration status from the shared lease store:
 
    ```bash
    writ --json status
@@ -165,9 +209,8 @@ Leases are the join: coordination state that the enforcement layer checks at wri
                │                │                │
                └────────────────┼────────────────┘
                                 ▼
-                     Durable state / watchlist
-                     watched.json is read-only today
-                     SQLite leases planned (M1 / #124)
+                     Durable coordination state
+                     SQLite leases.db (status/list/register)
 ```
 
 Call-outs:
@@ -175,7 +218,7 @@ Call-outs:
 - **Isolation:** workers must not share a dirty worktree. One writable worker per assigned worktree and branch.
 - **Babysit:** success means merge-ready (CI green, mergeable, reviews clean, threads resolved). The human still merges.
 - **Stacks:** handle from the bottom of the stack upward. Do not run parallel writers on one stack.
-- **State location:** default watched-state path is platform user-data (`writ/watched.json`), overridable with `WRIT_STATE_PATH` (legacy `WH_STATE_PATH` if unset). Do not treat that file as a writer API; this repo only *reads* it. The planned store is SQLite leases, not a new JSON path.
+- **State location:** collaboration status reads the SQLite lease store (`WRIT_LEASE_PATH`, else platform user-data `writ/leases.db`). `watched.json` (`WRIT_STATE_PATH`) is a leftover reader only and is not the status authority.
 
 ### Why hooks
 
@@ -196,9 +239,9 @@ Register with `writ install`. Matcher scope starts at `Bash(git *)` and `Bash(gh
 | **Worker** | A subagent bound to one assigned worktree and branch. Workers may integrate peer work locally; they never merge a GitHub pull request. |
 | **Worktree** | An isolated git checkout created by the harness (or plain `git worktree add`), registered with `writ worktree register`. Any path; no writ-specific root required. |
 
-| **Watchlist / hive** | Durable list of jobs. Today: optional `watched.json` *read* by `writ status` / `writ jobs`. Writer and SQLite leases are not in this tree (M1). |
+| **Watchlist / hive** | Legacy name. Live visibility is `writ status` / `writ worktree list` over the SQLite lease store. |
 | **Merge-ready** | CI green, conflict-free, required checks successful, review threads resolved. Report it; do not merge. |
-| **Lease** | Planned M1 record that admits a writer to a path scope. Not implemented. |
+| **Lease** | SQLite coordination row for a registered checkout (`WRITER_LOCKED` / `UNASSIGNED` today). |
 
 ## Commands
 
@@ -206,15 +249,17 @@ Implemented `writ` surface (`writ --help` is authoritative):
 
 | Command | Status | Operator meaning |
 | --- | --- | --- |
-| `writ status` / `writ jobs` | Implemented (read-only) | Show watched jobs. Empty unless an external process wrote the state file. See [`docs/status-schema.md`](docs/status-schema.md). |
+| `writ status` / `writ jobs` | Implemented (read-only) | Collaboration snapshot from the SQLite lease store. See [`docs/status-schema.md`](docs/status-schema.md). |
 | `writ ci classify` | Implemented | Classify `gh pr checks` / `statusCheckRollup` JSON. Emits residual codes plus a compact `collaboration` view for status consumers. Does not write state. |
 | `writ git-safe …` | Implemented | Run a git command after the allowlist and, for mutations, expected-branch checks. |
 | `writ gh-safe …` | Implemented | Run a `gh` command after the allowlist. GitHub PR merge operations are rejected. |
-| `writ supervisor run --timeout <secs> …` | Implemented | Spawn a child with wall-clock timeout. Unix kills the process group; Windows kills only the direct child (grandchildren may survive). |
+| `writ supervisor run --timeout <secs> …` | Implemented | Spawn a child with wall-clock, idle, and grace recovery (`--idle`/`--stall`, `--grace`, `--progress-secs`, env `WRIT_SUPERVISOR_*`; see [`docs/timeout-policy.md`](docs/timeout-policy.md)). Timeout is a handoff residual: Unix SIGTERM-then-SIGKILL on the process group; Windows kills only the direct child (grandchildren may survive). Never deletes a harness checkout. |
+| `writ watchlist list\|check\|check-all` | Implemented (view) | Collaboration status over `leases.db` plus optional live GitHub overlay. Does not persist a watchlist file. |
 | `writ worktree register\|unregister\|inspect\|list` | Implemented | Coordination records for harness-owned checkouts. Register/unregister never touch files or branches. |
 | `writ worktree create\|remove\|prune` | Deprecated | Managed lifecycle kept for caller compatibility during the transition. `create` requires `--schema-version 2` and `--start-point`. |
-| `writ --json` | Implemented | Version-1 JSON envelopes on stdout; diagnostics on stderr. Fixtures: [`docs/examples/`](docs/examples/). |
-| `writ install` / hook dispatcher | **Planned (M1)** | Register unbypassable hooks. Not a command today. |
+| `writ attribution format` | Implemented | Render review and collaboration replies with real agent/task/branch/session identity. Include a SHA only when one exists; never invent one. |
+| `writ --json` | Implemented | Envelope-producing commands emit versioned JSON on stdout (generic v1; status/jobs v2); diagnostics on stderr. Exceptions: `hook --json` has no envelope; `git-safe`/`gh-safe` validation failures and `install` failures emit stderr only. See the [`CLI contract`](docs/cli-contract.md) and [`fixtures`](docs/examples/). |
+| `writ install` / hook dispatcher | Implemented | Registers `writ hook` into `.claude/settings.json`; burn-in outstanding ([#124](https://github.com/rmems/writ/issues/124)). |
 
 JSON envelopes look like:
 
@@ -227,36 +272,46 @@ Policy rejections print to stderr and exit **2** (they do not wrap a JSON envelo
 ```console
 $ writ --json git-safe push --force
 writ: policy violation [BARE_FORCE_PUSH]: bare --force/-f is not allowed; use --force-with-lease only
-
-$ writ --json gh-safe pr merge 1
-writ: policy violation [MERGE_BLOCKED]: `gh pr merge` is not allowed
 ```
 
-### Removed hive verbs
+## Coordination model
 
-Milestone A skill stubs used these names. They are **not** commands in `writ` or [`SKILL.md`](SKILL.md). Do not invoke them.
+### Identity
 
-| Old verb | Was supposed to mean | Use instead |
-| --- | --- | --- |
-| `discover` | Show candidate issues/PRs under allowlisted owners | Host GitHub/Linear tools; operator-configured owners only ([#146](https://github.com/rmems/writ/issues/146)) |
-| `add` | Enqueue issues/PRs into the hive | Harness creates the checkout; `writ worktree register` joins it to coordination |
-| `check` | One maintenance/fix cycle in the current context | Worker flow in [`SKILL.md`](SKILL.md) + `writ git-safe` / `writ gh-safe` |
-| `check-all` | Orchestrated cycles across the hive | Host orchestrator; no hive runtime in this repo |
-| `list` | Show hive items / workers | `writ status` / `writ jobs` / `writ worktree list` |
+A lease row joins a task, an agent/session, and a checkout path — the "who owns what" record. `writ worktree register` creates it for an existing checkout; `unregister` releases it while keeping identity so a verified reclaim can prove ownership. TTL expiry marks a lease stale; it never erases the checkout's WIP.
+
+### Overlap and handoff
+
+Declared intended paths give early overlap visibility. Overlap on separate branches is advisory: the colliding worker identifies the owner and negotiates a split, a sequence, or a handoff. Duplicate live ownership of one task is a detected collision, not silent divergence. A stale lease is a recovery/handoff event — not permission to kill a worker or discard its changes.
+
+### Communication
+
+The shared store carries intent, dependency-ready, blocker, overlap, help-request, handoff, and completion records, with enough identity/version information to distinguish stale messages from live state. A manager can split scope or pick one integration owner without turning every message into a human approval gate.
+
+### Local integration
+
+`git merge`, `git rebase`, and `git cherry-pick` of peer branches into the assigned branch are routine; conflict repair is expected. Resolve the contended files, validate the combined result, and publish the resulting head/dependencies for other workers. A merge that would overwrite uncommitted WIP must be refused first — commit, stash, or abort. Default-branch integration belongs to GitHub policy.
+
+### GitHub vs Linear
+
+| Tool | Role |
+| --- | --- |
+| **Linear** | Optional task tracker: task identity, status, planning, when the operator uses it. |
+| **GitHub** | Source of truth for code, PRs, reviews, checks, and protected-branch merges. |
+| **writ** | Same-host coordination state only. No task-tracker clone, no merge authority. |
+
+GitHub issue twins or Beads mirrors are not a required workflow.
 
 ## Safety invariants
 
-These apply to every agent, platform, and command path. [`SKILL.md`](SKILL.md) restates them as procedure; [`AGENTS.md`](AGENTS.md) is the contract.
+Coordination integrity and WIP protection are enforced in Rust at the binary boundary, where a malformed prompt cannot bypass them:
 
-- **Never merge a GitHub pull request through `writ`.** Local feature-branch `git merge` is allowlisted; `gh pr merge`, auto-merge, and merge queues are not. GitHub repository protection owns remote PR merges ([`AGENTS.md`](AGENTS.md#remote-github-merges)).
-- Auto-merge, merge queues, scheduled merges, and admin bypasses are always forbidden.
 - Force pushes may use only `--force-with-lease`; bare `--force` and `-f` are forbidden.
-- Each job edits only its assigned branch and isolated worktree.
-- Mutating operations verify the expected branch and stay inside the configured path sandbox.
-- Stacked pull requests are handled from the bottom of the stack upward.
-- **Fix cap / budget:** unbounded fix loops are a named failure class (F2). There is **no runtime cap today**. The old prompt-only “3 code-fix commits per babysit cycle” is not enforced. Lease budgets are planned in [#167](https://github.com/rmems/writ/issues/167).
+- Each job edits only its assigned branch and isolated checkout; mutating operations verify the expected branch and stay inside the configured path sandbox.
+- One writable worker per assigned worktree and branch; stacked PRs are handled bottom-up.
+- Unbounded fix loops are a named failure class (F2); lease budgets are planned in [#167](https://github.com/rmems/writ/issues/167).
 
-Soft prompt text is not runtime enforcement. Hard stops live in Rust, at the binary boundary, where a malformed prompt cannot bypass them.
+`writ` enforces these rules only for commands routed through it deliberately — it is **opt-in, not unbypassable** — until the remaining hook burn-in lands ([#124](https://github.com/rmems/writ/issues/124)).
 
 ## Owner allowlist
 
@@ -268,16 +323,12 @@ Repository access is controlled by a configured owner allowlist, not a built-in 
 
 Examples use generic owners such as `acme` and `example-org`.
 
-Linear may mirror planning for an operator's own team; that team id is operator-local, not a product default.
-
 ## Related skills
 
 | Skill | Role |
 | --- | --- |
-| **`writ`** ([`SKILL.md`](SKILL.md)) | Fleet procedure: isolate worktrees, spawn workers, local integration, issue → PR. Does not merge GitHub pull requests. |
-| **`babysit-pr`** (installed companion) | Single-PR interactive monitoring in the current checkout: CI, reviews, threads, merge-ready report. Not a hive orchestrator and not a merge button. |
-
-`writ` admits writes across jobs, including local feature-branch integration. `babysit-pr` watches one PR. Neither merges a GitHub pull request.
+| **`writ`** ([`SKILL.md`](SKILL.md)) | Fleet procedure: register checkouts, coordinate workers, local integration, issue → PR. |
+| **`babysit-pr`** (installed companion) | Single-PR interactive monitoring in the current checkout: CI, reviews, threads, merge-ready report. |
 
 ## Build and gates
 
@@ -311,7 +362,8 @@ This is not `writ install`, which writes the `writ` hook block into `.claude/set
 | --- | --- | --- |
 | Worktree root | platform user-data `writ/worktrees` | `WRIT_WORKTREE_BASE`, else `WH_WORKTREE_BASE` |
 | Job worktree | `{worktree root}/{owner}/{repo}/{job_id}` | Deprecated managed lifecycle only; `register` accepts any path |
-| Watched state | platform user-data `writ/watched.json` | `WRIT_STATE_PATH`, else `WH_STATE_PATH` |
+| Lease store | platform user-data `writ/leases.db` | `WRIT_LEASE_PATH` |
+| Watched state (legacy reader) | platform user-data `writ/watched.json` | `WRIT_STATE_PATH`, else `WH_STATE_PATH` |
 | Rust binary | `writ` on `PATH` | `WRIT_BIN` |
 
 If the new `writ` data root is absent and a pre-rename `worktrees-hives` root still exists, the path resolver keeps using the legacy root so an upgrade does not hide existing state. That is a read/fallback, not an automatic directory move.
@@ -322,26 +374,26 @@ If the new `writ` data root is absent and a pre-rename `worktrees-hives` root st
 | --- | --- |
 | Agent does not see the `writ` skill | `ls "$HOME/.agents/skills/writ/SKILL.md"`; confirm the host's actual skill root; recreate the symlink. |
 | `writ: command not found` | `cargo install --path crates/writ` from the clone, or set `WRIT_BIN`. |
-| `writ status` / `writ jobs` is always empty | Expected. Nothing in this workspace writes `watched.json`. See [`docs/status-schema.md`](docs/status-schema.md). |
+
+| `writ status` / `writ jobs` is empty | Expected until a checkout is registered. Register with `writ worktree register`. See [`docs/status-schema.md`](docs/status-schema.md); for the live GitHub overlay use `writ watchlist` ([`docs/watchlist-schema.md`](docs/watchlist-schema.md)). |
 | `policy violation [BARE_FORCE_PUSH]` or `[MERGE_BLOCKED]` | Exit 2 is the safety boundary working. Use `--force-with-lease` only when allowed. `MERGE_BLOCKED` covers `gh pr merge`, `git mergetool`, default-branch local merge, and dirty-WIP merge — not routine feature-branch integration. |
 | Owner allowlist did not block another org | Confirm `WRIT_ALLOWED_OWNERS` / `--allowed-owners` is set. Empty lists deny. The gate covers worktree create and `gh` repo selectors, not host MCP calls. |
-| `writ install` is missing | Planned M1. Do not invent a second installer. Track [#18](https://github.com/rmems/writ/issues/18) and [#124](https://github.com/rmems/writ/issues/124). |
 
 ## Issue labels and templates
 
 Canonical product labels (use these; do not invent new names unless the epic
-expands the taxonomy). Prefer **`docs`** over GitHub’s default `documentation`.
+expands the taxonomy). Prefer **`docs`** over GitHub's default `documentation`.
 Keep GitHub label descriptions identical to this table (commands in
 [`CONTRIBUTING.md`](CONTRIBUTING.md)):
 
 | Label | Description |
 | --- | --- |
 | `epic` | Multi-issue umbrella / milestone grouping |
-| `core` | Skill loop primitives (discover, claim, PR, babysit, state) |
+| `core` | Coordination primitives (registration, leases, messages, handoff, status) |
 | `orchestrator` | Multi-subagent scheduling, caps, join/report |
 | `docs` | README, SKILL.md, templates, operator docs |
 | `platform` | Install paths, multi-agent-host packaging, validation on second host |
-| `safety` | Never-merge, force-with-lease, fix caps, owner allowlist, hang recovery |
+| `safety` | Force-with-lease, fix caps, owner allowlist, WIP preservation |
 
 Optional GitHub issue forms live in [`.github/ISSUE_TEMPLATE/`](.github/ISSUE_TEMPLATE/):
 **Feature** (new capability), **Bug** (unexpected failure), **Chore** (hygiene,
@@ -349,18 +401,13 @@ packaging, docs-only). Each asks for Summary, Problem / context, Acceptance
 criteria checkboxes, and the Linear footer documented in
 [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
-## Roadmap and issues
+## Roadmap and tracking
 
-- Product epic: [#1](https://github.com/rmems/writ/issues/1)
-- Current phase (hook enforcement): [#124](https://github.com/rmems/writ/issues/124)
-- Hook install narrative: [#18](https://github.com/rmems/writ/issues/18)
-- Owner-allowlist enforcement: [#146](https://github.com/rmems/writ/issues/146)
+- Product direction and task tracking for this repo: Linear (`writ` / `RM` tickets). Using Linear is a convention of this repository's maintainers, not a product requirement.
+- GitHub issues mirror actionable work items; they are optional, not a required workflow.
+- Open coordination work: crash-consistent lease/ownership records and the same-host claim/overlap/message/handoff layer build on the existing SQLite lease store.
 - Lease budgets (fix-loop bound): [#167](https://github.com/rmems/writ/issues/167)
-- Threat model: [#22](https://github.com/rmems/writ/issues/22) · Boundary tests: [#81](https://github.com/rmems/writ/issues/81)
-- Portable workflows: issue → commit [#84](https://github.com/rmems/writ/issues/84) / isolation [#6](https://github.com/rmems/writ/issues/6); commit → PR [#8](https://github.com/rmems/writ/issues/8)
-- Planning mirror: [Linear `worktrees-hives` project](https://linear.app/rpd-34/project/worktrees-hives-e3052de4caa3) (this issue: [RM-118](https://linear.app/rpd-34/issue/RM-118/expand-readme-install-commands-architecture))
-
-Milestone groups from the epic: **M1** hook enforcement + minimal lease store; **M2** rename (landed); **M3** cross-repo lease/state + MCP; **M4** path-scoped admission.
+- Hook burn-in: [#124](https://github.com/rmems/writ/issues/124) · Install narrative: [#18](https://github.com/rmems/writ/issues/18) · Owner allowlist: [#146](https://github.com/rmems/writ/issues/146)
 
 ## Project documentation
 
@@ -368,12 +415,15 @@ Milestone groups from the epic: **M1** hook enforcement + minimal lease store; *
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — issue templates and canonical labels
 - [`SKILL.md`](SKILL.md) — portable agent procedure (guidance, not a security boundary)
 - [`docs/install.md`](docs/install.md) — clone + symlink skill install, cross-agent roots, uninstall
+- [`docs/cli-contract.md`](docs/cli-contract.md) — command, JSON envelope, exit-code, persistence, and lifecycle compatibility matrix
 - [`REVIEW.md`](REVIEW.md) — pull-request lifecycle and review checklist
 - [`docs/ci-taxonomy.md`](docs/ci-taxonomy.md) — Class A/B/C CI check policy for companion-skill monitoring
 - [`docs/adr/0001-rust-only-v1-runtime-and-babysit-pr-boundary.md`](docs/adr/0001-rust-only-v1-runtime-and-babysit-pr-boundary.md) — v1 Rust-only runtime and Codex `babysit-pr` boundary
 - [`docs/workflows/safe-issue-verified-commit.md`](docs/workflows/safe-issue-verified-commit.md) — issue → verified push
-- [`docs/workflows/safe-verified-commit-to-pr.md`](docs/workflows/safe-verified-commit-to-pr.md) — verified push → PR handoff (does not merge the pull request)
+- [`docs/workflows/safe-verified-commit-to-pr.md`](docs/workflows/safe-verified-commit-to-pr.md) — verified push → PR handoff
 - [`docs/status-schema.md`](docs/status-schema.md) — `status` / `jobs` JSON
+- [`docs/timeout-policy.md`](docs/timeout-policy.md) — supervisor hang recovery (hard/idle/lost-child, grace kill, redispatch budget)
+- [`docs/watchlist-schema.md`](docs/watchlist-schema.md) — `watchlist` collaboration view
 - [`docs/examples/`](docs/examples/) — captured response envelopes
 - [`docs/hook-boundary.md`](docs/hook-boundary.md) — hook-boundary contract tests and two-hook burn-in (#81)
 

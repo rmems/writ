@@ -3,6 +3,7 @@
 //! The module boundaries are established in the R1 scaffold. Their behavior is
 //! implemented by the linked foundation issues.
 
+pub mod attribution;
 mod bash_argv;
 pub mod checkout;
 pub mod ci_taxonomy;
@@ -21,6 +22,8 @@ mod pr_import;
 pub mod state;
 pub mod status;
 pub mod supervisor;
+pub mod timeout_policy;
+pub mod watchlist;
 pub mod worktree;
 
 /// Version shared by the core library and CLI workspace packages.
