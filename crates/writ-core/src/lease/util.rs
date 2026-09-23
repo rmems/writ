@@ -77,3 +77,16 @@ pub(super) fn new_operation_id() -> String {
 pub(super) fn path_text(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
+
+pub(super) fn named_git_branch(branch: &str) -> bool {
+    !branch.is_empty() && branch != "(detached)"
+}
+
+/// Store a real branch as `refs/heads/…`; keep detached/empty identity as `HEAD`.
+pub(super) fn stored_branch_ref(branch: &str) -> String {
+    if named_git_branch(branch) {
+        format!("refs/heads/{branch}")
+    } else {
+        "HEAD".to_owned()
+    }
+}

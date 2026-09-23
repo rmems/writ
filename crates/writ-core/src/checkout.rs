@@ -752,7 +752,12 @@ mod tests {
             })
             .unwrap()
             .unwrap();
-        assert!(stored.worktree_path.contains("wts/one"));
+        assert!(
+            std::path::Path::new(&stored.worktree_path)
+                .ends_with(std::path::Path::new("wts").join("one")),
+            "stored path should remain the original checkout, got {}",
+            stored.worktree_path
+        );
         assert_eq!(stored.allocation_state, AllocationState::Prepared);
     }
 

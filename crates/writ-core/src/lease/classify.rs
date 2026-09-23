@@ -5,7 +5,7 @@ use std::process::Command;
 
 use super::{
     AllocationInspection, AllocationState, EvidenceClass, InspectRequest, Lease, now_secs,
-    path_text,
+    path_text, stored_branch_ref,
 };
 
 pub(super) struct GitEvidence {
@@ -18,23 +18,36 @@ pub(super) struct GitEvidence {
     pub repo_root_common_dir: Option<std::path::PathBuf>,
 }
 
-/// Match a `git worktree list --porcelain` dump against a stored path.
+/// Match a `git worktree list --porcelain -z` dump against a stored path.
 ///
 /// Git may spell the same directory with different separators, casing, or a
 /// canonical prefix than `Path::to_string_lossy`, so callers must not use
-/// substring `contains`.
-pub(super) fn porcelain_lists_worktree(listing: &str, worktree_path: &Path) -> bool {
-    listing.lines().any(|line| {
-        line.strip_prefix("worktree ")
-            .is_some_and(|path| crate::paths::same_existing_path(Path::new(path), worktree_path))
+/// substring `contains`. NUL delimiters keep newline-containing paths in one
+/// record; newline porcelain is accepted only as a test/fallback dump.
+pub(super) fn porcelain_lists_worktree(listing: &[u8], worktree_path: &Path) -> bool {
+    if listing.contains(&0) {
+        return crate::porcelain::parse_porcelain_z(listing)
+            .iter()
+            .any(|record| worktree_record_matches(&record.path, worktree_path));
+    }
+    std::str::from_utf8(listing).ok().is_some_and(|text| {
+        text.lines().any(|line| {
+            line.strip_prefix("worktree ")
+                .is_some_and(|path| worktree_record_matches(Path::new(path), worktree_path))
+        })
     })
 }
 
+fn worktree_record_matches(listed: &Path, worktree_path: &Path) -> bool {
+    crate::porcelain::paths_equal(listed, worktree_path)
+        || crate::paths::same_existing_path(listed, worktree_path)
+}
+
 pub(super) fn inspect_git(repo_root: &Path, worktree_path: &Path, branch: &str) -> GitEvidence {
-    let branch_ref = if branch.is_empty() {
-        String::new()
-    } else {
+    let branch_ref = if named_git_branch(branch) {
         format!("refs/heads/{branch}")
+    } else {
+        String::new()
     };
     let branch_commit = if branch_ref.is_empty() {
         None
@@ -53,7 +66,7 @@ pub(super) fn inspect_git(repo_root: &Path, worktree_path: &Path, branch: &str) 
         worktree_path,
         &["rev-parse", "--verify", "--end-of-options", "HEAD^{commit}"],
     );
-    let listed = optional_git_stdout(repo_root, &["worktree", "list", "--porcelain"])
+    let listed = optional_git_bytes(repo_root, &["worktree", "list", "--porcelain", "-z"])
         .is_some_and(|listing| porcelain_lists_worktree(&listing, worktree_path));
     // Harness-owned standalone clones are not in another repo's `worktree list`.
     let worktree_registered = listed || worktree_path.join(".git").exists();
@@ -215,7 +228,7 @@ fn git_common_dir(root: &Path) -> Option<std::path::PathBuf> {
 }
 
 fn named_git_branch(branch: &str) -> bool {
-    !branch.is_empty() && branch != "(detached)"
+    super::named_git_branch(branch)
 }
 
 fn ttl_is_expired(lease: &Lease) -> bool {
@@ -234,11 +247,7 @@ pub(super) fn inspect_now(
         .map(|row| row.branch.as_str())
         .or(request.branch)
         .unwrap_or("");
-    let branch_ref = if branch.is_empty() {
-        String::new()
-    } else {
-        format!("refs/heads/{branch}")
-    };
+    let branch_ref = stored_branch_ref(branch);
     let evidence = inspect_git(request.repo_root, request.worktree_path, branch);
     let ttl_expired = lease.as_ref().is_some_and(ttl_is_expired);
     let (classification, conflicts) =
@@ -269,6 +278,12 @@ pub(super) fn inspect_now(
 }
 
 fn optional_git_stdout(repo: &Path, args: &[&str]) -> Option<String> {
+    optional_git_bytes(repo, args)
+        .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_owned())
+        .filter(|text| !text.is_empty())
+}
+
+fn optional_git_bytes(repo: &Path, args: &[&str]) -> Option<Vec<u8>> {
     Command::new("git")
         .arg("-C")
         .arg(repo)
@@ -276,8 +291,8 @@ fn optional_git_stdout(repo: &Path, args: &[&str]) -> Option<String> {
         .output()
         .ok()
         .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
-        .filter(|text| !text.is_empty())
+        .map(|output| output.stdout)
+        .filter(|bytes| !bytes.is_empty())
 }
 
 fn live_checkout_without_lease(evidence: &GitEvidence) -> bool {

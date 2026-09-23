@@ -5,7 +5,8 @@ use rusqlite::{TransactionBehavior, params};
 use super::query::{LeaseLookup, lookup_lease};
 use super::{
     AllocateRequest, AllocationState, Error, JobKey, Lease, LeaseMode, LeaseStore, PolicyCode,
-    Result, lease_err, new_operation_id, now_secs, occupant, path_text, schema, terminal_error,
+    Result, lease_err, new_operation_id, now_secs, occupant, path_text, schema, stored_branch_ref,
+    terminal_error,
 };
 
 impl LeaseStore {
@@ -20,7 +21,7 @@ impl LeaseStore {
         }
         let now = now_secs();
         let operation_id = new_operation_id();
-        let branch_ref = format!("refs/heads/{}", request.branch);
+        let branch_ref = stored_branch_ref(request.branch);
         let worktree_path = path_text(request.worktree_path);
         let mut conn = self.lock()?;
         let tx = conn

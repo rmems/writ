@@ -271,12 +271,113 @@ fn execute_write(
     action: CoordAction,
 ) -> writ_core::error::Result<Response<serde_json::Value>> {
     match action {
-        CoordAction::Announce { .. } => announce(store, action),
         CoordAction::Send { .. } => send(store, action),
-        CoordAction::Ack { .. } => ack(store, action),
-        CoordAction::Pause { .. } => pause(store, action),
-        CoordAction::Handoff { .. } => handoff(store, action),
+        CoordAction::Announce { .. } | CoordAction::Handoff { .. } => execute_offer(store, action),
+        CoordAction::Ack { .. } | CoordAction::Pause { .. } => execute_control(store, action),
         _ => unreachable!("execute_write only handles mutating coord commands"),
+    }
+}
+
+fn execute_offer(
+    store: &LeaseStore,
+    action: CoordAction,
+) -> writ_core::error::Result<Response<serde_json::Value>> {
+    match action {
+        CoordAction::Announce {
+            owner,
+            repo_name,
+            job_id,
+            agent,
+            session,
+            intent,
+            paths,
+        } => value(
+            "coord.announce",
+            &store.announce(AnnounceRequest {
+                owner: &owner,
+                repo_name: &repo_name,
+                job_id: &job_id,
+                agent_id: &agent,
+                session_id: session.as_deref(),
+                agent_type: "worker",
+                intent: intent.as_deref(),
+                paths: &paths,
+            })?,
+        ),
+        CoordAction::Handoff {
+            owner,
+            repo_name,
+            job_id,
+            agent,
+            to_agent,
+            to_job,
+            generation,
+            body,
+        } => value(
+            "coord.handoff",
+            &store.propose_handoff(HandoffRequest {
+                owner: &owner,
+                repo_name: &repo_name,
+                job_id: &job_id,
+                from_agent_id: &agent,
+                to_agent_id: &to_agent,
+                to_job_id: to_job.as_deref(),
+                expected_generation: generation,
+                body: &body,
+            })?,
+        ),
+        _ => unreachable!("execute_offer only handles announce/handoff"),
+    }
+}
+
+fn execute_control(
+    store: &LeaseStore,
+    action: CoordAction,
+) -> writ_core::error::Result<Response<serde_json::Value>> {
+    match action {
+        CoordAction::Ack {
+            owner,
+            repo_name,
+            job_id,
+            id,
+            agent,
+            session,
+        } => {
+            let (ack, claim) = store.ack_message(AckRequest {
+                message_id: id,
+                owner: &owner,
+                repo_name: &repo_name,
+                job_id: &job_id,
+                agent_id: &agent,
+                session_id: session.as_deref(),
+            })?;
+            ok(
+                "coord.ack",
+                serde_json::json!({ "ack": ack, "claim": claim }),
+            )
+        }
+        CoordAction::Pause {
+            owner,
+            repo_name,
+            job_id,
+            agent,
+            body,
+        } => {
+            let (claim, help) = store.pause_claim(PauseRequest {
+                key: JobKey {
+                    owner: &owner,
+                    repo_name: &repo_name,
+                    job_id: &job_id,
+                },
+                agent_id: &agent,
+                body: body.as_deref(),
+            })?;
+            ok(
+                "coord.pause",
+                serde_json::json!({ "claim": claim, "help": help }),
+            )
+        }
+        _ => unreachable!("execute_control only handles ack/pause"),
     }
 }
 
@@ -323,35 +424,6 @@ fn job_field<T: Serialize>(
     ok(field.command, serde_json::json!({ field.name: payload }))
 }
 
-fn announce(
-    store: &LeaseStore,
-    action: CoordAction,
-) -> writ_core::error::Result<Response<serde_json::Value>> {
-    let CoordAction::Announce {
-        owner,
-        repo_name,
-        job_id,
-        agent,
-        session,
-        intent,
-        paths,
-    } = action
-    else {
-        unreachable!("dispatch only forwards Announce");
-    };
-    let result = store.announce(AnnounceRequest {
-        owner: &owner,
-        repo_name: &repo_name,
-        job_id: &job_id,
-        agent_id: &agent,
-        session_id: session.as_deref(),
-        agent_type: "worker",
-        intent: intent.as_deref(),
-        paths: &paths,
-    })?;
-    value("coord.announce", &result)
-}
-
 fn send(
     store: &LeaseStore,
     action: CoordAction,
@@ -388,98 +460,4 @@ fn send(
         ack_of,
     })?;
     value("coord.send", &message)
-}
-
-fn ack(
-    store: &LeaseStore,
-    action: CoordAction,
-) -> writ_core::error::Result<Response<serde_json::Value>> {
-    let CoordAction::Ack {
-        owner,
-        repo_name,
-        job_id,
-        id,
-        agent,
-        session,
-    } = action
-    else {
-        unreachable!("dispatch only forwards Ack");
-    };
-    let (ack, claim) = store.ack_message(AckRequest {
-        message_id: id,
-        owner: &owner,
-        repo_name: &repo_name,
-        job_id: &job_id,
-        agent_id: &agent,
-        session_id: session.as_deref(),
-    })?;
-    ok(
-        "coord.ack",
-        serde_json::json!({
-            "ack": ack,
-            "claim": claim,
-        }),
-    )
-}
-
-fn pause(
-    store: &LeaseStore,
-    action: CoordAction,
-) -> writ_core::error::Result<Response<serde_json::Value>> {
-    let CoordAction::Pause {
-        owner,
-        repo_name,
-        job_id,
-        agent,
-        body,
-    } = action
-    else {
-        unreachable!("dispatch only forwards Pause");
-    };
-    let (claim, help) = store.pause_claim(PauseRequest {
-        key: JobKey {
-            owner: &owner,
-            repo_name: &repo_name,
-            job_id: &job_id,
-        },
-        agent_id: &agent,
-        body: body.as_deref(),
-    })?;
-    ok(
-        "coord.pause",
-        serde_json::json!({
-            "claim": claim,
-            "help": help,
-        }),
-    )
-}
-
-fn handoff(
-    store: &LeaseStore,
-    action: CoordAction,
-) -> writ_core::error::Result<Response<serde_json::Value>> {
-    let CoordAction::Handoff {
-        owner,
-        repo_name,
-        job_id,
-        agent,
-        to_agent,
-        to_job,
-        generation,
-        body,
-    } = action
-    else {
-        unreachable!("dispatch only forwards Handoff");
-    };
-    let message = store.propose_handoff(HandoffRequest {
-        owner: &owner,
-        repo_name: &repo_name,
-        job_id: &job_id,
-        from_agent_id: &agent,
-        to_agent_id: &to_agent,
-        to_job_id: to_job.as_deref(),
-        expected_generation: generation,
-        body: &body,
-    })?;
-    value("coord.handoff", &message)
 }

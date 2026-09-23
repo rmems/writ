@@ -94,3 +94,18 @@ fn regrant_clears_pending_fix_cycle_journal() {
     let token = harness.store.prepare_fix_cycle(harness.key()).unwrap();
     assert_eq!(token.authorized, 1);
 }
+
+#[test]
+fn commit_fix_cycle_requires_mutate() {
+    let harness = active_job();
+    let token = harness.store.prepare_fix_cycle(harness.key()).unwrap();
+    let err = harness
+        .store
+        .commit_fix_cycle(&token.operation_id)
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("MUTATE"),
+        "expected MUTATE gate, got {err}"
+    );
+    assert_eq!(stored_fix_cycles(&harness), Some(0));
+}

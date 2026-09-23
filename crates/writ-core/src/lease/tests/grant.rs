@@ -328,3 +328,25 @@ fn unrecognized_mode_is_unknown_not_unassigned() {
     assert_eq!(lease.mode_raw, "NOT_A_MODE");
     assert_ne!(lease.mode, LeaseMode::Unassigned);
 }
+
+#[test]
+fn detached_prepare_stores_head_not_a_heads_ref() {
+    let harness = RepoHarness::new();
+    let prepared = harness
+        .store
+        .prepare_allocate(AllocateRequest {
+            repo: &harness.repo,
+            owner: "acme",
+            repo_name: "sample",
+            job_id: "job-1",
+            branch: "(detached)",
+            worktree_path: &harness.worktree,
+            requested_start_point: "HEAD",
+            start_commit: &harness.start,
+            ttl: None,
+        })
+        .unwrap();
+    assert_eq!(prepared.branch, "(detached)");
+    assert_eq!(prepared.branch_ref, "HEAD");
+    assert_ne!(prepared.branch_ref, "refs/heads/(detached)");
+}

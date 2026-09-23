@@ -252,30 +252,12 @@ impl LeaseStore {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| coord_err("begin coord announce", e))?;
-        upsert_agent(
+        let (intent, overlaps) = announce_tx(
             &tx,
-            AgentIdentity {
-                agent_id: request.agent_id,
-                agent_type: request.agent_type,
-                session_id: request.session_id,
-            },
-            now,
-        )?;
-        let existing = load_claim_tx(&tx, key)?;
-        if let Some(existing) = existing.as_ref()
-            && existing.agent_id != request.agent_id
-        {
-            return Err(held_error(existing));
-        }
-        let generation = next_owner_generation(existing.as_ref(), request.session_id);
-        let paused_at = existing.as_ref().and_then(|claim| claim.paused_at);
-        let (intent, overlaps) = persist_announce_tx(
-            &tx,
-            AnnouncePersist {
+            AnnounceTx {
+                key,
                 request: &request,
                 lease: &lease,
-                generation,
-                paused_at,
                 paths: &paths,
                 now,
             },
@@ -927,7 +909,63 @@ fn normalize_one(path: &str) -> String {
     while stripped.contains("//") {
         stripped = stripped.replace("//", "/");
     }
-    stripped.trim_end_matches('/').to_owned()
+    let mut parts: Vec<&str> = Vec::new();
+    for part in stripped.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                if parts.pop().is_none() {
+                    return String::new();
+                }
+            }
+            other => parts.push(other),
+        }
+    }
+    if parts.is_empty() {
+        ".".to_owned()
+    } else {
+        parts.join("/")
+    }
+}
+
+struct AnnounceTx<'a> {
+    key: JobKey<'a>,
+    request: &'a AnnounceRequest<'a>,
+    lease: &'a crate::lease::Lease,
+    paths: &'a [String],
+    now: i64,
+}
+
+fn announce_tx(
+    tx: &rusqlite::Transaction<'_>,
+    row: AnnounceTx<'_>,
+) -> Result<(CoordMessage, Vec<PathOverlap>)> {
+    upsert_agent(
+        tx,
+        AgentIdentity {
+            agent_id: row.request.agent_id,
+            agent_type: row.request.agent_type,
+            session_id: row.request.session_id,
+        },
+        row.now,
+    )?;
+    let existing = load_claim_tx(tx, row.key)?;
+    if let Some(existing) = existing.as_ref()
+        && existing.agent_id != row.request.agent_id
+    {
+        return Err(held_error(existing));
+    }
+    persist_announce_tx(
+        tx,
+        AnnouncePersist {
+            request: row.request,
+            lease: row.lease,
+            generation: next_owner_generation(existing.as_ref(), row.request.session_id),
+            paused_at: existing.as_ref().and_then(|claim| claim.paused_at),
+            paths: row.paths,
+            now: row.now,
+        },
+    )
 }
 
 struct AnnouncePersist<'a> {
@@ -1298,32 +1336,31 @@ mod tests {
         }
 
         fn seed_job(&self, job_id: &str, branch: &str) -> std::path::PathBuf {
-            self.seed_job_in("acme", "sample", job_id, branch)
+            self.seed_job_in(SeedJob {
+                owner: "acme",
+                repo_name: "sample",
+                job_id,
+                branch,
+            })
         }
 
-        fn seed_job_in(
-            &self,
-            owner: &str,
-            repo_name: &str,
-            job_id: &str,
-            branch: &str,
-        ) -> std::path::PathBuf {
+        fn seed_job_in(&self, spec: SeedJob<'_>) -> std::path::PathBuf {
             let worktree = self
                 ._temp
                 .path()
                 .join("worktrees")
-                .join(owner)
-                .join(repo_name)
-                .join(job_id);
+                .join(spec.owner)
+                .join(spec.repo_name)
+                .join(spec.job_id);
             fs::create_dir_all(&worktree).unwrap();
             let prepared = self
                 .store
                 .prepare_allocate(AllocateRequest {
                     repo: &self.repo,
-                    owner,
-                    repo_name,
-                    job_id,
-                    branch,
+                    owner: spec.owner,
+                    repo_name: spec.repo_name,
+                    job_id: spec.job_id,
+                    branch: spec.branch,
                     worktree_path: &worktree,
                     requested_start_point: "refs/heads/main",
                     start_commit: &self.start,
@@ -1334,6 +1371,13 @@ mod tests {
             self.store.commit_allocate(&prepared.operation_id).unwrap();
             worktree
         }
+    }
+
+    struct SeedJob<'a> {
+        owner: &'a str,
+        repo_name: &'a str,
+        job_id: &'a str,
+        branch: &'a str,
     }
 
     fn git(repo: &Path, args: &[&str]) -> String {
@@ -1357,27 +1401,37 @@ mod tests {
         agent: &'a str,
         paths: &'a [String],
     ) -> AnnounceResult {
-        announce_in(store, "acme", "sample", job_id, agent, paths)
+        announce_in(
+            store,
+            AnnounceCase {
+                owner: "acme",
+                repo_name: "sample",
+                job_id,
+                agent,
+                paths,
+            },
+        )
     }
 
-    fn announce_in<'a>(
-        store: &'a LeaseStore,
+    struct AnnounceCase<'a> {
         owner: &'a str,
         repo_name: &'a str,
         job_id: &'a str,
         agent: &'a str,
         paths: &'a [String],
-    ) -> AnnounceResult {
+    }
+
+    fn announce_in(store: &LeaseStore, spec: AnnounceCase<'_>) -> AnnounceResult {
         store
             .announce(AnnounceRequest {
-                owner,
-                repo_name,
-                job_id,
-                agent_id: agent,
+                owner: spec.owner,
+                repo_name: spec.repo_name,
+                job_id: spec.job_id,
+                agent_id: spec.agent,
                 session_id: Some("session-a"),
                 agent_type: "worker",
                 intent: Some("edit shared contract"),
-                paths,
+                paths: spec.paths,
             })
             .unwrap()
     }
@@ -1426,20 +1480,41 @@ mod tests {
         let harness = Harness::new();
         harness.seed_job("job-a", "hive/job-a");
         harness.seed_job("job-b", "hive/job-b");
-        harness.seed_job_in("other", "sample", "job-c", "hive/job-c");
-        harness.seed_job_in("acme", "other", "job-d", "hive/job-d");
+        harness.seed_job_in(SeedJob {
+            owner: "other",
+            repo_name: "sample",
+            job_id: "job-c",
+            branch: "hive/job-c",
+        });
+        harness.seed_job_in(SeedJob {
+            owner: "acme",
+            repo_name: "other",
+            job_id: "job-d",
+            branch: "hive/job-d",
+        });
         let paths = [String::from("crates/writ-core/src")];
 
         announce(&harness.store, "job-b", "agent-b", &paths);
         announce_in(
             &harness.store,
-            "other",
-            "sample",
-            "job-c",
-            "agent-c",
-            &paths,
+            AnnounceCase {
+                owner: "other",
+                repo_name: "sample",
+                job_id: "job-c",
+                agent: "agent-c",
+                paths: &paths,
+            },
         );
-        announce_in(&harness.store, "acme", "other", "job-d", "agent-d", &paths);
+        announce_in(
+            &harness.store,
+            AnnounceCase {
+                owner: "acme",
+                repo_name: "other",
+                job_id: "job-d",
+                agent: "agent-d",
+                paths: &paths,
+            },
+        );
 
         let result = announce(&harness.store, "job-a", "agent-a", &paths);
         assert_eq!(result.overlaps.len(), 1);
@@ -1601,18 +1676,49 @@ mod tests {
     }
 
     #[test]
+    fn declared_paths_canonicalize_internal_dot_and_parent() {
+        let harness = Harness::new();
+        harness.seed_job("job-a", "hive/job-a");
+        harness.seed_job("job-b", "hive/job-b");
+        announce(
+            &harness.store,
+            "job-a",
+            "agent-a",
+            &[String::from("crates/writ-core/src/coord.rs")],
+        );
+        let second = announce(
+            &harness.store,
+            "job-b",
+            "agent-b",
+            &[String::from("crates/writ-core/src/./lib/../coord.rs")],
+        );
+        assert_eq!(second.overlaps.len(), 1);
+        assert_eq!(
+            second.intent.paths,
+            vec![String::from("crates/writ-core/src/coord.rs")]
+        );
+    }
+
+    #[test]
     fn inbox_broadcasts_are_scoped_to_the_same_repository() {
         let harness = Harness::new();
         harness.seed_job("job-a", "hive/job-a");
-        harness.seed_job_in("acme", "other", "job-b", "hive/job-b");
+        harness.seed_job_in(SeedJob {
+            owner: "acme",
+            repo_name: "other",
+            job_id: "job-b",
+            branch: "hive/job-b",
+        });
         announce(&harness.store, "job-a", "agent-a", &[String::from("src")]);
         announce_in(
             &harness.store,
-            "acme",
-            "other",
-            "job-b",
-            "agent-b",
-            &[String::from("src")],
+            AnnounceCase {
+                owner: "acme",
+                repo_name: "other",
+                job_id: "job-b",
+                agent: "agent-b",
+                paths: &[String::from("src")],
+            },
         );
         let inbox = harness
             .store

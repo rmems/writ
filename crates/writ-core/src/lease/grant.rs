@@ -7,51 +7,18 @@ use rusqlite::{TransactionBehavior, params};
 use super::query::{LIVE_PATH_LOOKUP, LeaseLookup, lookup_lease};
 use super::{
     AllocationState, Error, JobKey, Lease, LeaseGrant, LeaseMode, LeaseStore, PolicyCode, Result,
-    lease_err, new_operation_id, now_secs, occupant, path_text, schema, terminal_error,
+    lease_err, new_operation_id, now_secs, occupant, path_text, schema, stored_branch_ref,
+    terminal_error,
 };
 
 impl LeaseStore {
     pub fn grant(&self, grant: LeaseGrant<'_>) -> Result<Lease> {
         let now = now_secs();
-        let repo = path_text(grant.repo);
-        let worktree_path = path_text(grant.worktree_path);
-        let branch_ref = format!("refs/heads/{}", grant.branch);
-        let operation_id = new_operation_id();
         let mut conn = self.lock()?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| lease_err("begin grant", e))?;
-        let existing = lookup_lease(
-            &tx,
-            LeaseLookup {
-                where_sql: "WHERE owner = ?1 AND repo_name = ?2 AND job_id = ?3",
-                sql_params: params![grant.owner, grant.repo_name, grant.job_id],
-                context: "lookup lease before grant",
-            },
-        )?;
-        reject_tombstoned(existing.as_ref())?;
-        occupant::reject_live_path_occupant(
-            &tx,
-            occupant::LivePathClaim {
-                worktree_path: &worktree_path,
-                owner: grant.owner,
-                repo_name: grant.repo_name,
-                job_id: grant.job_id,
-            },
-            "grant lease",
-        )?;
-        clear_released_claim(&tx, &grant, existing.as_ref())?;
-        apply_grant_upsert(
-            &tx,
-            GrantRow {
-                grant: &grant,
-                repo: &repo,
-                branch_ref: &branch_ref,
-                worktree_path: &worktree_path,
-                operation_id: &operation_id,
-                now,
-            },
-        )?;
+        write_grant(&tx, grant, now)?;
         tx.commit().map_err(|e| lease_err("commit grant", e))?;
         drop(conn);
         self.find_job(JobKey {
@@ -173,6 +140,44 @@ fn write_finalize(tx: &rusqlite::Transaction<'_>, row: FinalizeWrite<'_>) -> Res
             resolved_start_commit: Some(&row.lease.start_commit),
             status: "COMMITTED",
             now: row.now,
+        },
+    )
+}
+
+fn write_grant(tx: &rusqlite::Transaction<'_>, grant: LeaseGrant<'_>, now: i64) -> Result<()> {
+    let repo = path_text(grant.repo);
+    let worktree_path = path_text(grant.worktree_path);
+    let branch_ref = stored_branch_ref(grant.branch);
+    let operation_id = new_operation_id();
+    let existing = lookup_lease(
+        tx,
+        LeaseLookup {
+            where_sql: "WHERE owner = ?1 AND repo_name = ?2 AND job_id = ?3",
+            sql_params: params![grant.owner, grant.repo_name, grant.job_id],
+            context: "lookup lease before grant",
+        },
+    )?;
+    reject_tombstoned(existing.as_ref())?;
+    occupant::reject_live_path_occupant(
+        tx,
+        occupant::LivePathClaim {
+            worktree_path: &worktree_path,
+            owner: grant.owner,
+            repo_name: grant.repo_name,
+            job_id: grant.job_id,
+        },
+        "grant lease",
+    )?;
+    clear_released_claim(tx, &grant, existing.as_ref())?;
+    apply_grant_upsert(
+        tx,
+        GrantRow {
+            grant: &grant,
+            repo: &repo,
+            branch_ref: &branch_ref,
+            worktree_path: &worktree_path,
+            operation_id: &operation_id,
+            now,
         },
     )
 }

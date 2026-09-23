@@ -65,6 +65,7 @@ impl LeaseStore {
         if lease.allocation_state.is_terminal() {
             return Err(terminal_error(&lease));
         }
+        require_mutate_phase(&tx, operation_id)?;
         let committed = lease
             .pending_fix_cycles
             .unwrap_or(lease.fix_cycles.unwrap_or(0));
@@ -283,6 +284,27 @@ fn pending_fix_lease(
     .ok_or_else(|| Error::LeaseStore {
         context,
         message: format!("unknown pending fix-cycle {operation_id}"),
+    })
+}
+
+fn require_mutate_phase(tx: &rusqlite::Transaction<'_>, operation_id: &str) -> Result<()> {
+    let phase: Option<String> = tx
+        .query_row(
+            "SELECT phase FROM allocation_ops WHERE operation_id = ?1",
+            params![operation_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| lease_err("lookup fix-cycle phase", e))?;
+    if phase.as_deref() == Some("MUTATE") {
+        return Ok(());
+    }
+    Err(Error::LeaseStore {
+        context: "commit fix-cycle",
+        message: format!(
+            "fix_cycles commit requires MUTATE before COMMIT, found {}",
+            phase.as_deref().unwrap_or("missing")
+        ),
     })
 }
 

@@ -58,6 +58,11 @@ pub(crate) fn run(action: LeaseAction, ctx: LeaseCli<'_>) -> writ_core::error::R
             "ok={} command={}",
             response.ok, response.command
         )?;
+        writeln!(
+            ctx.stdout,
+            "{}",
+            serde_json::to_string_pretty(&response.data).map_err(std::io::Error::other)?
+        )?;
     }
     Ok(ExitCode::SUCCESS)
 }

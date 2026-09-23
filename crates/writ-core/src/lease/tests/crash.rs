@@ -190,9 +190,9 @@ fn crash_after_registration_is_fail_closed_when_head_is_absent() {
         "needs_attention",
     );
     assert!(harness.worktree.exists());
-    let listing = git(&harness.repo, &["worktree", "list", "--porcelain"]);
+    let listing = git(&harness.repo, &["worktree", "list", "--porcelain", "-z"]);
     assert!(
-        classify::porcelain_lists_worktree(&listing, &harness.worktree),
+        classify::porcelain_lists_worktree(listing.as_bytes(), &harness.worktree),
         "fail-closed reconcile must keep the registered worktree; listing={listing:?} expected={:?}",
         harness.worktree
     );
