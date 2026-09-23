@@ -6,9 +6,11 @@ use rusqlite::{Transaction, TransactionBehavior, params};
 
 use super::query::query_lease_tx;
 use super::{
-    AllocationInspection, AllocationState, Error, Lease, LeaseMode, LeaseStore, ReconcileOutcome,
-    Result, lease_err, now_secs, schema, terminal_outcome,
+    AllocationInspection, AllocationState, Error, EvidenceClass, InspectRequest, JobKey, Lease,
+    LeaseMode, LeaseStore, ReconcileOutcome, Result, classify, lease_err, now_secs, schema,
+    terminal_outcome,
 };
+use std::path::Path;
 
 #[derive(Clone, Copy)]
 enum RecoverLookup {
@@ -39,7 +41,17 @@ impl LeaseStore {
                 inspection,
             });
         }
-        let changed = apply_promote(&tx, expected, now)?;
+        let changed = apply_state(
+            &tx,
+            expected,
+            now,
+            StatePatch {
+                next: AllocationState::Active,
+                mode: LeaseMode::WriterLocked,
+                set_heartbeat: true,
+                context: "promote lease",
+            },
+        )?;
         if !changed {
             tx.commit().map_err(|e| lease_err("commit promote", e))?;
             return Ok(terminal_outcome(current, inspection));
@@ -64,26 +76,67 @@ impl LeaseStore {
         Ok(ReconcileOutcome::Promoted { lease, inspection })
     }
 
-    pub(super) fn abort_if_still_open(
-        &self,
-        expected: &Lease,
-        inspection: AllocationInspection,
-    ) -> Result<ReconcileOutcome> {
-        finish_open_recover(
-            self,
-            RecoverStep {
-                expected,
-                inspection,
-                lookup: RecoverLookup::Operation,
-                label: "abort",
-            },
-        )
+    /// Report derived path, refs, HEAD, registration, and operation identity.
+    ///
+    /// This never mutates git state, never adopts a worktree, and never writes
+    /// the lease store.
+    pub fn inspect(&self, request: InspectRequest<'_>) -> Result<AllocationInspection> {
+        let lease = self.find_job(JobKey {
+            owner: request.owner,
+            repo_name: request.repo_name,
+            job_id: request.job_id,
+        })?;
+        Ok(classify::inspect_now(&lease, request))
     }
 
-    pub(super) fn attention_if_still_open(
+    /// Reconcile an interrupted allocation without destructive cleanup.
+    pub fn reconcile(&self, key: JobKey<'_>, repo_root: &Path) -> Result<Option<ReconcileOutcome>> {
+        let Some(lease) = self.find_job(key)? else {
+            return Ok(None);
+        };
+        let request = InspectRequest {
+            repo_root,
+            owner: key.owner,
+            repo_name: key.repo_name,
+            job_id: key.job_id,
+            worktree_path: Path::new(&lease.worktree_path),
+            branch: Some(&lease.branch),
+        };
+        let inspection = classify::inspect_now(&Some(lease.clone()), request);
+        if lease.allocation_state == AllocationState::Tombstoned {
+            return Ok(Some(ReconcileOutcome::Tombstoned { lease, inspection }));
+        }
+        if lease.allocation_state == AllocationState::Released {
+            return Ok(Some(ReconcileOutcome::Released { lease, inspection }));
+        }
+        if lease.allocation_state == AllocationState::Active {
+            return Ok(Some(ReconcileOutcome::AlreadyActive { lease, inspection }));
+        }
+        if lease.allocation_state == AllocationState::Aborted {
+            return Ok(Some(ReconcileOutcome::Retry {
+                operation_id: lease.operation_id,
+                inspection,
+            }));
+        }
+
+        match inspection.classification {
+            EvidenceClass::Matching => Ok(Some(self.promote_if_still_open(&lease, inspection)?)),
+            EvidenceClass::Retryable => Ok(Some(
+                self.recover_if_still_open(&lease, inspection, "abort")?,
+            )),
+            _ => Ok(Some(self.recover_if_still_open(
+                &lease,
+                inspection,
+                "attention",
+            )?)),
+        }
+    }
+
+    fn recover_if_still_open(
         &self,
         expected: &Lease,
         inspection: AllocationInspection,
+        label: &'static str,
     ) -> Result<ReconcileOutcome> {
         finish_open_recover(
             self,
@@ -91,7 +144,7 @@ impl LeaseStore {
                 expected,
                 inspection,
                 lookup: RecoverLookup::Operation,
-                label: "attention",
+                label,
             },
         )
     }
@@ -119,7 +172,17 @@ fn finish_open_recover(store: &LeaseStore, step: RecoverStep<'_>) -> Result<Reco
     let changed = if step.label == "abort" {
         apply_abort(&tx, step.expected)?
     } else {
-        apply_attention(&tx, step.expected, now)?
+        apply_state(
+            &tx,
+            step.expected,
+            now,
+            StatePatch {
+                next: AllocationState::NeedsAttention,
+                mode: LeaseMode::NeedsHuman,
+                set_heartbeat: false,
+                context: "mark needs attention",
+            },
+        )?
     };
     if !changed {
         tx.commit()
@@ -209,21 +272,42 @@ fn load_open_lease(
     })
 }
 
-fn apply_promote(tx: &Transaction<'_>, expected: &Lease, now: i64) -> Result<bool> {
-    tx.execute(
+struct StatePatch {
+    next: AllocationState,
+    mode: LeaseMode,
+    set_heartbeat: bool,
+    context: &'static str,
+}
+
+fn apply_state(
+    tx: &Transaction<'_>,
+    expected: &Lease,
+    now: i64,
+    patch: StatePatch,
+) -> Result<bool> {
+    let sql = if patch.set_heartbeat {
         "
             UPDATE leases
             SET allocation_state = ?1, mode = ?2, heartbeat = ?3, updated_at = ?3
             WHERE operation_id = ?4 AND released_at IS NULL AND tombstoned_at IS NULL
-            ",
+            "
+    } else {
+        "
+            UPDATE leases
+            SET allocation_state = ?1, mode = ?2, updated_at = ?3
+            WHERE operation_id = ?4 AND released_at IS NULL AND tombstoned_at IS NULL
+            "
+    };
+    tx.execute(
+        sql,
         params![
-            AllocationState::Active.as_str(),
-            LeaseMode::WriterLocked.as_str(),
+            patch.next.as_str(),
+            patch.mode.as_str(),
             now,
             expected.operation_id,
         ],
     )
-    .map_err(|e| lease_err("promote lease", e))?;
+    .map_err(|e| lease_err(patch.context, e))?;
     Ok(tx.changes() == 1)
 }
 
@@ -238,24 +322,6 @@ fn apply_abort(tx: &Transaction<'_>, expected: &Lease) -> Result<bool> {
         params![expected.operation_id],
     )
     .map_err(|e| lease_err("abort reservation", e))?;
-    Ok(tx.changes() == 1)
-}
-
-fn apply_attention(tx: &Transaction<'_>, expected: &Lease, now: i64) -> Result<bool> {
-    tx.execute(
-        "
-            UPDATE leases
-            SET allocation_state = ?1, mode = ?2, updated_at = ?3
-            WHERE operation_id = ?4 AND released_at IS NULL AND tombstoned_at IS NULL
-            ",
-        params![
-            AllocationState::NeedsAttention.as_str(),
-            LeaseMode::NeedsHuman.as_str(),
-            now,
-            expected.operation_id,
-        ],
-    )
-    .map_err(|e| lease_err("mark needs attention", e))?;
     Ok(tx.changes() == 1)
 }
 

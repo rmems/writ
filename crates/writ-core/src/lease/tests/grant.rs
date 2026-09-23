@@ -1,4 +1,5 @@
 use super::*;
+use crate::error::{Error, PolicyCode};
 use rusqlite::params;
 
 // Exercises the `same_existing_path` tolerance inside `inspect_git`'s
