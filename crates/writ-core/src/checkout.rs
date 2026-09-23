@@ -189,6 +189,15 @@ impl CheckoutRegistry {
 /// explicit detached state), the repository identity, and dirty state. Never
 /// writes to the lease store or the working tree.
 pub fn inspect_checkout(path: &Path) -> Result<CheckoutInfo> {
+    inspect_checkout_inner(path, true)
+}
+
+/// HEAD and identity only. Skips `git status --porcelain`.
+pub fn inspect_checkout_for_status(path: &Path) -> Result<CheckoutInfo> {
+    inspect_checkout_inner(path, false)
+}
+
+fn inspect_checkout_inner(path: &Path, include_dirty: bool) -> Result<CheckoutInfo> {
     let toplevel = git_checked(
         path,
         &["rev-parse", "--show-toplevel"],
@@ -217,8 +226,9 @@ pub fn inspect_checkout(path: &Path) -> Result<CheckoutInfo> {
     )
     .map(|value| value.trim().to_owned())
     .filter(|value| !value.is_empty());
-    let dirty = git_optional(&path, &["status", "--porcelain"])
-        .is_some_and(|status| !status.trim().is_empty());
+    let dirty = include_dirty
+        && git_optional(&path, &["status", "--porcelain"])
+            .is_some_and(|status| !status.trim().is_empty());
 
     let origin_slug = crate::git_safe::origin_github_slug(&path).ok();
     let (owner, repo_name) = match origin_slug.as_deref().and_then(|s| s.split_once('/')) {
@@ -434,6 +444,15 @@ mod tests {
         assert!(info.branch.is_some());
         assert!(info.head_commit.is_some());
         assert!(!info.dirty);
+    }
+
+    #[test]
+    fn inspect_for_status_skips_porcelain_dirty_flag() {
+        let (_tmp, repo) = init_repo();
+        std::fs::write(repo.join("wip.txt"), "uncommitted\n").unwrap();
+        let info = inspect_checkout_for_status(&repo).unwrap();
+        assert!(!info.dirty);
+        assert!(inspect_checkout(&repo).unwrap().dirty);
     }
 
     #[test]
@@ -699,6 +718,43 @@ mod tests {
             .expect("deleted checkout must still release its lease");
         assert_eq!(lease.job_id, "gone-job");
         assert!(registry.registered().unwrap().is_empty());
+    }
+
+    #[test]
+    fn register_second_job_for_same_path_fails() {
+        let (tmp, repo) = init_repo();
+        let wt = tmp.path().join("wts/one");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "job/one",
+                wt.to_str().unwrap(),
+            ],
+        );
+
+        let store = LeaseStore::open(tmp.path().join("leases.db")).unwrap();
+        let registry = CheckoutRegistry::with_store(store).unwrap();
+        registry.register(&wt, "job-a").unwrap();
+
+        let err = registry.register(&wt, "job-b").unwrap_err();
+        assert!(matches!(
+            err,
+            crate::error::Error::PolicyViolation {
+                code: crate::error::PolicyCode::LeaseConflict,
+                ..
+            }
+        ));
+        assert_eq!(registry.registered().unwrap().len(), 1);
+
+        registry.unregister(&wt).unwrap();
+        registry.register(&wt, "job-b").unwrap();
+        let active = registry.registered().unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].job_id, "job-b");
     }
 
     #[test]

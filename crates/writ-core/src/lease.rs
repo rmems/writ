@@ -15,7 +15,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
 
 use crate::error::{Error, LeaseAttentionFailure, PolicyCode, Result};
@@ -31,6 +31,8 @@ pub enum LeaseMode {
     NeedsHuman,
     Blocked,
     MergeReady,
+    /// Stored value is not one of the known modes. Not treated as released.
+    Unknown,
 }
 
 impl LeaseMode {
@@ -43,6 +45,7 @@ impl LeaseMode {
             Self::NeedsHuman => "NEEDS_HUMAN",
             Self::Blocked => "BLOCKED",
             Self::MergeReady => "MERGE_READY",
+            Self::Unknown => "UNKNOWN",
         }
     }
 
@@ -53,7 +56,8 @@ impl LeaseMode {
             "NEEDS_HUMAN" => Self::NeedsHuman,
             "BLOCKED" => Self::Blocked,
             "MERGE_READY" => Self::MergeReady,
-            _ => Self::Unassigned,
+            "UNASSIGNED" => Self::Unassigned,
+            _ => Self::Unknown,
         }
     }
 }
@@ -150,6 +154,8 @@ pub struct Lease {
     pub operation_id: String,
     pub allocation_state: AllocationState,
     pub mode: LeaseMode,
+    /// Stored mode text before mapping; unrecognized values survive verbatim.
+    pub mode_raw: String,
     pub ttl: Option<i64>,
     pub heartbeat: Option<i64>,
     pub max_files: Option<i64>,
@@ -160,6 +166,20 @@ pub struct Lease {
     pub pending_fix_op_id: Option<String>,
     pub released_at: Option<i64>,
     pub tombstoned_at: Option<i64>,
+    /// SQLite row id. Identity for the lease record, not an ownership generation.
+    pub row_id: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// One `agents` registry row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentRecord {
+    pub agent_id: String,
+    pub agent_type: String,
+    pub session_id: Option<String>,
+    pub started_at: i64,
+    pub stopped_at: Option<i64>,
 }
 
 /// Inputs required to persist an allocation before the ownership mutation.
@@ -307,7 +327,7 @@ const LEASE_SELECT: &str = "SELECT repo, owner, repo_name, job_id, branch, branc
      worktree_path, requested_start_point, start_commit, operation_id, \
      allocation_state, mode, ttl, heartbeat, max_files, max_churn, \
      max_fix_cycles, fix_cycles, pending_fix_cycles, pending_fix_op_id, \
-     created_at, updated_at, released_at, tombstoned_at FROM leases";
+     created_at, updated_at, released_at, tombstoned_at, id FROM leases";
 
 /// SQLite-backed lease store with a durable allocation journal.
 pub struct LeaseStore {
@@ -387,11 +407,26 @@ impl LeaseStore {
                 started_at INTEGER NOT NULL,
                 stopped_at INTEGER
             );
+            CREATE UNIQUE INDEX IF NOT EXISTS leases_live_worktree_path
+                ON leases(worktree_path)
+                WHERE released_at IS NULL AND tombstoned_at IS NULL;
             ",
         )
         .map_err(|e| lease_err("initialize lease schema", e))?;
         ensure_crash_consistency_columns(&conn)?;
+        ensure_live_path_unique_index(&conn)?;
         crate::coord::ensure_schema(&conn)?;
+        Ok(Self {
+            path,
+            conn: Mutex::new(conn),
+        })
+    }
+
+    /// Open an existing store without creating files or applying schema.
+    pub fn open_read_only(path: impl Into<PathBuf>) -> Result<Self> {
+        let path = path.into();
+        let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|e| lease_err("open lease store read-only", e))?;
         Ok(Self {
             path,
             conn: Mutex::new(conn),
@@ -408,16 +443,22 @@ impl LeaseStore {
     ///
     /// Completes in one SQLite transaction as `ACTIVE`. Crash-consistency for
     /// interrupted registration uses [`Self::prepare_allocate`] instead. An
-    /// active lease held by a different checkout path is never seized.
+    /// active lease held by a different checkout path is never seized. A
+    /// different job cannot take a checkout path that already has a live
+    /// (unreleased, untombstoned) lease. Either conflict fails with
+    /// [`PolicyCode::LeaseConflict`].
     pub fn grant(&self, grant: LeaseGrant<'_>) -> Result<Lease> {
         let now = now_secs();
         let repo = path_text(grant.repo);
         let worktree_path = path_text(grant.worktree_path);
         let branch_ref = format!("refs/heads/{}", grant.branch);
         let operation_id = new_operation_id();
-        let conn = self.lock()?;
-        if let Some(existing) = query_lease_locked(
-            &conn,
+        let mut conn = self.lock()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| lease_err("begin grant", e))?;
+        if let Some(existing) = query_lease_tx(
+            &tx,
             "WHERE owner = ?1 AND repo_name = ?2 AND job_id = ?3",
             params![grant.owner, grant.repo_name, grant.job_id],
             "lookup lease before grant",
@@ -425,7 +466,15 @@ impl LeaseStore {
         {
             return Err(terminal_error(&existing));
         }
-        let changed = conn
+        reject_live_path_occupant(
+            &tx,
+            &worktree_path,
+            grant.owner,
+            grant.repo_name,
+            grant.job_id,
+            "grant lease",
+        )?;
+        let changed = tx
             .execute(
                 "
             INSERT INTO leases (
@@ -481,8 +530,7 @@ impl LeaseStore {
                     now,
                 ],
             )
-            .map_err(|e| lease_err("grant lease", e))?;
-        drop(conn);
+            .map_err(|e| map_live_path_constraint(e, "grant lease"))?;
         if changed == 0 {
             return Err(Error::PolicyViolation {
                 code: PolicyCode::LeaseConflict,
@@ -492,6 +540,8 @@ impl LeaseStore {
                 ),
             });
         }
+        tx.commit().map_err(|e| lease_err("commit grant", e))?;
+        drop(conn);
         self.find_job(JobKey {
             owner: grant.owner,
             repo_name: grant.repo_name,
@@ -514,19 +564,40 @@ impl LeaseStore {
 
     /// All currently held (active, unreleased) leases, in insertion order.
     pub fn list_active(&self) -> Result<Vec<Lease>> {
-        let query = format!(
-            "{LEASE_SELECT} WHERE released_at IS NULL AND tombstoned_at IS NULL \
-             AND allocation_state = 'ACTIVE' ORDER BY id"
-        );
         let conn = self.lock()?;
-        let mut stmt = conn
-            .prepare(&query)
-            .map_err(|e| lease_err("list active leases", e))?;
-        let rows = stmt
-            .query_map([], lease_from_row)
-            .map_err(|e| lease_err("list active leases", e))?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| lease_err("list active leases", e))
+        list_leases_on(
+            &conn,
+            "WHERE released_at IS NULL AND tombstoned_at IS NULL \
+             AND allocation_state = 'ACTIVE' ORDER BY id",
+            "list active leases",
+        )
+    }
+
+    /// All lease identity rows, including released ones, in insertion order.
+    pub fn list_all(&self) -> Result<Vec<Lease>> {
+        let conn = self.lock()?;
+        list_leases_on(&conn, "ORDER BY id", "list leases")
+    }
+
+    /// Agent registry rows, live first, then by start time.
+    pub fn list_agents(&self) -> Result<Vec<AgentRecord>> {
+        let conn = self.lock()?;
+        list_agents_on(&conn)
+    }
+
+    /// Leases and agents from one read transaction.
+    ///
+    /// The mutex serializes this connection only; the transaction keeps other
+    /// processes' writes from splitting the two reads.
+    pub fn snapshot(&self) -> Result<(Vec<Lease>, Vec<AgentRecord>)> {
+        let conn = self.lock()?;
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| lease_err("snapshot transaction", e))?;
+        let leases = list_leases_on(&tx, "ORDER BY id", "list leases")?;
+        let agents = list_agents_on(&tx)?;
+        tx.commit().map_err(|e| lease_err("snapshot commit", e))?;
+        Ok((leases, agents))
     }
 
     /// Upsert a live agent-registry row.
@@ -588,10 +659,19 @@ impl LeaseStore {
         let now = now_secs();
         let operation_id = new_operation_id();
         let branch_ref = format!("refs/heads/{}", request.branch);
+        let worktree_path = path_text(request.worktree_path);
         let mut conn = self.lock()?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| lease_err("begin allocate prepare", e))?;
+        reject_live_path_occupant(
+            &tx,
+            &worktree_path,
+            request.owner,
+            request.repo_name,
+            request.job_id,
+            "prepare allocate",
+        )?;
         tx.execute(
             "
             INSERT INTO leases (
@@ -612,7 +692,7 @@ impl LeaseStore {
                 request.job_id,
                 request.branch,
                 branch_ref,
-                path_text(request.worktree_path),
+                worktree_path,
                 request.requested_start_point,
                 request.start_commit,
                 operation_id,
@@ -622,7 +702,7 @@ impl LeaseStore {
                 now,
             ],
         )
-        .map_err(|e| lease_err("prepare allocate", e))?;
+        .map_err(|e| map_live_path_constraint(e, "prepare allocate"))?;
         insert_op(
             &tx,
             OpRecord {
@@ -808,9 +888,21 @@ impl LeaseStore {
     }
 
     /// Look up a lease by worktree path.
+    ///
+    /// Prefers the live (unreleased, untombstoned) row when one exists. After
+    /// sequential jobs have reused a checkout, released identity rows may share
+    /// the path; `query_row` would fail on that ambiguity, so this returns the
+    /// active holder or else the most recently released row.
     pub fn find_by_path(&self, worktree_path: &Path) -> Result<Option<Lease>> {
         self.query_lease(
-            "WHERE worktree_path = ?1",
+            "WHERE worktree_path = ?1
+                ORDER BY CASE
+                    WHEN released_at IS NULL AND tombstoned_at IS NULL THEN 0
+                    ELSE 1
+                END,
+                COALESCE(released_at, tombstoned_at, 0) DESC,
+                id DESC
+                LIMIT 1",
             params![path_text(worktree_path)],
             "lookup lease by path",
         )
@@ -1365,6 +1457,19 @@ fn ensure_crash_consistency_columns(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn ensure_live_path_unique_index(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "
+        CREATE UNIQUE INDEX IF NOT EXISTS leases_live_worktree_path
+            ON leases(worktree_path)
+            WHERE released_at IS NULL AND tombstoned_at IS NULL
+        ",
+        [],
+    )
+    .map_err(|e| lease_err("ensure live worktree path uniqueness", e))?;
+    Ok(())
+}
+
 struct OpRecord<'a> {
     operation_id: &'a str,
     owner: &'a str,
@@ -1446,7 +1551,33 @@ fn query_lease_tx(
         .map_err(|e| lease_err(context, e))
 }
 
+fn list_leases_on(conn: &Connection, suffix: &str, context: &'static str) -> Result<Vec<Lease>> {
+    let query = format!("{LEASE_SELECT} {suffix}");
+    let mut stmt = conn.prepare(&query).map_err(|e| lease_err(context, e))?;
+    let rows = stmt
+        .query_map([], lease_from_row)
+        .map_err(|e| lease_err(context, e))?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| lease_err(context, e))
+}
+
+fn list_agents_on(conn: &Connection) -> Result<Vec<AgentRecord>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT agent_id, agent_type, session_id, started_at, stopped_at
+             FROM agents
+             ORDER BY (stopped_at IS NOT NULL), started_at, agent_id",
+        )
+        .map_err(|e| lease_err("list agents", e))?;
+    let rows = stmt
+        .query_map([], agent_from_row)
+        .map_err(|e| lease_err("list agents", e))?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| lease_err("list agents", e))
+}
+
 fn lease_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Lease> {
+    let mode_raw: String = row.get(11)?;
     Ok(Lease {
         repo: row.get(0)?,
         owner: row.get(1)?,
@@ -1459,7 +1590,8 @@ fn lease_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Lease> {
         start_commit: row.get(8)?,
         operation_id: row.get(9)?,
         allocation_state: AllocationState::parse(&row.get::<_, String>(10)?),
-        mode: LeaseMode::parse(&row.get::<_, String>(11)?),
+        mode: LeaseMode::parse(&mode_raw),
+        mode_raw,
         ttl: row.get(12)?,
         heartbeat: row.get(13)?,
         max_files: row.get(14)?,
@@ -1470,6 +1602,19 @@ fn lease_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Lease> {
         pending_fix_op_id: row.get(19)?,
         released_at: row.get(22)?,
         tombstoned_at: row.get(23)?,
+        row_id: row.get(24)?,
+        created_at: row.get(20)?,
+        updated_at: row.get(21)?,
+    })
+}
+
+fn agent_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRecord> {
+    Ok(AgentRecord {
+        agent_id: row.get(0)?,
+        agent_type: row.get(1)?,
+        session_id: row.get(2)?,
+        started_at: row.get(3)?,
+        stopped_at: row.get(4)?,
     })
 }
 
@@ -1733,6 +1878,58 @@ fn lease_err(context: &'static str, err: rusqlite::Error) -> Error {
         context,
         message: err.to_string(),
     }
+}
+
+fn live_path_held_error(job_id: &str) -> Error {
+    Error::PolicyViolation {
+        code: PolicyCode::LeaseConflict,
+        message: format!("checkout already holds an active lease for job `{job_id}`"),
+    }
+}
+
+fn is_live_path_unique_violation(err: &rusqlite::Error) -> bool {
+    let text = err.to_string();
+    text.contains("UNIQUE constraint failed")
+        && (text.contains("leases_live_worktree_path") || text.contains("leases.worktree_path"))
+}
+
+fn map_live_path_constraint(err: rusqlite::Error, context: &'static str) -> Error {
+    if is_live_path_unique_violation(&err) {
+        Error::PolicyViolation {
+            code: PolicyCode::LeaseConflict,
+            message: "checkout already holds an active lease for another job".to_owned(),
+        }
+    } else {
+        lease_err(context, err)
+    }
+}
+
+fn reject_live_path_occupant(
+    conn: &Connection,
+    worktree_path: &str,
+    owner: &str,
+    repo_name: &str,
+    job_id: &str,
+    context: &'static str,
+) -> Result<()> {
+    let occupant: Option<String> = conn
+        .query_row(
+            "
+            SELECT job_id FROM leases
+            WHERE worktree_path = ?1
+              AND released_at IS NULL
+              AND tombstoned_at IS NULL
+              AND NOT (owner = ?2 AND repo_name = ?3 AND job_id = ?4)
+            ",
+            params![worktree_path, owner, repo_name, job_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| lease_err(context, e))?;
+    if let Some(held_by) = occupant {
+        return Err(live_path_held_error(&held_by));
+    }
+    Ok(())
 }
 
 fn now_secs() -> i64 {
@@ -2399,6 +2596,8 @@ mod tests {
         assert_eq!(held.max_files, None);
         assert_eq!(held.fix_cycles, Some(0));
         assert!(held.released_at.is_none());
+        assert!(held.row_id > 0);
+        assert!(held.created_at > 0);
 
         let released = store.release_by_path(&wt).unwrap().unwrap();
         assert_eq!(released.mode, LeaseMode::Unassigned);
@@ -2406,6 +2605,12 @@ mod tests {
 
         let active = store.list_active().unwrap();
         assert!(active.is_empty(), "released lease must not list as active");
+        let all = store.list_all().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].mode, LeaseMode::Unassigned);
+        let all = store.list_all().unwrap();
+        assert_eq!(all.len(), 1);
+        assert!(all[0].released_at.is_some());
 
         let resume = store
             .find_resume(ResumeKey {
@@ -2461,6 +2666,57 @@ mod tests {
     }
 
     #[test]
+    fn grant_refuses_active_path_held_by_different_job() {
+        let tmp = tempdir().unwrap();
+        let store = LeaseStore::open(tmp.path().join("leases.db")).unwrap();
+        let repo = tmp.path().join("repo");
+        let wt = tmp.path().join("checkouts/shared");
+        let grant_a = LeaseGrant {
+            repo: &repo,
+            owner: "local",
+            repo_name: "repo",
+            job_id: "job-a",
+            branch: "hive/job-a",
+            worktree_path: &wt,
+            start_commit: "abc123",
+        };
+        let grant_b = LeaseGrant {
+            job_id: "job-b",
+            branch: "hive/job-b",
+            ..grant_a
+        };
+
+        store.grant(grant_a).unwrap();
+        let err = store.grant(grant_b).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::LeaseConflict,
+                ..
+            }
+        ));
+        let active = store.list_active().unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].job_id, "job-a");
+
+        store.release_by_path(&wt).unwrap();
+        let moved = store.grant(grant_b).unwrap();
+        assert_eq!(moved.job_id, "job-b");
+        assert!(moved.released_at.is_none());
+
+        // Sequential reuse leaves a released row and an active row on the same
+        // path. Lookup must return the live holder, not fail closed on
+        // query_row's multiple-row error.
+        let found = store.find_by_path(&wt).unwrap().unwrap();
+        assert_eq!(found.job_id, "job-b");
+        assert!(found.released_at.is_none());
+
+        let released = store.release_by_path(&wt).unwrap().unwrap();
+        assert_eq!(released.job_id, "job-b");
+        assert!(released.released_at.is_some());
+    }
+
+    #[test]
     fn agent_upsert_and_retire() {
         let tmp = tempdir().unwrap();
         let store = LeaseStore::open(tmp.path().join("leases.db")).unwrap();
@@ -2471,7 +2727,20 @@ mod tests {
                 session_id: Some("session-1"),
             })
             .unwrap();
+        store
+            .upsert_agent(AgentIdentity {
+                agent_id: "agent-2",
+                agent_type: "Worker",
+                session_id: None,
+            })
+            .unwrap();
         store.retire_agent("agent-1").unwrap();
+        let agents = store.list_agents().unwrap();
+        assert_eq!(agents.len(), 2);
+        assert_eq!(agents[0].agent_id, "agent-2");
+        assert!(agents[0].stopped_at.is_none());
+        assert_eq!(agents[1].agent_id, "agent-1");
+        assert!(agents[1].stopped_at.is_some());
         let conn = store.conn.lock().unwrap();
         let stopped: Option<i64> = conn
             .query_row(
@@ -2505,5 +2774,40 @@ mod tests {
             "a standalone clone is a live checkout even when absent from origin's worktree list"
         );
         assert_eq!(evidence.head_commit.as_deref(), Some(start.as_str()));
+    }
+
+    #[test]
+    fn unrecognized_mode_is_unknown_not_unassigned() {
+        let tmp = tempdir().unwrap();
+        let store = LeaseStore::open(tmp.path().join("leases.db")).unwrap();
+        let repo = tmp.path().join("repo");
+        let wt = tmp.path().join("checkouts/a");
+        store
+            .grant(LeaseGrant {
+                repo: &repo,
+                owner: "acme",
+                repo_name: "sample",
+                job_id: "job-a",
+                branch: "hive/a",
+                worktree_path: &wt,
+                start_commit: "abc123",
+            })
+            .unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute("UPDATE leases SET mode = 'NOT_A_MODE'", [])
+                .unwrap();
+        }
+        let lease = store
+            .find_job(JobKey {
+                owner: "acme",
+                repo_name: "sample",
+                job_id: "job-a",
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(lease.mode, LeaseMode::Unknown);
+        assert_eq!(lease.mode_raw, "NOT_A_MODE");
+        assert_ne!(lease.mode, LeaseMode::Unassigned);
     }
 }

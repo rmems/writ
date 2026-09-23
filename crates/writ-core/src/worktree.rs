@@ -480,9 +480,11 @@ fn existing_worktree_mode(
     let expected_branch = format!("refs/heads/{}", request.branch);
     if porcelain::registration_matches(
         &listing,
-        worktree_path,
-        BranchRef(&expected_branch),
-        start_commit,
+        porcelain::RegistrationIdentity {
+            path: worktree_path,
+            branch_ref: BranchRef(&expected_branch),
+            head: start_commit,
+        },
     ) {
         return Ok(Some(CreateMode::AlreadyPresent));
     }
@@ -814,9 +816,11 @@ impl CreationPostconditions<'_> {
         })?;
         if !porcelain::registration_matches(
             &listing,
-            self.worktree_path,
-            actual_branch_ref,
-            head_commit,
+            porcelain::RegistrationIdentity {
+                path: self.worktree_path,
+                branch_ref: actual_branch_ref,
+                head: head_commit,
+            },
         ) {
             return Err(self.failure(
                 Some(actual_branch_ref),
@@ -849,6 +853,18 @@ impl CreationPostconditions<'_> {
     }
 }
 
+/// Verifies the newly created worktree matches the requested branch and commit.
+///
+/// The checks form a best-effort, non-atomic evidence chain: the resolving
+/// steps (`actual_branch_ref`, `branch_commit`, `head_commit`, and
+/// `verify_registration`) each run a separate `git` subprocess, while
+/// `verify_identity` is a pure in-memory comparison of already-resolved values.
+/// Git offers no cross-invocation lock spanning the subprocess steps, so the
+/// observed state could in principle change between calls. This is intentional
+/// and not a correctness gap. True
+/// atomicity across sequential subprocesses is not achievable, and writ's
+/// one-writer-per-worktree concurrency model (see AGENTS.md) is what bounds
+/// concurrent mutation of a freshly created worktree, not this sequence.
 fn verify_creation_postconditions(postconditions: CreationPostconditions<'_>) -> Result<String> {
     let actual_branch_ref = postconditions.actual_branch_ref()?;
     let actual_branch = BranchRef(&actual_branch_ref);
@@ -1665,16 +1681,41 @@ mod tests {
 
         assert!(porcelain::registration_matches(
             &correct,
-            path,
-            BranchRef("refs/heads/feature/job"),
-            CommitId(&expected_head),
+            porcelain::RegistrationIdentity {
+                path,
+                branch_ref: BranchRef("refs/heads/feature/job"),
+                head: CommitId(&expected_head),
+            },
         ));
         assert!(!porcelain::registration_matches(
             &wrong_branch,
-            path,
-            BranchRef("refs/heads/feature/job"),
-            CommitId(&expected_head),
+            porcelain::RegistrationIdentity {
+                path,
+                branch_ref: BranchRef("refs/heads/feature/job"),
+                head: CommitId(&expected_head),
+            },
         ));
+    }
+
+    #[test]
+    fn successful_create_reports_registered_residual_state() {
+        let harness = Harness::sha1();
+        let start_commit = harness.head();
+        let wt = harness
+            .create("job-registered", "feature/registered", &start_commit)
+            .unwrap();
+        let residual = inspect_residual_state(
+            &harness.repo_root,
+            &wt.path,
+            BranchName("feature/registered"),
+        );
+        assert!(residual.path_exists);
+        assert!(residual.worktree_registered);
+        assert_eq!(
+            residual.branch_commit.as_deref(),
+            Some(start_commit.as_str())
+        );
+        assert_eq!(residual.head_commit.as_deref(), Some(start_commit.as_str()));
     }
 
     #[test]
@@ -2284,12 +2325,22 @@ mod tests {
             .output()
             .unwrap();
         assert!(listing.status.success());
-        assert!(porcelain::registration_matches(
-            &listing.stdout,
-            &wt.path,
-            BranchRef("refs/heads/feature/newline"),
-            CommitId(&start),
-        ));
+        assert!(
+            porcelain::registration_matches(
+                &listing.stdout,
+                porcelain::RegistrationIdentity {
+                    path: &wt.path,
+                    branch_ref: BranchRef("refs/heads/feature/newline"),
+                    head: CommitId(&start),
+                },
+            ),
+            "newline-containing worktree path must stay in one porcelain record"
+        );
+        let residual = inspect_residual_state(&repo_root, &wt.path, BranchName("feature/newline"));
+        assert!(
+            residual.worktree_registered,
+            "newline-path creation must report worktree_registered rather than a false postcondition miss"
+        );
         assert_eq!(wt.start_commit.as_deref(), Some(start.as_str()));
         assert_eq!(wt.head_commit.as_deref(), Some(start.as_str()));
     }

@@ -18,6 +18,7 @@ use crate::error::{Error, PolicyCode, Result};
 
 mod gh;
 mod identity;
+mod origin;
 mod restricted;
 #[cfg(test)]
 mod tests;
@@ -29,8 +30,9 @@ pub use gh::{
 };
 pub use identity::{
     github_owner_name, github_repo_slugs_match, is_supported_github_remote,
-    normalize_github_repo_identity, normalize_github_repo_slug, origin_github_slug,
+    normalize_github_repo_identity, normalize_github_repo_slug,
 };
+pub use origin::{origin_github_repo_selector, origin_github_slug};
 pub(crate) use restricted::{
     run_allowlisted_git_restricted, run_allowlisted_git_restricted_with_file,
 };
