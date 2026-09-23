@@ -76,12 +76,18 @@ engines:
   # leases.db. Unit tests live beside the loaders (sqlite row maps, probe
   # JSON). Complexity engines count those fixtures and query_map closures as
   # production cyclomatic complexity. Security engines stay enabled.
+  #
+  # `coord.rs` was modularized into `coord/mod.rs` plus siblings
+  # (`declared_paths.rs`, etc.). Complexity/metric/lizard exclude the
+  # directory glob so branched schema negotiation stays excluded on purpose,
+  # the same way as `lease/**` / `git_safe/**` / `watchlist/**`. Security
+  # engines stay enabled on these paths.
   complexity:
     exclude_paths:
       - "crates/*/tests/**"
       - "crates/*/src/attribution.rs"
       - "crates/*/src/checkout.rs"
-      - "crates/*/src/coord.rs"
+      - "crates/*/src/coord/**"
       - "crates/*/src/lease/**"
       - "crates/*/src/status.rs"
       - "crates/*/src/worktree.rs"
@@ -104,7 +110,7 @@ engines:
       - "crates/*/tests/**"
       - "crates/*/src/attribution.rs"
       - "crates/*/src/checkout.rs"
-      - "crates/*/src/coord.rs"
+      - "crates/*/src/coord/**"
       - "crates/*/src/lease/**"
       - "crates/*/src/status.rs"
       - "crates/*/src/worktree.rs"
@@ -125,7 +131,7 @@ engines:
       - "crates/*/tests/**"
       - "crates/*/src/attribution.rs"
       - "crates/*/src/checkout.rs"
-      - "crates/*/src/coord.rs"
+      - "crates/*/src/coord/**"
       - "crates/*/src/lease/**"
       - "crates/*/src/status.rs"
       - "crates/*/src/worktree.rs"
