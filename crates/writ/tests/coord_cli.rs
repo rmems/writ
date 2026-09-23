@@ -7,9 +7,14 @@ use std::thread;
 
 use common::{TestDir, add_origin, git, init_repo, json, writ};
 
-fn create_job(root: &Path, repo: &Path, job_id: &str, branch: &str) -> PathBuf {
+struct JobSpec<'a> {
+    job: &'a str,
+    branch: &'a str,
+}
+
+fn create_job(root: &Path, repo: &Path, spec: JobSpec<'_>) -> PathBuf {
     let start = git(repo, &["rev-parse", "HEAD"]);
-    let path = root.join("checkouts").join(job_id);
+    let path = root.join("checkouts").join(spec.job);
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     git(
         repo,
@@ -17,7 +22,7 @@ fn create_job(root: &Path, repo: &Path, job_id: &str, branch: &str) -> PathBuf {
             "worktree",
             "add",
             "-b",
-            branch,
+            spec.branch,
             "--",
             path.to_str().unwrap(),
             &start,
@@ -31,21 +36,22 @@ fn create_job(root: &Path, repo: &Path, job_id: &str, branch: &str) -> PathBuf {
             "register",
             path.to_str().unwrap(),
             "--job",
-            job_id,
+            spec.job,
         ],
     );
     assert!(registered.status.success(), "{:?}", registered.stderr);
     path
 }
 
-fn announce(
-    root: &Path,
-    job: &str,
-    agent: &str,
-    session: &str,
-    intent: &str,
-    path: &str,
-) -> Output {
+struct AnnounceSpec<'a> {
+    job: &'a str,
+    agent: &'a str,
+    session: &'a str,
+    intent: &'a str,
+    path: &'a str,
+}
+
+fn announce(root: &Path, spec: AnnounceSpec<'_>) -> Output {
     writ(
         root,
         &[
@@ -54,15 +60,15 @@ fn announce(
             "announce",
             "acme",
             "sample",
-            job,
+            spec.job,
             "--agent",
-            agent,
+            spec.agent,
             "--session",
-            session,
+            spec.session,
             "--intent",
-            intent,
+            spec.intent,
             "--path",
-            path,
+            spec.path,
         ],
     )
 }
@@ -117,7 +123,7 @@ fn assert_cross_process_visibility(root: &Path) {
     );
 }
 
-fn transfer_paused_job(root: &Path) {
+fn pause_job(root: &Path) {
     let paused = writ(
         root,
         &[
@@ -142,6 +148,9 @@ fn transfer_paused_job(root: &Path) {
         ],
     );
     assert_eq!(json(&seize)["error"]["code"], "COORD_CLAIM_HELD");
+}
+
+fn ack_handoff(root: &Path) {
     let handoff = writ(
         root,
         &[
@@ -189,30 +198,53 @@ fn transfer_paused_job(root: &Path) {
     );
 }
 
+fn transfer_paused_job(root: &Path) {
+    pause_job(root);
+    ack_handoff(root);
+}
+
 #[test]
 fn two_processes_share_store_and_exchange_overlap_help_handoff() {
     let root = TestDir::new("coord-cli");
     let repo = init_repo(&root.path);
     add_origin(&repo);
-    let path_a = create_job(&root.path, &repo, "job-a", "hive/job-a");
-    let path_b = create_job(&root.path, &repo, "job-b", "hive/job-b");
+    let path_a = create_job(
+        &root.path,
+        &repo,
+        JobSpec {
+            job: "job-a",
+            branch: "hive/job-a",
+        },
+    );
+    let path_b = create_job(
+        &root.path,
+        &repo,
+        JobSpec {
+            job: "job-b",
+            branch: "hive/job-b",
+        },
+    );
     fs::write(path_a.join("wip.txt"), "do not delete").unwrap();
     assert_advisory_overlap(
         &announce(
             &root.path,
-            "job-a",
-            "agent-a",
-            "sess-a",
-            "own coord.rs",
-            "crates/writ-core/src/coord.rs",
+            AnnounceSpec {
+                job: "job-a",
+                agent: "agent-a",
+                session: "sess-a",
+                intent: "own coord.rs",
+                path: "crates/writ-core/src/coord.rs",
+            },
         ),
         &announce(
             &root.path,
-            "job-b",
-            "agent-b",
-            "sess-b",
-            "own coord module",
-            "crates/writ-core/src",
+            AnnounceSpec {
+                job: "job-b",
+                agent: "agent-b",
+                session: "sess-b",
+                intent: "own coord module",
+                path: "crates/writ-core/src",
+            },
         ),
     );
     assert_cross_process_visibility(&root.path);
@@ -229,8 +261,22 @@ fn two_processes_can_list_the_same_claims() {
     let root = TestDir::new("coord-cli");
     let repo = init_repo(&root.path);
     add_origin(&repo);
-    create_job(&root.path, &repo, "job-a", "hive/job-a");
-    create_job(&root.path, &repo, "job-b", "hive/job-b");
+    create_job(
+        &root.path,
+        &repo,
+        JobSpec {
+            job: "job-a",
+            branch: "hive/job-a",
+        },
+    );
+    create_job(
+        &root.path,
+        &repo,
+        JobSpec {
+            job: "job-b",
+            branch: "hive/job-b",
+        },
+    );
     let announced = writ(
         &root.path,
         &[

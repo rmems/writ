@@ -258,34 +258,15 @@ impl LeaseStore {
         }
         let generation = existing.as_ref().map_or(1, |claim| claim.owner_generation);
         let paused_at = existing.as_ref().and_then(|claim| claim.paused_at);
-        persist_announce_claim(
+        let (intent, overlaps) = persist_announce_tx(
             &tx,
+            key,
             AnnouncePersist {
                 request: &request,
                 lease: &lease,
                 generation,
                 paused_at,
                 paths: &paths,
-                now,
-            },
-        )?;
-        let intent = insert_announce_intent(
-            &tx,
-            IntentInsert {
-                request: &request,
-                generation,
-                paths: &paths,
-                now,
-            },
-        )?;
-        let others = list_other_claims_tx(&tx, key)?;
-        let overlaps = record_advisory_overlaps(
-            &tx,
-            OverlapScan {
-                request: &request,
-                generation,
-                paths: &paths,
-                others: &others,
                 now,
             },
         )?;
@@ -886,7 +867,7 @@ struct AnnouncePersist<'a> {
     now: i64,
 }
 
-fn persist_announce_claim(tx: &rusqlite::Transaction<'_>, row: AnnouncePersist<'_>) -> Result<()> {
+fn persist_announce_claim(tx: &rusqlite::Transaction<'_>, row: &AnnouncePersist<'_>) -> Result<()> {
     let paths_json = encode_paths(row.paths)?;
     tx.execute(
         "
@@ -919,6 +900,35 @@ fn persist_announce_claim(tx: &rusqlite::Transaction<'_>, row: AnnouncePersist<'
     )
     .map_err(|e| coord_err("upsert coord claim", e))?;
     Ok(())
+}
+
+fn persist_announce_tx(
+    tx: &rusqlite::Transaction<'_>,
+    key: JobKey<'_>,
+    row: AnnouncePersist<'_>,
+) -> Result<(CoordMessage, Vec<PathOverlap>)> {
+    persist_announce_claim(tx, &row)?;
+    let intent = insert_announce_intent(
+        tx,
+        IntentInsert {
+            request: row.request,
+            generation: row.generation,
+            paths: row.paths,
+            now: row.now,
+        },
+    )?;
+    let others = list_other_claims_tx(tx, key)?;
+    let overlaps = record_advisory_overlaps(
+        tx,
+        OverlapScan {
+            request: row.request,
+            generation: row.generation,
+            paths: row.paths,
+            others: &others,
+            now: row.now,
+        },
+    )?;
+    Ok((intent, overlaps))
 }
 
 struct IntentInsert<'a> {
@@ -1254,6 +1264,35 @@ mod tests {
         }
     }
 
+    fn sample_handoff(store: &LeaseStore, body: &str, to_job_id: Option<&str>) -> CoordMessage {
+        store
+            .propose_handoff(HandoffRequest {
+                owner: "acme",
+                repo_name: "sample",
+                job_id: "job-a",
+                from_agent_id: "agent-a",
+                to_agent_id: "agent-b",
+                to_job_id,
+                expected_generation: Some(1),
+                body,
+            })
+            .unwrap()
+    }
+
+    fn sample_ack(
+        peer: &LeaseStore,
+        message_id: i64,
+    ) -> crate::error::Result<(CoordMessage, Option<CoordClaim>)> {
+        peer.ack_message(AckRequest {
+            message_id,
+            owner: "acme",
+            repo_name: "sample",
+            job_id: "job-a",
+            agent_id: "agent-b",
+            session_id: Some("session-b"),
+        })
+    }
+
     #[test]
     fn pause_does_not_release_or_delete_wip_and_requires_handoff_ack() {
         let harness = Harness::new();
@@ -1267,10 +1306,9 @@ mod tests {
             &[String::from("crates/writ-core/src/coord.rs")],
         );
         let peer = LeaseStore::open(&harness.path).unwrap();
-        let key = job_key_a();
         let (paused, help) = harness
             .store
-            .pause_claim(key, "agent-a", Some("owner crashed"))
+            .pause_claim(job_key_a(), "agent-a", Some("owner crashed"))
             .unwrap();
         assert!(paused.paused_at.is_some() && help.kind == MessageKind::Help);
         assert_eq!(fs::read_to_string(&wip).unwrap(), "keep me");
@@ -1284,29 +1322,12 @@ mod tests {
             intent: Some("take over"),
             paths: &[String::from("crates/writ-core/src/coord.rs")],
         }));
-        let handoff = harness
-            .store
-            .propose_handoff(HandoffRequest {
-                owner: "acme",
-                repo_name: "sample",
-                job_id: "job-a",
-                from_agent_id: "agent-a",
-                to_agent_id: "agent-b",
-                to_job_id: Some("job-a"),
-                expected_generation: Some(1),
-                body: "paused owner transferring assignment",
-            })
-            .unwrap();
-        let (ack, transferred) = peer
-            .ack_message(AckRequest {
-                message_id: handoff.id,
-                owner: "acme",
-                repo_name: "sample",
-                job_id: "job-a",
-                agent_id: "agent-b",
-                session_id: Some("session-b"),
-            })
-            .unwrap();
+        let handoff = sample_handoff(
+            &harness.store,
+            "paused owner transferring assignment",
+            Some("job-a"),
+        );
+        let (ack, transferred) = sample_ack(&peer, handoff.id).unwrap();
         let transferred = transferred.expect("handoff ACK transfers the claim");
         assert_eq!(
             (
@@ -1316,38 +1337,11 @@ mod tests {
             ),
             (MessageKind::Ack, "agent-b", 2)
         );
-        assert!(
-            peer.ack_message(AckRequest {
-                message_id: handoff.id,
-                owner: "acme",
-                repo_name: "sample",
-                job_id: "job-a",
-                agent_id: "agent-b",
-                session_id: Some("session-b"),
-            })
-            .is_err()
-        );
+        assert!(sample_ack(&peer, handoff.id).is_err());
         assert_eq!(fs::read_to_string(&wip).unwrap(), "keep me");
     }
 
-    #[test]
-    fn stale_generation_handoff_is_rejected() {
-        let harness = Harness::new();
-        harness.seed_job("job-a", "hive/job-a");
-        announce(&harness.store, "job-a", "agent-a", &[]);
-        let err = harness
-            .store
-            .propose_handoff(HandoffRequest {
-                owner: "acme",
-                repo_name: "sample",
-                job_id: "job-a",
-                from_agent_id: "agent-a",
-                to_agent_id: "agent-b",
-                to_job_id: None,
-                expected_generation: Some(99),
-                body: "stale",
-            })
-            .unwrap_err();
+    fn assert_stale(err: Error) {
         match err {
             Error::PolicyViolation {
                 code: PolicyCode::CoordStaleGeneration,
@@ -1355,57 +1349,32 @@ mod tests {
             } => {}
             other => panic!("expected stale generation, got {other:?}"),
         }
+    }
 
+    #[test]
+    fn stale_generation_handoff_is_rejected() {
+        let harness = Harness::new();
+        harness.seed_job("job-a", "hive/job-a");
+        announce(&harness.store, "job-a", "agent-a", &[]);
+        assert_stale(
+            harness
+                .store
+                .propose_handoff(HandoffRequest {
+                    owner: "acme",
+                    repo_name: "sample",
+                    job_id: "job-a",
+                    from_agent_id: "agent-a",
+                    to_agent_id: "agent-b",
+                    to_job_id: None,
+                    expected_generation: Some(99),
+                    body: "stale",
+                })
+                .unwrap_err(),
+        );
         let peer = LeaseStore::open(&harness.path).unwrap();
-        let first = harness
-            .store
-            .propose_handoff(HandoffRequest {
-                owner: "acme",
-                repo_name: "sample",
-                job_id: "job-a",
-                from_agent_id: "agent-a",
-                to_agent_id: "agent-b",
-                to_job_id: None,
-                expected_generation: Some(1),
-                body: "first gen-1 offer",
-            })
-            .unwrap();
-        let leftover = harness
-            .store
-            .propose_handoff(HandoffRequest {
-                owner: "acme",
-                repo_name: "sample",
-                job_id: "job-a",
-                from_agent_id: "agent-a",
-                to_agent_id: "agent-b",
-                to_job_id: None,
-                expected_generation: Some(1),
-                body: "leftover gen-1 offer",
-            })
-            .unwrap();
-        peer.ack_message(AckRequest {
-            message_id: first.id,
-            owner: "acme",
-            repo_name: "sample",
-            job_id: "job-a",
-            agent_id: "agent-b",
-            session_id: Some("session-b"),
-        })
-        .unwrap();
-        let stale_ack = peer.ack_message(AckRequest {
-            message_id: leftover.id,
-            owner: "acme",
-            repo_name: "sample",
-            job_id: "job-a",
-            agent_id: "agent-b",
-            session_id: Some("session-b"),
-        });
-        match stale_ack {
-            Err(Error::PolicyViolation {
-                code: PolicyCode::CoordStaleGeneration,
-                ..
-            }) => {}
-            other => panic!("expected stale generation on leftover handoff ACK, got {other:?}"),
-        }
+        let first = sample_handoff(&harness.store, "first gen-1 offer", None);
+        let leftover = sample_handoff(&harness.store, "leftover gen-1 offer", None);
+        sample_ack(&peer, first.id).unwrap();
+        assert_stale(sample_ack(&peer, leftover.id).unwrap_err());
     }
 }
