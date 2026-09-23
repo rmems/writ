@@ -296,27 +296,7 @@ fn execute_offer(
     action: CoordAction,
 ) -> writ_core::error::Result<Response<serde_json::Value>> {
     match action {
-        CoordAction::Announce {
-            owner,
-            repo_name,
-            job_id,
-            agent,
-            session,
-            intent,
-            paths,
-        } => value(
-            "coord.announce",
-            &store.announce(AnnounceRequest {
-                owner: &owner,
-                repo_name: &repo_name,
-                job_id: &job_id,
-                agent_id: &agent,
-                session_id: session.as_deref(),
-                agent_type: "worker",
-                intent: intent.as_deref(),
-                paths: &paths,
-            })?,
-        ),
+        CoordAction::Announce { .. } => execute_announce(store, action),
         CoordAction::Handoff {
             owner,
             repo_name,
@@ -341,6 +321,37 @@ fn execute_offer(
         ),
         _ => unreachable!("execute_offer only handles announce/handoff"),
     }
+}
+
+fn execute_announce(
+    store: &LeaseStore,
+    action: CoordAction,
+) -> writ_core::error::Result<Response<serde_json::Value>> {
+    let CoordAction::Announce {
+        owner,
+        repo_name,
+        job_id,
+        agent,
+        session,
+        intent,
+        paths,
+    } = action
+    else {
+        unreachable!("execute_announce only handles Announce");
+    };
+    value(
+        "coord.announce",
+        &store.announce(AnnounceRequest {
+            owner: &owner,
+            repo_name: &repo_name,
+            job_id: &job_id,
+            agent_id: &agent,
+            session_id: session.as_deref(),
+            agent_type: "worker",
+            intent: intent.as_deref(),
+            paths: &paths,
+        })?,
+    )
 }
 
 fn execute_control(
