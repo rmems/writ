@@ -229,40 +229,53 @@ struct ReadCmd<'a> {
 
 fn execute_read(cmd: ReadCmd<'_>) -> writ_core::error::Result<Response<serde_json::Value>> {
     match cmd.action {
+        CoordAction::List => list_allowed(cmd.store, cmd.allowlist),
+        other => load_coord_read(cmd.store, other),
+    }
+}
+
+fn load_coord_read(
+    store: &LeaseStore,
+    action: CoordAction,
+) -> writ_core::error::Result<Response<serde_json::Value>> {
+    let (owner, repo_name, job_id, field) = match action {
         CoordAction::Show {
             owner,
             repo_name,
             job_id,
-        } => job_field(
-            JobKey {
-                owner: &owner,
-                repo_name: &repo_name,
-                job_id: &job_id,
-            },
+        } => (
+            owner,
+            repo_name,
+            job_id,
             JobField {
                 command: "coord.show",
                 name: "claim",
             },
-            |key| cmd.store.find_claim(key),
         ),
-        CoordAction::List => list_allowed(cmd.store, cmd.allowlist),
         CoordAction::Inbox {
             owner,
             repo_name,
             job_id,
-        } => job_field(
-            JobKey {
-                owner: &owner,
-                repo_name: &repo_name,
-                job_id: &job_id,
-            },
+        } => (
+            owner,
+            repo_name,
+            job_id,
             JobField {
                 command: "coord.inbox",
                 name: "messages",
             },
-            |key| cmd.store.inbox(key),
         ),
-        _ => unreachable!("execute_read only handles show/list/inbox"),
+        _ => unreachable!("load_coord_read only handles show/inbox"),
+    };
+    let key = JobKey {
+        owner: &owner,
+        repo_name: &repo_name,
+        job_id: &job_id,
+    };
+    if field.name == "claim" {
+        job_field(key, field, |key| store.find_claim(key))
+    } else {
+        job_field(key, field, |key| store.inbox(key))
     }
 }
 
