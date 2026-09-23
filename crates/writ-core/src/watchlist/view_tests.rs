@@ -102,29 +102,17 @@ fn exec_sql(store: &LeaseStore, sql: &str) {
         .unwrap();
 }
 
-const COORD_TABLES: &str = "
-            CREATE TABLE coord_claims (
-                owner TEXT, repo_name TEXT, job_id TEXT, agent_id TEXT,
-                session_id TEXT, intent TEXT, declared_paths TEXT,
-                owner_generation INTEGER, paused_at INTEGER
-            );
-            CREATE TABLE coord_messages (
-                kind TEXT, from_agent_id TEXT, from_job_id TEXT,
-                to_owner TEXT, to_repo_name TEXT, to_job_id TEXT,
-                body TEXT, acked_at INTEGER
-            );
-";
-
 #[test]
 fn list_reads_leases_without_coord_or_github() {
     let seeded = seed_job();
     let data = load_view(&seeded.store, &WatchQuery::default(), None, &allowlist()).unwrap();
-    assert!(!data.coord_available);
+    assert!(data.coord_available);
     assert!(!data.github_probed);
     assert_eq!(data.entries.len(), 1);
     assert_eq!(data.entries[0].collab_status, CollabStatus::Running);
     assert_eq!(data.entries[0].recovery_status, RecoveryStatus::Live);
     assert!(data.entries[0].github.is_none());
+    assert!(data.entries[0].coord.agent_id.is_none());
 }
 
 #[test]
@@ -132,12 +120,16 @@ fn paused_claim_and_help_message_shape_waiting_and_paused() {
     let seeded = seed_job();
     exec_sql(
         &seeded.store,
-        &format!(
-            "{COORD_TABLES}
-            INSERT INTO coord_claims VALUES (
-                'acme','sample','job-1','agent-a',NULL,NULL,'[]',1,10
-            );"
-        ),
+        "
+            INSERT INTO coord_claims (
+                owner, repo_name, job_id, branch, worktree_path, agent_id,
+                session_id, intent, declared_paths, owner_generation, paused_at,
+                created_at, updated_at
+            ) VALUES (
+                'acme','sample','job-1','hive/job-1','checkout','agent-a',
+                NULL,NULL,'[]',1,10,1,1
+            );
+        ",
     );
     let data = load_view(&seeded.store, &WatchQuery::default(), None, &allowlist()).unwrap();
     assert!(data.coord_available);
@@ -182,15 +174,25 @@ fn unacked_help_without_pause_is_waiting() {
     let seeded = seed_job();
     exec_sql(
         &seeded.store,
-        &format!(
-            "{COORD_TABLES}
-            INSERT INTO coord_claims VALUES (
-                'acme','sample','job-1','agent-a',NULL,NULL,'[]',1,NULL
+        "
+            INSERT INTO coord_claims (
+                owner, repo_name, job_id, branch, worktree_path, agent_id,
+                session_id, intent, declared_paths, owner_generation, paused_at,
+                created_at, updated_at
+            ) VALUES (
+                'acme','sample','job-1','hive/job-1','checkout','agent-a',
+                NULL,NULL,'[]',1,NULL,1,1
             );
-            INSERT INTO coord_messages VALUES (
-                'handoff','agent-b','job-2','acme','sample','job-1','take over', NULL
-            );"
-        ),
+            INSERT INTO coord_messages (
+                created_at, kind, from_agent_id, from_owner, from_repo_name, from_job_id,
+                to_agent_id, to_owner, to_repo_name, to_job_id, owner_generation,
+                body, paths, ack_of, acked_at
+            ) VALUES (
+                1,'handoff','agent-b','acme','sample','job-2',
+                NULL,'acme','sample','job-1',1,
+                'take over','[]',NULL,NULL
+            );
+        ",
     );
     let data = load_view(&seeded.store, &WatchQuery::default(), None, &allowlist()).unwrap();
     assert_eq!(data.entries[0].collab_status, CollabStatus::Waiting);
@@ -359,7 +361,10 @@ fn disallowed_owner_is_filtered_from_entries() {
 #[test]
 fn coord_read_failure_surfaces_residual() {
     let seeded = seed_job();
-    exec_sql(&seeded.store, "CREATE TABLE coord_claims (broken INTEGER);");
+    exec_sql(
+        &seeded.store,
+        "DROP TABLE coord_claims; CREATE TABLE coord_claims (broken INTEGER);",
+    );
     let data = load_view(&seeded.store, &WatchQuery::default(), None, &allowlist()).unwrap();
     assert!(
         data.entries[0]

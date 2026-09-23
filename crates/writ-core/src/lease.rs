@@ -329,6 +329,15 @@ const LEASE_SELECT: &str = "SELECT repo, owner, repo_name, job_id, branch, branc
      max_fix_cycles, fix_cycles, pending_fix_cycles, pending_fix_op_id, \
      created_at, updated_at, released_at, tombstoned_at, id FROM leases";
 
+const LIVE_PATH_LOOKUP: &str = "WHERE worktree_path = ?1
+                ORDER BY CASE
+                    WHEN released_at IS NULL AND tombstoned_at IS NULL THEN 0
+                    ELSE 1
+                END,
+                COALESCE(released_at, tombstoned_at, 0) DESC,
+                id DESC
+                LIMIT 1";
+
 /// SQLite-backed lease store with a durable allocation journal.
 pub struct LeaseStore {
     path: PathBuf,
@@ -818,12 +827,8 @@ impl LeaseStore {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| lease_err("begin lease finalize", e))?;
-        let existing = query_lease_tx(
-            &tx,
-            "WHERE worktree_path = ?1",
-            params![path],
-            "lookup lease by path",
-        )?;
+        let existing =
+            query_lease_tx(&tx, LIVE_PATH_LOOKUP, params![path], "lookup lease by path")?;
         let Some(lease) = existing else {
             tx.commit()
                 .map_err(|e| lease_err("commit lease finalize", e))?;
@@ -845,7 +850,7 @@ impl LeaseStore {
             UPDATE leases
             SET allocation_state = ?1, mode = ?2, released_at = ?3, tombstoned_at = ?4,
                 updated_at = ?5
-            WHERE worktree_path = ?6 AND tombstoned_at IS NULL
+            WHERE id = ?6 AND tombstoned_at IS NULL
             ",
             params![
                 state.as_str(),
@@ -853,7 +858,7 @@ impl LeaseStore {
                 released_at,
                 tombstoned_at,
                 now,
-                path,
+                lease.row_id,
             ],
         )
         .map_err(|e| lease_err("finalize lease", e))?;
@@ -895,14 +900,7 @@ impl LeaseStore {
     /// active holder or else the most recently released row.
     pub fn find_by_path(&self, worktree_path: &Path) -> Result<Option<Lease>> {
         self.query_lease(
-            "WHERE worktree_path = ?1
-                ORDER BY CASE
-                    WHEN released_at IS NULL AND tombstoned_at IS NULL THEN 0
-                    ELSE 1
-                END,
-                COALESCE(released_at, tombstoned_at, 0) DESC,
-                id DESC
-                LIMIT 1",
+            LIVE_PATH_LOOKUP,
             params![path_text(worktree_path)],
             "lookup lease by path",
         )
