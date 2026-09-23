@@ -477,10 +477,12 @@ impl LeaseStore {
         }
         reject_live_path_occupant(
             &tx,
-            &worktree_path,
-            grant.owner,
-            grant.repo_name,
-            grant.job_id,
+            LivePathClaim {
+                worktree_path: &worktree_path,
+                owner: grant.owner,
+                repo_name: grant.repo_name,
+                job_id: grant.job_id,
+            },
             "grant lease",
         )?;
         let changed = tx
@@ -675,10 +677,12 @@ impl LeaseStore {
             .map_err(|e| lease_err("begin allocate prepare", e))?;
         reject_live_path_occupant(
             &tx,
-            &worktree_path,
-            request.owner,
-            request.repo_name,
-            request.job_id,
+            LivePathClaim {
+                worktree_path: &worktree_path,
+                owner: request.owner,
+                repo_name: request.repo_name,
+                job_id: request.job_id,
+            },
             "prepare allocate",
         )?;
         tx.execute(
@@ -1718,21 +1722,30 @@ fn classify(
     _path: &Path,
     ttl_expired: bool,
 ) -> (EvidenceClass, Vec<String>) {
-    let Some(lease) = lease else {
-        if evidence.path_exists || evidence.branch_commit.is_some() || evidence.worktree_registered
-        {
-            return (
-                EvidenceClass::MissingLease,
-                vec!["live worktree or branch with no lease row".to_owned()],
-            );
-        }
-        return (EvidenceClass::Absent, Vec::new());
-    };
-    if lease.allocation_state == AllocationState::Tombstoned {
-        return (EvidenceClass::Tombstoned, Vec::new());
+    match lease {
+        None => classify_missing_lease(evidence),
+        Some(lease) => classify_existing(lease, evidence, ttl_expired),
     }
-    if lease.allocation_state == AllocationState::Released {
-        return (EvidenceClass::Released, Vec::new());
+}
+
+fn classify_missing_lease(evidence: &GitEvidence) -> (EvidenceClass, Vec<String>) {
+    if evidence.path_exists || evidence.branch_commit.is_some() || evidence.worktree_registered {
+        (
+            EvidenceClass::MissingLease,
+            vec!["live worktree or branch with no lease row".to_owned()],
+        )
+    } else {
+        (EvidenceClass::Absent, Vec::new())
+    }
+}
+
+fn classify_existing(
+    lease: &Lease,
+    evidence: &GitEvidence,
+    ttl_expired: bool,
+) -> (EvidenceClass, Vec<String>) {
+    if let Some(class) = classify_terminal_or_retryable(lease, evidence, ttl_expired) {
+        return (class, Vec::new());
     }
     if lease.allocation_state == AllocationState::Active && ttl_expired && evidence.path_exists {
         return (
@@ -1740,15 +1753,37 @@ fn classify(
             vec!["lease heartbeat/ttl expired while worktree is still live".to_owned()],
         );
     }
+    let conflicts = identity_conflicts(lease, evidence);
+    if conflicts.is_empty() {
+        (EvidenceClass::Matching, conflicts)
+    } else {
+        (EvidenceClass::NeedsAttention, conflicts)
+    }
+}
 
-    let no_mutation = !evidence.path_exists
+fn classify_terminal_or_retryable(
+    lease: &Lease,
+    evidence: &GitEvidence,
+    _ttl_expired: bool,
+) -> Option<EvidenceClass> {
+    match lease.allocation_state {
+        AllocationState::Tombstoned => Some(EvidenceClass::Tombstoned),
+        AllocationState::Released => Some(EvidenceClass::Released),
+        _ if no_git_mutation(evidence) && lease.allocation_state.is_in_progress() => {
+            Some(EvidenceClass::Retryable)
+        }
+        _ => None,
+    }
+}
+
+fn no_git_mutation(evidence: &GitEvidence) -> bool {
+    !evidence.path_exists
         && evidence.branch_commit.is_none()
         && evidence.head_commit.is_none()
-        && !evidence.worktree_registered;
-    if no_mutation && lease.allocation_state.is_in_progress() {
-        return (EvidenceClass::Retryable, Vec::new());
-    }
+        && !evidence.worktree_registered
+}
 
+fn identity_conflicts(lease: &Lease, evidence: &GitEvidence) -> Vec<String> {
     let mut conflicts = Vec::new();
     if !evidence.path_exists {
         conflicts.push("derived path is missing".to_owned());
@@ -1756,28 +1791,39 @@ fn classify(
     if !evidence.worktree_registered {
         conflicts.push("worktree is not registered".to_owned());
     }
-    if named_git_branch(&lease.branch) {
-        match evidence.branch_commit.as_deref() {
-            Some(commit) if commit == lease.start_commit => {}
-            Some(commit) => conflicts.push(format!(
-                "branch commit {commit} != resolved start {}",
-                lease.start_commit
-            )),
-            None => conflicts.push("branch commit is absent".to_owned()),
-        }
+    if named_git_branch(&lease.branch)
+        && let Some(conflict) = commit_conflict(
+            evidence.branch_commit.as_deref(),
+            &lease.start_commit,
+            "branch commit",
+            "branch commit is absent",
+        )
+    {
+        conflicts.push(conflict);
     }
-    match evidence.head_commit.as_deref() {
-        Some(commit) if commit == lease.start_commit => {}
-        Some(commit) => conflicts.push(format!(
-            "worker HEAD {commit} != resolved start {}",
-            lease.start_commit
+    if let Some(conflict) = commit_conflict(
+        evidence.head_commit.as_deref(),
+        &lease.start_commit,
+        "worker HEAD",
+        "worker HEAD is absent",
+    ) {
+        conflicts.push(conflict);
+    }
+    conflicts
+}
+
+fn commit_conflict(
+    observed: Option<&str>,
+    expected: &str,
+    present_label: &str,
+    absent: &str,
+) -> Option<String> {
+    match observed {
+        Some(commit) if commit == expected => None,
+        Some(commit) => Some(format!(
+            "{present_label} {commit} != resolved start {expected}"
         )),
-        None => conflicts.push("worker HEAD is absent".to_owned()),
-    }
-    if conflicts.is_empty() {
-        (EvidenceClass::Matching, conflicts)
-    } else {
-        (EvidenceClass::NeedsAttention, conflicts)
+        None => Some(absent.to_owned()),
     }
 }
 
@@ -1904,10 +1950,7 @@ fn map_live_path_constraint(err: rusqlite::Error, context: &'static str) -> Erro
 
 fn reject_live_path_occupant(
     conn: &Connection,
-    worktree_path: &str,
-    owner: &str,
-    repo_name: &str,
-    job_id: &str,
+    claim: LivePathClaim<'_>,
     context: &'static str,
 ) -> Result<()> {
     let occupant: Option<String> = conn
@@ -1919,7 +1962,12 @@ fn reject_live_path_occupant(
               AND tombstoned_at IS NULL
               AND NOT (owner = ?2 AND repo_name = ?3 AND job_id = ?4)
             ",
-            params![worktree_path, owner, repo_name, job_id],
+            params![
+                claim.worktree_path,
+                claim.owner,
+                claim.repo_name,
+                claim.job_id
+            ],
             |row| row.get(0),
         )
         .optional()
@@ -1928,6 +1976,13 @@ fn reject_live_path_occupant(
         return Err(live_path_held_error(&held_by));
     }
     Ok(())
+}
+
+struct LivePathClaim<'a> {
+    worktree_path: &'a str,
+    owner: &'a str,
+    repo_name: &'a str,
+    job_id: &'a str,
 }
 
 fn now_secs() -> i64 {

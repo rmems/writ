@@ -23,16 +23,17 @@ impl Display for WorktreeCreationFailure {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "worktree creation failed for branch `{}` at `{}`: {}; residual_state \
-             path_exists={} registered={} branch_commit={} head_commit={}; automatic cleanup \
-             skipped because concurrent adoption cannot be disproven",
+            "worktree creation failed for branch `{}` at `{}`: {}; ",
             self.branch,
             self.path.display(),
             self.stderr.trim(),
+        )?;
+        write_git_residual(
+            f,
             self.path_exists,
             self.worktree_registered,
-            self.branch_commit.as_deref().unwrap_or("<absent>"),
-            self.head_commit.as_deref().unwrap_or("<absent>")
+            self.branch_commit.as_deref(),
+            self.head_commit.as_deref(),
         )
     }
 }
@@ -69,17 +70,18 @@ impl Display for LeaseAttentionFailure {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "lease allocation `{}` needs attention (state={} class={}): {}; \
-             residual_state path_exists={} registered={} branch_commit={} head_commit={}; \
-             automatic cleanup skipped because concurrent adoption cannot be disproven",
+            "lease allocation `{}` needs attention (state={} class={}): {}; ",
             self.operation_id,
             self.allocation_state,
             self.classification,
             self.conflicts.join("; "),
+        )?;
+        write_git_residual(
+            f,
             self.path_exists,
             self.worktree_registered,
-            self.branch_commit.as_deref().unwrap_or("<absent>"),
-            self.head_commit.as_deref().unwrap_or("<absent>")
+            self.branch_commit.as_deref(),
+            self.head_commit.as_deref(),
         )
     }
 }
@@ -121,20 +123,38 @@ impl Display for WorktreePostconditionFailure {
         write!(
             f,
             "worktree postcondition failed for branch `{}` at `{}`: expected_commit={} \
-             actual_branch={} reason={}; residual_state path_exists={} registered={} \
-             branch_commit={} head_commit={}; automatic cleanup skipped because concurrent \
-             adoption cannot be disproven",
+             actual_branch={} reason={}; ",
             self.branch,
             self.path.display(),
             self.expected_commit,
             self.actual_branch.as_deref().unwrap_or("<unavailable>"),
             self.reason,
+        )?;
+        write_git_residual(
+            f,
             self.path_exists,
             self.worktree_registered,
-            self.branch_commit.as_deref().unwrap_or("<absent>"),
-            self.head_commit.as_deref().unwrap_or("<absent>")
+            self.branch_commit.as_deref(),
+            self.head_commit.as_deref(),
         )
     }
+}
+
+fn write_git_residual(
+    f: &mut Formatter<'_>,
+    path_exists: bool,
+    registered: bool,
+    branch_commit: Option<&str>,
+    head_commit: Option<&str>,
+) -> std::fmt::Result {
+    write!(
+        f,
+        "residual_state path_exists={path_exists} registered={registered} \
+         branch_commit={} head_commit={}; automatic cleanup skipped because \
+         concurrent adoption cannot be disproven",
+        branch_commit.unwrap_or("<absent>"),
+        head_commit.unwrap_or("<absent>"),
+    )
 }
 
 /// One fully qualified ref that collided with an unqualified start point.

@@ -84,88 +84,72 @@ impl CheckoutRegistry {
     /// common dir with other worktrees, or may be a standalone clone.
     pub fn register(&self, path: &Path, job_id: &str) -> Result<CheckoutInfo> {
         let info = inspect_checkout(path)?;
-        let branch = info.branch.as_deref().unwrap_or(DETACHED_BRANCH);
-        let start_commit = info.head_commit.as_deref().unwrap_or("");
+        if self.resume_or_refresh(&info, job_id)? {
+            return Ok(info);
+        }
+        self.commit_new_registration(&info, job_id)?;
+        Ok(info)
+    }
+
+    fn resume_or_refresh(&self, info: &CheckoutInfo, job_id: &str) -> Result<bool> {
+        let key = registration_job_key(info, job_id);
+        let Some(existing) = self.leases.find_job(key)? else {
+            return Ok(false);
+        };
+        match existing.allocation_state {
+            AllocationState::Active | AllocationState::Released => {
+                self.leases.grant(registration_grant(info, job_id))?;
+                Ok(true)
+            }
+            AllocationState::Tombstoned => Err(tombstoned_job_error(info, job_id)),
+            AllocationState::Prepared
+            | AllocationState::Mutating
+            | AllocationState::NeedsAttention
+            | AllocationState::Aborted => self.resume_interrupted(info, job_id),
+        }
+    }
+
+    fn resume_interrupted(&self, info: &CheckoutInfo, job_id: &str) -> Result<bool> {
+        let Some(outcome) = self
+            .leases
+            .reconcile(registration_job_key(info, job_id), &info.common_dir)?
+        else {
+            return Ok(false);
+        };
+        match outcome {
+            ReconcileOutcome::Promoted { .. } | ReconcileOutcome::AlreadyActive { .. } => Ok(true),
+            ReconcileOutcome::Retry { .. } => Ok(false),
+            ReconcileOutcome::NeedsAttention { lease, inspection } => {
+                Err(attention_error(&lease, &inspection))
+            }
+            ReconcileOutcome::Released { .. } => {
+                self.leases.grant(registration_grant(info, job_id))?;
+                Ok(true)
+            }
+            ReconcileOutcome::Tombstoned { lease, .. } => Err(tombstoned_op_error(&lease)),
+        }
+    }
+
+    fn commit_new_registration(&self, info: &CheckoutInfo, job_id: &str) -> Result<()> {
         let requested_start_point = info
             .branch
             .as_deref()
             .map(|name| format!("refs/heads/{name}"))
             .unwrap_or_else(|| "HEAD".to_owned());
-        let key = JobKey {
-            owner: &info.owner,
-            repo_name: &info.repo_name,
-            job_id,
-        };
-        let grant = LeaseGrant {
-            repo: &info.common_dir,
-            owner: &info.owner,
-            repo_name: &info.repo_name,
-            job_id,
-            branch,
-            worktree_path: &info.path,
-            start_commit,
-        };
-
-        if let Some(existing) = self.leases.find_job(key)? {
-            match existing.allocation_state {
-                AllocationState::Active | AllocationState::Released => {
-                    self.leases.grant(grant)?;
-                    return Ok(info);
-                }
-                AllocationState::Tombstoned => {
-                    return Err(crate::error::Error::PolicyViolation {
-                        code: crate::error::PolicyCode::LeaseTombstoned,
-                        message: format!(
-                            "refusing to resurrect tombstoned lease for {}/{}/{job_id}",
-                            info.owner, info.repo_name
-                        ),
-                    });
-                }
-                AllocationState::Prepared
-                | AllocationState::Mutating
-                | AllocationState::NeedsAttention
-                | AllocationState::Aborted => {
-                    if let Some(outcome) = self.leases.reconcile(key, &info.common_dir)? {
-                        match outcome {
-                            ReconcileOutcome::Promoted { .. }
-                            | ReconcileOutcome::AlreadyActive { .. } => return Ok(info),
-                            ReconcileOutcome::Retry { .. } => {}
-                            ReconcileOutcome::NeedsAttention { lease, inspection } => {
-                                return Err(attention_error(&lease, &inspection));
-                            }
-                            ReconcileOutcome::Released { .. } => {
-                                self.leases.grant(grant)?;
-                                return Ok(info);
-                            }
-                            ReconcileOutcome::Tombstoned { lease, .. } => {
-                                return Err(crate::error::Error::PolicyViolation {
-                                    code: crate::error::PolicyCode::LeaseTombstoned,
-                                    message: format!(
-                                        "refusing to resurrect tombstoned lease {}",
-                                        lease.operation_id
-                                    ),
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
         let prepared = self.leases.prepare_allocate(AllocateRequest {
             repo: &info.common_dir,
             owner: &info.owner,
             repo_name: &info.repo_name,
             job_id,
-            branch,
+            branch: info.branch.as_deref().unwrap_or(DETACHED_BRANCH),
             worktree_path: &info.path,
             requested_start_point: &requested_start_point,
-            start_commit,
+            start_commit: info.head_commit.as_deref().unwrap_or(""),
             ttl: None,
         })?;
         self.leases.mark_mutating(&prepared.operation_id)?;
         self.leases.commit_allocate(&prepared.operation_id)?;
-        Ok(info)
+        Ok(())
     }
 
     /// Release the coordination record for `path` without touching the
@@ -180,6 +164,46 @@ impl CheckoutRegistry {
     /// Currently held (unreleased) registrations.
     pub fn registered(&self) -> Result<Vec<Lease>> {
         self.leases.list_active()
+    }
+}
+
+fn registration_job_key<'a>(info: &'a CheckoutInfo, job_id: &'a str) -> JobKey<'a> {
+    JobKey {
+        owner: &info.owner,
+        repo_name: &info.repo_name,
+        job_id,
+    }
+}
+
+fn registration_grant<'a>(info: &'a CheckoutInfo, job_id: &'a str) -> LeaseGrant<'a> {
+    LeaseGrant {
+        repo: &info.common_dir,
+        owner: &info.owner,
+        repo_name: &info.repo_name,
+        job_id,
+        branch: info.branch.as_deref().unwrap_or(DETACHED_BRANCH),
+        worktree_path: &info.path,
+        start_commit: info.head_commit.as_deref().unwrap_or(""),
+    }
+}
+
+fn tombstoned_job_error(info: &CheckoutInfo, job_id: &str) -> Error {
+    Error::PolicyViolation {
+        code: PolicyCode::LeaseTombstoned,
+        message: format!(
+            "refusing to resurrect tombstoned lease for {}/{}/{job_id}",
+            info.owner, info.repo_name
+        ),
+    }
+}
+
+fn tombstoned_op_error(lease: &Lease) -> Error {
+    Error::PolicyViolation {
+        code: PolicyCode::LeaseTombstoned,
+        message: format!(
+            "refusing to resurrect tombstoned lease {}",
+            lease.operation_id
+        ),
     }
 }
 

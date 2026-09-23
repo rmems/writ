@@ -11,7 +11,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
 
 use crate::error::{Error, PolicyCode, Result};
-use crate::lease::{JobKey, Lease, LeaseStore};
+use crate::lease::{AgentIdentity, JobKey, Lease, LeaseStore};
 
 /// Shared coordination event kinds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -243,9 +243,11 @@ impl LeaseStore {
             .map_err(|e| coord_err("begin coord announce", e))?;
         upsert_agent(
             &tx,
-            request.agent_id,
-            request.agent_type,
-            request.session_id,
+            AgentIdentity {
+                agent_id: request.agent_id,
+                agent_type: request.agent_type,
+                session_id: request.session_id,
+            },
             now,
         )?;
         let existing = load_claim_tx(&tx, key)?;
@@ -310,42 +312,7 @@ impl LeaseStore {
             },
         )?;
         let others = list_other_claims_tx(&tx, key)?;
-        let mut overlaps = Vec::new();
-        for other in others {
-            let shared = overlapping_paths(&paths, &other.declared_paths);
-            if shared.is_empty() {
-                continue;
-            }
-            let overlap = PathOverlap {
-                owner: other.owner.clone(),
-                repo_name: other.repo_name.clone(),
-                job_id: other.job_id.clone(),
-                agent_id: other.agent_id.clone(),
-                branch: other.branch.clone(),
-                paths: shared.clone(),
-                advisory: true,
-            };
-            insert_message(
-                &tx,
-                NewMessage {
-                    kind: MessageKind::Overlap,
-                    from_agent_id: request.agent_id,
-                    from_owner: request.owner,
-                    from_repo_name: request.repo_name,
-                    from_job_id: request.job_id,
-                    to_agent_id: Some(other.agent_id.as_str()),
-                    to_owner: Some(other.owner.as_str()),
-                    to_repo_name: Some(other.repo_name.as_str()),
-                    to_job_id: Some(other.job_id.as_str()),
-                    owner_generation: generation,
-                    body: "advisory declared-path overlap",
-                    paths: &shared,
-                    ack_of: None,
-                    now,
-                },
-            )?;
-            overlaps.push(overlap);
-        }
+        let overlaps = record_advisory_overlaps(&tx, &request, generation, &paths, &others, now)?;
         tx.commit()
             .map_err(|e| coord_err("commit coord announce", e))?;
         drop(conn);
@@ -749,9 +716,7 @@ fn transfer_on_handoff_ack(
 
 fn upsert_agent(
     tx: &rusqlite::Transaction<'_>,
-    agent_id: &str,
-    agent_type: &str,
-    session_id: Option<&str>,
+    identity: AgentIdentity<'_>,
     now: i64,
 ) -> Result<()> {
     tx.execute(
@@ -761,9 +726,15 @@ fn upsert_agent(
         ON CONFLICT(agent_id) DO UPDATE SET
             agent_type = excluded.agent_type,
             session_id = excluded.session_id,
+            started_at = excluded.started_at,
             stopped_at = NULL
         ",
-        params![agent_id, agent_type, session_id, now],
+        params![
+            identity.agent_id,
+            identity.agent_type,
+            identity.session_id,
+            now
+        ],
     )
     .map_err(|e| coord_err("upsert agent", e))?;
     Ok(())
@@ -932,21 +903,94 @@ fn normalize_one(path: &str) -> String {
 
 fn overlapping_paths(left: &[String], right: &[String]) -> Vec<String> {
     let mut hits = Vec::new();
-    for a in left {
-        for b in right {
-            if paths_overlap(a, b) {
-                let shared = if a.len() <= b.len() {
-                    a.clone()
-                } else {
-                    b.clone()
-                };
-                if !hits.iter().any(|existing| existing == &shared) {
-                    hits.push(shared);
-                }
-            }
-        }
+    for path in left {
+        collect_path_overlaps(path, right, &mut hits);
     }
     hits
+}
+
+fn collect_path_overlaps(path: &str, others: &[String], hits: &mut Vec<String>) {
+    for other in others {
+        if let Some(shared) = shorter_overlap(path, other) {
+            push_unique_overlap(hits, shared);
+        }
+    }
+}
+
+fn shorter_overlap(left: &str, right: &str) -> Option<String> {
+    if !paths_overlap(left, right) {
+        return None;
+    }
+    if left.len() <= right.len() {
+        Some(left.to_owned())
+    } else {
+        Some(right.to_owned())
+    }
+}
+
+fn push_unique_overlap(hits: &mut Vec<String>, shared: String) {
+    if !hits.iter().any(|existing| existing == &shared) {
+        hits.push(shared);
+    }
+}
+
+fn record_advisory_overlaps(
+    tx: &rusqlite::Transaction<'_>,
+    request: &AnnounceRequest<'_>,
+    generation: i64,
+    paths: &[String],
+    others: &[CoordClaim],
+    now: i64,
+) -> Result<Vec<PathOverlap>> {
+    let mut overlaps = Vec::new();
+    for other in others {
+        if let Some(overlap) = advisory_overlap_with(tx, request, generation, paths, other, now)? {
+            overlaps.push(overlap);
+        }
+    }
+    Ok(overlaps)
+}
+
+fn advisory_overlap_with(
+    tx: &rusqlite::Transaction<'_>,
+    request: &AnnounceRequest<'_>,
+    generation: i64,
+    paths: &[String],
+    other: &CoordClaim,
+    now: i64,
+) -> Result<Option<PathOverlap>> {
+    let shared = overlapping_paths(paths, &other.declared_paths);
+    if shared.is_empty() {
+        return Ok(None);
+    }
+    insert_message(
+        tx,
+        NewMessage {
+            kind: MessageKind::Overlap,
+            from_agent_id: request.agent_id,
+            from_owner: request.owner,
+            from_repo_name: request.repo_name,
+            from_job_id: request.job_id,
+            to_agent_id: Some(other.agent_id.as_str()),
+            to_owner: Some(other.owner.as_str()),
+            to_repo_name: Some(other.repo_name.as_str()),
+            to_job_id: Some(other.job_id.as_str()),
+            owner_generation: generation,
+            body: "advisory declared-path overlap",
+            paths: &shared,
+            ack_of: None,
+            now,
+        },
+    )?;
+    Ok(Some(PathOverlap {
+        owner: other.owner.clone(),
+        repo_name: other.repo_name.clone(),
+        job_id: other.job_id.clone(),
+        agent_id: other.agent_id.clone(),
+        branch: other.branch.clone(),
+        paths: shared,
+        advisory: true,
+    }))
 }
 
 fn paths_overlap(left: &str, right: &str) -> bool {
