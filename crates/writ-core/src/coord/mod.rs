@@ -13,6 +13,9 @@ use serde::Serialize;
 use crate::error::{Error, PolicyCode, Result};
 use crate::lease::{AgentIdentity, AllocationState, JobKey, Lease, LeaseStore};
 
+mod declared_paths;
+use declared_paths::{decode_paths_row, encode_paths, normalize_paths};
+
 /// Shared coordination event kinds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -867,65 +870,6 @@ fn message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CoordMessage> {
         ack_of: row.get(14)?,
         acked_at: row.get(15)?,
     })
-}
-
-fn decode_paths_row(raw: String) -> rusqlite::Result<Vec<String>> {
-    serde_json::from_str(&raw).map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Text, Box::new(error))
-    })
-}
-
-fn encode_paths(paths: &[String]) -> Result<String> {
-    serde_json::to_string(paths).map_err(|error| Error::LeaseStore {
-        context: "encode declared paths",
-        message: error.to_string(),
-    })
-}
-
-fn normalize_paths(paths: &[String]) -> Vec<String> {
-    let mut normalized = Vec::new();
-    for path in paths {
-        let cleaned = normalize_one(path);
-        if cleaned.is_empty() || normalized.iter().any(|existing| existing == &cleaned) {
-            continue;
-        }
-        normalized.push(cleaned);
-    }
-    normalized
-}
-
-fn normalize_one(path: &str) -> String {
-    let trimmed = path.trim().replace('\\', "/");
-    if trimmed.is_empty() {
-        return String::new();
-    }
-    if trimmed == "." || trimmed == "./" {
-        return ".".to_owned();
-    }
-    let mut stripped = trimmed.trim_start_matches("./").to_owned();
-    if stripped.is_empty() || stripped == "." {
-        return ".".to_owned();
-    }
-    while stripped.contains("//") {
-        stripped = stripped.replace("//", "/");
-    }
-    let mut parts: Vec<&str> = Vec::new();
-    for part in stripped.split('/') {
-        match part {
-            "" | "." => {}
-            ".." => {
-                if parts.pop().is_none() {
-                    return String::new();
-                }
-            }
-            other => parts.push(other),
-        }
-    }
-    if parts.is_empty() {
-        ".".to_owned()
-    } else {
-        parts.join("/")
-    }
 }
 
 struct AnnounceTx<'a> {
