@@ -126,9 +126,10 @@ Agents are listed separately because the store does not join them to lease rows.
 `JobStatus.ci_class` is a job-level rollup, not Class A/B/C. Map it from
 `writ --json ci classify` → `data.collaboration.ci_class` when a classify
 result is available: `fail` only for GitHub-required failures; advisory,
-pending, external-access, and unknown requiredness stay non-fail. Copy
-`residual_codes` into existing watchlist notes. **Do not** persist a second
-CI store from this command; `state.rs` remains read-only for `watched.json`.
+pending, skipped, external-access, and unknown requiredness stay non-fail.
+A skipped analysis is not a performed pass. Copy `residual_codes` into
+existing watchlist notes. **Do not** persist a second CI store from this
+command; `state.rs` remains read-only for `watched.json`.
 
 ## Example: empty report
 

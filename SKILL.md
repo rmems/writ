@@ -182,7 +182,7 @@ When monitoring PR checks, classify each row from `gh pr checks --json name,stat
 | **B** | Codacy (and similar quality gates) | Fix real file+line findings; residual human gate on `ACTION_REQUIRED` | Empty pushes to wake the dashboard |
 | **C** | Kilo, CodeRabbit, Gitar, unknown bots | Report residual (`class_c:kilo_pending`, …); continue Class A | Empty retrigger commits |
 
-`skipping` is non-blocking. `pending` means continue other work without rerun spam. **Prefer a real fix or `gh run rerun` over noise commits.** Residual codes belong in watchlist notes and the final report.
+`skipping` is non-blocking and is **not** a performed pass (skip-only is `unknown`, not `pass`). `pending` means continue other work without rerun spam. **Prefer a real fix or `gh run rerun` over noise commits.** Residual codes belong in watchlist notes and the final report.
 
 `writ --json ci classify` emits a compact `data.collaboration` object (`ci_class`, observation counts, `residual_codes`, `blocks_unrelated_workers: false`). Copy that into existing RM-139 / RM-127 status views. Do **not** write `watched.json`, a second store, or a lease row for CI. An externally blocked service must not freeze unrelated workers.
 

@@ -1300,7 +1300,7 @@ fn write_classify_result(
     )?;
     writeln!(
         stdout,
-        "github is the required-check authority; unknown/advisory/pending/external-access are not writ merge gates"
+        "github is the required-check authority; unknown/advisory/pending/skipped/cancelled/external-access are not writ merge gates"
     )?;
     for check in &report.checks {
         let residual = check.residual_code.as_deref().unwrap_or("-");

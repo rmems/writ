@@ -61,7 +61,7 @@ Use rollup when `bucket` is not enough (especially `ACTION_REQUIRED`):
 | Input | Classifier conclusion | Cycle behavior |
 | --- | --- | --- |
 | `bucket: pass` / `SUCCESS` / `NEUTRAL` | success / neutral | Ignore (non-actionable) |
-| `bucket: skipping` / `SKIPPED` | skipped | **Non-blocking.** Do not fail the cycle. |
+| `bucket: skipping` / `SKIPPED` | skipped | **Non-blocking, not a performed pass.** Do not fail the cycle. A skip-only rollup is `unknown`, not `pass`. |
 | `bucket: pending` / `EXPECTED` / queued | pending | **Wait.** Continue other work. Do not rerun or empty-push. Class C pending still records a residual code. |
 | `bucket: cancel` / `CANCELLED` | cancelled | Class A with a run id: **one** `gh run rerun`. Otherwise residual or fix-source as class dictates. |
 | `FAILURE` / `ERROR` / `fail` | failure | Class A/B: fix source. Class C: residual. |
@@ -84,7 +84,8 @@ is parsed only from `isRequired` / `is_required` / `required`. A provider name
 | `pending` | Still running | Continue other work. Do not rerun-spam. |
 | `external_access` | `ACTION_REQUIRED` (dashboard / login / configuration) | Residual human/config gate. Do not empty-push. Unrelated workers continue. |
 | `unknown_requiredness` | Blocking outcome with **no** requiredness field | Report it. **Not** a writ merge gate and **not** a pass. |
-| `success` / `skipping` | Terminal pass or skip | Ignore. |
+| `success` | Terminal pass (`SUCCESS` / `NEUTRAL`) | Ignore. |
+| `skipping` | `skipping` / `SKIPPED` | Ignore as a cycle blocker. **Not** a performed pass. |
 
 `required_failure_count` / `required_failure_codes` on `ci.classify` count only
 `required_failure`. GitHub is the required-check authority. This classifier does
@@ -148,10 +149,11 @@ is a job-level rollup, not A/B/C. Watchlist consumers should keep
 that rollup (`ci_class`, observation counts, `residual_codes`).
 `blocks_unrelated_workers` is always `false` so an external/advisory/unknown
 gate does not freeze other jobs. `continue_other_work` is `true` unless a
-required check failed. This object is a **derived view** of the classify
-result. It does not write `watched.json` or the lease store; RM-139 / RM-127
-consume it. Empty retrigger commits remain forbidden
-(`forbid_empty_retrigger_commit: true`).
+required check failed. `skipped_count` counts `skipping` observations; a
+skip-only rollup is `ci_class: unknown`, not `pass`. This object is a
+**derived view** of the classify result. It does not write `watched.json` or
+the lease store; RM-139 / RM-127 consume it. Empty retrigger commits remain
+forbidden (`forbid_empty_retrigger_commit: true`).
 
 ## CLI
 

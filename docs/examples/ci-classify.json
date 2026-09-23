@@ -1,6 +1,4 @@
 {
-    "ok": true,
-    "schema_version": 1,
     "command": "ci.classify",
     "data": {
         "advisory_finding_codes": [],
@@ -107,12 +105,13 @@
             "residual_codes": [
                 "class_c:kilo_pending"
             ],
+            "skipped_count": 1,
             "unknown_requiredness_count": 2
         },
         "external_access_codes": [],
         "fixable_failure_count": 2,
         "github_is_required_check_authority": true,
-        "operator_note": "GitHub is the required-check authority. A provider name does not decide requiredness. Unknown requiredness, advisory findings, pending results, and external access/configuration problems are reported and are not writ merge gates.",
+        "operator_note": "GitHub is the required-check authority. A provider name does not decide requiredness. Unknown requiredness, advisory findings, pending results, skipped analyses, and external access/configuration problems are reported and are not writ merge gates. A skipped analysis is not a performed pass.",
         "pending_codes": [
             "class_c:kilo_pending"
         ],
@@ -121,11 +120,16 @@
         "residual_codes": [
             "class_c:kilo_pending"
         ],
+        "skipped_codes": [
+            "skipping:supabase_preview"
+        ],
         "unknown_requiredness_codes": [
             "unknown_requiredness:build_test",
             "unknown_requiredness:codacy_static_code_analysis"
         ],
         "unknown_requiredness_is_not_a_writ_merge_gate": true
     },
-    "error": null
+    "error": null,
+    "ok": true,
+    "schema_version": 1
 }

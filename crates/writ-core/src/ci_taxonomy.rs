@@ -124,10 +124,18 @@ pub enum CheckConclusion {
 }
 
 impl CheckConclusion {
-    /// `gh pr checks` bucket `pass` / GraphQL `SUCCESS`.
+    /// Performed terminal pass: `gh pr checks` bucket `pass` / GraphQL `SUCCESS` / `NEUTRAL`.
+    ///
+    /// [`Self::Skipped`] is non-blocking but is **not** a performed pass.
     #[must_use]
     pub const fn is_terminal_passing(self) -> bool {
-        matches!(self, Self::Success | Self::Skipped | Self::Neutral)
+        matches!(self, Self::Success | Self::Neutral)
+    }
+
+    /// Outcomes that do not fail the cycle: performed pass or an explicit skip.
+    #[must_use]
+    pub const fn is_non_blocking(self) -> bool {
+        self.is_terminal_passing() || matches!(self, Self::Skipped)
     }
 
     /// Outcomes that still need a decision (fix, rerun, residual, or wait).
@@ -229,6 +237,7 @@ pub struct CollaborationCiStatus {
     pub continue_other_work: bool,
     pub required_failure_count: usize,
     pub pending_count: usize,
+    pub skipped_count: usize,
     pub advisory_finding_count: usize,
     pub external_access_count: usize,
     pub unknown_requiredness_count: usize,
@@ -307,6 +316,12 @@ impl ClassificationReport {
         self.with_observation(ObservationKind::Pending)
     }
 
+    /// `skipping` / `SKIPPED` checks. Non-blocking and not a performed pass.
+    #[must_use]
+    pub fn skipped_checks(&self) -> Vec<&ClassifiedCheck> {
+        self.with_observation(ObservationKind::Skipping)
+    }
+
     /// Dashboard / login / configuration problems (`ACTION_REQUIRED`).
     #[must_use]
     pub fn external_access(&self) -> Vec<&ClassifiedCheck> {
@@ -361,24 +376,39 @@ impl ClassificationReport {
         codes
     }
 
-    /// True when there is at least one check and every check is terminal-passing.
+    /// True when every check is non-blocking **and** at least one actually passed.
     ///
-    /// `skipping` / `SKIPPED` counts as passing (non-blocking). Empty input is
-    /// unknown, not success. Pending checks mean the rollup is not done.
+    /// `skipping` / `SKIPPED` does not fail the cycle, but a skip-only rollup is
+    /// not a performed pass. Empty input is unknown, not success. Pending checks
+    /// mean the rollup is not done.
     #[must_use]
     pub fn all_passed(&self) -> bool {
         !self.checks.is_empty()
             && self
                 .checks
                 .iter()
-                .all(|c| c.entry.conclusion.is_terminal_passing())
+                .all(|c| c.entry.conclusion.is_non_blocking())
+            && self.has_performed_pass()
+    }
+
+    fn has_performed_pass(&self) -> bool {
+        self.checks
+            .iter()
+            .any(|c| c.entry.conclusion.is_terminal_passing())
+    }
+
+    fn has_performed_required_pass(&self) -> bool {
+        self.checks.iter().any(|c| {
+            c.entry.requirement == Requirement::Required && c.entry.conclusion.is_terminal_passing()
+        })
     }
 
     /// Job-level rollup for [`JobStatus.ci_class`](crate::status::JobStatus).
     ///
     /// `fail` is only [`ObservationKind::RequiredFailure`]. Advisory findings,
-    /// `ACTION_REQUIRED` external-access, pending, and unknown requiredness are
-    /// not treated as a writ merge gate.
+    /// `ACTION_REQUIRED` external-access, pending, skipping, and unknown
+    /// requiredness are not treated as a writ merge gate. Skip-only rollups are
+    /// [`CiClass::Unknown`], not [`CiClass::Pass`].
     #[must_use]
     pub fn job_ci_class(&self) -> CiClass {
         if self.checks.is_empty() {
@@ -390,12 +420,7 @@ impl ClassificationReport {
         if !self.pending_checks().is_empty() {
             return CiClass::Pending;
         }
-        if self
-            .checks
-            .iter()
-            .any(|c| c.entry.requirement == Requirement::Required)
-            || self.all_passed()
-        {
+        if self.all_passed() || self.has_performed_required_pass() {
             return CiClass::Pass;
         }
         CiClass::Unknown
@@ -410,6 +435,7 @@ impl ClassificationReport {
             continue_other_work: self.required_failures().is_empty(),
             required_failure_count: self.required_failures().len(),
             pending_count: self.pending_checks().len(),
+            skipped_count: self.skipped_checks().len(),
             advisory_finding_count: self.advisory_findings().len(),
             external_access_count: self.external_access().len(),
             unknown_requiredness_count: self.unknown_requiredness().len(),
@@ -502,11 +528,12 @@ pub fn classify_response_data(report: &ClassificationReport) -> Value {
         "required_failure_codes": report.observation_codes(ObservationKind::RequiredFailure),
         "advisory_finding_codes": report.observation_codes(ObservationKind::AdvisoryFinding),
         "pending_codes": report.observation_codes(ObservationKind::Pending),
+        "skipped_codes": report.observation_codes(ObservationKind::Skipping),
         "external_access_codes": report.observation_codes(ObservationKind::ExternalAccess),
         "unknown_requiredness_codes": report.observation_codes(ObservationKind::UnknownRequiredness),
         "github_is_required_check_authority": true,
         "unknown_requiredness_is_not_a_writ_merge_gate": true,
-        "operator_note": "GitHub is the required-check authority. A provider name does not decide requiredness. Unknown requiredness, advisory findings, pending results, and external access/configuration problems are reported and are not writ merge gates.",
+        "operator_note": "GitHub is the required-check authority. A provider name does not decide requiredness. Unknown requiredness, advisory findings, pending results, skipped analyses, and external access/configuration problems are reported and are not writ merge gates. A skipped analysis is not a performed pass.",
         "collaboration": report.collaboration_status(),
     })
 }
@@ -696,7 +723,7 @@ fn policies_for(
     conclusion: CheckConclusion,
     run_id: Option<u64>,
 ) -> BTreeSet<Policy> {
-    if conclusion.is_terminal_passing() || conclusion == CheckConclusion::Pending {
+    if conclusion.is_non_blocking() || conclusion == CheckConclusion::Pending {
         return BTreeSet::new();
     }
 
@@ -767,7 +794,7 @@ fn recommended_action(
     policies: &BTreeSet<Policy>,
     residual: Option<&str>,
 ) -> RecommendedAction {
-    if entry.conclusion.is_terminal_passing() {
+    if entry.conclusion.is_non_blocking() {
         return RecommendedAction::Ignore;
     }
     if entry.conclusion == CheckConclusion::Pending {
@@ -1279,13 +1306,48 @@ mod tests {
             "skipping",
             "https://supabase.com/preview",
         )]);
-        assert!(report.all_passed());
+        assert!(!report.all_passed());
+        assert_eq!(report.job_ci_class(), CiClass::Unknown);
         assert!(report.failures().is_empty());
         assert!(report.residual_codes().is_empty());
+        assert_eq!(report.skipped_checks().len(), 1);
+        assert_eq!(report.checks[0].observation, ObservationKind::Skipping);
         assert_eq!(
             report.checks[0].recommended_action,
             RecommendedAction::Ignore
         );
+        let collab = report.collaboration_status();
+        assert_eq!(collab.skipped_count, 1);
+        assert!(!collab.blocks_unrelated_workers);
+        assert!(collab.continue_other_work);
+        assert_eq!(collab.ci_class, CiClass::Unknown);
+    }
+
+    #[test]
+    fn skip_plus_success_is_all_passed() {
+        let report = classify_checks(&[
+            raw_check("Build & Test", "CI", "pass", actions_url()),
+            raw_check("Supabase Preview", "", "skipping", ""),
+        ]);
+        assert!(report.all_passed());
+        assert_eq!(report.job_ci_class(), CiClass::Pass);
+        assert_eq!(report.skipped_checks().len(), 1);
+        assert!(report.failures().is_empty());
+    }
+
+    #[test]
+    fn required_skip_is_not_a_performed_pass() {
+        let report = classify_checks_json(&json!([{
+            "name": "optional-preview",
+            "bucket": "skipping",
+            "isRequired": true,
+        }]))
+        .unwrap();
+        assert!(!report.all_passed());
+        assert_eq!(report.job_ci_class(), CiClass::Unknown);
+        assert_eq!(report.checks[0].observation, ObservationKind::Skipping);
+        assert!(report.required_failures().is_empty());
+        assert!(report.collaboration_status().continue_other_work);
     }
 
     #[test]
@@ -1610,6 +1672,8 @@ mod tests {
         assert_eq!(data["collaboration"]["blocks_unrelated_workers"], false);
         assert_eq!(data["collaboration"]["continue_other_work"], true);
         assert_eq!(data["collaboration"]["forbid_empty_retrigger_commit"], true);
+        assert_eq!(data["collaboration"]["skipped_count"], 0);
+        assert_eq!(data["skipped_codes"], json!([]));
     }
 
     #[test]
