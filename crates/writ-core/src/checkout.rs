@@ -106,11 +106,30 @@ impl CheckoutRegistry {
             | AllocationState::Mutating
             | AllocationState::NeedsAttention
             | AllocationState::Aborted
-            | AllocationState::Unknown => self.resume_interrupted(info, job_id),
+            | AllocationState::Unknown => self.resume_interrupted(info, job_id, &existing),
         }
     }
 
-    fn resume_interrupted(&self, info: &CheckoutInfo, job_id: &str) -> Result<bool> {
+    fn resume_interrupted(
+        &self,
+        info: &CheckoutInfo,
+        job_id: &str,
+        existing: &Lease,
+    ) -> Result<bool> {
+        if !registration_matches_lease(info, existing) {
+            return Err(Error::PolicyViolation {
+                code: PolicyCode::LeaseConflict,
+                message: format!(
+                    "interrupted lease for {}/{}/{job_id} protects `{}` on `{}`; refusing to resume it for `{}` on `{}`",
+                    info.owner,
+                    info.repo_name,
+                    existing.worktree_path,
+                    existing.branch,
+                    info.path.display(),
+                    info.branch.as_deref().unwrap_or(DETACHED_BRANCH)
+                ),
+            });
+        }
         let Some(outcome) = self
             .leases
             .reconcile(registration_job_key(info, job_id), &info.common_dir)?
@@ -174,6 +193,16 @@ fn registration_job_key<'a>(info: &'a CheckoutInfo, job_id: &'a str) -> JobKey<'
         repo_name: &info.repo_name,
         job_id,
     }
+}
+
+fn registration_matches_lease(info: &CheckoutInfo, lease: &Lease) -> bool {
+    let branch = info.branch.as_deref().unwrap_or(DETACHED_BRANCH);
+    let path_matches =
+        crate::paths::same_existing_path(Path::new(&lease.worktree_path), &info.path)
+            || lease.worktree_path == info.path.to_string_lossy();
+    let repo_matches = crate::paths::same_existing_path(Path::new(&lease.repo), &info.common_dir)
+        || lease.repo == info.common_dir.to_string_lossy();
+    path_matches && repo_matches && lease.branch == branch
 }
 
 fn registration_grant<'a>(info: &'a CheckoutInfo, job_id: &'a str) -> LeaseGrant<'a> {
@@ -672,6 +701,59 @@ mod tests {
             "linked worktrees must share the repo segment of the lease identity"
         );
         assert_eq!(linked.owner, primary.owner);
+    }
+
+    #[test]
+    fn register_does_not_resume_interrupted_lease_for_a_different_checkout() {
+        let (tmp, repo) = init_repo();
+        let wt1 = tmp.path().join("wts/one");
+        let wt2 = tmp.path().join("wts/two");
+        for (wt, branch) in [(&wt1, "job/one"), (&wt2, "job/two")] {
+            git(
+                &repo,
+                &[
+                    "worktree",
+                    "add",
+                    "--quiet",
+                    "-b",
+                    branch,
+                    wt.to_str().unwrap(),
+                ],
+            );
+        }
+
+        let store_path = tmp.path().join("leases.db");
+        let registry =
+            CheckoutRegistry::with_store(LeaseStore::open(&store_path).unwrap()).unwrap();
+        registry.register(&wt1, "shared-job").unwrap();
+        let conn = rusqlite::Connection::open(&store_path).unwrap();
+        conn.execute(
+            "UPDATE leases SET allocation_state = 'PREPARED', mode = 'UNASSIGNED' WHERE job_id = 'shared-job'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let err = registry.register(&wt2, "shared-job").unwrap_err();
+        assert!(matches!(
+            err,
+            crate::error::Error::PolicyViolation {
+                code: crate::error::PolicyCode::LeaseConflict,
+                ..
+            }
+        ));
+        let info = inspect_checkout(&wt1).unwrap();
+        let stored = LeaseStore::open(&store_path)
+            .unwrap()
+            .find_job(JobKey {
+                owner: &info.owner,
+                repo_name: &info.repo_name,
+                job_id: "shared-job",
+            })
+            .unwrap()
+            .unwrap();
+        assert!(stored.worktree_path.contains("wts/one"));
+        assert_eq!(stored.allocation_state, AllocationState::Prepared);
     }
 
     #[test]

@@ -112,6 +112,7 @@ fn grant_release_preserves_identity_and_budget_columns() {
         .unwrap();
     assert_eq!(resume.start_commit, "abc123");
     assert_eq!(resume.branch_ref, "refs/heads/hive/gh-42");
+    assert_eq!(resume.requested_start_point, "refs/heads/hive/gh-42");
 }
 
 #[test]

@@ -142,16 +142,28 @@ impl LeaseStore {
                 Ok(FixCycleReconcile::Committed { fix_cycles })
             }
             Some(false) => {
-                self.abort_fix_cycle(&operation_id)?;
-                Ok(FixCycleReconcile::Aborted {
-                    fix_cycles: lease.fix_cycles.unwrap_or(0),
-                })
+                if self.abort_fix_cycle(&operation_id)? {
+                    Ok(FixCycleReconcile::Aborted {
+                        fix_cycles: lease.fix_cycles.unwrap_or(0),
+                    })
+                } else {
+                    Ok(FixCycleReconcile::NeedsAttention {
+                        pending: lease.pending_fix_cycles.unwrap_or(0),
+                        operation_id,
+                    })
+                }
             }
             None if phase.as_deref() == Some("PREPARE") => {
-                self.abort_fix_cycle(&operation_id)?;
-                Ok(FixCycleReconcile::Aborted {
-                    fix_cycles: lease.fix_cycles.unwrap_or(0),
-                })
+                if self.abort_fix_cycle(&operation_id)? {
+                    Ok(FixCycleReconcile::Aborted {
+                        fix_cycles: lease.fix_cycles.unwrap_or(0),
+                    })
+                } else {
+                    Ok(FixCycleReconcile::NeedsAttention {
+                        pending: lease.pending_fix_cycles.unwrap_or(0),
+                        operation_id,
+                    })
+                }
             }
             None => Ok(FixCycleReconcile::NeedsAttention {
                 pending: lease.pending_fix_cycles.unwrap_or(0),
@@ -160,12 +172,24 @@ impl LeaseStore {
         }
     }
 
-    fn abort_fix_cycle(&self, operation_id: &str) -> Result<()> {
+    fn abort_fix_cycle(&self, operation_id: &str) -> Result<bool> {
         let now = now_secs();
         let mut conn = self.lock()?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| lease_err("begin fix-cycle abort", e))?;
+        tx.execute(
+            "
+            UPDATE allocation_ops
+            SET phase = 'PREPARE', status = 'ABORTED', updated_at = ?1
+            WHERE operation_id = ?2 AND phase = 'PREPARE'
+            ",
+            params![now, operation_id],
+        )
+        .map_err(|e| lease_err("abort fix-cycle", e))?;
+        if tx.changes() != 1 {
+            return Ok(false);
+        }
         tx.execute(
             "
             UPDATE leases
@@ -175,18 +199,9 @@ impl LeaseStore {
             params![now, operation_id],
         )
         .map_err(|e| lease_err("abort fix-cycle", e))?;
-        schema::update_op_phase(
-            &tx,
-            schema::OpPhase {
-                operation_id,
-                phase: "PREPARE",
-                status: "ABORTED",
-                now,
-            },
-        )?;
         tx.commit()
             .map_err(|e| lease_err("commit fix-cycle abort", e))?;
-        Ok(())
+        Ok(true)
     }
 
     fn op_phase(&self, operation_id: &str) -> Result<Option<String>> {

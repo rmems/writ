@@ -11,7 +11,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
 
 use crate::error::{Error, PolicyCode, Result};
-use crate::lease::{AgentIdentity, JobKey, Lease, LeaseStore};
+use crate::lease::{AgentIdentity, AllocationState, JobKey, Lease, LeaseStore};
 
 /// Shared coordination event kinds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -23,6 +23,7 @@ pub enum MessageKind {
     Handoff,
     Ack,
     Dependency,
+    Blocker,
 }
 
 impl MessageKind {
@@ -35,6 +36,7 @@ impl MessageKind {
             Self::Handoff => "handoff",
             Self::Ack => "ack",
             Self::Dependency => "dependency",
+            Self::Blocker => "blocker",
         }
     }
 
@@ -47,6 +49,7 @@ impl MessageKind {
             "handoff" => Ok(Self::Handoff),
             "ack" => Ok(Self::Ack),
             "dependency" => Ok(Self::Dependency),
+            "blocker" => Ok(Self::Blocker),
             other => Err(Error::LeaseStore {
                 context: "parse coord message kind",
                 message: format!("unknown message kind `{other}`"),
@@ -256,7 +259,13 @@ impl LeaseStore {
         {
             return Err(held_error(existing));
         }
-        let generation = existing.as_ref().map_or(1, |claim| claim.owner_generation);
+        let generation = match existing.as_ref() {
+            None => 1,
+            Some(claim) if claim.session_id.as_deref() != request.session_id => {
+                claim.owner_generation + 1
+            }
+            Some(claim) => claim.owner_generation,
+        };
         let paused_at = existing.as_ref().and_then(|claim| claim.paused_at);
         let (intent, overlaps) = persist_announce_tx(
             &tx,
@@ -313,7 +322,8 @@ impl LeaseStore {
                 "{MESSAGE_SELECT} WHERE \
                  (from_owner = ?1 AND from_repo_name = ?2 AND from_job_id = ?3) \
                  OR (to_owner = ?1 AND to_repo_name = ?2 AND to_job_id = ?3) \
-                 OR (to_job_id IS NULL AND kind IN ('intent', 'help', 'overlap', 'dependency')) \
+                 OR (to_job_id IS NULL AND from_owner = ?1 AND from_repo_name = ?2 \
+                     AND kind IN ('intent', 'help', 'overlap', 'dependency', 'blocker')) \
                  ORDER BY id"
             ))
             .map_err(|e| coord_err("list coord inbox", e))?;
@@ -335,6 +345,25 @@ impl LeaseStore {
                 message: "handoff requires propose_handoff so owner_generation is bound".to_owned(),
             });
         }
+        if request.kind == MessageKind::Ack {
+            let Some(message_id) = request.ack_of else {
+                return Err(Error::LeaseStore {
+                    context: "send coord message",
+                    message: "ack requires --ack-of so coord ack can update the original message"
+                        .to_owned(),
+                });
+            };
+            let (ack, _) = self.ack_message(AckRequest {
+                message_id,
+                owner: request.owner,
+                repo_name: request.repo_name,
+                job_id: request.job_id,
+                agent_id: request.agent_id,
+                session_id: None,
+            })?;
+            return Ok(ack);
+        }
+        require_complete_recipient(request)?;
         let key = JobKey {
             owner: request.owner,
             repo_name: request.repo_name,
@@ -507,6 +536,9 @@ impl LeaseStore {
                 message: format!("message {} is already acknowledged", request.message_id),
             });
         }
+        if message.kind != MessageKind::Handoff {
+            require_ack_recipient(&tx, &message, request)?;
+        }
         let transferred = if message.kind == MessageKind::Handoff {
             Some(transfer_on_handoff_ack(&tx, &message, request, now)?)
         } else {
@@ -566,6 +598,80 @@ struct NewMessage<'a> {
     now: i64,
 }
 
+fn require_complete_recipient(request: SendRequest<'_>) -> Result<()> {
+    let parts = [
+        request.to_owner,
+        request.to_repo_name,
+        request.to_job_id,
+        request.to_agent_id,
+    ];
+    if parts.iter().all(Option::is_none) {
+        return Ok(());
+    }
+    let job_tuple = (request.to_owner, request.to_repo_name, request.to_job_id);
+    if matches!(job_tuple, (Some(_), Some(_), Some(_))) {
+        return Ok(());
+    }
+    Err(Error::LeaseStore {
+        context: "send coord message",
+        message: "message recipient must be a complete owner/repository/job tuple or a broadcast"
+            .to_owned(),
+    })
+}
+
+fn require_ack_recipient(
+    tx: &rusqlite::Transaction<'_>,
+    message: &CoordMessage,
+    request: AckRequest<'_>,
+) -> Result<()> {
+    let key = JobKey {
+        owner: request.owner,
+        repo_name: request.repo_name,
+        job_id: request.job_id,
+    };
+    let claim = load_claim_tx(tx, key)?.ok_or_else(|| Error::PolicyViolation {
+        code: PolicyCode::CoordClaimMissing,
+        message: format!(
+            "no coordination claim for {}/{}/{} to acknowledge a message",
+            key.owner, key.repo_name, key.job_id
+        ),
+    })?;
+    if claim.agent_id != request.agent_id {
+        return Err(held_error(&claim));
+    }
+    if let Some(to_owner) = message.to_owner.as_deref()
+        && to_owner != request.owner
+    {
+        return Err(ack_recipient_error(request));
+    }
+    if let Some(to_repo) = message.to_repo_name.as_deref()
+        && to_repo != request.repo_name
+    {
+        return Err(ack_recipient_error(request));
+    }
+    if let Some(to_job) = message.to_job_id.as_deref()
+        && to_job != request.job_id
+    {
+        return Err(ack_recipient_error(request));
+    }
+    if let Some(to_agent) = message.to_agent_id.as_deref()
+        && to_agent != request.agent_id
+    {
+        return Err(ack_recipient_error(request));
+    }
+    Ok(())
+}
+
+fn ack_recipient_error(request: AckRequest<'_>) -> Error {
+    Error::PolicyViolation {
+        code: PolicyCode::CoordClaimMissing,
+        message: format!(
+            "job {}/{}/{} is not the recipient of message {}",
+            request.owner, request.repo_name, request.job_id, request.message_id
+        ),
+    }
+}
+
 fn live_lease(store: &LeaseStore, key: JobKey<'_>) -> Result<Lease> {
     let lease = store.find_job(key)?.ok_or_else(|| Error::PolicyViolation {
         code: PolicyCode::CoordClaimMissing,
@@ -574,11 +680,11 @@ fn live_lease(store: &LeaseStore, key: JobKey<'_>) -> Result<Lease> {
             key.owner, key.repo_name, key.job_id
         ),
     })?;
-    if lease.allocation_state.is_terminal() {
+    if lease.allocation_state != AllocationState::Active {
         return Err(Error::PolicyViolation {
             code: PolicyCode::CoordClaimMissing,
             message: format!(
-                "lease {}/{}/{} is {}; coordination claims stay on live assignments",
+                "lease {}/{}/{} is {}; coordination claims require an ACTIVE assignment",
                 lease.owner,
                 lease.repo_name,
                 lease.job_id,
@@ -851,7 +957,16 @@ fn normalize_paths(paths: &[String]) -> Vec<String> {
 
 fn normalize_one(path: &str) -> String {
     let trimmed = path.trim().replace('\\', "/");
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if trimmed == "." || trimmed == "./" {
+        return ".".to_owned();
+    }
     let mut stripped = trimmed.trim_start_matches("./").to_owned();
+    if stripped.is_empty() || stripped == "." {
+        return ".".to_owned();
+    }
     while stripped.contains("//") {
         stripped = stripped.replace("//", "/");
     }
@@ -881,6 +996,7 @@ fn persist_announce_claim(tx: &rusqlite::Transaction<'_>, row: &AnnouncePersist<
             session_id = excluded.session_id,
             intent = excluded.intent,
             declared_paths = excluded.declared_paths,
+            owner_generation = excluded.owner_generation,
             updated_at = excluded.updated_at
         ",
         params![
@@ -1061,6 +1177,12 @@ fn advisory_overlap_with(
 }
 
 fn paths_overlap(left: &str, right: &str) -> bool {
+    if left.is_empty() || right.is_empty() {
+        return false;
+    }
+    if left == "." || right == "." {
+        return true;
+    }
     left == right
         || left.starts_with(&(right.to_owned() + "/"))
         || right.starts_with(&(left.to_owned() + "/"))
@@ -1430,5 +1552,208 @@ mod tests {
         let leftover = sample_handoff(&harness.store, "leftover gen-1 offer", None);
         sample_ack(&peer, first.id).unwrap();
         assert_stale(sample_ack(&peer, leftover.id).unwrap_err());
+    }
+
+    #[test]
+    fn repository_root_declaration_overlaps_nested_paths() {
+        let harness = Harness::new();
+        harness.seed_job("job-a", "hive/job-a");
+        harness.seed_job("job-b", "hive/job-b");
+        announce(&harness.store, "job-a", "agent-a", &[String::from(".")]);
+        let second = announce(
+            &harness.store,
+            "job-b",
+            "agent-b",
+            &[String::from("src/lib.rs")],
+        );
+        assert_eq!(second.overlaps.len(), 1);
+        assert_eq!(second.overlaps[0].paths, vec![String::from(".")]);
+    }
+
+    #[test]
+    fn inbox_broadcasts_are_scoped_to_the_same_repository() {
+        let harness = Harness::new();
+        harness.seed_job("job-a", "hive/job-a");
+        harness.seed_job_in("acme", "other", "job-b", "hive/job-b");
+        announce(&harness.store, "job-a", "agent-a", &[String::from("src")]);
+        announce_in(
+            &harness.store,
+            "acme",
+            "other",
+            "job-b",
+            "agent-b",
+            &[String::from("src")],
+        );
+        let inbox = harness
+            .store
+            .inbox(JobKey {
+                owner: "acme",
+                repo_name: "sample",
+                job_id: "job-a",
+            })
+            .unwrap();
+        assert!(
+            inbox
+                .iter()
+                .all(|message| message.from_repo_name != "other")
+        );
+    }
+
+    #[test]
+    fn send_ack_routes_through_ack_message() {
+        let harness = Harness::new();
+        harness.seed_job("job-a", "hive/job-a");
+        announce(&harness.store, "job-a", "agent-a", &[]);
+        let help = harness
+            .store
+            .send_message(SendRequest {
+                owner: "acme",
+                repo_name: "sample",
+                job_id: "job-a",
+                agent_id: "agent-a",
+                kind: MessageKind::Help,
+                body: "need a review",
+                to_agent_id: None,
+                to_owner: Some("acme"),
+                to_repo_name: Some("sample"),
+                to_job_id: Some("job-a"),
+                paths: &[],
+                ack_of: None,
+            })
+            .unwrap();
+        harness
+            .store
+            .send_message(SendRequest {
+                owner: "acme",
+                repo_name: "sample",
+                job_id: "job-a",
+                agent_id: "agent-a",
+                kind: MessageKind::Ack,
+                body: "acked",
+                to_agent_id: None,
+                to_owner: None,
+                to_repo_name: None,
+                to_job_id: None,
+                paths: &[],
+                ack_of: Some(help.id),
+            })
+            .unwrap();
+        let original = harness
+            .store
+            .inbox(job_key_a())
+            .unwrap()
+            .into_iter()
+            .find(|message| message.id == help.id)
+            .unwrap();
+        assert!(original.acked_at.is_some());
+    }
+
+    #[test]
+    fn incomplete_recipients_are_rejected() {
+        let harness = Harness::new();
+        harness.seed_job("job-a", "hive/job-a");
+        announce(&harness.store, "job-a", "agent-a", &[]);
+        let err = harness
+            .store
+            .send_message(SendRequest {
+                owner: "acme",
+                repo_name: "sample",
+                job_id: "job-a",
+                agent_id: "agent-a",
+                kind: MessageKind::Help,
+                body: "partial",
+                to_agent_id: None,
+                to_owner: None,
+                to_repo_name: None,
+                to_job_id: Some("job-b"),
+                paths: &[],
+                ack_of: None,
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("complete owner/repository/job"));
+    }
+
+    #[test]
+    fn session_change_increments_owner_generation() {
+        let harness = Harness::new();
+        harness.seed_job("job-a", "hive/job-a");
+        let first = announce(&harness.store, "job-a", "agent-a", &[]);
+        assert_eq!(first.claim.owner_generation, 1);
+        let second = harness
+            .store
+            .announce(AnnounceRequest {
+                owner: "acme",
+                repo_name: "sample",
+                job_id: "job-a",
+                agent_id: "agent-a",
+                session_id: Some("session-restarted"),
+                agent_type: "worker",
+                intent: Some("restart"),
+                paths: &[],
+            })
+            .unwrap();
+        assert_eq!(second.claim.owner_generation, 2);
+    }
+
+    #[test]
+    fn regrant_clears_stale_coord_claim() {
+        let harness = Harness::new();
+        let worktree = harness.seed_job("job-a", "hive/job-a");
+        announce(&harness.store, "job-a", "agent-a", &[]);
+        harness.store.release_by_path(&worktree).unwrap();
+        harness
+            .store
+            .grant(crate::lease::LeaseGrant {
+                repo: &harness.repo,
+                owner: "acme",
+                repo_name: "sample",
+                job_id: "job-a",
+                branch: "hive/job-a",
+                worktree_path: &worktree,
+                start_commit: &harness.start,
+            })
+            .unwrap();
+        let claimed = announce(&harness.store, "job-a", "agent-b", &[]);
+        assert_eq!(claimed.claim.agent_id, "agent-b");
+    }
+
+    #[test]
+    fn blocker_kind_is_accepted() {
+        assert_eq!(MessageKind::parse("blocker").unwrap(), MessageKind::Blocker);
+    }
+
+    #[test]
+    fn prepared_lease_cannot_announce() {
+        let harness = Harness::new();
+        let worktree = harness._temp.path().join("worktrees/prepared");
+        fs::create_dir_all(&worktree).unwrap();
+        harness
+            .store
+            .prepare_allocate(AllocateRequest {
+                repo: &harness.repo,
+                owner: "acme",
+                repo_name: "sample",
+                job_id: "job-prep",
+                branch: "hive/prep",
+                worktree_path: &worktree,
+                requested_start_point: "refs/heads/main",
+                start_commit: &harness.start,
+                ttl: None,
+            })
+            .unwrap();
+        let err = harness
+            .store
+            .announce(AnnounceRequest {
+                owner: "acme",
+                repo_name: "sample",
+                job_id: "job-prep",
+                agent_id: "agent-a",
+                session_id: Some("session-a"),
+                agent_type: "worker",
+                intent: None,
+                paths: &[],
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("ACTIVE"));
     }
 }

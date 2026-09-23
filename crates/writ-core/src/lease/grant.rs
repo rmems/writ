@@ -21,14 +21,16 @@ impl LeaseStore {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| lease_err("begin grant", e))?;
-        if let Some(existing) = query_lease_tx(
+        let existing = query_lease_tx(
             &tx,
             "WHERE owner = ?1 AND repo_name = ?2 AND job_id = ?3",
             params![grant.owner, grant.repo_name, grant.job_id],
             "lookup lease before grant",
-        )? && existing.allocation_state == AllocationState::Tombstoned
+        )?;
+        if let Some(existing) = existing.as_ref()
+            && existing.allocation_state == AllocationState::Tombstoned
         {
-            return Err(terminal_error(&existing));
+            return Err(terminal_error(existing));
         }
         occupant::reject_live_path_occupant(
             &tx,
@@ -40,6 +42,16 @@ impl LeaseStore {
             },
             "grant lease",
         )?;
+        if existing
+            .as_ref()
+            .is_some_and(|lease| lease.allocation_state == AllocationState::Released)
+        {
+            tx.execute(
+                "DELETE FROM coord_claims WHERE owner = ?1 AND repo_name = ?2 AND job_id = ?3",
+                params![grant.owner, grant.repo_name, grant.job_id],
+            )
+            .map_err(|e| lease_err("clear stale coord claim on regrant", e))?;
+        }
         let changed = tx
             .execute(
                 schema::GRANT_UPSERT,
@@ -51,6 +63,7 @@ impl LeaseStore {
                     grant.branch,
                     branch_ref,
                     worktree_path,
+                    branch_ref,
                     grant.start_commit,
                     operation_id,
                     AllocationState::Active.as_str(),

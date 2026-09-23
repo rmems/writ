@@ -14,6 +14,8 @@ pub(super) struct GitEvidence {
     pub branch_commit: Option<String>,
     pub head_commit: Option<String>,
     pub worktree_registered: bool,
+    pub checkout_common_dir: Option<std::path::PathBuf>,
+    pub repo_root_common_dir: Option<std::path::PathBuf>,
 }
 
 /// Match a `git worktree list --porcelain` dump against a stored path.
@@ -61,6 +63,8 @@ pub(super) fn inspect_git(repo_root: &Path, worktree_path: &Path, branch: &str) 
         branch_commit,
         head_commit,
         worktree_registered,
+        checkout_common_dir: git_common_dir(worktree_path),
+        repo_root_common_dir: git_common_dir(repo_root),
     }
 }
 
@@ -139,6 +143,9 @@ fn identity_conflicts(lease: &Lease, evidence: &GitEvidence) -> Vec<String> {
     if !evidence.worktree_registered {
         conflicts.push("worktree is not registered".to_owned());
     }
+    if let Some(conflict) = repo_identity_conflict(lease, evidence) {
+        conflicts.push(conflict);
+    }
     if named_git_branch(&lease.branch)
         && let Some(conflict) = commit_conflict(
             evidence.branch_commit.as_deref(),
@@ -171,8 +178,40 @@ fn commit_conflict(
         Some(commit) => Some(format!(
             "{present_label} {commit} != resolved start {expected}"
         )),
+        None if expected.is_empty() => None,
         None => Some(absent.to_owned()),
     }
+}
+
+fn repo_identity_conflict(_lease: &Lease, evidence: &GitEvidence) -> Option<String> {
+    match (
+        evidence.checkout_common_dir.as_deref(),
+        evidence.repo_root_common_dir.as_deref(),
+    ) {
+        (Some(checkout), Some(repo_root))
+            if crate::paths::same_existing_path(checkout, repo_root) =>
+        {
+            None
+        }
+        (Some(_), Some(_)) => {
+            Some("checkout and repo_root do not share the stored lease's git identity".to_owned())
+        }
+        _ if evidence.path_exists => {
+            Some("checkout and repo_root do not share the stored lease's git identity".to_owned())
+        }
+        _ => None,
+    }
+}
+
+fn git_common_dir(root: &Path) -> Option<std::path::PathBuf> {
+    let raw = optional_git_stdout(root, &["rev-parse", "--git-common-dir"])?;
+    let candidate = Path::new(&raw);
+    let joined = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        root.join(candidate)
+    };
+    Some(crate::paths::canonicalize_for_tools(&joined).unwrap_or(joined))
 }
 
 fn named_git_branch(branch: &str) -> bool {

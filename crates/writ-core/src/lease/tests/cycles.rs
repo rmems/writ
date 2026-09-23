@@ -70,3 +70,27 @@ fn fix_cycles_mutate_without_proof_stays_needs_attention() {
     ));
     assert_eq!(stored_fix_cycles(&harness), Some(0));
 }
+
+#[test]
+fn regrant_clears_pending_fix_cycle_journal() {
+    let harness = active_job();
+    harness.store.prepare_fix_cycle(harness.key()).unwrap();
+    harness.store.release_by_path(&harness.worktree).unwrap();
+    harness
+        .store
+        .grant(LeaseGrant {
+            repo: &harness.repo,
+            owner: "acme",
+            repo_name: "sample",
+            job_id: "job-1",
+            branch: "hive/job-1",
+            worktree_path: &harness.worktree,
+            start_commit: &harness.start,
+        })
+        .unwrap();
+    let lease = harness.store.find_job(harness.key()).unwrap().unwrap();
+    assert!(lease.pending_fix_op_id.is_none());
+    assert!(lease.pending_fix_cycles.is_none());
+    let token = harness.store.prepare_fix_cycle(harness.key()).unwrap();
+    assert_eq!(token.authorized, 1);
+}

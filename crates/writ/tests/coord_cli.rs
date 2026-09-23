@@ -296,4 +296,23 @@ fn two_processes_can_list_the_same_claims() {
     let listed = writ(&root.path, &["--json", "coord", "list"]);
     assert!(listed.status.success(), "{:?}", listed.stderr);
     assert_eq!(json(&listed)["data"]["claims"].as_array().unwrap().len(), 1);
+
+    let human = writ(&root.path, &["coord", "list"]);
+    assert!(human.status.success(), "{:?}", human.stderr);
+    let stdout = String::from_utf8_lossy(&human.stdout);
+    assert!(stdout.contains("job-a"), "{stdout}");
+}
+
+#[test]
+fn coord_list_denies_empty_allowlist() {
+    let root = TestDir::new("coord-cli");
+    let denied = std::process::Command::new(env!("CARGO_BIN_EXE_writ"))
+        .env("WRIT_WORKTREE_BASE", root.path.join("worktrees"))
+        .env("WRIT_LEASE_PATH", root.path.join("leases.db"))
+        .env_remove("WRIT_ALLOWED_OWNERS")
+        .env_remove("WH_ALLOWED_OWNERS")
+        .args(["--json", "coord", "list"])
+        .output()
+        .unwrap();
+    assert!(!denied.status.success());
 }

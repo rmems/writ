@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::Result;
 use crate::git_safe::origin_github_repo_selector;
-use crate::lease::{Lease, LeaseMode, LeaseStore};
+use crate::lease::{AllocationState, Lease, LeaseMode, LeaseStore};
 use crate::owners::OwnerAllowlist;
 
 use super::classify::classify_snapshot;
@@ -182,8 +182,11 @@ fn github_state(snapshot: PrSnapshot) -> GithubState {
 }
 
 fn recovery_of(lease: &Lease) -> RecoveryStatus {
-    if lease.released_at.is_some() {
+    if lease.allocation_state.is_terminal() || lease.released_at.is_some() {
         return RecoveryStatus::Released;
+    }
+    if lease.allocation_state != AllocationState::Active {
+        return RecoveryStatus::NeedsReconcile;
     }
     if !Path::new(&lease.worktree_path).exists() {
         return RecoveryStatus::MissingCheckout;
@@ -206,7 +209,13 @@ fn heartbeat_stale(lease: &Lease) -> bool {
 }
 
 fn collab_of(lease: &Lease, overlay: &CoordOverlay, github: Option<&GithubState>) -> CollabStatus {
-    if lease.released_at.is_some() || lease.mode == LeaseMode::Unassigned {
+    if lease.allocation_state.is_terminal() || lease.released_at.is_some() {
+        return CollabStatus::Released;
+    }
+    if lease.allocation_state != AllocationState::Active {
+        return CollabStatus::Waiting;
+    }
+    if lease.mode == LeaseMode::Unassigned {
         return CollabStatus::Released;
     }
     if is_conflicted(lease, github) {
@@ -259,6 +268,7 @@ fn collect_blockers(
         RecoveryStatus::Live | RecoveryStatus::Released => {}
         RecoveryStatus::StaleHeartbeat => blockers.push("recovery:stale_heartbeat".to_owned()),
         RecoveryStatus::MissingCheckout => blockers.push("recovery:missing_checkout".to_owned()),
+        RecoveryStatus::NeedsReconcile => blockers.push("recovery:needs_reconcile".to_owned()),
     }
     blockers
 }

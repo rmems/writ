@@ -89,6 +89,19 @@ impl LeaseStore {
         if current.allocation_state.is_terminal() {
             return Err(terminal_error(&current));
         }
+        if current.allocation_state == next
+            && matches!(next, AllocationState::Mutating | AllocationState::Active)
+        {
+            tx.commit()
+                .map_err(|e| lease_err("commit allocate advance", e))?;
+            drop(conn);
+            return self
+                .find_by_operation(operation_id)?
+                .ok_or_else(|| Error::LeaseStore {
+                    context: "advance allocate",
+                    message: "lease row missing after idempotent advance".to_owned(),
+                });
+        }
         let expected = match (current.allocation_state, next) {
             (AllocationState::Prepared, AllocationState::Mutating) => AllocationState::Prepared,
             (AllocationState::Mutating, AllocationState::Active) => AllocationState::Mutating,

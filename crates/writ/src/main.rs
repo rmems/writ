@@ -776,12 +776,12 @@ fn worktree_response(
 
 fn lease_response(
     action: LeaseAction,
+    allowlist: &writ_core::owners::OwnerAllowlist,
 ) -> writ_core::error::Result<writ_core::contract::Response<serde_json::Value>> {
     use writ_core::contract::Response;
     use writ_core::lease::{InspectRequest, JobKey, LeaseStore};
     use writ_core::paths::lease_store_path;
 
-    let store = LeaseStore::open(lease_store_path())?;
     match action {
         LeaseAction::Inspect {
             repo,
@@ -791,16 +791,33 @@ fn lease_response(
             branch,
             path,
         } => {
-            let worktree_path =
-                inspect_worktree_path(&store, &owner, &repo_name, &job_id, path.as_deref())?;
-            let inspection = store.inspect(InspectRequest {
-                repo_root: &repo,
-                owner: &owner,
-                repo_name: &repo_name,
-                job_id: &job_id,
-                worktree_path: &worktree_path,
-                branch: branch.as_deref(),
-            })?;
+            allowlist.enforce_owner(&owner)?;
+            let store = open_inspect_store()?;
+            let worktree_path = inspect_worktree_path(
+                store.as_ref(),
+                &owner,
+                &repo_name,
+                &job_id,
+                path.as_deref(),
+            )?;
+            let inspection = match store.as_ref() {
+                Some(store) => store.inspect(InspectRequest {
+                    repo_root: &repo,
+                    owner: &owner,
+                    repo_name: &repo_name,
+                    job_id: &job_id,
+                    worktree_path: &worktree_path,
+                    branch: branch.as_deref(),
+                })?,
+                None => writ_core::lease::LeaseStore::inspect_without_store(InspectRequest {
+                    repo_root: &repo,
+                    owner: &owner,
+                    repo_name: &repo_name,
+                    job_id: &job_id,
+                    worktree_path: &worktree_path,
+                    branch: branch.as_deref(),
+                }),
+            };
             Ok(Response::success(
                 "lease.inspect",
                 serde_json::to_value(&inspection).map_err(std::io::Error::other)?,
@@ -812,6 +829,8 @@ fn lease_response(
             repo_name,
             job_id,
         } => {
+            allowlist.enforce_owner(&owner)?;
+            let store = LeaseStore::open(lease_store_path())?;
             let key = JobKey {
                 owner: &owner,
                 repo_name: &repo_name,
@@ -844,8 +863,25 @@ fn lease_response(
     }
 }
 
+fn open_inspect_store() -> writ_core::error::Result<Option<writ_core::lease::LeaseStore>> {
+    use writ_core::lease::LeaseStore;
+    use writ_core::paths::lease_store_path;
+
+    let path = lease_store_path();
+    match std::fs::metadata(&path) {
+        Ok(meta) if meta.is_file() => Ok(Some(LeaseStore::open_read_only(path)?)),
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("lease store path is not a regular file: {}", path.display()),
+        )
+        .into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn inspect_worktree_path(
-    store: &writ_core::lease::LeaseStore,
+    store: Option<&writ_core::lease::LeaseStore>,
     owner: &str,
     repo_name: &str,
     job_id: &str,
@@ -854,11 +890,13 @@ fn inspect_worktree_path(
     use writ_core::lease::JobKey;
     use writ_core::paths::{derive_worktree_path, worktree_base_path};
 
-    if let Some(lease) = store.find_job(JobKey {
-        owner,
-        repo_name,
-        job_id,
-    })? {
+    if let Some(store) = store
+        && let Some(lease) = store.find_job(JobKey {
+            owner,
+            repo_name,
+            job_id,
+        })?
+    {
         return Ok(std::path::PathBuf::from(lease.worktree_path));
     }
     if let Some(path) = path {
@@ -869,10 +907,11 @@ fn inspect_worktree_path(
 
 fn run_lease(
     action: LeaseAction,
+    allowlist: &writ_core::owners::OwnerAllowlist,
     json: bool,
     stdout: &mut impl Write,
 ) -> writ_core::error::Result<ExitCode> {
-    let response = lease_response(action)?;
+    let response = lease_response(action, allowlist)?;
     if json {
         write_json_line(stdout, &response)?;
     } else {
@@ -1127,8 +1166,8 @@ async fn run(cli: Cli, stdout: &mut impl Write) -> writ_core::error::Result<Exit
             }
         },
         Some(Command::Worktree { action }) => run_worktree(action, &allowlist, cli.json, stdout),
-        Some(Command::Lease { action }) => run_lease(action, cli.json, stdout),
-        Some(Command::Coord { action }) => coord::run(action, cli.json, stdout),
+        Some(Command::Lease { action }) => run_lease(action, &allowlist, cli.json, stdout),
+        Some(Command::Coord { action }) => coord::run(action, &allowlist, cli.json, stdout),
         Some(Command::Attribution { action }) => run_attribution(action, cli.json, stdout),
         Some(Command::Hook) => run_hook(stdout),
         Some(Command::Install { settings, writ_bin }) => {

@@ -2,13 +2,28 @@
 
 use rusqlite::{Connection, OptionalExtension};
 
-use super::{AgentRecord, AllocationState, Lease, LeaseMode, Result, lease_err};
+use super::{AgentRecord, AllocationState, Lease, LeaseMode, Result, lease_err, schema};
 
 pub(super) const LEASE_SELECT: &str = "SELECT repo, owner, repo_name, job_id, branch, branch_ref, \
      worktree_path, requested_start_point, start_commit, operation_id, \
      allocation_state, mode, ttl, heartbeat, max_files, max_churn, \
      max_fix_cycles, fix_cycles, pending_fix_cycles, pending_fix_op_id, \
      created_at, updated_at, released_at, tombstoned_at, id FROM leases";
+
+pub(super) const LEGACY_LEASE_SELECT: &str = "SELECT repo, owner, repo_name, job_id, branch, branch_ref, \
+     worktree_path, start_commit, start_commit, 'legacy-' || id, \
+     CASE WHEN released_at IS NOT NULL THEN 'RELEASED' ELSE 'ACTIVE' END, \
+     mode, ttl, heartbeat, max_files, max_churn, \
+     max_fix_cycles, fix_cycles, NULL, NULL, \
+     created_at, updated_at, released_at, NULL, id FROM leases";
+
+fn lease_select_sql(conn: &Connection) -> Result<String> {
+    if schema::has_crash_consistency_columns(conn)? {
+        Ok(LEASE_SELECT.to_owned())
+    } else {
+        Ok(LEGACY_LEASE_SELECT.to_owned())
+    }
+}
 
 pub(super) const LIVE_PATH_LOOKUP: &str = "WHERE worktree_path = ?1
                 ORDER BY CASE
@@ -25,7 +40,7 @@ pub(super) fn query_lease_locked(
     sql_params: impl rusqlite::Params,
     context: &'static str,
 ) -> Result<Option<Lease>> {
-    let query = format!("{LEASE_SELECT} {where_sql}");
+    let query = format!("{} {where_sql}", lease_select_sql(conn)?);
     conn.query_row(&query, sql_params, lease_from_row)
         .optional()
         .map_err(|e| lease_err(context, e))
@@ -37,7 +52,7 @@ pub(crate) fn query_lease_tx(
     sql_params: impl rusqlite::Params,
     context: &'static str,
 ) -> Result<Option<Lease>> {
-    let query = format!("{LEASE_SELECT} {where_sql}");
+    let query = format!("{} {where_sql}", lease_select_sql(tx)?);
     tx.query_row(&query, sql_params, lease_from_row)
         .optional()
         .map_err(|e| lease_err(context, e))
@@ -48,7 +63,7 @@ pub(super) fn list_leases_on(
     suffix: &str,
     context: &'static str,
 ) -> Result<Vec<Lease>> {
-    let query = format!("{LEASE_SELECT} {suffix}");
+    let query = format!("{} {suffix}", lease_select_sql(conn)?);
     let mut stmt = conn.prepare(&query).map_err(|e| lease_err(context, e))?;
     let rows = stmt
         .query_map([], lease_from_row)

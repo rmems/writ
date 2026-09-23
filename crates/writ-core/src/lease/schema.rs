@@ -66,8 +66,8 @@ pub(super) const GRANT_UPSERT: &str = r"
                 pending_fix_cycles, pending_fix_op_id, created_at, updated_at,
                 released_at, tombstoned_at
             ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9, ?10, ?11, NULL, ?12,
-                NULL, NULL, NULL, 0, NULL, NULL, ?12, ?12, NULL, NULL
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, NULL, ?13,
+                NULL, NULL, NULL, 0, NULL, NULL, ?13, ?13, NULL, NULL
             )
             ON CONFLICT(owner, repo_name, job_id) DO UPDATE SET
                 repo = excluded.repo,
@@ -80,6 +80,14 @@ pub(super) const GRANT_UPSERT: &str = r"
                         OR leases.requested_start_point = ''
                     THEN excluded.requested_start_point
                     ELSE leases.requested_start_point
+                END,
+                pending_fix_cycles = CASE
+                    WHEN leases.released_at IS NOT NULL THEN NULL
+                    ELSE leases.pending_fix_cycles
+                END,
+                pending_fix_op_id = CASE
+                    WHEN leases.released_at IS NOT NULL THEN NULL
+                    ELSE leases.pending_fix_op_id
                 END,
                 operation_id = CASE
                     WHEN leases.released_at IS NOT NULL OR leases.operation_id = ''
@@ -185,6 +193,20 @@ fn ensure_crash_consistency_columns(conn: &Connection) -> Result<()> {
     )
     .map_err(|e| lease_err("backfill allocation_state", e))?;
     Ok(())
+}
+
+pub(super) fn has_crash_consistency_columns(conn: &Connection) -> Result<bool> {
+    let names = table_column_names(conn)?;
+    Ok([
+        "requested_start_point",
+        "operation_id",
+        "allocation_state",
+        "pending_fix_cycles",
+        "pending_fix_op_id",
+        "tombstoned_at",
+    ]
+    .into_iter()
+    .all(|column| names.iter().any(|name| name == column)))
 }
 
 fn ensure_live_path_unique_index(conn: &Connection) -> Result<()> {
@@ -365,5 +387,27 @@ mod tests {
             }
             other => panic!("expected lease-store error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn read_only_open_reads_parent_schema_without_migrating() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("leases.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            create_legacy_leases(&conn);
+            insert_legacy_lease(&conn, "job-a", "/worktrees/a");
+        }
+        let store = crate::lease::LeaseStore::open_read_only(&path).unwrap();
+        let leases = store.list_all().unwrap();
+        assert_eq!(leases.len(), 1);
+        assert_eq!(leases[0].requested_start_point, "abc123");
+        assert_eq!(leases[0].start_commit, "abc123");
+        assert!(leases[0].operation_id.starts_with("legacy-"));
+        assert_eq!(
+            leases[0].allocation_state,
+            crate::lease::AllocationState::Active
+        );
+        assert!(!has_crash_consistency_columns(&Connection::open(&path).unwrap()).unwrap());
     }
 }

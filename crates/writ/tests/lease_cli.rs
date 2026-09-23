@@ -145,4 +145,38 @@ fn inspect_distinguishes_missing_lease_from_live_worktree() {
         (Some("missing_lease"), Some(false), Some(true))
     );
     assert!(path.exists());
+    assert!(
+        !root.path.join("leases.db").exists(),
+        "inspect must not create a lease store"
+    );
+}
+
+#[test]
+fn lease_reconcile_rejects_disallowed_owner() {
+    let root = TestDir::new("lease-cli");
+    let repo = init_repo(&root.path);
+    add_origin(&repo);
+    let path = root.path.join("checkouts/job-deny");
+    add_worktree(&repo, &path, "hive/job-deny");
+    assert!(register_job(&root.path, &path, "job-deny").status.success());
+    let denied = writ(
+        &root.path,
+        &[
+            "--allowed-owners",
+            "other",
+            "--json",
+            "lease",
+            "reconcile",
+            "--repo",
+            repo.to_str().unwrap(),
+            "acme",
+            "sample",
+            "job-deny",
+        ],
+    );
+    assert!(!denied.status.success());
+    assert!(
+        String::from_utf8_lossy(&denied.stderr).contains("allowlist")
+            || String::from_utf8_lossy(&denied.stdout).contains("OWNER_NOT_ALLOWED")
+    );
 }

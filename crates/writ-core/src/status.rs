@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::checkout::{CheckoutInfo, DETACHED_BRANCH, inspect_checkout_for_status};
 use crate::contract::Response;
-use crate::lease::{AgentRecord, Lease, LeaseMode, LeaseStore};
+use crate::lease::{AgentRecord, AllocationState, Lease, LeaseMode, LeaseStore};
 use crate::paths::lease_store_path;
 use crate::timeout_policy::{RecoveryStage, TimeoutClass};
 
@@ -266,6 +266,19 @@ pub fn collaboration_state_from_mode(mode: LeaseMode) -> CollaborationState {
     }
 }
 
+fn collaboration_state_from_lease(lease: &Lease) -> CollaborationState {
+    match lease.allocation_state {
+        AllocationState::Prepared | AllocationState::Mutating | AllocationState::Aborted => {
+            CollaborationState::Waiting
+        }
+        AllocationState::NeedsAttention | AllocationState::Unknown => {
+            CollaborationState::Conflicted
+        }
+        AllocationState::Released | AllocationState::Tombstoned => CollaborationState::Unassigned,
+        AllocationState::Active => collaboration_state_from_mode(lease.mode),
+    }
+}
+
 /// Load collaboration status from the default lease-store path.
 pub fn load() -> Result<JobsData, String> {
     load_from_path(&lease_store_path())
@@ -325,7 +338,7 @@ fn job_from_lease(lease: &Lease) -> JobStatus {
         recovery_stage: None,
         last_output_ms: None,
         max_redispatch_per_item: None,
-        collaboration_state: collaboration_state_from_mode(lease.mode),
+        collaboration_state: collaboration_state_from_lease(lease),
         lease_mode: Some(lease.mode_raw.clone()),
         head,
         head_source,
@@ -342,14 +355,18 @@ fn job_from_lease(lease: &Lease) -> JobStatus {
 }
 
 fn resolve_head(lease: &Lease) -> (Option<String>, Option<String>, Option<bool>) {
+    let interrupted =
+        lease.allocation_state != AllocationState::Active && !lease.allocation_state.is_terminal();
     match inspect_checkout_for_status(Path::new(&lease.worktree_path)) {
-        Ok(info) if checkout_matches_lease(&info, lease) => {
-            (info.head_commit, Some("checkout".to_owned()), Some(false))
-        }
+        Ok(info) if checkout_matches_lease(&info, lease) => (
+            info.head_commit,
+            Some("checkout".to_owned()),
+            Some(interrupted),
+        ),
         Ok(_) | Err(_) => (
             nonempty_head(&lease.start_commit),
             Some("lease".to_owned()),
-            Some(lease.released_at.is_none()),
+            Some(interrupted || lease.released_at.is_none()),
         ),
     }
 }

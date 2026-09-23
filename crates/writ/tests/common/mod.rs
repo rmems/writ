@@ -67,6 +67,7 @@ pub fn writ(root: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_writ"))
         .env("WRIT_WORKTREE_BASE", root.join("worktrees"))
         .env("WRIT_LEASE_PATH", root.join("leases.db"))
+        .env("WRIT_ALLOWED_OWNERS", "acme")
         .args(args)
         .output()
         .unwrap()

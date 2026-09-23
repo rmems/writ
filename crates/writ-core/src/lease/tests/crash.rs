@@ -369,3 +369,100 @@ fn inspect_does_not_mutate_or_adopt() {
         AllocationState::Prepared
     );
 }
+
+#[test]
+fn allocate_retries_of_completed_phases_are_idempotent() {
+    let harness = RepoHarness::new();
+    let prepared = harness.store.prepare_allocate(harness.request()).unwrap();
+    let mutating = harness.store.mark_mutating(&prepared.operation_id).unwrap();
+    let again = harness.store.mark_mutating(&prepared.operation_id).unwrap();
+    assert_eq!(again.allocation_state, AllocationState::Mutating);
+    assert_eq!(again.operation_id, mutating.operation_id);
+    let active = harness
+        .store
+        .commit_allocate(&prepared.operation_id)
+        .unwrap();
+    let committed = harness
+        .store
+        .commit_allocate(&prepared.operation_id)
+        .unwrap();
+    assert_eq!(committed.allocation_state, AllocationState::Active);
+    assert_eq!(committed.operation_id, active.operation_id);
+}
+
+#[test]
+fn inspect_rejects_a_foreign_repository_with_the_same_branch() {
+    let harness = RepoHarness::new();
+    harness.prepare_and_add_worktree();
+    let foreign = harness._temp.path().join("foreign");
+    git(
+        harness._temp.path(),
+        &[
+            "clone",
+            "--quiet",
+            harness.repo.to_str().unwrap(),
+            foreign.to_str().unwrap(),
+        ],
+    );
+    git(&foreign, &["branch", "hive/job-1", &harness.start]);
+    let inspection = harness
+        .store
+        .inspect(InspectRequest {
+            repo_root: &foreign,
+            owner: "acme",
+            repo_name: "sample",
+            job_id: "job-1",
+            worktree_path: &harness.worktree,
+            branch: Some("hive/job-1"),
+        })
+        .unwrap();
+    assert_eq!(inspection.classification, EvidenceClass::NeedsAttention);
+    assert!(
+        inspection
+            .conflicts
+            .iter()
+            .any(|conflict| conflict.contains("git identity"))
+    );
+}
+
+#[test]
+fn unborn_head_matches_empty_start_commit() {
+    let temp = tempdir().unwrap();
+    let repo = temp.path().join("unborn");
+    fs::create_dir(&repo).unwrap();
+    git(&repo, &["init", "-b", "main"]);
+    git(&repo, &["config", "user.email", "test@example.com"]);
+    git(&repo, &["config", "user.name", "Test User"]);
+    let store = LeaseStore::open(temp.path().join("leases.db")).unwrap();
+    store
+        .prepare_allocate(AllocateRequest {
+            repo: &repo,
+            owner: "acme",
+            repo_name: "sample",
+            job_id: "job-1",
+            branch: "main",
+            worktree_path: &repo,
+            requested_start_point: "refs/heads/main",
+            start_commit: "",
+            ttl: None,
+        })
+        .unwrap();
+    let inspection = store
+        .inspect(InspectRequest {
+            repo_root: &repo,
+            owner: "acme",
+            repo_name: "sample",
+            job_id: "job-1",
+            worktree_path: &repo,
+            branch: Some("main"),
+        })
+        .unwrap();
+    assert!(
+        !inspection
+            .conflicts
+            .iter()
+            .any(|conflict| conflict.contains("HEAD is absent")),
+        "{:?}",
+        inspection.conflicts
+    );
+}

@@ -429,7 +429,7 @@ impl Error {
     #[must_use]
     pub const fn exit_code(&self) -> u8 {
         match self {
-            Self::PolicyViolation { .. } => 2,
+            Self::PolicyViolation { .. } | Self::LeaseAttention(_) => 2,
             _ => 1,
         }
     }
@@ -470,6 +470,19 @@ mod tests {
 
         assert_eq!(policy.exit_code(), 2);
         assert_eq!(postcondition.exit_code(), 1);
+
+        let attention = Error::LeaseAttention(Box::new(super::LeaseAttentionFailure {
+            operation_id: "op-1".to_owned(),
+            allocation_state: "NEEDS_ATTENTION".to_owned(),
+            classification: "needs_attention".to_owned(),
+            conflicts: vec!["conflict".to_owned()],
+            path: PathBuf::from("/wt"),
+            path_exists: true,
+            branch_commit: None,
+            head_commit: None,
+            worktree_registered: true,
+        }));
+        assert_eq!(attention.exit_code(), 2);
 
         let ambiguous = Error::AmbiguousStartPoint {
             start_point: "collision".to_owned(),

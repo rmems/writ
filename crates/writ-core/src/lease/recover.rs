@@ -92,6 +92,12 @@ impl LeaseStore {
         Ok(classify::inspect_now(&lease, request))
     }
 
+    /// Inspect git evidence when no lease store exists yet.
+    #[must_use]
+    pub fn inspect_without_store(request: InspectRequest<'_>) -> AllocationInspection {
+        classify::inspect_now(&None, request)
+    }
+
     /// Reconcile an interrupted allocation without destructive cleanup.
     pub fn reconcile(&self, key: JobKey<'_>, repo_root: &Path) -> Result<Option<ReconcileOutcome>> {
         let Some(lease) = self.find_job(key)? else {
@@ -276,6 +282,15 @@ fn load_open_lease(
         }),
         Some(current) if current.allocation_state.is_terminal() => {
             ControlFlow::Break(terminal_outcome(current, inspection.clone()))
+        }
+        Some(current)
+            if matches!(lookup, RecoverLookup::Job)
+                && current.operation_id != expected.operation_id =>
+        {
+            ControlFlow::Break(ReconcileOutcome::NeedsAttention {
+                lease: current,
+                inspection: inspection.clone(),
+            })
         }
         Some(current) => ControlFlow::Continue(current),
     })
