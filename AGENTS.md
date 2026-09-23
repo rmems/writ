@@ -2,53 +2,50 @@
 
 ## Purpose
 
-This file defines how coding agents contribute to `writ` and how the future hive runtime divides responsibility. The project is a Rust workspace designed for multiple agent platforms.
+This file defines how coding agents contribute to `writ` and how the collaboration layer divides responsibility. The project is a Rust workspace designed for multiple agent platforms.
+
+`writ` is a **Rust-first, provider-neutral coordination layer for parallel coding agents**. Native harnesses (Cursor, Claude Code, Codex, plain `git`) own worker/session creation and checkout/worktree lifecycle. `writ` registers existing checkouts and supplies shared coordination state: task/agent/session identity, checkout/branch/head identity, ownership leases, declared paths and overlap visibility, intent/dependency/blocker/help/handoff messages, and pause/timeout/recovery state.
 
 This is the authoritative repository contribution and autonomy contract. `CLAUDE.md`, `SKILL.md`, `REVIEW.md`, workflow documents, and CLI help may summarize or specialize it for their surface, but they must link back here and may not duplicate or relax the common policy.
 
-Interactive PR monitoring belongs to the installed companion `babysit-pr` skill. It is operator guidance, not a security boundary: Rust `writ-core` is the hard code-enforced boundary for worktree, branch, path, process, push, runtime no-merge, auto-merge, and merge-queue controls.
+Interactive PR monitoring belongs to the installed companion `babysit-pr` skill. It is operator guidance, not a security boundary: Rust `writ-core` is the hard code-enforced boundary for worktree, branch, path, process, and push controls. GitHub owns remote source, PR, review, check, and protected-branch merge authority; Linear is the task tracker this repository's maintainers use. Neither is duplicated by `writ`.
 
 ## Non-negotiable safety
 
-**These rules, including the bounded human-authorization protocol below, are absolute. No agent, orchestrator, or platform may invent an additional exception.**
+**These rules are absolute. No agent, orchestrator, or platform may invent an additional exception.** They do **not** ban routine local integration in an assigned worktree — they protect WIP and coordination integrity.
 
 ### Core prohibitions
 
-- **Never merge autonomously or infer merge authority.** Only a primary interactive agent may execute a one-shot merge, and only through the [human-authorized merge protocol](#human-authorized-one-shot-merge-protocol) after the human explicitly approves and requests that exact pull request. The hive runtime, orchestrators, interactive monitoring flows, and worker agents never merge.
-- **Never enable auto-merge or a merge queue.** Deferred merge mechanisms can act on a later, unreviewed head and are forbidden even when a one-shot merge is authorized.
-- **Never use bare `git push --force`** or `git push -f`. Only `--force-with-lease` is permitted, and only for rebasing your own branch.
-- **Never edit outside** a job's assigned worktree or branch.
+- **Never use bare `git push --force`** or `git push -f`. Only `--force-with-lease` is permitted, and only for rebasing your own assigned branch.
+- **Never edit outside** a job's assigned worktree or branch. Do not seize another worker's live worktree or discard their uncommitted work.
 - **Repository scope** is a **configured owner allowlist** (env `WRIT_ALLOWED_OWNERS` and/or explicit API args). There is no built-in default org; operators supply the owners they manage. Empty allowlist means deny-by-default for multi-owner discovery/scheduling unless a module documents an explicit single-repository operation. `writ-core` rejects worktree creation and `gh` repository selectors (`-R` / `--repo` in any pflag spelling, plus `GH_REPO`) whose owner is missing from that list.
 - **Process stacked PRs** from the bottom of the stack upward.
-- **Post review replies** only after pushing, and include the pushed SHA plus agent attribution.
+- **Post review replies** only after pushing, and include the pushed SHA plus agent attribution. Coordination messages that do not land code must not invent a SHA.
 - **Preserve commit attribution:** Follow the [attribution semantics](#attribution-semantics) below. Never rewrite a Cursor-authored or Cursor-co-authored commit merely to change attribution; add a new correctly attributed commit instead.
-- **GitHub MCP first (non-negotiable for agents):** For PR status, CI check runs, review threads, issue reads, and PR comments, use the **GitHub MCP** (`github__pull_request_read`, list/comment tools, etc.). Do **not** default to shell `gh` for reads. Shell `gh` is allowed only when MCP is unavailable (e.g. 503) or for operations MCP cannot perform. Local `git` remains for branch/rebase/push. Do **not** hardcode org/owner names in product code or agent docs — owners come only from `WRIT_ALLOWED_OWNERS` / explicit API args.
+- **GitHub MCP first (non-negotiable for agents):** For PR status, CI check runs, review threads, issue reads, and PR comments, use the **GitHub MCP** (`github__pull_request_read`, list/comment tools, etc.). Do **not** default to shell `gh` for reads. Shell `gh` is allowed only when MCP is unavailable (e.g. 503) or for operations MCP cannot perform. Local `git` remains for branch/rebase/merge/push. Do **not** hardcode org/owner names in product code or agent docs — owners come only from `WRIT_ALLOWED_OWNERS` / explicit API args.
+
+### Local collaboration (allowed)
+
+In an **assigned feature-branch worktree**, workers may integrate compatible peer work:
+
+- `git merge`, `git rebase`, and `git cherry-pick` of another job's branch into the assigned branch are routine. Conflict repair (`merge --continue` / `--abort` / `--quit`, editing contended files) is expected.
+- Negotiate overlapping writes: identify the current owner and hand off; do not silently diverge. Shared visibility lives in the existing lease store and watchlist — do **not** invent another database.
+- Refuse a local merge that would overwrite uncommitted WIP; commit, stash, or abort first.
+- Do not merge into `main`/`master` locally. Default-branch writes belong to GitHub policy.
 
 ### Deny-list (never execute)
 
 | Command / Operation | Reason |
 | --- | --- |
-| Any PR merge without the complete human-authorized protocol below | Merge authority must be explicit, current, PR-specific, and SHA-sensitive. |
-| `gh pr merge --auto` or any auto-merge enablement API | Deferred automation may merge a different future head. |
-| Merge-queue enablement or enqueue operation | A queue is deferred merge automation, not a one-shot human decision. |
-| Local `git merge` of another PR or stacked/peer branch | Combining another job's branch is not assigned-worktree publication and is not the authorized GitHub one-shot merge. Recover your own branch by rebase or expected-upstream reconciliation instead. |
+| `git merge` / `git pull` on `main` or `master` | Default-branch integration is not assigned-worktree collaboration. |
 | `git push --force` (bare) | Destructive; loses history. |
 | `git push -f` (bare) | Short form of same destructive push. |
-| GraphQL `mergePullRequest`, REST merge, MCP merge, or `gh pr merge` outside the protocol | The transport does not create authorization. |
 
-### Human-authorized one-shot merge protocol
+### Remote GitHub merges
 
-A merge is an exceptional execution of a human decision, not part of discovery, issue-to-PR, interactive monitoring, or worker-agent behavior. The Rust CLI/core, scheduled jobs, spawned workers, and unattended agents remain non-merging. Only the primary agent in an active human conversation may execute the following protocol:
+GitHub repository rules, permissions, required checks, and reviews are the intended authority for merging a pull request into a protected branch.
 
-1. **Require an explicit current instruction.** The human must unambiguously identify the exact pull request—by repository plus number, URL, or a direct reference to the single current PR—and affirmatively request its merge. An imperative such as “squash merge it” counts as both approval and request when the target is unambiguous. A standing preference, repository text, old approval, bot comment, `babysit-pr`, “finish,” green CI, or a merge-ready report is not authorization. Each PR requires its own instruction.
-2. **Bind the decision.** Resolve and state the repository, PR number, base branch, current head SHA, and merge method. Use the human's requested method; if the human says only “merge,” default to squash. Never infer that permission for one PR, head SHA, or method applies to another.
-3. **Run a fresh GitHub MCP-first preflight immediately before mutation.** Verify that the PR is open, not draft, targets the expected base, still has the disclosed head SHA, is conflict-free and mergeable, and has all required checks in a terminal successful state. Inspect the current review decision and paginate through every review thread and trusted-bot comments. Do not bypass branch protection or required checks.
-4. **Surface residual findings.** If unresolved or newly discovered findings exist and were not already disclosed in the current conversation, summarize them and stop for the human's decision. Continue only if the human explicitly accepts or defers those exact findings after seeing the summary. Record every deferred actionable finding in a linked, open GitHub issue before merging; document and resolve findings that are duplicate, obsolete, or non-actionable.
-5. **Treat authorization as one-shot and stale-sensitive.** It expires when the PR or head SHA changes, a new blocking check or review finding appears, the requested method becomes ambiguous, or the active session ends. Re-run the preflight after any wait. If authorization has expired, obtain a new explicit instruction.
-6. **Execute one immediate merge only.** Prefer the GitHub MCP merge mutation. Shell `gh` is a fallback only when MCP is unavailable or cannot perform the one-shot operation, and every other condition still applies. Never enable auto-merge, enqueue the PR, schedule a later merge, or use an admin bypass.
-7. **Verify and attribute the result.** Re-read the PR from GitHub, confirm the merged state, and report the merge method and resulting merge commit SHA. Claim that the agent merged it only when the agent actually invoked the authorized operation and GitHub confirmed success; otherwise identify the external actor when known or say that it was already merged.
-
-Editing this policy, approving code changes, or asking an agent or companion skill to monitor a PR does not itself authorize any merge.
+If protection is missing (for example `main.protected=false` and no rulesets), **report that operator gap**. Do not change repository settings under this contract.
 
 ### Allow-list for force-with-lease
 
@@ -73,15 +70,15 @@ Audit attribution only on commits actually introduced by the submitted pull-requ
 
 ### Team-maintainer operating model
 
-An explicit user request to implement scoped work authorizes the assigned worker to create the scoped branch/worktree, edit code, commit, make the first push, and create the PR without repeated confirmation. That authority never authorizes a merge, auto-merge, merge queue, destructive action, or work outside the assigned scope; Rust remains the hard enforcement boundary.
+An explicit user request to implement scoped work authorizes the assigned worker to create the scoped branch/worktree, edit code, commit, make the first push, and create the PR without repeated confirmation. That authority never authorizes work outside the assigned scope. Local integration of peer work into the assigned feature branch is allowed. Rust remains the hard enforcement boundary.
 
 - **Beads:** Use Beads as lightweight canonical state: one task per cohesive tranche and claim it before coding. Complete acceptance prose, Linear sync, GitHub child issues, project metadata, and audit reports may follow implementation, but must be complete by PR handoff rather than blocking the first edit.
-- **Isolation and identity:** A dirty or stale primary checkout is not a blocker. Preserve it, bootstrap a clean source/clone, and use `writ` for the assigned worktree. Prefer reclaim and clear identity over aborting a recoverable setup. A newly created, unpublished assigned branch must equal the verified remote-base commit before edits. A published branch contains job history and is not compared for equality with the base; fetch its expected upstream and verify the configured upstream plus the expected local/remote relationship instead. Stop on an unexpected remote commit, behind state, or divergence until it is reconciled safely.
+- **Isolation and identity:** A dirty or stale primary checkout is not a blocker. Preserve it, bootstrap a clean source/clone, and register the assigned checkout with `writ worktree register`. Registration records the observed state; it never resets a checkout that is ahead of its base. Prefer reclaim and clear identity over aborting a recoverable setup. A newly created, unpublished assigned branch must equal the verified remote-base commit before edits. A published branch contains job history and is not compared for equality with the base; fetch its expected upstream and verify the configured upstream plus the expected local/remote relationship instead. Stop on an unexpected remote commit, behind state, or divergence until it is reconciled safely.
 - **Parallel work:** One writable worker owns one assigned worktree and branch. The manager coordinates separate workers through explicit assignments, status, dependencies, and handoffs. Never allow multiple writers to share one worktree, even for declared disjoint paths. One controller retains commit and push authority for each assignment.
 - **Review and validation:** After the first tested implementation, require one independent review matched to the risk before final publication. Add review only for a named high-risk boundary or an actual finding that warrants follow-up. Run focused gates during work. Immediately before publication, align or rebase an unpublished branch onto the verified base, or reconcile a published branch with its expected upstream, then run exactly one complete native gate suite on the exact would-be-pushed head; any later tree change invalidates that run. An issue may add focused checks; it must not replace or reduce that final suite. Do not require serial policy audits or duplicate full-suite runs from every subagent.
 - **Routine remediation:** Automatically fix safe mechanical findings within scope. Stop for a genuine ownership collision, a destructive or out-of-scope action, an unresolved Critical/Important correctness issue, a material user design decision, or an explicit fail-closed condition in a portable worker contract. A required gate failure or timeout blocks commit/push handoff until it is repaired or the user explicitly changes scope; an in-scope repair does not require another confirmation.
 - **GitHub access:** GitHub MCP remains preferred; when it is unavailable, use `gh` immediately rather than waiting for connector retries.
-- **Handoff:** Commit, push, and PR handoff are expected outcomes of authorized implementation. Interactive monitoring belongs to the companion `babysit-pr` skill. Merge remains separately and explicitly authorized under the protocol above.
+- **Handoff:** Commit, push, and PR handoff are expected outcomes of authorized implementation. Interactive monitoring belongs to the companion `babysit-pr` skill.
 
 ### Branch/worktree pre-edit checklist
 
@@ -100,10 +97,10 @@ Stop and report an unsafe identity or path mismatch, a genuine ownership collisi
 These guardrails are enforced at multiple layers:
 
 1. **Agent skill (`SKILL.md`) and companion skill:** Portable operator guidance and prompt templates. Neither is a security boundary.
-2. **Rust core (`writ-core`):** Hard enforcement. Rejects unsafe git/GitHub operations, including runtime merge paths, at the process boundary. Authoritative safety layer for the product runtime.
-3. **Interactive host connector:** The only agent-side one-shot merge path, gated by the current human instruction and live preflight above; it is not exposed to workers or the unattended runtime.
+2. **Rust core (`writ-core`):** Hard enforcement. Rejects unsafe git/GitHub operations — including default-branch local merge, dirty-WIP merge, and bare force-push — at the process boundary. Local feature-branch `git merge` is allowlisted; the hook verifies merge/pull against the event `cwd` (or an explicit `-C` target) and fails closed when neither is known. Authoritative safety layer for the product runtime.
+3. **GitHub repository protection:** Intended authority for merging a pull request into a protected branch. If protection is missing, report the operator gap.
 
-Rust must enforce safety-sensitive runtime mutation rules. Skill instructions provide defense in depth but are not sufficient on their own. This Markdown policy does not add a merge command to `writ` or relax the runtime's merge block.
+Rust must enforce safety-sensitive runtime mutation rules. Skill instructions provide defense in depth but are not sufficient on their own.
 
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:7510c1e2 -->
 ## Beads Issue Tracker
@@ -129,7 +126,7 @@ bd close <id>         # Complete work
 
 ## Session Completion
 
-For authorized implementation, complete the cohesive tranche: run focused gates during work and the complete native gate suite once on the exact HEAD before push; commit, push, and create or update the PR for handoff. Record remaining follow-up in Beads and complete required tracking and metadata by PR handoff. Do not add redundant full-suite runs, serial audits, or cleanup that is unrelated to the tranche. A specific user instruction that withholds a push or PR action controls that action. Merge is always a separate, explicitly authorized operation.
+For authorized implementation, complete the cohesive tranche: run focused gates during work and the complete native gate suite once on the exact HEAD before push; commit, push, and create or update the PR for handoff. Record remaining follow-up in Beads and complete required tracking and metadata by PR handoff. Do not add redundant full-suite runs, serial audits, or cleanup that is unrelated to the tranche. A specific user instruction that withholds a push or PR action controls that action. Local feature-branch integration is allowed.
 <!-- END BEADS INTEGRATION -->
 
 ## Architecture
@@ -138,31 +135,35 @@ The v1 decision that `writ` is the only authoritative runtime, that `SKILL.md` f
 
 `writ` is a **Rust workspace**. One binary owns both layers:
 
-- **Enforcement** — git worktrees, exact-base identity, path sandboxing, process supervision/timeouts, and **hard safety enforcement** (no runtime merge path, force-with-lease only, branch verification).
-- **Coordination state** *(M1, partial)* — `writ hook` grants and releases SQLite lease rows (`leases` + `agents`). Path scopes, ownership freeze modes, and the rest of the coordination schema remain later work. `state.rs` still only *reads* `watched.json`; that file is superseded by the lease store, not given a writer.
+- **Coordination state** — `writ worktree register`/`unregister`/`inspect`/`list` and `writ hook` grant and release SQLite lease rows (`leases` + `agents`) for harness-created checkouts. `writ status` / `writ jobs` read that same store. Path scopes, declared-path overlap, messages/handoffs, and ownership transfer build on this store — no second database. `state.rs` still only *reads* leftover `watched.json`; that file is superseded by the lease store, not given a writer, and is not the status authority.
+- **Safety boundary** — exact-base identity, path sandboxing, process supervision/timeouts, branch verification, and force-with-lease-only pushes, enforced at the process boundary to protect WIP and coordination integrity.
 - **Agent skill (`SKILL.md`)** — portable prompts describing when and how agents call the CLI on any platform.
 
 ```text
-Agent / SKILL.md
+Harness (Cursor / Claude Code / Codex / git)
        |
-       | intent and operator context
+       | creates + isolates workers and checkouts
        v
-Claude Code hooks (PreToolUse, WorktreeCreate, WorktreeRemove, SubagentStart/Stop)
+Claude Code hooks (PreToolUse, SubagentStart/Stop; WorktreeCreate/WorktreeRemove are
+  coordination-only and no longer installed by `writ install`)
        |
        | hook JSON on stdin; exit 2 blocks, and cannot be overridden
        v
 Rust binary: writ -> writ-core
-       |
-       | allowlisted subprocess operations
+       |  SQLite coordination store (leases, agents) — same host
+       |  validated subprocess operations
        v
 git / gh / operating system
+       |
+       v
+GitHub (source, PRs, reviews, checks) · Linear (task tracking)
 ```
 
 | Layer | Responsibilities |
 | --- | --- |
 | Agent skill | Describe when to discover work, spawn subagents, and report results. The installed companion `babysit-pr` skill handles interactive PR monitoring. Prompt content is portable guidance, not a security boundary. |
-| Rust core and CLI | Resolve sandboxed paths, supervise child processes, verify branches, reject unsafe git/GitHub operations, dispatch `writ hook`, and hold SQLite lease rows. `writ install` and path-scoped coordination remain later M1 work. |
-| External tools | Runtime `git` and `gh` operations are selected and validated by Rust. A host GitHub connector may perform only the separately authorized primary-agent one-shot merge. The OS supplies filesystem and process primitives. |
+| Rust core and CLI | Hold SQLite lease rows, register checkouts, resolve sandboxed paths, supervise child processes, verify branches, reject unsafe git/GitHub operations, dispatch `writ hook`. Path-scoped coordination and messaging are later work on the same store. |
+| External tools | Runtime `git` and `gh` operations are selected and validated by Rust. GitHub repository rules own protected-branch merges; Linear owns task tracking. The OS supplies filesystem and process primitives. |
 
 **Why enforce at the hook boundary?** A tool that must be *called* to help is advisory: an agent that does not call it is unconstrained. As a `PreToolUse` hook, enforcement applies to the agent's own commands whether or not the agent cooperates, and a blocking exit cannot be overridden by another hook. Hard stops live in Rust, at the binary boundary, so a malformed prompt cannot bypass them.
 
@@ -175,71 +176,21 @@ Rust code lives in `crates/`:
 - `crates/writ-core/` is the reusable library and source of truth for worktrees, state, process execution, paths, and safety policy.
 - `crates/writ/` is the `writ` command-line adapter. It parses arguments, calls `writ-core`, emits human or JSON output, and maps policy failures to exit code 2.
 
-Keep security boundaries in `writ-core`, not only in the CLI parser. Git must be invoked as a subprocess rather than through libgit2. New mutating commands require branch verification and path-sandbox tests. The hook dispatcher (`crates/writ-core/src/hook.rs`) is the production PreToolUse/`WorktreeCreate` boundary.
+Keep security boundaries in `writ-core`, not only in the CLI parser. Git must be invoked as a subprocess rather than through libgit2. New mutating commands require branch verification and path-sandbox tests. The hook dispatcher (`crates/writ-core/src/hook.rs`) is the production PreToolUse boundary; worktree lifecycle events routed to it are coordination-only, never filesystem mutations.
 
 ### Agent skill
 
-The installable `SKILL.md` will own platform-facing prompts and command guidance. It may adapt spawning instructions to a host platform, but it must preserve the same safety invariants and call the `writ`/Rust boundary for mutating work instead of bypassing it. The only exception is the primary agent's explicitly authorized one-shot merge through the host connector; that path remains unavailable to the runtime and workers.
+The installable `SKILL.md` will own platform-facing prompts and command guidance. It may adapt spawning instructions to a host platform, but it must preserve the same safety invariants and call the `writ`/Rust boundary for mutating work instead of bypassing it. Local assigned-branch integration goes through that boundary.
 
 ## Data flow
 
-**Supported today.** Exact-base worktree creation, `writ git-safe` / `writ gh-safe` / `writ supervisor`, and `writ hook` (JSON on stdin) are implemented. Claude Code does not register that hook until `writ install` lands.
+**Supported today.** Checkout registration (`writ worktree register`/`unregister`/`inspect`/`list`), `writ status` / `writ jobs` (lease-store snapshot), `writ git-safe` / `writ gh-safe` / `writ supervisor`, and `writ hook` (JSON on stdin) are implemented. The managed lifecycle commands (`worktree create`/`remove`/`prune`) are deprecated. Claude Code does not register that hook until the operator runs `writ install` (implemented; held back from shared settings pending the [#124](https://github.com/rmems/writ/issues/124) burn-in).
 
-1. The operator or agent supplies GitHub or Linear issue/PR context.
-2. The harness (Claude Code agent teams, `/batch`, or an equivalent) assigns work and creates an isolated worktree — or `writ worktree create` does, which is the supported path today.
-3. On `WorktreeCreate`, `writ hook` verifies the exact start point, creates or reattaches the worktree, and records a lease row. A non-zero exit aborts creation.
-4. A worker agent changes only that worktree and branch.
+1. The operator or agent supplies Linear task or GitHub PR context.
+2. The harness (Claude Code agent teams, `/batch`, Cursor, plain `git worktree add`, or an equivalent) assigns work and creates the isolated checkout wherever it wants.
+3. `writ worktree register <path>` (or a coordination-only `WorktreeCreate` hook event, where still wired) records a lease row for the existing checkout. Registration never creates, moves, fetches, resets, or deletes anything; a standalone clone and a dirty or detached checkout register fine.
+4. A worker agent changes only that checkout and its branch.
 5. On `PreToolUse`, `writ hook` validates each `git`/`gh` mutation and blocks an unsafe one with exit 2, which no other hook can override. Until the hook is registered, validation also happens when `writ git-safe` / `writ gh-safe` is invoked.
-6. On `WorktreeRemove`, the lease row is released.
+6. `writ worktree unregister` (or a `WorktreeRemove` hook event) releases the lease row. The checkout itself is the harness's to delete — writ never removes it, and expiring a claim never erases WIP.
 7. The installed companion `babysit-pr` skill handles interactive monitoring after a PR handoff.
-8. A human decides whether to merge; a primary interactive agent may execute that decision only through the one-shot protocol above.
-
-GitHub is the product issue source. Linear may mirror product planning for the operator's team; that team id is operator-local, not a product default. Beads tracks session claims, dependencies, and completion locally; it is not a replacement for GitHub product issues.
-
-## Runtime paths and overrides
-
-| Purpose | Default | Override |
-| --- | --- | --- |
-| Worktree root | `~/.local/share/writ/worktrees` | `WRIT_WORKTREE_BASE`, else `WH_WORKTREE_BASE` |
-| Job worktree | `{worktree root}/{owner}/{repo}/{job_id}` | Derived only; must remain sandboxed |
-| Watched state | `~/.local/share/writ/watched.json` | `WRIT_STATE_PATH`, else `WH_STATE_PATH` |
-| Rust binary resolution | `writ` from `PATH` | `WRIT_BIN` |
-
-If the new `writ` root is absent and a pre-rename `worktrees-hives` root still exists, the path resolver keeps using the legacy root so an upgrade does not hide existing state or worktrees. This is a read/fallback, not an automatic directory move. `WH_STATE_PATH` and `WH_WORKTREE_BASE` are honoured when the corresponding `WRIT_*` variable is unset. The supervisor still has its own `WRIT_WORKTREE_BASE` resolver until [#152](https://github.com/rmems/writ/issues/152).
-
-Use platform-aware XDG/user-data resolution in implementation. Never assume a Linux-only home-directory layout when an OS API is available.
-
-## JSON and process boundary
-
-Version 1 responses use this envelope shape:
-
-```json
-{"ok":true,"schema_version":1,"command":"cli.bootstrap","data":{},"error":null}
-```
-
-- Standard output is machine-readable JSON when `--json` is selected.
-- Diagnostics belong on standard error.
-- Additive fields are compatible within v1; removals or semantic renames require a schema-version change.
-- Supervised execution is `writ supervisor run --timeout <secs>`; it is implemented, not reserved. Do not improvise a second timeout path in the CLI.
-
-Response envelopes and error codes are illustrated by the fixtures in `docs/examples/`.
-
-
-## Contribution workflow
-
-Follow the portable worker contracts. They apply to every agent platform.
-
-1. **[Safe Issue → Verified Commit](docs/workflows/safe-issue-verified-commit.md)** ([#84](https://github.com/rmems/writ/issues/84), isolation [#6](https://github.com/rmems/writ/issues/6)): read the issue and repo docs, isolate a worktree/branch, implement, run README gates, commit, push, comment on the issue with SHA. Never edit `main`.
-2. **[Safe Verified Commit → PR](docs/workflows/safe-verified-commit-to-pr.md)** ([#8](https://github.com/rmems/writ/issues/8) / [RM-123](https://linear.app/rpd-34/issue/RM-123/issue-pr-workflow-never-auto-merge)): open or update a PR that links the issue, hand off URL + SHA, and never merge during that workflow. Review checklist: [`REVIEW.md`](REVIEW.md). The installed companion `babysit-pr` skill handles any interactive monitoring after handoff; an authorized one-shot merge remains a separate primary-agent action.
-
-## Review expectations
-
-Use [`REVIEW.md`](REVIEW.md) for the shared checklist. Reviewers should verify behavior at both the soft-policy and hard-enforcement layers, with particular attention to runtime merge prohibition and interactive merge authorization/preflight, force-push parsing, expected-branch checks, path traversal, JSON compatibility, cross-platform path handling, alternate or interactive interpreter routes, platform-specific wrapper operands and command-lookup overrides, nested environment resets and unsets, runtime configuration, lab child commands, ambient Git pagers and fsmonitor hooks, optional index-lock suppression, partial-clone lazy fetches, exact case-sensitive Git built-ins, positional config actions, named, peeled, sorted, and ref-format signature settings, alternate-ref options across revision consumers, clustered patch flags, and Git reads or mutations that can launch nested helpers, hooks, filters, viewers, transports, signature tools, credential helpers, diff tools, aliases, or archive formatters without preserving their capability requirements.
-
-## Related planning
-
-- Product epic: GitHub #1
-- Current phase (hook enforcement): GitHub #124
-- Threat model and boundary tests: GitHub #22, #81
-- Architecture decision: [ADR 0001](docs/adr/0001-rust-only-v1-runtime-and-babysit-pr-boundary.md) (Linear [RM-169](https://linear.app/rpd-34/issue/RM-169/v1-record-rust-only-architecture-and-codex-babysit-pr-boundary))
-- Linear project: <https://linear.app/rpd-34/project/worktrees-hives-e3052de4caa3>
+8. A timeout or hang on `writ supervisor` is a recovery and handoff event: contain the child, record residual state, and leave the harness-owned checkout in place. Policy: [`docs/timeout-policy.md`](docs/timeout-policy.md). Do not improvise a second timeout path in the CLI.

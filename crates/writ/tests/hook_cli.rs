@@ -90,16 +90,66 @@ fn hook_blocks_quoted_force_push_and_config_injection() {
 }
 
 #[test]
-fn hook_worktree_create_requires_source_ref() {
+fn hook_worktree_create_is_coordination_only() {
     let root = TestDir::new();
+    // No existing checkout named: allow native creation untouched.
     let output = writ_hook(
         &root.0,
-        r#"{"hook_event_name":"WorktreeCreate","cwd":"/tmp","name":"wt"}"#,
+        r#"{"hook_event_name":"WorktreeCreate","worktree_path":"/nonexistent/wt","name":"wt"}"#,
         None,
     );
-    assert_eq!(output.status.code(), Some(2));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("START_POINT_REQUIRED"), "stderr={stderr}");
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stdout.is_empty(), "no path may be claimed");
+}
+
+#[test]
+fn hook_worktree_events_register_and_release_without_deleting() {
+    let root = TestDir::new();
+    let repo = root.0.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    let git = |dir: &PathBuf, args: &[&str]| {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?}");
+    };
+    git(&repo, &["init", "--quiet", "-b", "main"]);
+    git(&repo, &["config", "user.email", "t@e.com"]);
+    git(&repo, &["config", "user.name", "t"]);
+    fs::write(repo.join("f"), "x\n").unwrap();
+    git(&repo, &["add", "f"]);
+    git(&repo, &["commit", "--quiet", "-m", "init"]);
+
+    let create = writ_hook(
+        &root.0,
+        &serde_json::json!({
+            "hook_event_name": "WorktreeCreate",
+            "worktree_path": repo,
+            "worktree_name": "job-1",
+        })
+        .to_string(),
+        None,
+    );
+    assert_eq!(create.status.code(), Some(0));
+    assert!(!create.stdout.is_empty(), "existing checkout registered");
+
+    let remove = writ_hook(
+        &root.0,
+        &serde_json::json!({
+            "hook_event_name": "WorktreeRemove",
+            "worktree_path": repo,
+        })
+        .to_string(),
+        None,
+    );
+    assert_eq!(remove.status.code(), Some(0));
+    assert!(
+        repo.join(".git").exists(),
+        "WorktreeRemove must never delete a harness-owned checkout"
+    );
 }
 
 #[test]
@@ -158,7 +208,7 @@ fn hook_boundary_fail_closed_cases() {
     for (payload, exit, needle) in [
         ("{", 2, "IO_ERROR"),
         (
-            r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"git merge origin/main"}}"#,
+            r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"gh pr merge 1"}}"#,
             2,
             "MERGE_BLOCKED",
         ),
@@ -186,6 +236,36 @@ fn hook_global_allowed_owners_flag_enforces_gh_repo_targets() {
         r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"gh repo delete other/project --yes"}}"#,
         Some("acme"),
     );
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("OWNER_NOT_ALLOWED"), "stderr={stderr}");
+}
+
+#[test]
+fn hook_allowed_owners_cli_overrides_env_for_gh_checks() {
+    let root = TestDir::new();
+    let worktree_base = root.0.join("worktrees");
+    let lease_path = root.0.join("leases.db");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_writ"))
+        .env("WRIT_WORKTREE_BASE", &worktree_base)
+        .env("WRIT_LEASE_PATH", &lease_path)
+        .env("WRIT_ALLOWED_OWNERS", "acme")
+        .args(["--allowed-owners", "other-org", "hook"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // CLI `other-org` wins over env `acme`; acme target must be rejected.
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(
+            br#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"gh repo delete acme/project --yes"}}"#,
+        )
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("OWNER_NOT_ALLOWED"), "stderr={stderr}");

@@ -3,7 +3,8 @@
 //! Safety invariants enforced at the Rust core boundary:
 //! - Only allowlisted git subcommands may be executed.
 //! - Bare `--force` / `-f` is always rejected; only `--force-with-lease` is permitted.
-//! - Merge is blocked only when it is the git subcommand (branch names like `merge` are allowed).
+//! - Local `git merge` on an assigned feature branch is allowed; `git mergetool` stays blocked.
+//! - Merge into `main`/`master`, or with uncommitted work, is refused so WIP is preserved.
 //! - `gh pr merge` and merge-related flags are blocked; `gh api` is not allowlisted.
 //! - Mutating commands verify the current branch when `expected_branch` is provided to `run`.
 //! - `gh -R` / `--repo` selectors are checked against the configured owner allowlist.
@@ -17,6 +18,7 @@ use crate::error::{Error, PolicyCode, Result};
 
 mod gh;
 mod identity;
+mod origin;
 mod restricted;
 #[cfg(test)]
 mod tests;
@@ -28,8 +30,9 @@ pub use gh::{
 };
 pub use identity::{
     github_owner_name, github_repo_slugs_match, is_supported_github_remote,
-    normalize_github_repo_identity, normalize_github_repo_slug, origin_github_slug,
+    normalize_github_repo_identity, normalize_github_repo_slug,
 };
+pub use origin::{origin_github_repo_selector, origin_github_slug};
 pub(crate) use restricted::{
     run_allowlisted_git_restricted, run_allowlisted_git_restricted_with_file,
 };
@@ -49,6 +52,7 @@ const ALLOWED_GIT_SUBCOMMANDS: &[&str] = &[
     "log",
     "ls-files",
     "ls-remote",
+    "merge",
     "merge-base",
     "mv",
     "pull",
@@ -76,6 +80,7 @@ const MUTATING_SUBCOMMANDS: &[&str] = &[
     "clone",
     "commit",
     "config",
+    "merge",
     "mv",
     "pull",
     "push",
@@ -117,11 +122,12 @@ impl SafeGitCommand {
 
         let subcommand = &args[0];
 
-        // Reject merge only when it is the git subcommand (not a branch/ref named "merge").
-        if is_merge_subcommand(subcommand) {
+        // Interactive mergetool can run configured helpers; keep it blocked.
+        // A branch or ref named `merge` is still allowed as a non-subcommand.
+        if subcommand == "mergetool" {
             return Err(Error::PolicyViolation {
                 code: PolicyCode::MergeBlocked,
-                message: format!("merge is not allowed: `git {}`", args.join(" ")),
+                message: format!("mergetool is not allowed: `git {}`", args.join(" ")),
             });
         }
 
@@ -294,11 +300,47 @@ impl SafeGitCommand {
         Ok(())
     }
 
+    /// Admit a local `git merge` or `git pull` in `repo_dir` without building a
+    /// merge-permission engine.
+    ///
+    /// Feature-branch integration and `--abort`/`--continue`/`--quit` are allowed.
+    /// Default-branch (`main`/`master`) integration and dirty-tree merges that would
+    /// clobber uncommitted work are refused.
+    pub fn admit_local_merge(&self, repo_dir: &Path) -> Result<()> {
+        let verb = match self.subcommand() {
+            "merge" => "merge",
+            "pull" => "pull",
+            _ => return Ok(()),
+        };
+        if merge_is_recovery(&self.args) {
+            return Ok(());
+        }
+        let current = resolve_current_branch(repo_dir)?;
+        if is_default_integration_branch(&current) {
+            return Err(Error::PolicyViolation {
+                code: PolicyCode::MergeBlocked,
+                message: format!(
+                    "local {verb} on default branch `{current}` is not allowed; GitHub owns protected-branch integration"
+                ),
+            });
+        }
+        if working_tree_is_dirty(repo_dir)? {
+            return Err(Error::PolicyViolation {
+                code: PolicyCode::MergeBlocked,
+                message: format!(
+                    "refusing git {verb} with uncommitted work; commit, stash, or abort to preserve WIP"
+                ),
+            });
+        }
+        Ok(())
+    }
+
     /// Execute the validated git command in `repo_dir`.
     ///
     /// When `expected_branch` is `Some` and this command is mutating, verifies the
     /// current branch before running.
     pub fn run(&self, repo_dir: &Path, expected_branch: Option<&str>) -> Result<GitOutput> {
+        self.admit_local_merge(repo_dir)?;
         if self.requires_branch_check()
             && let Some(expected) = expected_branch
         {
@@ -883,8 +925,33 @@ fn push_destination_names(args: &[String]) -> Vec<String> {
     dests
 }
 
-fn is_merge_subcommand(subcommand: &str) -> bool {
-    matches!(subcommand, "merge" | "mergetool")
+fn merge_is_recovery(args: &[String]) -> bool {
+    args.iter()
+        .any(|a| a == "--abort" || a == "--continue" || a == "--quit")
+}
+
+fn is_default_integration_branch(branch: &str) -> bool {
+    matches!(branch, "main" | "master")
+}
+
+fn working_tree_is_dirty(repo_dir: &Path) -> Result<bool> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_dir)
+        .args(["status", "--porcelain", "-uall"])
+        .output()
+        .map_err(|e| Error::Io {
+            context: "inspect worktree dirtiness",
+            source: e,
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(Error::PolicyViolation {
+            code: PolicyCode::GitDirUnavailable,
+            message: format!("failed to inspect worktree: {}", stderr.trim()),
+        });
+    }
+    Ok(!String::from_utf8_lossy(&output.stdout).trim().is_empty())
 }
 
 /// True for bare force flags that are never allowed.
