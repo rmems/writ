@@ -11,6 +11,7 @@ use crate::error::{Error, PolicyCode, Result};
 use crate::lease::{JobKey, LeaseStore};
 
 mod access;
+mod ack;
 mod announce;
 mod declared_paths;
 mod types;
@@ -26,10 +27,10 @@ pub use types::{
 
 use access::{
     CLAIM_SELECT, MESSAGE_SELECT, NewMessage, claim_from_row, insert_message, live_lease,
-    load_claim_locked, load_claim_tx, load_message_tx, message_from_row, require_ack_recipient,
-    require_active_lease_tx, require_agent_claim, require_complete_recipient,
-    transfer_on_handoff_ack,
+    load_claim_locked, load_claim_tx, load_message_tx, message_from_row, require_active_lease_tx,
+    require_agent_claim,
 };
+use ack::{require_ack_recipient, require_complete_recipient, transfer_on_handoff_ack};
 use announce::{AnnounceTx, MailboxDraft, announce_tx, mailbox_from_send, route_generic_ack};
 use declared_paths::normalize_paths;
 use util::{coord_err, coord_missing, held_error, now_secs, stale_error, terminal_allocation};
