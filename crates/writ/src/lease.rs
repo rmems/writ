@@ -120,7 +120,7 @@ fn inspect_lease(
     use writ_core::lease::InspectRequest;
 
     request.allowlist.enforce_owner(request.owner)?;
-    let store = open_inspect_store()?;
+    let store = crate::store::open_existing_read_only_store()?;
     let worktree_path = inspect_worktree_path(InspectPath {
         store: store.as_ref(),
         owner: request.owner,
@@ -184,23 +184,6 @@ fn reconcile_lease(
                 serde_json::json!({ "outcome": outcome.as_str() }),
             ))
         }
-    }
-}
-
-fn open_inspect_store() -> writ_core::error::Result<Option<writ_core::lease::LeaseStore>> {
-    use writ_core::lease::LeaseStore;
-    use writ_core::paths::lease_store_path;
-
-    let path = lease_store_path();
-    match std::fs::metadata(&path) {
-        Ok(meta) if meta.is_file() => Ok(Some(LeaseStore::open_read_only(path)?)),
-        Ok(_) => Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("lease store path is not a regular file: {}", path.display()),
-        )
-        .into()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.into()),
     }
 }
 

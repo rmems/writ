@@ -7,6 +7,7 @@ use clap::{Args, Parser, Subcommand};
 
 mod coord;
 mod lease;
+mod store;
 mod watchlist;
 
 /// Manage isolated issue-to-PR jobs and their durable state.
