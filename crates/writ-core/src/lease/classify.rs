@@ -147,8 +147,15 @@ fn classify_terminal_or_retryable(
 
 fn stored_repo_matches(lease: &Lease, repo_root: &Path) -> bool {
     let stored = Path::new(&lease.repo);
-    crate::porcelain::paths_equal(stored, repo_root)
-        || crate::paths::same_existing_path(stored, repo_root)
+    if repo_paths_match(stored, repo_root) {
+        return true;
+    }
+    git_common_dir(repo_root).is_some_and(|common| repo_paths_match(stored, &common))
+}
+
+fn repo_paths_match(stored: &Path, candidate: &Path) -> bool {
+    crate::porcelain::paths_equal(stored, candidate)
+        || crate::paths::same_existing_path(stored, candidate)
 }
 
 fn no_git_mutation(evidence: &GitEvidence) -> bool {
