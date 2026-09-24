@@ -426,6 +426,37 @@ fn inspect_rejects_a_foreign_repository_with_the_same_branch() {
 }
 
 #[test]
+fn inspect_does_not_retry_prepared_lease_against_a_foreign_repo() {
+    let harness = RepoHarness::new();
+    let prepared = harness.store.prepare_allocate(harness.request()).unwrap();
+    assert_eq!(prepared.allocation_state, AllocationState::Prepared);
+    let foreign = harness._temp.path().join("missing-foreign-repo");
+    let inspection = harness
+        .store
+        .inspect(InspectRequest {
+            repo_root: &foreign,
+            owner: "acme",
+            repo_name: "sample",
+            job_id: "job-1",
+            worktree_path: &harness.worktree,
+            branch: Some("hive/job-1"),
+        })
+        .unwrap();
+    assert_eq!(inspection.classification, EvidenceClass::NeedsAttention);
+    assert!(
+        inspection
+            .conflicts
+            .iter()
+            .any(|conflict| conflict.contains("git identity")),
+        "{:?}",
+        inspection.conflicts
+    );
+    let outcome = assert_outcome(&harness.store, harness.key(), &foreign, "needs_attention");
+    assert!(matches!(outcome, ReconcileOutcome::NeedsAttention { .. }));
+    assert!(harness.store.find_job(harness.key()).unwrap().is_some());
+}
+
+#[test]
 fn unborn_head_matches_empty_start_commit() {
     let temp = tempdir().unwrap();
     let repo = temp.path().join("unborn");

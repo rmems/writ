@@ -248,13 +248,13 @@ impl LeaseStore {
             repo_name: request.repo_name,
             job_id: request.job_id,
         };
-        let lease = live_lease(self, key)?;
         let paths = normalize_paths(request.paths);
         let now = now_secs();
         let mut conn = self.lock()?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| coord_err("begin coord announce", e))?;
+        let lease = require_active_lease_tx(&tx, key)?;
         let (intent, overlaps) = announce_tx(
             &tx,
             AnnounceTx {
@@ -621,6 +621,29 @@ fn ack_recipient_error(request: AckRequest<'_>) -> Error {
     }
 }
 
+fn require_active_lease_tx(tx: &rusqlite::Transaction<'_>, key: JobKey<'_>) -> Result<Lease> {
+    let lease = crate::lease::lookup_job(tx, key)?.ok_or_else(|| Error::PolicyViolation {
+        code: PolicyCode::CoordClaimMissing,
+        message: format!(
+            "no lease exists for {}/{}/{} to attach a coordination claim",
+            key.owner, key.repo_name, key.job_id
+        ),
+    })?;
+    if lease.allocation_state != AllocationState::Active {
+        return Err(Error::PolicyViolation {
+            code: PolicyCode::CoordClaimMissing,
+            message: format!(
+                "lease {}/{}/{} is {}; coordination claims require an ACTIVE assignment",
+                lease.owner,
+                lease.repo_name,
+                lease.job_id,
+                lease.allocation_state.as_str()
+            ),
+        });
+    }
+    Ok(lease)
+}
+
 fn live_lease(store: &LeaseStore, key: JobKey<'_>) -> Result<Lease> {
     let lease = store.find_job(key)?.ok_or_else(|| Error::PolicyViolation {
         code: PolicyCode::CoordClaimMissing,
@@ -666,6 +689,7 @@ fn transfer_on_handoff_ack(
     request: AckRequest<'_>,
     now: i64,
 ) -> Result<CoordClaim> {
+    require_handoff_ack_scope(handoff, request)?;
     let expected_agent = handoff
         .to_agent_id
         .as_deref()
@@ -724,6 +748,22 @@ fn transfer_on_handoff_ack(
         return Err(stale_error(&current, handoff.owner_generation));
     }
     load_claim_tx(tx, from_key)?.ok_or_else(|| coord_missing("claim missing after handoff ACK"))
+}
+
+fn require_handoff_ack_scope(handoff: &CoordMessage, request: AckRequest<'_>) -> Result<()> {
+    if request.owner == handoff.from_owner
+        && request.repo_name == handoff.from_repo_name
+        && request.job_id == handoff.from_job_id
+    {
+        return Ok(());
+    }
+    Err(Error::PolicyViolation {
+        code: PolicyCode::CoordClaimMissing,
+        message: format!(
+            "job {}/{}/{} is not the source of handoff {}",
+            request.owner, request.repo_name, request.job_id, handoff.id
+        ),
+    })
 }
 
 fn upsert_agent(
@@ -884,6 +924,20 @@ fn announce_tx(
     tx: &rusqlite::Transaction<'_>,
     row: AnnounceTx<'_>,
 ) -> Result<(CoordMessage, Vec<PathOverlap>)> {
+    let lease = require_active_lease_tx(tx, row.key)?;
+    if lease.operation_id != row.lease.operation_id {
+        return Err(Error::PolicyViolation {
+            code: PolicyCode::CoordClaimMissing,
+            message: format!(
+                "lease {}/{}/{} changed during announce (operation {} != {})",
+                row.key.owner,
+                row.key.repo_name,
+                row.key.job_id,
+                lease.operation_id,
+                row.lease.operation_id
+            ),
+        });
+    }
     upsert_agent(
         tx,
         AgentIdentity {
@@ -903,7 +957,7 @@ fn announce_tx(
         tx,
         AnnouncePersist {
             request: row.request,
-            lease: row.lease,
+            lease: &lease,
             generation: next_owner_generation(existing.as_ref(), row.request.session_id),
             paused_at: existing.as_ref().and_then(|claim| claim.paused_at),
             paths: row.paths,
@@ -1601,6 +1655,80 @@ mod tests {
         let leftover = sample_handoff(&harness.store, "leftover gen-1 offer", None);
         sample_ack(&peer, first.id).unwrap();
         assert_stale(sample_ack(&peer, leftover.id).unwrap_err());
+    }
+
+    #[test]
+    fn handoff_ack_rejects_a_foreign_job_identity() {
+        let harness = Harness::new();
+        harness.seed_job("job-a", "hive/job-a");
+        harness.seed_job("job-b", "hive/job-b");
+        announce(&harness.store, "job-a", "agent-a", &[]);
+        announce(&harness.store, "job-b", "agent-b", &[]);
+        let handoff = sample_handoff(&harness.store, "transfer job-a", Some("job-a"));
+        let err = harness
+            .store
+            .ack_message(AckRequest {
+                message_id: handoff.id,
+                owner: "acme",
+                repo_name: "sample",
+                job_id: "job-b",
+                agent_id: "agent-b",
+                session_id: Some("session-b"),
+            })
+            .unwrap_err();
+        match err {
+            Error::PolicyViolation {
+                code: PolicyCode::CoordClaimMissing,
+                message,
+            } => assert!(
+                message.contains("is not the source of handoff"),
+                "{message}"
+            ),
+            other => panic!("expected source-scope rejection, got {other:?}"),
+        }
+        let claim = harness.store.find_claim(job_key_a()).unwrap().unwrap();
+        assert_eq!(claim.agent_id, "agent-a");
+    }
+
+    #[test]
+    fn announce_rechecks_active_lease_inside_the_write_txn() {
+        let harness = Harness::new();
+        let worktree = harness._temp.path().join("worktrees/acme/sample/job-a");
+        fs::create_dir_all(&worktree).unwrap();
+        harness
+            .store
+            .prepare_allocate(AllocateRequest {
+                repo: &harness.repo,
+                owner: "acme",
+                repo_name: "sample",
+                job_id: "job-a",
+                branch: "hive/job-a",
+                worktree_path: &worktree,
+                requested_start_point: "refs/heads/main",
+                start_commit: &harness.start,
+                ttl: None,
+            })
+            .unwrap();
+        let err = harness
+            .store
+            .announce(AnnounceRequest {
+                owner: "acme",
+                repo_name: "sample",
+                job_id: "job-a",
+                agent_id: "agent-a",
+                session_id: None,
+                agent_type: "worker",
+                intent: None,
+                paths: &[],
+            })
+            .unwrap_err();
+        match err {
+            Error::PolicyViolation {
+                code: PolicyCode::CoordClaimMissing,
+                message,
+            } => assert!(message.contains("PREPARED"), "{message}"),
+            other => panic!("expected missing ACTIVE lease, got {other:?}"),
+        }
     }
 
     #[test]

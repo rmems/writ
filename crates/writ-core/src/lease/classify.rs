@@ -84,12 +84,12 @@ pub(super) fn inspect_git(repo_root: &Path, worktree_path: &Path, branch: &str) 
 fn classify(
     lease: &Option<Lease>,
     evidence: &GitEvidence,
-    _path: &Path,
+    repo_root: &Path,
     ttl_expired: bool,
 ) -> (EvidenceClass, Vec<String>) {
     match lease {
         None => classify_missing_lease(evidence),
-        Some(lease) => classify_existing(lease, evidence, ttl_expired),
+        Some(lease) => classify_existing(lease, evidence, repo_root, ttl_expired),
     }
 }
 
@@ -107,9 +107,10 @@ fn classify_missing_lease(evidence: &GitEvidence) -> (EvidenceClass, Vec<String>
 fn classify_existing(
     lease: &Lease,
     evidence: &GitEvidence,
+    repo_root: &Path,
     ttl_expired: bool,
 ) -> (EvidenceClass, Vec<String>) {
-    if let Some(class) = classify_terminal_or_retryable(lease, evidence, ttl_expired) {
+    if let Some(class) = classify_terminal_or_retryable(lease, evidence, repo_root) {
         return (class, Vec::new());
     }
     if orphaned_live_lease(lease, evidence, ttl_expired) {
@@ -118,7 +119,7 @@ fn classify_existing(
             vec!["lease heartbeat/ttl expired while worktree is still live".to_owned()],
         );
     }
-    let conflicts = identity_conflicts(lease, evidence);
+    let conflicts = identity_conflicts(lease, evidence, repo_root);
     if conflicts.is_empty() {
         (EvidenceClass::Matching, conflicts)
     } else {
@@ -129,16 +130,25 @@ fn classify_existing(
 fn classify_terminal_or_retryable(
     lease: &Lease,
     evidence: &GitEvidence,
-    _ttl_expired: bool,
+    repo_root: &Path,
 ) -> Option<EvidenceClass> {
     match lease.allocation_state {
         AllocationState::Tombstoned => Some(EvidenceClass::Tombstoned),
         AllocationState::Released => Some(EvidenceClass::Released),
-        _ if no_git_mutation(evidence) && lease.allocation_state.is_in_progress() => {
+        _ if no_git_mutation(evidence)
+            && lease.allocation_state.is_in_progress()
+            && stored_repo_matches(lease, repo_root) =>
+        {
             Some(EvidenceClass::Retryable)
         }
         _ => None,
     }
+}
+
+fn stored_repo_matches(lease: &Lease, repo_root: &Path) -> bool {
+    let stored = Path::new(&lease.repo);
+    crate::porcelain::paths_equal(stored, repo_root)
+        || crate::paths::same_existing_path(stored, repo_root)
 }
 
 fn no_git_mutation(evidence: &GitEvidence) -> bool {
@@ -148,7 +158,7 @@ fn no_git_mutation(evidence: &GitEvidence) -> bool {
         && !evidence.worktree_registered
 }
 
-fn identity_conflicts(lease: &Lease, evidence: &GitEvidence) -> Vec<String> {
+fn identity_conflicts(lease: &Lease, evidence: &GitEvidence, repo_root: &Path) -> Vec<String> {
     let mut conflicts = Vec::new();
     if !evidence.path_exists {
         conflicts.push("derived path is missing".to_owned());
@@ -156,7 +166,7 @@ fn identity_conflicts(lease: &Lease, evidence: &GitEvidence) -> Vec<String> {
     if !evidence.worktree_registered {
         conflicts.push("worktree is not registered".to_owned());
     }
-    if let Some(conflict) = repo_identity_conflict(lease, evidence) {
+    if let Some(conflict) = repo_identity_conflict(lease, evidence, repo_root) {
         conflicts.push(conflict);
     }
     if named_git_branch(&lease.branch)
@@ -196,7 +206,16 @@ fn commit_conflict(
     }
 }
 
-fn repo_identity_conflict(_lease: &Lease, evidence: &GitEvidence) -> Option<String> {
+fn repo_identity_conflict(
+    lease: &Lease,
+    evidence: &GitEvidence,
+    repo_root: &Path,
+) -> Option<String> {
+    if !stored_repo_matches(lease, repo_root) {
+        return Some(
+            "checkout and repo_root do not share the stored lease's git identity".to_owned(),
+        );
+    }
     match (
         evidence.checkout_common_dir.as_deref(),
         evidence.repo_root_common_dir.as_deref(),
@@ -250,8 +269,7 @@ pub(super) fn inspect_now(
     let branch_ref = stored_branch_ref(branch);
     let evidence = inspect_git(request.repo_root, request.worktree_path, branch);
     let ttl_expired = lease.as_ref().is_some_and(ttl_is_expired);
-    let (classification, conflicts) =
-        classify(lease, &evidence, request.worktree_path, ttl_expired);
+    let (classification, conflicts) = classify(lease, &evidence, request.repo_root, ttl_expired);
     AllocationInspection {
         operation_id: lease.as_ref().map(|row| row.operation_id.clone()),
         allocation_state: lease

@@ -426,3 +426,35 @@ fn stale_closed_pr_is_skipped_for_open_match() {
     let github = data.entries[0].github.as_ref().unwrap();
     assert_eq!(github.number, 31);
 }
+
+#[test]
+fn interrupted_leases_appear_on_the_default_watchlist() {
+    let seeded = seed_job();
+    for state in ["PREPARED", "MUTATING", "ABORTED", "NEEDS_ATTENTION"] {
+        exec_sql(
+            &seeded.store,
+            &format!(
+                "UPDATE leases SET allocation_state = '{state}', \
+                 released_at = NULL, tombstoned_at = NULL"
+            ),
+        );
+        let data = view(&seeded.store, &WatchQuery::default(), None, &allowlist());
+        assert_eq!(data.entries.len(), 1, "{state}");
+        assert_eq!(
+            data.entries[0].recovery_status,
+            RecoveryStatus::NeedsReconcile,
+            "{state}"
+        );
+        assert_eq!(
+            data.entries[0].collab_status,
+            CollabStatus::Waiting,
+            "{state}"
+        );
+    }
+    exec_sql(
+        &seeded.store,
+        "UPDATE leases SET allocation_state = 'RELEASED', released_at = 99",
+    );
+    let hidden = view(&seeded.store, &WatchQuery::default(), None, &allowlist());
+    assert!(hidden.entries.is_empty());
+}

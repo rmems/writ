@@ -106,6 +106,16 @@ impl LeaseStore {
         )
     }
 
+    /// Unreleased, non-tombstoned leases, including interrupted allocation states.
+    pub fn list_live(&self) -> Result<Vec<Lease>> {
+        let conn = self.lock()?;
+        list_leases_on(
+            &conn,
+            "WHERE released_at IS NULL AND tombstoned_at IS NULL ORDER BY id",
+            "list live leases",
+        )
+    }
+
     /// All lease identity rows, including released ones, in insertion order.
     pub fn list_all(&self) -> Result<Vec<Lease>> {
         let conn = self.lock()?;
@@ -176,6 +186,18 @@ impl LeaseStore {
             message: "lease store mutex poisoned".to_owned(),
         })
     }
+}
+
+/// Look up a job row on an already-open connection (including a write txn).
+pub(crate) fn lookup_job(conn: &Connection, key: JobKey<'_>) -> Result<Option<Lease>> {
+    lookup_lease(
+        conn,
+        LeaseLookup {
+            where_sql: "WHERE owner = ?1 AND repo_name = ?2 AND job_id = ?3",
+            sql_params: params![key.owner, key.repo_name, key.job_id],
+            context: "lookup lease",
+        },
+    )
 }
 
 #[cfg(test)]

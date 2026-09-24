@@ -94,6 +94,10 @@ fn grant_release_preserves_identity_and_budget_columns() {
 
     let active = store.list_active().unwrap();
     assert!(active.is_empty(), "released lease must not list as active");
+    assert!(
+        store.list_live().unwrap().is_empty(),
+        "released lease must not list as live"
+    );
     let all = store.list_all().unwrap();
     assert_eq!(all.len(), 1);
     assert_eq!(all[0].mode, LeaseMode::Unassigned);
@@ -349,4 +353,29 @@ fn detached_prepare_stores_head_not_a_heads_ref() {
     assert_eq!(prepared.branch, "(detached)");
     assert_eq!(prepared.branch_ref, "HEAD");
     assert_ne!(prepared.branch_ref, "refs/heads/(detached)");
+}
+
+#[test]
+fn list_live_includes_interrupted_and_excludes_released() {
+    let tmp = tempdir().unwrap();
+    let store = LeaseStore::open(tmp.path().join("leases.db")).unwrap();
+    let repo = tmp.path().join("repo");
+    let wt = tmp.path().join("worktrees/acme/sample/gh-42");
+    store
+        .grant(LeaseGrant {
+            repo: &repo,
+            owner: "acme",
+            repo_name: "sample",
+            job_id: "gh-42",
+            branch: "hive/gh-42",
+            worktree_path: &wt,
+            start_commit: "abc123",
+        })
+        .unwrap();
+    rusqlite::Connection::open(store.path())
+        .unwrap()
+        .execute("UPDATE leases SET allocation_state = 'PREPARED'", [])
+        .unwrap();
+    assert!(store.list_active().unwrap().is_empty());
+    assert_eq!(store.list_live().unwrap().len(), 1);
 }

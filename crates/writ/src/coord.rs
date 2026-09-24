@@ -168,11 +168,60 @@ fn dispatch(
     allowlist: &OwnerAllowlist,
 ) -> writ_core::error::Result<Response<serde_json::Value>> {
     enforce_coord_owners(&action, allowlist)?;
+    if coord_is_read(&action) {
+        return execute_coord_read(action, allowlist);
+    }
     execute(Execute {
         store: LeaseStore::open(lease_store_path())?,
         action,
         allowlist,
     })
+}
+
+fn coord_is_read(action: &CoordAction) -> bool {
+    matches!(
+        action,
+        CoordAction::Show { .. } | CoordAction::List | CoordAction::Inbox { .. }
+    )
+}
+
+fn execute_coord_read(
+    action: CoordAction,
+    allowlist: &OwnerAllowlist,
+) -> writ_core::error::Result<Response<serde_json::Value>> {
+    match open_coord_read_store()? {
+        None => absent_coord_read(&action),
+        Some(store) => execute_read(ReadCmd {
+            store: &store,
+            action,
+            allowlist,
+        }),
+    }
+}
+
+fn open_coord_read_store() -> writ_core::error::Result<Option<LeaseStore>> {
+    let path = lease_store_path();
+    match std::fs::metadata(&path) {
+        Ok(meta) if meta.is_file() => Ok(Some(LeaseStore::open_read_only(path)?)),
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("lease store path is not a regular file: {}", path.display()),
+        )
+        .into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn absent_coord_read(
+    action: &CoordAction,
+) -> writ_core::error::Result<Response<serde_json::Value>> {
+    match action {
+        CoordAction::List => ok("coord.list", serde_json::json!({ "claims": [] })),
+        CoordAction::Show { .. } => ok("coord.show", serde_json::json!({ "claim": null })),
+        CoordAction::Inbox { .. } => ok("coord.inbox", serde_json::json!({ "messages": [] })),
+        _ => unreachable!("absent_coord_read only handles show/list/inbox"),
+    }
 }
 
 fn enforce_coord_owners(

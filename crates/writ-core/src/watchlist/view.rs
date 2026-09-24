@@ -45,7 +45,7 @@ pub fn load_view(request: ViewLoad<'_>) -> Result<WatchlistData> {
     let leases = if request.query.include_released {
         request.store.list_all()?
     } else {
-        request.store.list_active()?
+        request.store.list_live()?
     };
     let coord = load_coord_snapshot(request.store.path());
     let mut entries = Vec::new();

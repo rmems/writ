@@ -316,3 +316,29 @@ fn coord_list_denies_empty_allowlist() {
         .unwrap();
     assert!(!denied.status.success());
 }
+
+#[test]
+fn coord_reads_succeed_without_creating_a_store() {
+    let root = TestDir::new("coord-cli-absent");
+    let listed = writ(&root.path, &["--json", "coord", "list"]);
+    assert!(listed.status.success(), "{:?}", listed.stderr);
+    assert_eq!(json(&listed)["data"]["claims"].as_array().unwrap().len(), 0);
+    assert!(!root.path.join("leases.db").exists());
+    let shown = writ(
+        &root.path,
+        &["--json", "coord", "show", "acme", "sample", "job-a"],
+    );
+    assert!(shown.status.success(), "{:?}", shown.stderr);
+    assert!(json(&shown)["data"]["claim"].is_null());
+    assert!(!root.path.join("leases.db").exists());
+    let inbox = writ(
+        &root.path,
+        &["--json", "coord", "inbox", "acme", "sample", "job-a"],
+    );
+    assert!(inbox.status.success(), "{:?}", inbox.stderr);
+    assert_eq!(
+        json(&inbox)["data"]["messages"].as_array().unwrap().len(),
+        0
+    );
+    assert!(!root.path.join("leases.db").exists());
+}
