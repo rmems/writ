@@ -135,14 +135,25 @@ fn classify_terminal_or_retryable(
     match lease.allocation_state {
         AllocationState::Tombstoned => Some(EvidenceClass::Tombstoned),
         AllocationState::Released => Some(EvidenceClass::Released),
-        _ if no_git_mutation(evidence)
-            && lease.allocation_state.is_in_progress()
-            && stored_repo_matches(lease, repo_root) =>
-        {
-            Some(EvidenceClass::Retryable)
-        }
-        _ => None,
+        _ => retryable_without_git_mutation(lease, evidence, repo_root),
     }
+}
+
+fn retryable_without_git_mutation(
+    lease: &Lease,
+    evidence: &GitEvidence,
+    repo_root: &Path,
+) -> Option<EvidenceClass> {
+    if !lease.allocation_state.is_in_progress() {
+        return None;
+    }
+    if !no_git_mutation(evidence) {
+        return None;
+    }
+    if !stored_repo_matches(lease, repo_root) {
+        return None;
+    }
+    Some(EvidenceClass::Retryable)
 }
 
 fn stored_repo_matches(lease: &Lease, repo_root: &Path) -> bool {
