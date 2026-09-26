@@ -54,17 +54,21 @@ fn writ_hook(
     child.wait_with_output().unwrap()
 }
 
-#[test]
-fn hook_blocks_git_force_push_with_exit_2() {
+fn assert_hook_rejects(payload: &str, allowed_owners: Option<&str>, needle: &str) {
     let root = TestDir::new();
-    let output = writ_hook(
-        &root.0,
-        r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"git push --force origin main"}}"#,
-        None,
-    );
+    let output = writ_hook(&root.0, payload, allowed_owners);
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("BARE_FORCE_PUSH"), "stderr={stderr}");
+    assert!(stderr.contains(needle), "stderr={stderr}");
+}
+
+#[test]
+fn hook_blocks_git_force_push_with_exit_2() {
+    assert_hook_rejects(
+        r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"git push --force origin main"}}"#,
+        None,
+        "BARE_FORCE_PUSH",
+    );
 }
 
 #[test]
@@ -230,15 +234,11 @@ fn hook_boundary_fail_closed_cases() {
 
 #[test]
 fn hook_global_allowed_owners_flag_enforces_gh_repo_targets() {
-    let root = TestDir::new();
-    let output = writ_hook(
-        &root.0,
+    assert_hook_rejects(
         r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"gh repo delete other/project --yes"}}"#,
         Some("acme"),
+        "OWNER_NOT_ALLOWED",
     );
-    assert_eq!(output.status.code(), Some(2));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("OWNER_NOT_ALLOWED"), "stderr={stderr}");
 }
 
 #[test]
