@@ -61,6 +61,9 @@ pub(super) fn require_ack_recipient(
 }
 
 fn ack_targets_request(message: &CoordMessage, request: AckRequest<'_>) -> bool {
+    if !broadcast_ack_in_scope(message, request) {
+        return false;
+    }
     let fields = [
         (message.to_owner.as_deref(), request.owner),
         (message.to_repo_name.as_deref(), request.repo_name),
@@ -70,6 +73,16 @@ fn ack_targets_request(message: &CoordMessage, request: AckRequest<'_>) -> bool 
     fields
         .iter()
         .all(|(expected, actual)| field_matches(*expected, actual))
+}
+
+fn broadcast_ack_in_scope(message: &CoordMessage, request: AckRequest<'_>) -> bool {
+    if message.to_job_id.is_some() {
+        return true;
+    }
+    if message.from_owner != request.owner {
+        return false;
+    }
+    message.from_repo_name == request.repo_name
 }
 
 fn field_matches(expected: Option<&str>, actual: &str) -> bool {

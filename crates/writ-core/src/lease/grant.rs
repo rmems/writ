@@ -157,7 +157,7 @@ fn write_grant(tx: &rusqlite::Transaction<'_>, grant: LeaseGrant<'_>, now: i64) 
             context: "lookup lease before grant",
         },
     )?;
-    reject_tombstoned(existing.as_ref())?;
+    reject_ungrantable(existing.as_ref())?;
     occupant::reject_live_path_occupant(
         tx,
         occupant::LivePathClaim {
@@ -182,13 +182,22 @@ fn write_grant(tx: &rusqlite::Transaction<'_>, grant: LeaseGrant<'_>, now: i64) 
     )
 }
 
-fn reject_tombstoned(existing: Option<&Lease>) -> Result<()> {
-    if let Some(existing) = existing
-        && existing.allocation_state == AllocationState::Tombstoned
-    {
-        return Err(terminal_error(existing));
+fn reject_ungrantable(existing: Option<&Lease>) -> Result<()> {
+    let Some(existing) = existing else {
+        return Ok(());
+    };
+    match existing.allocation_state {
+        AllocationState::Active | AllocationState::Released => Ok(()),
+        AllocationState::Tombstoned => Err(terminal_error(existing)),
+        other => Err(Error::PolicyViolation {
+            code: PolicyCode::LeaseNeedsAttention,
+            message: format!(
+                "lease {} is {}; reconcile before granting",
+                existing.operation_id,
+                other.as_str()
+            ),
+        }),
     }
-    Ok(())
 }
 
 fn clear_released_claim(

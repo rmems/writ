@@ -228,7 +228,7 @@ fn heartbeat_stale(lease: &Lease) -> bool {
 fn collab_of(lease: &Lease, overlay: &CoordOverlay, github: Option<&GithubState>) -> CollabStatus {
     match lease_life(lease) {
         LeaseLife::Terminal => return CollabStatus::Released,
-        LeaseLife::Incomplete => return CollabStatus::Waiting,
+        LeaseLife::Incomplete => return incomplete_collab(lease),
         LeaseLife::Active => {}
     }
     if lease.mode == LeaseMode::Unassigned {
@@ -247,6 +247,13 @@ fn collab_of(lease: &Lease, overlay: &CoordOverlay, github: Option<&GithubState>
         return CollabStatus::ReadyForIntegration;
     }
     CollabStatus::Running
+}
+
+fn incomplete_collab(lease: &Lease) -> CollabStatus {
+    match lease.allocation_state {
+        AllocationState::NeedsAttention | AllocationState::Unknown => CollabStatus::Conflicted,
+        _ => CollabStatus::Waiting,
+    }
 }
 
 fn is_conflicted(lease: &Lease, github: Option<&GithubState>) -> bool {

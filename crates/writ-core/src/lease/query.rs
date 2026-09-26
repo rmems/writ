@@ -10,12 +10,17 @@ pub(super) const LEASE_SELECT: &str = "SELECT repo, owner, repo_name, job_id, br
      max_fix_cycles, fix_cycles, pending_fix_cycles, pending_fix_op_id, \
      created_at, updated_at, released_at, tombstoned_at, id FROM leases";
 
-pub(super) const LEGACY_LEASE_SELECT: &str = "SELECT repo, owner, repo_name, job_id, branch, branch_ref, \
-     worktree_path, start_commit, start_commit, 'legacy-' || id, \
-     CASE WHEN released_at IS NOT NULL THEN 'RELEASED' ELSE 'ACTIVE' END, \
+pub(super) const LEGACY_LEASE_SELECT: &str = "SELECT * FROM (\
+     SELECT repo, owner, repo_name, job_id, branch, branch_ref, \
+     worktree_path, start_commit AS requested_start_point, start_commit, \
+     'legacy-' || id AS operation_id, \
+     CASE WHEN released_at IS NOT NULL THEN 'RELEASED' ELSE 'ACTIVE' END \
+         AS allocation_state, \
      mode, ttl, heartbeat, max_files, max_churn, \
-     max_fix_cycles, fix_cycles, NULL, NULL, \
-     created_at, updated_at, released_at, NULL, id FROM leases";
+     max_fix_cycles, fix_cycles, \
+     NULL AS pending_fix_cycles, NULL AS pending_fix_op_id, \
+     created_at, updated_at, released_at, NULL AS tombstoned_at, id \
+     FROM leases)";
 
 fn lease_select_sql(conn: &Connection) -> Result<String> {
     if schema::has_crash_consistency_columns(conn)? {

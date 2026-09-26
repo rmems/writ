@@ -473,6 +473,26 @@ fn declared_paths_canonicalize_internal_dot_and_parent() {
 }
 
 #[test]
+fn announce_rejects_escaping_declared_paths() {
+    let harness = Harness::new();
+    harness.seed_job("job-a", "hive/job-a");
+    let err = harness
+        .store
+        .announce(AnnounceRequest {
+            owner: "acme",
+            repo_name: "sample",
+            job_id: "job-a",
+            agent_id: "agent-a",
+            session_id: Some("session-a"),
+            agent_type: "worker",
+            intent: Some("edit"),
+            paths: &[String::from("src/../../secret")],
+        })
+        .unwrap_err();
+    assert!(err.to_string().contains("repository-relative"));
+}
+
+#[test]
 fn inbox_broadcasts_are_scoped_to_the_same_repository() {
     let harness = Harness::new();
     harness.seed_job("job-a", "hive/job-a");
@@ -506,6 +526,64 @@ fn inbox_broadcasts_are_scoped_to_the_same_repository() {
             .iter()
             .all(|message| message.from_repo_name != "other")
     );
+}
+
+#[test]
+fn broadcast_ack_is_scoped_to_the_sender_repository() {
+    let harness = Harness::new();
+    harness.seed_job("job-a", "hive/job-a");
+    harness.seed_job("job-c", "hive/job-c");
+    harness.seed_job_in(SeedJob {
+        owner: "acme",
+        repo_name: "other",
+        job_id: "job-b",
+        branch: "hive/job-b",
+    });
+    let announced = announce(&harness.store, "job-a", "agent-a", &[String::from("src")]);
+    announce(&harness.store, "job-c", "agent-c", &[String::from("docs")]);
+    announce_in(
+        &harness.store,
+        AnnounceCase {
+            owner: "acme",
+            repo_name: "other",
+            job_id: "job-b",
+            agent: "agent-b",
+            paths: &[String::from("src")],
+        },
+    );
+    let intent_id = announced.intent.id;
+    let foreign = harness.store.ack_message(AckRequest {
+        message_id: intent_id,
+        owner: "acme",
+        repo_name: "other",
+        job_id: "job-b",
+        agent_id: "agent-b",
+        session_id: Some("session-a"),
+    });
+    assert!(
+        foreign.is_err(),
+        "foreign-repo ACK must not mark a broadcast"
+    );
+    let local = harness
+        .store
+        .ack_message(AckRequest {
+            message_id: intent_id,
+            owner: "acme",
+            repo_name: "sample",
+            job_id: "job-c",
+            agent_id: "agent-c",
+            session_id: Some("session-a"),
+        })
+        .unwrap();
+    assert!(local.0.kind == MessageKind::Ack);
+    let original = harness
+        .store
+        .inbox(job_key_a())
+        .unwrap()
+        .into_iter()
+        .find(|message| message.id == intent_id)
+        .unwrap();
+    assert!(original.acked_at.is_some());
 }
 
 #[test]

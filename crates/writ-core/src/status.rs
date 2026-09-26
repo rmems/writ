@@ -366,7 +366,7 @@ fn resolve_head(lease: &Lease) -> (Option<String>, Option<String>, Option<bool>)
         Ok(_) | Err(_) => (
             nonempty_head(&lease.start_commit),
             Some("lease".to_owned()),
-            Some(interrupted || lease.released_at.is_none()),
+            Some(!lease.allocation_state.is_terminal() && lease.released_at.is_none()),
         ),
     }
 }
@@ -1014,5 +1014,18 @@ mod tests {
         assert_eq!(job.head.as_deref(), Some(head.as_str()));
         assert_eq!(job.head_source.as_deref(), Some("lease"));
         assert_eq!(job.recovery_needed, Some(true));
+    }
+
+    #[test]
+    fn tombstoned_lease_does_not_report_recovery_needed() {
+        let tmp = tempdir().unwrap();
+        let store = LeaseStore::open(tmp.path().join("leases.db")).unwrap();
+        let repo = tmp.path().join("repo");
+        let wt = tmp.path().join("checkouts/a");
+        store.grant(grant(&repo, &wt, "job-a", "hive/a")).unwrap();
+        store.tombstone_by_path(&wt).unwrap();
+        let job = &load_from_store(&store).unwrap().jobs[0];
+        assert_eq!(job.collaboration_state, CollaborationState::Unassigned);
+        assert_eq!(job.recovery_needed, Some(false));
     }
 }

@@ -409,5 +409,14 @@ mod tests {
             crate::lease::AllocationState::Active
         );
         assert!(!has_crash_consistency_columns(&Connection::open(&path).unwrap()).unwrap());
+        let active = store.list_active().unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].job_id, "job-a");
+        let by_path = store
+            .find_by_path(std::path::Path::new("/worktrees/a"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(by_path.job_id, "job-a");
+        assert!(by_path.tombstoned_at.is_none());
     }
 }

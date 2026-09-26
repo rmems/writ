@@ -117,6 +117,24 @@ fn exec_sql(store: &LeaseStore, sql: &str) {
         .unwrap();
 }
 
+fn assert_interrupted_collab(store: &LeaseStore, state: &str, expected: CollabStatus) {
+    exec_sql(
+        store,
+        &format!(
+            "UPDATE leases SET allocation_state = '{state}', \
+             released_at = NULL, tombstoned_at = NULL"
+        ),
+    );
+    let data = view(store, &WatchQuery::default(), None, &allowlist());
+    assert_eq!(data.entries.len(), 1, "{state}");
+    assert_eq!(
+        data.entries[0].recovery_status,
+        RecoveryStatus::NeedsReconcile,
+        "{state}"
+    );
+    assert_eq!(data.entries[0].collab_status, expected, "{state}");
+}
+
 #[test]
 fn list_reads_leases_without_coord_or_github() {
     let seeded = seed_job();
@@ -430,26 +448,13 @@ fn stale_closed_pr_is_skipped_for_open_match() {
 #[test]
 fn interrupted_leases_appear_on_the_default_watchlist() {
     let seeded = seed_job();
-    for state in ["PREPARED", "MUTATING", "ABORTED", "NEEDS_ATTENTION"] {
-        exec_sql(
-            &seeded.store,
-            &format!(
-                "UPDATE leases SET allocation_state = '{state}', \
-                 released_at = NULL, tombstoned_at = NULL"
-            ),
-        );
-        let data = view(&seeded.store, &WatchQuery::default(), None, &allowlist());
-        assert_eq!(data.entries.len(), 1, "{state}");
-        assert_eq!(
-            data.entries[0].recovery_status,
-            RecoveryStatus::NeedsReconcile,
-            "{state}"
-        );
-        assert_eq!(
-            data.entries[0].collab_status,
-            CollabStatus::Waiting,
-            "{state}"
-        );
+    let waiting = ["PREPARED", "MUTATING", "ABORTED"];
+    let conflicted = ["NEEDS_ATTENTION", "UNKNOWN"];
+    for state in waiting {
+        assert_interrupted_collab(&seeded.store, state, CollabStatus::Waiting);
+    }
+    for state in conflicted {
+        assert_interrupted_collab(&seeded.store, state, CollabStatus::Conflicted);
     }
     exec_sql(
         &seeded.store,

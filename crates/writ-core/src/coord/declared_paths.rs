@@ -15,16 +15,37 @@ pub(super) fn encode_paths(paths: &[String]) -> Result<String> {
     })
 }
 
-pub(super) fn normalize_paths(paths: &[String]) -> Vec<String> {
+pub(super) fn normalize_paths(paths: &[String]) -> Result<Vec<String>> {
     let mut normalized = Vec::new();
     for path in paths {
+        let raw = path.trim().replace('\\', "/");
+        if raw.is_empty() {
+            continue;
+        }
+        if is_absolute_declared(&raw) {
+            return Err(invalid_path(path));
+        }
         let cleaned = normalize_one(path);
-        if cleaned.is_empty() || normalized.iter().any(|existing| existing == &cleaned) {
+        if cleaned.is_empty() {
+            return Err(invalid_path(path));
+        }
+        if normalized.iter().any(|existing| existing == &cleaned) {
             continue;
         }
         normalized.push(cleaned);
     }
-    normalized
+    Ok(normalized)
+}
+
+fn is_absolute_declared(raw: &str) -> bool {
+    raw.starts_with('/') || raw.contains(':')
+}
+
+fn invalid_path(path: &str) -> Error {
+    Error::LeaseStore {
+        context: "normalize declared paths",
+        message: format!("declared path `{path}` must be repository-relative"),
+    }
 }
 
 fn normalize_one(path: &str) -> String {
@@ -69,5 +90,28 @@ fn collapse_dots(stripped: &str) -> String {
         ".".to_owned()
     } else {
         parts.join("/")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_paths;
+
+    #[test]
+    fn blanks_are_dropped_and_relative_paths_canonicalize() {
+        let paths = normalize_paths(&[
+            String::from("  "),
+            String::from("crates/writ-core/src/./lib/../coord.rs"),
+        ])
+        .unwrap();
+        assert_eq!(paths, vec!["crates/writ-core/src/coord.rs"]);
+    }
+
+    #[test]
+    fn absolute_and_escaping_paths_are_rejected() {
+        let abs = normalize_paths(&[String::from("/crates/x")]).unwrap_err();
+        assert!(abs.to_string().contains("repository-relative"));
+        let escape = normalize_paths(&[String::from("src/../../x")]).unwrap_err();
+        assert!(escape.to_string().contains("repository-relative"));
     }
 }

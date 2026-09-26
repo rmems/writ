@@ -239,6 +239,25 @@ fn grant_refuses_active_path_held_by_different_job() {
 }
 
 #[test]
+fn grant_refuses_interrupted_allocation_without_reconcile() {
+    let harness = RepoHarness::new();
+    harness.store.prepare_allocate(harness.request()).unwrap();
+    let err = harness
+        .store
+        .grant(LeaseGrant {
+            repo: &harness.repo,
+            owner: "acme",
+            repo_name: "sample",
+            job_id: "job-1",
+            branch: "hive/job-1",
+            worktree_path: &harness.worktree,
+            start_commit: &harness.start,
+        })
+        .unwrap_err();
+    assert_policy(err, PolicyCode::LeaseNeedsAttention);
+}
+
+#[test]
 fn agent_upsert_and_retire() {
     let tmp = tempdir().unwrap();
     let store = LeaseStore::open(tmp.path().join("leases.db")).unwrap();

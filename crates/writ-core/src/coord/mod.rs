@@ -91,7 +91,7 @@ impl LeaseStore {
             repo_name: request.repo_name,
             job_id: request.job_id,
         };
-        let paths = normalize_paths(request.paths);
+        let paths = normalize_paths(request.paths)?;
         let now = now_secs();
         let mut conn = self.lock()?;
         let tx = conn
@@ -178,7 +178,7 @@ impl LeaseStore {
             job_id: request.job_id,
         };
         let claim = require_agent_claim(self, key, request.agent_id)?;
-        let paths = normalize_paths(request.paths);
+        let paths = normalize_paths(request.paths)?;
         let now = now_secs();
         let mut conn = self.lock()?;
         let tx = conn
