@@ -1329,6 +1329,7 @@ fn write_classify_result(
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
     use std::process::ExitCode;
     use std::str;
 
@@ -1404,30 +1405,29 @@ mod tests {
         Cli::command().debug_assert();
     }
 
-    #[tokio::test]
-    async fn ci_classify_emits_v1_envelope() {
-        let path = std::env::temp_dir().join(format!(
-            "writ-ci-classify-{}-{}.json",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::write(
-            &path,
-            r#"[{"name":"Build & Test","workflow":"CI","bucket":"fail","link":"https://github.com/acme/example-org/actions/runs/1"},{"name":"Kilo Code Review","bucket":"pending","link":"https://app.kilo.ai/r/1"}]"#,
-        )
-        .unwrap();
-        let cli = Cli {
+    fn classify_input(body: &[u8]) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("checks.json");
+        std::fs::write(&path, body).unwrap();
+        (dir, path)
+    }
+
+    fn classify_cli(path: PathBuf) -> Cli {
+        Cli {
             json: true,
             allowed_owners: None,
             command: Some(super::Command::Ci {
-                action: super::CiAction::Classify {
-                    file: Some(path.clone()),
-                },
+                action: super::CiAction::Classify { file: Some(path) },
             }),
-        };
+        }
+    }
+
+    #[tokio::test]
+    async fn ci_classify_emits_v1_envelope() {
+        let (_dir, path) = classify_input(
+            br#"[{"name":"Build & Test","workflow":"CI","bucket":"fail","link":"https://github.com/acme/example-org/actions/runs/1"},{"name":"Kilo Code Review","bucket":"pending","link":"https://app.kilo.ai/r/1"}]"#,
+        );
+        let cli = classify_cli(path);
         let mut stdout = Vec::new();
         let code = run(cli, &mut stdout).await.unwrap();
         assert_eq!(code, ExitCode::SUCCESS);
@@ -1470,29 +1470,12 @@ mod tests {
                 .expect("blocks_unrelated_workers"),
             false
         );
-        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]
     async fn ci_classify_invalid_json_sets_ok_false() {
-        let path = std::env::temp_dir().join(format!(
-            "writ-ci-classify-bad-{}-{}.json",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::write(&path, "not-json").unwrap();
-        let cli = Cli {
-            json: true,
-            allowed_owners: None,
-            command: Some(super::Command::Ci {
-                action: super::CiAction::Classify {
-                    file: Some(path.clone()),
-                },
-            }),
-        };
+        let (_dir, path) = classify_input(b"not-json");
+        let cli = classify_cli(path);
         let mut stdout = Vec::new();
         let err = run(cli, &mut stdout).await.unwrap_err();
         assert_eq!(err.exit_code(), 1);
@@ -1503,7 +1486,6 @@ mod tests {
             v.pointer("/error/code").expect("code"),
             "CLASSIFY_INPUT_INVALID"
         );
-        let _ = std::fs::remove_file(path);
     }
 
     fn parse_format(args: &[&str]) -> super::AttributionAction {
