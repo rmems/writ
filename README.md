@@ -250,6 +250,7 @@ Implemented `writ` surface (`writ --help` is authoritative):
 | Command | Status | Operator meaning |
 | --- | --- | --- |
 | `writ status` / `writ jobs` | Implemented (read-only) | Collaboration snapshot from the SQLite lease store. See [`docs/status-schema.md`](docs/status-schema.md). |
+| `writ ci classify` | Implemented | Classify `gh pr checks` / `statusCheckRollup` JSON. Emits residual codes plus a compact `collaboration` view for status consumers. Does not write state. |
 | `writ git-safe …` | Implemented | Run a git command after the allowlist and, for mutations, expected-branch checks. |
 | `writ gh-safe …` | Implemented | Run a `gh` command after the allowlist. GitHub PR merge operations are rejected. |
 | `writ supervisor run --timeout <secs> …` | Implemented | Spawn a child with wall-clock, idle, and grace recovery (`--idle`/`--stall`, `--grace`, `--progress-secs`, env `WRIT_SUPERVISOR_*`; see [`docs/timeout-policy.md`](docs/timeout-policy.md)). Timeout is a handoff residual: Unix SIGTERM-then-SIGKILL on the process group; Windows kills only the direct child (grandchildren may survive). Never deletes a harness checkout. |
@@ -416,6 +417,7 @@ criteria checkboxes, and the Linear footer documented in
 - [`docs/install.md`](docs/install.md) — clone + symlink skill install, cross-agent roots, uninstall
 - [`docs/cli-contract.md`](docs/cli-contract.md) — command, JSON envelope, exit-code, persistence, and lifecycle compatibility matrix
 - [`REVIEW.md`](REVIEW.md) — pull-request lifecycle and review checklist
+- [`docs/ci-taxonomy.md`](docs/ci-taxonomy.md) — Class A/B/C CI check policy for companion-skill monitoring
 - [`docs/adr/0001-rust-only-v1-runtime-and-babysit-pr-boundary.md`](docs/adr/0001-rust-only-v1-runtime-and-babysit-pr-boundary.md) — v1 Rust-only runtime and Codex `babysit-pr` boundary
 - [`docs/workflows/safe-issue-verified-commit.md`](docs/workflows/safe-issue-verified-commit.md) — issue → verified push
 - [`docs/workflows/safe-verified-commit-to-pr.md`](docs/workflows/safe-verified-commit-to-pr.md) — verified push → PR handoff

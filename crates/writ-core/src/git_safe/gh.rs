@@ -13,10 +13,18 @@ use super::{GitOutput, reject_external_path};
 ///
 /// Note: `api` is intentionally excluded so merge-related REST/GraphQL cannot be
 /// invoked through `gh api` (e.g. `mergePullRequest` / REST merge endpoints).
+/// `run` is allowlisted so official Actions log views and flake reruns can go
+/// through this boundary; nested `run` verbs are restricted separately.
 const ALLOWED_GH_SUBCOMMANDS: &[&str] = &[
-    "auth", "browse", "gist", "issue", "label", "pr", "release", "repo", "secret", "ssh-key",
-    "variable", "workflow",
+    "auth", "browse", "gist", "issue", "label", "pr", "release", "repo", "run", "secret",
+    "ssh-key", "variable", "workflow",
 ];
+
+/// `gh run` verbs that fetch logs or perform an official rerun.
+///
+/// `delete` and `cancel` stay blocked: they are destructive and are not the
+/// Class A flake path (`gh run rerun` / `gh run view --log-failed`).
+const ALLOWED_GH_RUN_SUBSUBCOMMANDS: &[&str] = &["download", "list", "rerun", "view", "watch"];
 
 /// `gh pr` sub-subcommands that are blocked (merge / merge-like updates).
 ///
@@ -65,6 +73,7 @@ impl SafeGhCommand {
     pub fn with_allowlist(args: &[String], allowlist: &OwnerAllowlist) -> Result<Self> {
         let subcommand = gh_subcommand(args)?;
         gh_reject_blocked_pr_subsubcommand(subcommand, args)?;
+        gh_reject_disallowed_run_verb(subcommand, args)?;
         gh_reject_external_clone_destination(subcommand, args)?;
         gh_enforce_clone_target_owner(subcommand, args, allowlist)?;
         gh_reject_blocked_flags(args)?;
@@ -128,6 +137,33 @@ fn gh_reject_blocked_pr_subsubcommand(subcommand: &str, args: &[String]) -> Resu
             return Err(Error::PolicyViolation {
                 code: PolicyCode::MergeBlocked,
                 message: format!("`gh pr {pr_sub}` is not allowed"),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Restrict `gh run` to log fetch and official rerun verbs.
+fn gh_reject_disallowed_run_verb(subcommand: &str, args: &[String]) -> Result<()> {
+    if subcommand != "run" {
+        return Ok(());
+    }
+    match first_positional_after(&args[1..]) {
+        Some(run_sub) => {
+            let allowed_run: HashSet<&str> =
+                ALLOWED_GH_RUN_SUBSUBCOMMANDS.iter().copied().collect();
+            if !allowed_run.contains(run_sub) {
+                return Err(Error::PolicyViolation {
+                    code: PolicyCode::GhSubcommandNotAllowed,
+                    message: format!("`gh run {run_sub}` is not allowed"),
+                });
+            }
+        }
+        None => {
+            return Err(Error::PolicyViolation {
+                code: PolicyCode::GhSubcommandNotAllowed,
+                message: "`gh run` requires an allowed verb (view, list, watch, rerun, download)"
+                    .to_owned(),
             });
         }
     }

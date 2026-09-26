@@ -24,6 +24,7 @@ All of them, under `--json`:
 | `watchlist list\|check\|check-all` | `cli.watchlist.list` / `cli.watchlist.check` / `cli.watchlist.check_all` |
 | `watchlist add\|remove` | `cli.watchlist.add` / `cli.watchlist.remove` (never persist) |
 | `git-safe` / `gh-safe` | `git.safe` / `gh.safe` |
+| `ci classify` | `ci.classify` |
 | `worktree register\|unregister\|inspect\|list` | `worktree.register` etc. |
 | `worktree create\|remove\|prune` | `worktree.create` etc. (deprecated) |
 | `attribution format` | `attribution.format` |
@@ -57,6 +58,7 @@ cargo build
 writ --json                                   # cli.bootstrap
 writ --json status                            # cli.status
 writ --json git-safe --repo <repo> rev-parse --is-inside-work-tree   # git.safe
+writ --json ci classify --file docs/examples/ci-classify-input.json  # ci.classify
 writ --json worktree list                     # worktree.list
 writ --json worktree register <path>          # worktree.register
 writ --json attribution format --body "Looks good!"   # attribution.format

@@ -1327,6 +1327,61 @@ fn gh_issue_list_allowed() {
     assert_eq!(cmd.args(), &["issue", "list"]);
 }
 
+#[test]
+fn gh_run_rerun_and_view_allowed() {
+    let rerun =
+        SafeGhCommand::new(&["run".to_owned(), "rerun".to_owned(), "12345".to_owned()]).unwrap();
+    assert_eq!(rerun.args(), &["run", "rerun", "12345"]);
+
+    let view = SafeGhCommand::new(&[
+        "run".to_owned(),
+        "view".to_owned(),
+        "12345".to_owned(),
+        "--log-failed".to_owned(),
+    ])
+    .unwrap();
+    assert_eq!(view.args(), &["run", "view", "12345", "--log-failed"]);
+
+    let repo_flag = SafeGhCommand::with_allowlist(
+        &[
+            "run".to_owned(),
+            "-R".to_owned(),
+            "acme/example-org".to_owned(),
+            "rerun".to_owned(),
+            "9".to_owned(),
+        ],
+        &crate::owners::OwnerAllowlist::from_owners(["acme"]),
+    )
+    .unwrap();
+    assert_eq!(
+        repo_flag.args(),
+        &["run", "-R", "acme/example-org", "rerun", "9"]
+    );
+}
+
+#[test]
+fn gh_run_delete_and_cancel_rejected() {
+    for verb in ["delete", "cancel"] {
+        let err =
+            SafeGhCommand::new(&["run".to_owned(), verb.to_owned(), "1".to_owned()]).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::GhSubcommandNotAllowed,
+                ..
+            }
+        ));
+    }
+    let err = SafeGhCommand::new(&["run".to_owned()]).unwrap_err();
+    assert!(matches!(
+        err,
+        Error::PolicyViolation {
+            code: PolicyCode::GhSubcommandNotAllowed,
+            ..
+        }
+    ));
+}
+
 // ---- error display tests ----
 
 #[test]
