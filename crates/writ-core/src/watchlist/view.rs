@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::Result;
 use crate::git_safe::origin_github_repo_selector;
-use crate::lease::{Lease, LeaseMode, LeaseStore};
+use crate::lease::{AllocationState, Lease, LeaseMode, LeaseStore};
 use crate::owners::OwnerAllowlist;
 
 use super::classify::classify_snapshot;
@@ -26,6 +26,14 @@ pub struct WatchQuery {
     pub probe_github: bool,
 }
 
+/// Inputs for assembling one watchlist view.
+pub struct ViewLoad<'a> {
+    pub store: &'a LeaseStore,
+    pub query: &'a WatchQuery,
+    pub probe: Option<&'a dyn GithubProbe>,
+    pub allowlist: &'a OwnerAllowlist,
+}
+
 /// Load a filtered collaboration view from leases and optional overlays.
 ///
 /// Leases whose owner is outside `allowlist` are never emitted (deny-by-default
@@ -33,32 +41,29 @@ pub struct WatchQuery {
 /// probes are batched per repository. Lease-store read failures are returned to
 /// the caller. This function never writes leases, coordination tables, or JSON
 /// state.
-pub fn load_view(
-    store: &LeaseStore,
-    query: &WatchQuery,
-    probe: Option<&dyn GithubProbe>,
-    allowlist: &OwnerAllowlist,
-) -> Result<WatchlistData> {
-    let leases = if query.include_released {
-        store.list_all()?
+pub fn load_view(request: ViewLoad<'_>) -> Result<WatchlistData> {
+    let leases = if request.query.include_released {
+        request.store.list_all()?
     } else {
-        store.list_active()?
+        request.store.list_live()?
     };
-    let coord = load_coord_snapshot(store.path());
+    let coord = load_coord_snapshot(request.store.path());
     let mut entries = Vec::new();
     let mut pr_cache: HashMap<String, std::result::Result<Vec<PrSnapshot>, ProbeError>> =
         HashMap::new();
     for lease in &leases {
-        if !allowlist.allows(&lease.owner) || !matches_filter(lease, query) {
+        if !request.allowlist.allows(&lease.owner) || !matches_filter(lease, request.query) {
             continue;
         }
-        let github = probe.and_then(|p| probe_lease(lease, p, &mut pr_cache));
+        let github = request
+            .probe
+            .and_then(|p| probe_lease(lease, p, &mut pr_cache));
         entries.push(entry_from_lease(lease, &coord, github));
     }
     Ok(WatchlistData {
         entries,
         coord_available: coord.available,
-        github_probed: query.probe_github,
+        github_probed: request.query.probe_github,
     })
 }
 
@@ -181,17 +186,32 @@ fn github_state(snapshot: PrSnapshot) -> GithubState {
     }
 }
 
+enum LeaseLife {
+    Terminal,
+    Incomplete,
+    Active,
+}
+
+fn lease_life(lease: &Lease) -> LeaseLife {
+    if lease.allocation_state.is_terminal() || lease.released_at.is_some() {
+        LeaseLife::Terminal
+    } else if lease.allocation_state != AllocationState::Active {
+        LeaseLife::Incomplete
+    } else {
+        LeaseLife::Active
+    }
+}
+
 fn recovery_of(lease: &Lease) -> RecoveryStatus {
-    if lease.released_at.is_some() {
-        return RecoveryStatus::Released;
+    match lease_life(lease) {
+        LeaseLife::Terminal => RecoveryStatus::Released,
+        LeaseLife::Incomplete => RecoveryStatus::NeedsReconcile,
+        LeaseLife::Active if !Path::new(&lease.worktree_path).exists() => {
+            RecoveryStatus::MissingCheckout
+        }
+        LeaseLife::Active if heartbeat_stale(lease) => RecoveryStatus::StaleHeartbeat,
+        LeaseLife::Active => RecoveryStatus::Live,
     }
-    if !Path::new(&lease.worktree_path).exists() {
-        return RecoveryStatus::MissingCheckout;
-    }
-    if heartbeat_stale(lease) {
-        return RecoveryStatus::StaleHeartbeat;
-    }
-    RecoveryStatus::Live
 }
 
 fn heartbeat_stale(lease: &Lease) -> bool {
@@ -206,7 +226,12 @@ fn heartbeat_stale(lease: &Lease) -> bool {
 }
 
 fn collab_of(lease: &Lease, overlay: &CoordOverlay, github: Option<&GithubState>) -> CollabStatus {
-    if lease.released_at.is_some() || lease.mode == LeaseMode::Unassigned {
+    match lease_life(lease) {
+        LeaseLife::Terminal => return CollabStatus::Released,
+        LeaseLife::Incomplete => return incomplete_collab(lease),
+        LeaseLife::Active => {}
+    }
+    if lease.mode == LeaseMode::Unassigned {
         return CollabStatus::Released;
     }
     if is_conflicted(lease, github) {
@@ -222,6 +247,13 @@ fn collab_of(lease: &Lease, overlay: &CoordOverlay, github: Option<&GithubState>
         return CollabStatus::ReadyForIntegration;
     }
     CollabStatus::Running
+}
+
+fn incomplete_collab(lease: &Lease) -> CollabStatus {
+    match lease.allocation_state {
+        AllocationState::NeedsAttention | AllocationState::Unknown => CollabStatus::Conflicted,
+        _ => CollabStatus::Waiting,
+    }
 }
 
 fn is_conflicted(lease: &Lease, github: Option<&GithubState>) -> bool {
@@ -259,6 +291,7 @@ fn collect_blockers(
         RecoveryStatus::Live | RecoveryStatus::Released => {}
         RecoveryStatus::StaleHeartbeat => blockers.push("recovery:stale_heartbeat".to_owned()),
         RecoveryStatus::MissingCheckout => blockers.push("recovery:missing_checkout".to_owned()),
+        RecoveryStatus::NeedsReconcile => blockers.push("recovery:needs_reconcile".to_owned()),
     }
     blockers
 }

@@ -5,6 +5,9 @@ use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
 
+mod coord;
+mod lease;
+mod store;
 mod watchlist;
 
 /// Manage isolated issue-to-PR jobs and their durable state.
@@ -65,6 +68,18 @@ enum Command {
     Worktree {
         #[command(subcommand)]
         action: WorktreeAction,
+    },
+
+    /// Crash-consistent lease inspection and reconciliation.
+    Lease {
+        #[command(subcommand)]
+        action: lease::LeaseAction,
+    },
+
+    /// Same-host coordination claims and overlap/help/handoff messages.
+    Coord {
+        #[command(subcommand)]
+        action: coord::CoordAction,
     },
 
     /// Format an attributed PR thread reply or summary comment.
@@ -407,6 +422,31 @@ fn worktree_error_data(error: &writ_core::error::Error) -> serde_json::Value {
             postcondition_failure_data(failure)
         }
         writ_core::error::Error::PrImportFailed(failure) => import_failure_data(failure),
+        writ_core::error::Error::LeaseAttention(failure) => {
+            let writ_core::error::LeaseAttentionFailure {
+                operation_id,
+                allocation_state,
+                classification,
+                conflicts,
+                path,
+                path_exists,
+                branch_commit,
+                head_commit,
+                worktree_registered,
+            } = failure.as_ref();
+            serde_json::json!({
+                "operation_id": operation_id,
+                "allocation_state": allocation_state,
+                "classification": classification,
+                "conflicts": conflicts,
+                "path": path,
+                "path_exists": path_exists,
+                "branch_commit": branch_commit,
+                "head_commit": head_commit,
+                "worktree_registered": worktree_registered,
+                "cleanup_performed": false,
+            })
+        }
         _ => serde_json::json!({}),
     }
 }
@@ -468,6 +508,11 @@ fn worktree_command_name(cli: &Cli) -> Option<&'static str> {
             WorktreeAction::Remove { .. } => "worktree.remove",
             WorktreeAction::Prune { .. } => "worktree.prune",
         }),
+        Some(Command::Lease { action }) => Some(match action {
+            lease::LeaseAction::Inspect { .. } => "lease.inspect",
+            lease::LeaseAction::Reconcile { .. } => "lease.reconcile",
+        }),
+        Some(Command::Coord { action }) => Some(action.envelope_command()),
         _ => None,
     }
 }
@@ -883,7 +928,10 @@ fn emit_install_output(
     )
 }
 
-fn write_json_line(stdout: &mut impl Write, value: &impl serde::Serialize) -> io::Result<()> {
+pub(crate) fn write_json_line(
+    stdout: &mut (impl Write + ?Sized),
+    value: &impl serde::Serialize,
+) -> io::Result<()> {
     serde_json::to_writer(&mut *stdout, value).map_err(io::Error::other)?;
     stdout.write_all(b"\n")
 }
@@ -901,66 +949,108 @@ fn writ_command(writ_bin: Option<PathBuf>) -> String {
 }
 
 async fn run(cli: Cli, stdout: &mut impl Write) -> writ_core::error::Result<ExitCode> {
+    let json = cli.json;
     let allowlist =
         writ_core::owners::OwnerAllowlist::from_cli_or_env(cli.allowed_owners.as_deref());
     match cli.command {
-        Some(Command::Status) => {
-            run_status(cli.json, "cli.status", writ_core::status::load(), stdout)?;
-            Ok(ExitCode::SUCCESS)
-        }
-        Some(Command::Jobs) => {
-            run_status(cli.json, "cli.jobs", writ_core::status::load(), stdout)?;
-            Ok(ExitCode::SUCCESS)
-        }
+        Some(Command::Status) => run_snapshot("cli.status", json, stdout),
+        Some(Command::Jobs) => run_snapshot("cli.jobs", json, stdout),
         Some(Command::GitSafe {
             expected_branch,
             repo,
             args,
-        }) => run_git_safe(&args, expected_branch.as_deref(), repo, cli.json, stdout),
-        Some(Command::GhSafe { args }) => run_gh_safe(&args, &allowlist, cli.json, stdout),
-        Some(Command::Supervisor { action }) => match action {
-            SupervisorAction::Run {
-                timeouts,
-                expected_branch,
-                repo,
-                max_parallel,
-                cmd,
-            } => {
-                run_supervisor(
-                    cli.json,
-                    &timeouts,
-                    max_parallel,
-                    cmd,
-                    writ_core::supervisor::RunOptions {
-                        expected_branch,
-                        repo,
-                        allowlist: Some(allowlist),
-                        ..Default::default()
-                    },
+        }) => run_git_safe(&args, expected_branch.as_deref(), repo, json, stdout),
+        Some(Command::GhSafe { args }) => run_gh_safe(&args, &allowlist, json, stdout),
+        Some(Command::Supervisor { action }) => {
+            run_supervisor_action(
+                action,
+                SupervisorCli {
+                    allowlist,
+                    json,
                     stdout,
-                )
-                .await
-            }
-        },
-        Some(Command::Worktree { action }) => run_worktree(action, &allowlist, cli.json, stdout),
-        Some(Command::Attribution { action }) => run_attribution(action, cli.json, stdout),
+                },
+            )
+            .await
+        }
+        Some(Command::Worktree { action }) => run_worktree(action, &allowlist, json, stdout),
+        Some(Command::Lease { action }) => lease::run(
+            action,
+            lease::LeaseCli {
+                allowlist: &allowlist,
+                json,
+                stdout,
+            },
+        ),
+        Some(Command::Coord { action }) => coord::run(
+            action,
+            coord::CoordCli {
+                allowlist: &allowlist,
+                json,
+                stdout,
+            },
+        ),
+        Some(Command::Attribution { action }) => run_attribution(action, json, stdout),
         Some(Command::Hook) => run_hook(stdout),
         Some(Command::Install { settings, writ_bin }) => {
-            run_install(settings, writ_bin, cli.json, stdout)
+            run_install(settings, writ_bin, json, stdout)
         }
-        Some(Command::Watchlist { action }) => watchlist::run(action, &allowlist, cli.json, stdout),
-        None => {
-            if cli.json {
-                serde_json::to_writer(
-                    &mut *stdout,
-                    &writ_core::contract::Response::bootstrap_success(),
-                )
-                .map_err(io::Error::other)?;
-                stdout.write_all(b"\n")?;
-            }
-            Ok(ExitCode::SUCCESS)
-        }
+        Some(Command::Watchlist { action }) => watchlist::run(action, &allowlist, json, stdout),
+        None => run_bootstrap(json, stdout),
     }
+}
+
+fn run_snapshot(
+    command: &'static str,
+    json: bool,
+    stdout: &mut impl Write,
+) -> writ_core::error::Result<ExitCode> {
+    run_status(json, command, writ_core::status::load(), stdout)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+fn run_bootstrap(json: bool, stdout: &mut impl Write) -> writ_core::error::Result<ExitCode> {
+    if json {
+        serde_json::to_writer(
+            &mut *stdout,
+            &writ_core::contract::Response::bootstrap_success(),
+        )
+        .map_err(io::Error::other)?;
+        stdout.write_all(b"\n")?;
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+struct SupervisorCli<'a> {
+    allowlist: writ_core::owners::OwnerAllowlist,
+    json: bool,
+    stdout: &'a mut dyn Write,
+}
+
+async fn run_supervisor_action(
+    action: SupervisorAction,
+    ctx: SupervisorCli<'_>,
+) -> writ_core::error::Result<ExitCode> {
+    let SupervisorAction::Run {
+        timeouts,
+        expected_branch,
+        repo,
+        max_parallel,
+        cmd,
+    } = action;
+    run_supervisor(
+        ctx.json,
+        &timeouts,
+        max_parallel,
+        cmd,
+        writ_core::supervisor::RunOptions {
+            expected_branch,
+            repo,
+            allowlist: Some(ctx.allowlist),
+            ..Default::default()
+        },
+        ctx.stdout,
+    )
+    .await
 }
 
 fn secs_opt(secs: u64) -> Option<Duration> {
@@ -974,7 +1064,7 @@ async fn run_supervisor(
     max_parallel: usize,
     cmd: Vec<String>,
     mut options: writ_core::supervisor::RunOptions,
-    stdout: &mut impl Write,
+    stdout: &mut (impl Write + ?Sized),
 ) -> writ_core::error::Result<ExitCode> {
     let program = match cmd.first() {
         Some(p) => p.as_str(),
@@ -1021,7 +1111,7 @@ async fn run_supervisor(
 fn write_supervisor_result(
     json: bool,
     result: Result<&writ_core::supervisor::SupervisedOutput, &writ_core::error::Error>,
-    stdout: &mut impl Write,
+    stdout: &mut (impl Write + ?Sized),
 ) -> io::Result<()> {
     if !json {
         if let Ok(output) = result {
@@ -1832,6 +1922,86 @@ mod tests {
         assert_eq!(pr_number, Some(42));
         assert_eq!(head_repo.as_deref(), Some("acme/fork"));
         assert_eq!(source_remote.as_deref(), None);
+    }
+
+    #[test]
+    fn lease_inspect_parser_accepts_identity() {
+        let inspect = Cli::try_parse_from([
+            "writ",
+            "lease",
+            "inspect",
+            "--repo",
+            ".",
+            "--branch",
+            "hive/job",
+            "--path",
+            "/tmp/checkout",
+            "acme",
+            "sample",
+            "job",
+        ])
+        .unwrap();
+        let Some(super::Command::Lease {
+            action: super::lease::LeaseAction::Inspect { job_id, .. },
+        }) = inspect.command
+        else {
+            panic!("expected lease inspect")
+        };
+        assert_eq!(job_id, "job");
+
+        let reconcile = Cli::try_parse_from([
+            "writ",
+            "lease",
+            "reconcile",
+            "--repo",
+            ".",
+            "acme",
+            "sample",
+            "job",
+        ])
+        .unwrap();
+        assert!(matches!(
+            reconcile.command,
+            Some(super::Command::Lease {
+                action: super::lease::LeaseAction::Reconcile { .. },
+            })
+        ));
+    }
+
+    #[test]
+    fn coord_announce_parser_accepts_identity_and_paths() {
+        let parsed = Cli::try_parse_from([
+            "writ",
+            "coord",
+            "announce",
+            "acme",
+            "sample",
+            "job",
+            "--agent",
+            "agent-a",
+            "--session",
+            "sess-1",
+            "--intent",
+            "edit coord",
+            "--path",
+            "crates/writ-core/src/coord.rs",
+        ])
+        .unwrap();
+        let Some(super::Command::Coord {
+            action:
+                super::coord::CoordAction::Announce {
+                    agent,
+                    job_id,
+                    paths,
+                    ..
+                },
+        }) = parsed.command
+        else {
+            panic!("expected coord announce")
+        };
+        assert_eq!(agent, "agent-a");
+        assert_eq!(job_id, "job");
+        assert_eq!(paths, vec!["crates/writ-core/src/coord.rs"]);
     }
 
     #[tokio::test]

@@ -17,7 +17,7 @@ pub use github::{GhPrProbe, GithubProbe, ProbeError};
 pub use types::{
     CollabStatus, CoordOverlay, GithubState, RecoveryStatus, WatchEntry, WatchlistData,
 };
-pub use view::{WatchQuery, load_view};
+pub use view::{ViewLoad, WatchQuery, load_view};
 
 pub use classify::classify_snapshot;
 pub use github::{BranchRef, PrRef, PrSnapshot, parse_pr_view};

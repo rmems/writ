@@ -8,7 +8,7 @@ use writ_core::contract::{ErrorData, Response, SCHEMA_VERSION};
 use writ_core::lease::LeaseStore;
 use writ_core::owners::OwnerAllowlist;
 use writ_core::paths::lease_store_path;
-use writ_core::watchlist::{GhPrProbe, WatchQuery, WatchlistData, load_view};
+use writ_core::watchlist::{GhPrProbe, ViewLoad, WatchQuery, WatchlistData, load_view};
 
 #[derive(Debug, Subcommand)]
 pub enum WatchlistAction {
@@ -169,7 +169,12 @@ fn render_view(
         let store = LeaseStore::open_read_only(&path)?;
         let probe = GhPrProbe::new(request.allowlist.clone());
         let github = query.probe_github.then_some(&probe as _);
-        load_view(&store, &query, github, request.allowlist)?
+        load_view(ViewLoad {
+            store: &store,
+            query: &query,
+            probe: github,
+            allowlist: request.allowlist,
+        })?
     } else {
         WatchlistData::empty(query.probe_github, false)
     };
