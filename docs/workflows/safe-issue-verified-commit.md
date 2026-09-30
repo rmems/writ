@@ -24,7 +24,7 @@ Abort and report if any of these fail:
 - Owner is outside the configured allowlist (unless the operator named this repo/job explicitly).
 - Unsafe identity or path mismatch, a genuine ownership collision, or a non-recoverable cleanliness/remote check. Exact remote-base equality applies only to a newly created, unpublished assigned branch. A published branch must have the expected upstream and local/remote relationship instead. Repair a clean bootstrap source or unpublished verified-base alignment before editing; do not abort isolated work because a primary checkout is dirty or stale.
 - `writ` is missing and no enforcing wrapper is available (mutating runs). An "enforcing wrapper" means a wrapper that routes the mutation through `writ-core`'s allowlist and branch verification; a wrapper that merely calls `git` directly is not one, and does not satisfy this check.
-- Any required quality gate fails or times out
+- A **merge-ready** claim when a required quality gate failed or timed out (a checkpoint with honest residuals is not this stop)
 - A deny-listed command would be required (GitHub PR merge, local merge into `main`/`master`, dirty-WIP merge, bare `--force` / `-f`)
 - `git push` exits non-zero or the remote rejects the push
 
@@ -110,7 +110,7 @@ Then:
 
 Run this stage **only** after Stage 6 step 3 succeeded (push accepted by the remote).
 
-Comment on the GitHub issue (MCP first) with:
+Comment on the Linear task (maintainers) and, when a GitHub issue already exists, on that issue (MCP first) with:
 
 - branch
 - pushed SHA (`git rev-parse HEAD` **after** that successful push)

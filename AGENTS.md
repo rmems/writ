@@ -139,14 +139,14 @@ Rust binary: writ -> writ-core
 git / gh / operating system
        |
        v
-GitHub (source, PRs, reviews, checks) · Linear (task tracking)
+GitHub (source, PRs, reviews, checks) · Linear (maintainers' optional backlog)
 ```
 
 | Layer | Responsibilities |
 | --- | --- |
 | Agent skill | Describe when to discover work, spawn subagents, and report results. The installed companion `babysit-pr` skill handles interactive PR monitoring. Prompt content is portable guidance, not a security boundary. |
 | Rust core and CLI | Hold SQLite lease rows, register checkouts, resolve sandboxed paths, supervise child processes, verify branches, reject unsafe git/GitHub operations, dispatch `writ hook`. Path-scoped coordination and messaging are later work on the same store. |
-| External tools | Runtime `git` and `gh` operations are selected and validated by Rust. GitHub repository rules own protected-branch merges; Linear owns task tracking. The OS supplies filesystem and process primitives. |
+| External tools | Runtime `git` and `gh` operations are selected and validated by Rust. GitHub repository rules own protected-branch merges; Linear is this repository's maintainers' optional backlog, not a contributor requirement. The OS supplies filesystem and process primitives. |
 
 **Why enforce at the hook boundary?** A tool that must be *called* to help is advisory: an agent that does not call it is unconstrained. As a `PreToolUse` hook, enforcement applies to the agent's own commands whether or not the agent cooperates, and a blocking exit cannot be overridden by another hook. Hard stops live in Rust, at the binary boundary, so a malformed prompt cannot bypass them.
 
