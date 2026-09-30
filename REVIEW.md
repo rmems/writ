@@ -5,9 +5,12 @@ This guide defines the review and pull-request lifecycle for `writ`. It applies 
 ## Lifecycle
 
 ```text
-issue -> claimed job -> isolated worktree -> focused commits -> pull request
-      -> companion-skill interactive monitoring -> merge-ready report -> human merge decision
-      -> human merges on GitHub (repository protection owns the merge)
+task (Linear for maintainers, or a GitHub issue when one exists)
+      -> isolated writer checkout -> focused commits / checkpoint push / draft PR
+      -> focused checks with truthful status
+      -> integrated validation + risk-matched review before merge-ready
+      -> companion-skill interactive monitoring (optional)
+      -> human merge decision on GitHub
 ```
 
 The orchestrator, unattended runtime, installed companion `babysit-pr` skill, and worker agents may prepare or monitor a pull request and report that it is merge-ready, but they never merge the pull request or claim that an automated merge will occur. The companion skill is guidance, not an enforcement boundary. Local feature-branch integration in an assigned worktree is allowed; GitHub owns remote PR merges. Auto-merge and merge queues remain forbidden. If `main` is unprotected, report that operator gap rather than rebuilding a writ merge-permission protocol.
@@ -18,9 +21,9 @@ For stacked pull requests, review and fix the bottom PR before its children. Re-
 
 ### Scope and traceability
 
-- [ ] The PR links its GitHub issue and, when present, the matching Linear `RM-*` issue.
+- [ ] The PR links Linear `RM-*` when this is maintainer work, or the GitHub issue when one exists. Do not invent a GitHub issue twin.
 - [ ] Changes satisfy the linked acceptance criteria without unrelated refactors.
-- [ ] Session work is reflected accurately in Beads.
+- [ ] Checkpoint/draft status is distinct from a merge-ready claim; test evidence is truthful.
 - [ ] Generated replies identify the agent. Review-fix replies include the pushed commit SHA. Coordination messages and no-code-change replies do not invent a SHA.
 - [ ] Attribution is audited only on commits reachable from the submitted PR head and not its base, excluding synthetic review-merge/checkout and test-fixture commits. The Git author is the primary author, `Co-authored-by` credits an additional contributor, and `Agent` identifies the coding agent; the presence of one does not prove another.
 - [ ] Every Codex-authored commit in that submitted range contains exact `Agent: Codex` and `Co-authored-by: Codex <noreply@openai.com>` trailers without rewriting Cursor-attributed history.

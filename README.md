@@ -397,13 +397,14 @@ Keep GitHub label descriptions identical to this table (commands in
 Optional GitHub issue forms live in [`.github/ISSUE_TEMPLATE/`](.github/ISSUE_TEMPLATE/):
 **Feature** (new capability), **Bug** (unexpected failure), **Chore** (hygiene,
 packaging, docs-only). Each asks for Summary, Problem / context, Acceptance
-criteria checkboxes, and the Linear footer documented in
-[`CONTRIBUTING.md`](CONTRIBUTING.md).
+criteria checkboxes, and an optional Linear footer documented in
+[`CONTRIBUTING.md`](CONTRIBUTING.md). Linear is maintainer backlog, not a
+required contributor service.
 
 ## Roadmap and tracking
 
 - Product direction and task tracking for this repo: Linear (`writ` / `RM` tickets). Using Linear is a convention of this repository's maintainers, not a product requirement.
-- GitHub issues mirror actionable work items; they are optional, not a required workflow.
+- GitHub issues are optional for GitHub-filed work; they are not required Linear mirrors.
 - Open coordination work: crash-consistent lease/ownership records and the same-host claim/overlap/message/handoff layer build on the existing SQLite lease store.
 - Lease budgets (fix-loop bound): [#167](https://github.com/rmems/writ/issues/167)
 - Hook burn-in: [#124](https://github.com/rmems/writ/issues/124) · Install narrative: [#18](https://github.com/rmems/writ/issues/18) · Owner allowlist: [#146](https://github.com/rmems/writ/issues/146)

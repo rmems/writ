@@ -45,20 +45,22 @@ Before making any code change, the agent MUST verify:
 
 Repair a clean bootstrap source or a newly created unpublished branch's verified-base alignment before editing. Abort and report an unsafe identity or path mismatch, a genuine ownership collision, or any other non-recoverable failure.
 
-### Validation and final publication sequence
+### Validation, checkpoints, and merge readiness
 
-Run focused, task-relevant gates while working. After the first tested
-implementation and before final publication, obtain one independent review
-matched to the change's risk. Additional review is required only for a named
-high-risk boundary or a reproduced finding that warrants follow-up.
+Run focused, task-relevant gates while working. Checkpoint commits, checkpoint
+pushes, and draft PRs may proceed with honest test status and ordinary
+non-destructive publication checks. Do not describe an unrun or failing check
+as passed.
+
+Before claiming merge or release readiness, obtain one independent review
+matched to the change's risk (extra review only for a named high-risk boundary
+or a reproduced finding) and run appropriate integrated validation on the exact
+`HEAD`. Do not require a full workspace suite for every checkpoint.
 
 Before first publication of an unpublished assigned branch, fetch the verified
 remote base and complete final alignment or rebase. For a published branch,
 fetch and reconcile it with its expected upstream; do not require equality with
-the base. Then run exactly one complete native gate suite on the exact `HEAD`
-that would be pushed. An issue may add focused checks; it must not replace or
-reduce that final suite. Any later tree change invalidates that run and requires
-restoring the applicable alignment and rerunning the suite before push.
+the base. Any later tree change invalidates a readiness run.
 
 ### Final status guidance
 
@@ -168,7 +170,7 @@ SHA policy: include `--commit-sha` only when referring to committed or pushed wo
 - **Recovery:** `live`, `released`, `stale_heartbeat`, `missing_checkout`.
 - **GitHub:** `check` / `check-all` probe PRs live (`gh pr list --head`). That overlay is not a merge gate. `--repo` / `--owner` filters are optional; probes still honour `WRIT_ALLOWED_OWNERS`.
 - **`add` / `remove`:** do not persist. Register or unregister a checkout instead.
-- Same-host SQLite is not cross-host coordination. Linear remains the required task tracker.
+- Same-host SQLite is not cross-host coordination. Linear is the maintainers' optional backlog, not a required contributor service.
 
 See [`docs/watchlist-schema.md`](docs/watchlist-schema.md).
 
@@ -186,7 +188,7 @@ SAFETY RULES (non-negotiable):
 - One writable worker per assigned worktree and branch
 - Before editing, verify: worktree path, branch name, clean assigned state, and remote alignment; exact remote-base equality applies only to a newly created unpublished branch, while a published branch must match its expected upstream relationship
 - Repair a clean bootstrap source or unpublished verified-base alignment; abort on unsafe identity or path mismatch
-- After the first tested implementation and before publication, obtain one independent risk-matched review; add review only for a named high-risk boundary or an actual finding
+- After the first tested implementation and before a merge-ready claim, obtain one independent risk-matched review; add review only for a named high-risk boundary or an actual finding. Checkpoints and draft PRs need truthful focused-check status, not a full-suite claim
 - Use `writ attribution format` for automated replies. Intent/dependency/overlap/help/handoff/conflict messages need real agent/task/branch/session identity and must not invent a SHA. After a successful push, review-fix replies include that real SHA.
 ```
 
@@ -201,4 +203,4 @@ Long-running supervised commands use `writ supervisor run` with the named policy
 This skill is portable procedure, not a security boundary. Route orchestrated
 mutations through `writ`, with Rust enforcing the runtime boundary as
 defined in [`AGENTS.md`](AGENTS.md#enforcement-layers). GitHub owns remote PR
-integration; Linear owns task tracking.
+integration; Linear is the maintainers' task record when they use it.
