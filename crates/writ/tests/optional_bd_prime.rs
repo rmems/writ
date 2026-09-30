@@ -13,8 +13,10 @@ struct TestDir(PathBuf);
 impl TestDir {
     fn new() -> Self {
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        let path =
-            std::env::temp_dir().join(format!("writ-optional-bd-prime-{}-{id}", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "writ-optional-bd-prime-{}-{id}",
+            std::process::id()
+        ));
         fs::create_dir_all(&path).unwrap();
         Self(path)
     }
@@ -59,7 +61,11 @@ fn missing_bd_is_success() {
 fn present_bd_is_invoked() {
     let dir = TestDir::new();
     let stub = dir.0.join("bd");
-    fs::write(&stub, "#!/usr/bin/env bash\necho PRIME-RAN \"$@\"\nexit 0\n").unwrap();
+    fs::write(
+        &stub,
+        "#!/usr/bin/env bash\necho PRIME-RAN \"$@\"\nexit 0\n",
+    )
+    .unwrap();
     let mut perms = fs::metadata(&stub).unwrap().permissions();
     perms.set_mode(0o755);
     fs::set_permissions(&stub, perms).unwrap();
