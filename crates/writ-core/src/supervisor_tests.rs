@@ -423,12 +423,12 @@ struct GraceCase {
     script: &'static str,
     stage: RecoveryStage,
     killed: bool,
-    bound_secs: Option<u64>,
+    bound: Option<Duration>,
 }
 
 #[cfg(unix)]
-fn grace_case_matches(case: &GraceCase, output: &SupervisedOutput, elapsed_secs: u64) -> bool {
-    let within_bound = case.bound_secs.is_none_or(|limit| elapsed_secs < limit);
+fn grace_case_matches(case: &GraceCase, output: &SupervisedOutput, elapsed: Duration) -> bool {
+    let within_bound = case.bound.is_none_or(|limit| elapsed < limit);
     let killed_timeout = if case.killed {
         is_killed_timeout(output, TimeoutClass::Hard, SupervisorErrorCode::TimedOut)
     } else {
@@ -450,7 +450,7 @@ async fn graceful_cancel_follows_term_sensitivity() {
             script: "trap '' TERM; while true; do :; done",
             stage: RecoveryStage::Kill,
             killed: true,
-            bound_secs: None,
+            bound: None,
         },
         GraceCase {
             worker_ms: 150,
@@ -458,7 +458,7 @@ async fn graceful_cancel_follows_term_sensitivity() {
             script: "trap 'exit 0' TERM; sleep 60",
             stage: RecoveryStage::GracefulCancel,
             killed: false,
-            bound_secs: Some(3),
+            bound: Some(Duration::from_secs(3)),
         },
     ];
     for case in cases {
@@ -477,9 +477,9 @@ async fn graceful_cancel_follows_term_sensitivity() {
                 &RunOptions::default(),
             )
             .await;
-        let elapsed_secs = started.elapsed().as_secs();
+        let elapsed = started.elapsed();
         assert!(
-            grace_case_matches(&case, &output, elapsed_secs),
+            grace_case_matches(&case, &output, elapsed),
             "grace case mismatch script={} output={output:?}",
             case.script
         );
