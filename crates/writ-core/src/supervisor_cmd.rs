@@ -125,9 +125,11 @@ fn prepare_git_command(prep: &CommandRequest<'_>) -> Result<PreparedCommand> {
 }
 
 /// Prepare a supervised `gh` command: enforce argv/allowlist policy and, for
-/// mutating `gh pr` commands, require an expected branch and bind the effective
-/// repo selector (explicit `-R` or implicit `GH_REPO`) to the verified local
-/// origin before PATH-forcing the `gh` binary.
+/// mutating `gh pr` and `gh run` commands, require an expected branch and bind
+/// the effective repo selector (explicit `-R` or implicit `GH_REPO`) to the
+/// verified local origin before PATH-forcing the `gh` binary. For `gh run
+/// download`, validate the `--dir` destination against the resolved worktree
+/// root (the child's cwd), not the supervisor's process cwd.
 fn prepare_gh_command(prep: &CommandRequest<'_>) -> Result<PreparedCommand> {
     let owned_args: Vec<String> = prep.args.iter().map(|s| (*s).to_owned()).collect();
     let options = prep.options;
@@ -148,6 +150,13 @@ fn prepare_gh_command(prep: &CommandRequest<'_>) -> Result<PreparedCommand> {
                     .to_owned(),
             })?;
         let repo = resolve_supervised_repo(options.repo.as_deref())?;
+        // Validate a `gh run download` destination against the REAL worktree
+        // root the child will run in (`repo` == `prepared.cwd`), not the
+        // supervisor's process cwd. `with_allowlist` above only applied the
+        // cwd-independent string gate; the symlink-resolution gate must inspect
+        // the directory the child actually extracts into. No-op for non-download
+        // commands.
+        crate::git_safe::reject_external_gh_download_destination_in(&owned_args, &repo)?;
         // Bind the effective repo selector to the verified local checkout so jobs
         // cannot mutate a different GitHub repository after the branch gate. An
         // explicit `-R/--repo` wins; otherwise gh reads the implicit `GH_REPO`

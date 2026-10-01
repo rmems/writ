@@ -178,8 +178,57 @@ fn gh_reject_disallowed_run_verb(subcommand: &str, args: &[String]) -> Result<()
 /// Reject destinations that leave the worktree. `--name` and `--pattern` select
 /// artifacts; they are not output paths. Unknown download flags are rejected so
 /// a clustered short cannot hide an outside destination.
+///
+/// # Validation split (PR #183 review follow-up)
+///
+/// This runs only the cwd-independent **string** gate ([`reject_external_path`]:
+/// absolute / `..` / drive / UNC). It is reached from
+/// [`SafeGhCommand::with_allowlist`], which has no worktree context:
+/// [`SafeGhCommand::new`] is a direct-call path with no supervised worktree, and
+/// the child `gh` is actually spawned with its cwd set to the resolved worktree
+/// (`prepared.cwd`), not the supervisor process cwd. Resolving a symlink here
+/// against `std::env::current_dir()` would therefore inspect the wrong directory
+/// in the normal supervised case. The symlink-resolution gate is applied
+/// separately against the real worktree root in
+/// [`reject_external_gh_download_destination_in`], called from
+/// `supervisor_cmd::prepare_gh_command` where the worktree root is known.
+/// Direct `SafeGhCommand::new` callers still get the string gate here.
 fn gh_reject_external_download_destination(subcommand: &str, args: &[String]) -> Result<()> {
     if subcommand != "run" || first_positional_after(&args[1..]) != Some("download") {
+        return Ok(());
+    }
+    for dest in gh_run_download_dirs(args)? {
+        // Cwd-independent string gate: rejects absolute / `..` / drive / UNC
+        // spellings. The symlink-resolution gate is rooted at the worktree in
+        // `reject_external_gh_download_destination_in` (supervised path).
+        reject_external_path(Some(dest), "gh run download destination")?;
+    }
+    Ok(())
+}
+
+/// Validate a `gh run download` command's `--dir` / `-D` destinations against an
+/// explicit `worktree_root` (the resolved repo dir that becomes the child `gh`
+/// process cwd), running **both** gates fail-closed:
+///
+/// 1. the pure-string [`reject_external_path`] check (absolute / `..` / drive /
+///    UNC), unchanged; and
+/// 2. the symlink-resolution check, which joins/resolves each destination
+///    against the canonicalized `worktree_root` and confirms the resolved
+///    nearest-existing-ancestor stays within it, rejecting symlink components.
+///
+/// This is the worktree-root-aware entry point used by the supervisor so the
+/// defense inspects the directory the child actually extracts into, regardless
+/// of the supervisor's own process cwd. It is a pure function of
+/// `(args, worktree_root)` and does not read `std::env::current_dir()`.
+///
+/// A no-op unless `args` is a `gh run download` invocation.
+pub fn reject_external_gh_download_destination_in(
+    args: &[String],
+    worktree_root: &std::path::Path,
+) -> Result<()> {
+    if args.first().map(String::as_str) != Some("run")
+        || first_positional_after(&args[1..]) != Some("download")
+    {
         return Ok(());
     }
     for dest in gh_run_download_dirs(args)? {
@@ -187,34 +236,38 @@ fn gh_reject_external_download_destination(subcommand: &str, args: &[String]) ->
         // UNC spellings.
         reject_external_path(Some(dest), "gh run download destination")?;
         // Second gate: a plain relative name can still be (or traverse) a
-        // symlink that escapes the worktree. Resolve it fail-closed.
-        reject_symlinked_download_destination(dest)?;
+        // symlink that escapes the worktree. Resolve it against the real
+        // worktree root fail-closed.
+        reject_symlinked_download_destination_in(dest, worktree_root)?;
     }
     Ok(())
 }
 
-/// Reject a `gh run download --dir` destination that escapes the worktree via a
-/// symlink, which the pure-string [`reject_external_path`] gate cannot see.
+/// Reject a `gh run download --dir` destination that escapes `worktree_root` via
+/// a symlink, which the pure-string [`reject_external_path`] gate cannot see.
 ///
 /// The destination may not exist yet, so this resolves the nearest existing
 /// ancestor (walking up component by component), canonicalizes it, and confirms
-/// it stays within the canonicalized current working directory (the `gh`
-/// process cwd / worktree root). It also rejects when any existing leading
-/// component is itself a symlink. Fails closed on any IO error that prevents
-/// validating an existing component.
-fn reject_symlinked_download_destination(dest: &str) -> Result<()> {
+/// it stays within the canonicalized `worktree_root` (the directory the child
+/// `gh` process runs in). It also rejects when any existing leading component is
+/// itself a symlink. Fails closed on any IO error that prevents validating an
+/// existing component.
+///
+/// `worktree_root` is passed explicitly (not read from `std::env::current_dir()`)
+/// so the gate inspects the directory the child actually extracts into even when
+/// the supervisor's process cwd differs from the worktree.
+fn reject_symlinked_download_destination_in(
+    dest: &str,
+    worktree_root: &std::path::Path,
+) -> Result<()> {
     use std::path::Path;
 
-    let cwd = std::env::current_dir().map_err(|e| Error::Io {
-        context: "resolve cwd for gh run download destination",
-        source: e,
-    })?;
-    let cwd_root = cwd.canonicalize().map_err(|e| Error::Io {
-        context: "canonicalize cwd for gh run download destination",
+    let root = worktree_root.canonicalize().map_err(|e| Error::Io {
+        context: "canonicalize worktree root for gh run download destination",
         source: e,
     })?;
 
-    let joined = cwd.join(Path::new(dest));
+    let joined = root.join(Path::new(dest));
 
     // Walk the full path toward the root until a component exists on disk.
     let mut existing = joined.as_path();
@@ -230,7 +283,7 @@ fn reject_symlinked_download_destination(dest: &str) -> Result<()> {
                     context: "canonicalize gh run download destination ancestor",
                     source: e,
                 })?;
-                if !canon.starts_with(&cwd_root) {
+                if !canon.starts_with(&root) {
                     return Err(symlinked_download_escape(dest));
                 }
                 return Ok(());

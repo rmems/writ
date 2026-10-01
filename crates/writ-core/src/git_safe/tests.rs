@@ -1361,9 +1361,11 @@ fn gh_run_rerun_and_view_allowed() {
 
 #[test]
 fn gh_run_download_relative_dir_allowed() {
-    // `--dir artifacts` resolves against the process cwd via
-    // `reject_symlinked_download_destination`; pin to a clean worktree so a
-    // sibling chdir test cannot make this spuriously fail or pass.
+    // `SafeGhCommand::new` applies only the cwd-independent string gate to a
+    // download `--dir` (the symlink gate is rooted at the worktree in the
+    // supervisor path), so these are not cwd-dependent. Pin a clean cwd anyway
+    // to keep the sibling download tests mutually isolated under cargo's
+    // parallel execution.
     let (_guard, _reset, _worktree) = pin_cwd_to_clean_worktree();
 
     let relative = SafeGhCommand::new(&[
@@ -1909,13 +1911,17 @@ fn gh_run_rerun_mismatched_selector_rejected_by_origin_bind() {
 
 // ---- FEAT-002 / PR #183 finding #7: symlinked download destination escape ----
 
-/// Serialize every test that resolves a download `--dir` against the
-/// process-global `std::env::current_dir`. The symlink tests chdir the whole
-/// process, so any sibling test that also runs `reject_symlinked_download_destination`
-/// must hold this lock too, otherwise it observes a foreign or disappearing cwd
-/// under cargo's parallel execution. This is cross-platform on purpose: the
-/// sibling download tests are not `#[cfg(unix)]`, so the lock and cwd pinning
-/// must compile and serialize on every platform.
+/// Serialize the sibling download tests that resolve a `--dir` against the
+/// process-global `std::env::current_dir`. [`SafeGhCommand::new`] /
+/// `with_allowlist` apply only the cwd-independent *string* gate, so these do
+/// not actually depend on the cwd for correctness; pinning here removes any
+/// cross-test chdir flake while keeping the tests deterministic. Cross-platform
+/// on purpose: the sibling download tests are not `#[cfg(unix)]`, so the lock
+/// and cwd pinning must compile and serialize on every platform.
+///
+/// The worktree-root-aware symlink tests below do NOT use this guard: they call
+/// [`reject_external_gh_download_destination_in`] with an explicit root and need
+/// no `set_current_dir`, so they are free of the `CWD_GUARD` serialization.
 static CWD_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Restores the original working directory on drop so later tests are
@@ -1949,34 +1955,50 @@ fn pin_cwd_to_clean_worktree() -> (
     (guard, reset, worktree)
 }
 
+/// A `gh run download --dir <symlink>` whose destination escapes the worktree
+/// via a symlink is rejected by the worktree-root-aware validator, and crucially
+/// the validator uses the passed `worktree_root` — NOT the process cwd — so the
+/// escape is caught even when the supervisor process runs in a different
+/// directory (the normal supervised case). This is a pure function of
+/// `(args, root)`: no `set_current_dir`, hence no `CWD_GUARD`.
+///
+/// If the validator were reverted to reading `std::env::current_dir()` instead
+/// of `worktree_root`, the `evil` symlink lives only in `worktree_root` (not in
+/// the process cwd, which stays elsewhere), so the walk would step up to an
+/// existing ancestor of the process cwd and WRONGLY accept — this test would
+/// fail. That makes it a meaningful regression guard for finding #1.
 #[cfg(unix)]
 #[test]
-fn gh_run_download_symlinked_dir_rejected() {
+fn gh_run_download_symlink_escape_uses_worktree_root_not_cwd() {
     use std::os::unix::fs::symlink;
 
-    let _guard = CWD_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-    let original = std::env::current_dir().unwrap();
-    let _reset = CwdReset {
-        original: original.clone(),
-    };
-
-    // Worktree root the gh process runs in.
-    let worktree = tempfile::tempdir().unwrap();
     // External directory the symlink escapes to.
     let outside = tempfile::tempdir().unwrap();
+    // Worktree root the child `gh` process would run in.
+    let worktree = tempfile::tempdir().unwrap();
     let worktree_root = worktree.path().canonicalize().unwrap();
-    std::env::set_current_dir(&worktree_root).unwrap();
 
-    // `evil` is a relative name that passes the string check but points outside.
+    // Keep the PROCESS cwd somewhere else entirely so a cwd-based check could
+    // not see the worktree's `evil` symlink. We do not chdir to it; the
+    // validator takes the root explicitly.
+    let process_cwd = tempfile::tempdir().unwrap();
+    let _process_cwd_root = process_cwd.path().canonicalize().unwrap();
+
+    // `evil` is a relative name that passes the string check but points outside
+    // the worktree.
     symlink(outside.path(), worktree_root.join("evil")).unwrap();
 
-    let err = SafeGhCommand::new(&[
-        "run".to_owned(),
-        "download".to_owned(),
-        "--dir".to_owned(),
-        "evil".to_owned(),
-        "123".to_owned(),
-    ])
+    // Direct symlink destination is rejected.
+    let err = reject_external_gh_download_destination_in(
+        &[
+            "run".to_owned(),
+            "download".to_owned(),
+            "--dir".to_owned(),
+            "evil".to_owned(),
+            "123".to_owned(),
+        ],
+        &worktree_root,
+    )
     .unwrap_err();
     assert!(
         matches!(
@@ -1991,13 +2013,16 @@ fn gh_run_download_symlinked_dir_rejected() {
 
     // A symlink used as a leading component of a deeper destination is also
     // rejected (the extraction would still land outside).
-    let err = SafeGhCommand::new(&[
-        "run".to_owned(),
-        "download".to_owned(),
-        "--dir".to_owned(),
-        "evil/artifacts".to_owned(),
-        "123".to_owned(),
-    ])
+    let err = reject_external_gh_download_destination_in(
+        &[
+            "run".to_owned(),
+            "download".to_owned(),
+            "--dir".to_owned(),
+            "evil/artifacts".to_owned(),
+            "123".to_owned(),
+        ],
+        &worktree_root,
+    )
     .unwrap_err();
     assert!(
         matches!(
@@ -2011,30 +2036,74 @@ fn gh_run_download_symlinked_dir_rejected() {
     );
 }
 
+/// A plain in-worktree relative destination is accepted by the worktree-root-aware
+/// validator while the process cwd stays elsewhere (proving the root, not the
+/// cwd, is what the gate resolves against). Pure function of `(args, root)`:
+/// no `set_current_dir`, no `CWD_GUARD`.
 #[cfg(unix)]
 #[test]
-fn gh_run_download_plain_relative_dir_accepted() {
-    let (_guard, _reset, worktree) = pin_cwd_to_clean_worktree();
+fn gh_run_download_plain_relative_dir_accepted_against_worktree_root() {
+    // Process cwd stays wherever the test harness launched; we never chdir.
+    let worktree = tempfile::tempdir().unwrap();
     let worktree_root = worktree.path().canonicalize().unwrap();
 
     // A plain in-worktree relative destination (nonexistent nested dir) is fine.
-    SafeGhCommand::new(&[
-        "run".to_owned(),
-        "download".to_owned(),
-        "--dir".to_owned(),
-        "sub/artifacts".to_owned(),
-        "123".to_owned(),
-    ])
+    reject_external_gh_download_destination_in(
+        &[
+            "run".to_owned(),
+            "download".to_owned(),
+            "--dir".to_owned(),
+            "sub/artifacts".to_owned(),
+            "123".to_owned(),
+        ],
+        &worktree_root,
+    )
     .unwrap();
 
     // An existing real (non-symlink) in-worktree directory is also accepted.
     std::fs::create_dir_all(worktree_root.join("real")).unwrap();
-    SafeGhCommand::new(&[
-        "run".to_owned(),
-        "download".to_owned(),
-        "--dir".to_owned(),
-        "real".to_owned(),
-        "123".to_owned(),
-    ])
+    reject_external_gh_download_destination_in(
+        &[
+            "run".to_owned(),
+            "download".to_owned(),
+            "--dir".to_owned(),
+            "real".to_owned(),
+            "123".to_owned(),
+        ],
+        &worktree_root,
+    )
+    .unwrap();
+
+    // The pure-string gate still rejects absolute / `..` escapes here too (both
+    // gates run in the worktree-root-aware entry point).
+    for bad in ["/tmp/outside", "../outside"] {
+        let err = reject_external_gh_download_destination_in(
+            &[
+                "run".to_owned(),
+                "download".to_owned(),
+                "--dir".to_owned(),
+                bad.to_owned(),
+                "123".to_owned(),
+            ],
+            &worktree_root,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::PolicyViolation {
+                    code: PolicyCode::PathNotAllowed,
+                    ..
+                }
+            ),
+            "expected PathNotAllowed for {bad}, got {err:?}"
+        );
+    }
+
+    // A non-download command is a no-op even with an odd `--dir` elsewhere.
+    reject_external_gh_download_destination_in(
+        &["run".to_owned(), "view".to_owned(), "123".to_owned()],
+        &worktree_root,
+    )
     .unwrap();
 }

@@ -29,7 +29,7 @@ mod tests;
 pub use gh::{
     SafeGhCommand, bind_gh_repo_selector_to_origin, effective_gh_repo_selector,
     enforce_gh_repo_targets, first_positional_after, gh_repo_env_target, gh_repo_selector,
-    gh_requires_branch_check, pin_gh_repo_selector,
+    gh_requires_branch_check, pin_gh_repo_selector, reject_external_gh_download_destination_in,
 };
 pub use identity::{
     github_owner_name, github_repo_slugs_match, is_supported_github_remote,
