@@ -60,7 +60,6 @@ body:
     attributes:
       label: Linear
       description: Optional maintainer task id. Leave blank unless an RM-* task already exists. Do not invent a Linear twin.
-      value: |
-        Linear: <url> (`RM-N`)
+      placeholder: "Linear: <url> (`RM-N`)"
     validations:
       required: false

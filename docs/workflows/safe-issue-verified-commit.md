@@ -1,6 +1,6 @@
 # Safe Issue → Verified Commit
 
-Portable worker contract for any coding agent (Codex, Claude, Grok, Hermes, Devin, or later). Stops at a verified push and an issue comment. Does not open a PR — that is [Safe Verified Commit → PR](safe-verified-commit-to-pr.md).
+Portable worker contract for any coding agent (Codex, Claude, Grok, Hermes, Devin, or later). Stops at a verified push and a comment on the supplied tracker. Does not open a PR — that is [Safe Verified Commit → PR](safe-verified-commit-to-pr.md).
 
 Safety rules live in [`AGENTS.md`](../../AGENTS.md) and [`SKILL.md`](../../SKILL.md). This file does not relax them.
 
@@ -81,10 +81,11 @@ claim merge readiness**. You may still make a checkpoint commit or draft PR
 when the residual is stated honestly. A hang or timeout is not a license to
 report a failed gate as passed.
 
-After the first tested implementation, obtain one independent review matched to
-the change's risk before final publication. Additional review is required only
-for a named high-risk boundary or a reproduced finding that warrants follow-up.
-Address in-scope findings and rerun affected focused checks before continuing.
+A checkpoint push or draft PR does not require independent review. Before a
+merge-ready claim, obtain one independent review matched to the change's risk.
+Additional review is required only for a named high-risk boundary or a
+reproduced finding that warrants follow-up. Address in-scope findings and
+rerun affected focused checks before continuing.
 
 ### 5. Commit
 
@@ -110,7 +111,13 @@ Then:
 
 Run this stage **only** after Stage 6 step 3 succeeded (push accepted by the remote).
 
-Comment on the Linear task (maintainers) and, when a GitHub issue already exists, on that issue (MCP first) with:
+Report on the tracker that was supplied. Do not create a GitHub issue or a Linear task to hold the comment.
+
+- Linear task: comment on that task.
+- Existing GitHub issue: comment on that issue (MCP first).
+- Linear-only work stops at the Linear comment.
+
+Include:
 
 - branch
 - pushed SHA (`git rev-parse HEAD` **after** that successful push)
@@ -126,4 +133,4 @@ Stop after isolate + a written implementation plan. No commits, push, or issue c
 
 ## Done when
 
-Branch is pushed (remote accepted), status is truthful (checkpoint vs merge-ready), and the task or GitHub issue has a SHA-bearing comment only after that successful push.
+Branch is pushed (remote accepted), status is truthful (checkpoint vs merge-ready), and the supplied tracker has a SHA-bearing comment only after that successful push.

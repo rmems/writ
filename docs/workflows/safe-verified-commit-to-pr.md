@@ -11,11 +11,11 @@ Contract: Issue → PR [#8](https://github.com/rmems/writ/issues/8) / Linear [RM
 | Input | Required | Notes |
 | --- | --- | --- |
 | Verified push | yes | Branch already pushed; report focused-check or readiness status truthfully |
-| `task` | yes | Linear `RM-*` (maintainers) and/or GitHub issue. Do not create a GitHub issue twin for Linear-only work. |
+| `task` | no | Linear `RM-*` and/or a GitHub issue when one was supplied. `none` or omitted when neither exists. A pull request alone is enough. Do not invent a tracker. |
 | `owner` / `repo` | no | Resolve from `git remote` if omitted |
 | `dry_run` | no | Describe the PR you would open. Do not create or update it |
 
-One task → one PR unless the task explicitly groups work.
+When a task was supplied, one task → one PR unless the task explicitly groups work. With no tracker, the branch's pull request is the record.
 
 ## Hard stops
 
@@ -54,16 +54,20 @@ Suggested body:
 <what changed>
 
 ## Task
-Linear: RM-<n>   <!-- omit if this is GitHub-only work -->
+<!-- Omit this section when no Linear task and no GitHub issue exist. -->
+Linear: RM-<n>
 Refs #<n>        <!-- omit if no GitHub issue exists; use Fixes only when that issue is done -->
 
 ## Status
-checkpoint / merge-ready candidate
+<!-- checkpoint, or merge-ready candidate only after the integrated gates below passed -->
 
 ## Test plan
-- [ ] Focused checks covering this change (required for checkpoints; report residuals)
-- [ ] Integrated native gates from README.md (required before a merge-ready claim)
-- [ ] CI on PR
+- Focused checks: <command and result> (required for a checkpoint; name residuals)
+- Integrated gates before a merge-ready claim, each with its result:
+  - `cargo fmt --all -- --check`
+  - `cargo clippy --workspace --all-targets -- -D warnings`
+  - `cargo test --workspace`
+- CI on the PR (do not describe a skip or failure as a pass)
 
 ## Notes for review
 - Known residuals: ...
@@ -72,7 +76,7 @@ checkpoint / merge-ready candidate
 ### Partial / blocked
 
 - Code exists but the task is incomplete: open a **draft** or clearly partial PR with a Remaining section. That is a checkpoint, not merge-ready.
-- Zero commits: do **not** open an empty PR. Comment residuals on the Linear task or existing GitHub issue instead.
+- Zero commits: do **not** open an empty PR. Comment residuals on the Linear task, an existing GitHub issue, or an existing PR.
 
 ### 9. Handoff
 
@@ -81,7 +85,7 @@ After the create/update call, record at least:
 | Field | Rule |
 | --- | --- |
 | `repo` | `owner/repo` |
-| `task` | Linear `RM-*` and/or GitHub issue number; explicit none for the unused tracker |
+| `task` | Linear `RM-*` and/or GitHub issue number when supplied; `none` when neither was |
 | `pr` | PR number |
 | `url` | PR URL |
 | `branch` | job branch |
@@ -93,13 +97,13 @@ Before treating the PR as handed off, validate **all** of the following via GitH
 
 1. The PR is still **open** or **draft**. Query this state through GitHub MCP.
 2. Auto-merge is **disabled** and the PR is **not** in the merge queue. Query both through GitHub MCP.
-3. The PR body links the **input** Linear task and/or existing GitHub issue. Do not fail handoff because a GitHub issue twin is absent. If a GitHub issue was an input, `Fixes`/`Refs` must target that issue (`Fixes` only when fully done).
+3. When a Linear task or GitHub issue was an input, the PR body links that input. Handoff succeeds with no tracker link when none was supplied. Do not invent a GitHub issue twin or a Linear task. If a GitHub issue was an input, `Fixes`/`Refs` must target that issue (`Fixes` only when fully done).
 4. Query the remote source branch tip and the PR head SHA via GitHub MCP. Both must equal the recorded `head_sha` (the `git rev-parse HEAD` value after the last successful push).
 5. Status is truthful: a draft/checkpoint must not be labeled merge-ready.
 
-Abort the handoff and report a residual (do **not** merge, do not claim handoff complete) if any check fails — including a closed/merged PR, auto-merge or merge-queue enabled, a missing Linear/GitHub link that was an actual input, or a remote SHA that differs from `head_sha`.
+Abort the handoff and report a residual (do **not** merge, do not claim handoff complete) if any check fails — including a closed/merged PR, auto-merge or merge-queue enabled, a missing link for a tracker that was an actual input, or a remote SHA that differs from `head_sha`. Absence of a tracker is not a failure.
 
-Comment on the Linear task (maintainers) and, when a GitHub issue already exists, on that issue (MCP first) with PR URL, the **validated** pushed commit SHA, checkpoint vs merge-ready status, residuals, and agent name using the [reply attribution](../../SKILL.md#reply-attribution) templates. Do not open a GitHub issue just to host the comment.
+When a Linear task or GitHub issue was supplied, comment there (GitHub via MCP first) with PR URL, the **validated** pushed commit SHA, checkpoint vs merge-ready status, residuals, and agent name using the [reply attribution](../../SKILL.md#reply-attribution) templates. When neither was supplied, the PR is the handoff record. Do not open a GitHub issue just to host the comment.
 
 If interactive monitoring is needed after handoff, invoke the installed companion `babysit-pr` skill. This workflow itself only creates or updates the PR and hands it off.
 
@@ -119,4 +123,4 @@ If the PR is already merged, report that a human merged it and stop.
 
 ## Done when
 
-An open (or draft) PR has auto-merge and merge-queue disabled, links the input Linear task and/or existing GitHub issue without inventing a twin, remote source-branch tip and PR head both equal the recorded `head_sha`, the tracker comment includes URL + validated SHA + agent + checkpoint vs readiness, and no GitHub PR merge path was invoked.
+An open (or draft) PR has auto-merge and merge-queue disabled, links a Linear task or GitHub issue only when one was an input, remote source-branch tip and PR head both equal the recorded `head_sha`, any supplied-tracker comment includes URL + validated SHA + agent + checkpoint vs readiness, and no GitHub PR merge path was invoked.

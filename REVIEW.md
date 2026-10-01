@@ -23,11 +23,11 @@ For stacked pull requests, review and fix the bottom PR before its children. Re-
 
 - [ ] The PR links Linear `RM-*` when this is maintainer work, or the GitHub issue when one exists. Do not invent a GitHub issue twin.
 - [ ] Changes satisfy the linked acceptance criteria without unrelated refactors.
-- [ ] Checkpoint/draft status is distinct from a merge-ready claim; test evidence is truthful.
+- [ ] Checkpoint/draft status is distinct from a merge-ready claim. A merge-ready claim names the integrated gates that ran (`cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`) and their results. Unrun, unchecked, or failed gates stay residuals.
 - [ ] Generated replies identify the agent. Review-fix replies include the pushed commit SHA. Coordination messages and no-code-change replies do not invent a SHA.
 - [ ] Attribution is audited only on commits reachable from the submitted PR head and not its base, excluding synthetic review-merge/checkout and test-fixture commits. The Git author is the primary author, `Co-authored-by` credits an additional contributor, and `Agent` identifies the coding agent; the presence of one does not prove another.
 - [ ] Every Codex-authored commit in that submitted range contains exact `Agent: Codex` and `Co-authored-by: Codex <noreply@openai.com>` trailers without rewriting Cursor-attributed history.
-- [ ] After the first tested implementation and before final publication, one independent review matched to the change's risk was completed. Extra review was requested only for a named high-risk boundary or a reproduced finding that warranted follow-up.
+- [ ] Before a merge-ready claim, one independent review matched to the change's risk was completed. A checkpoint or draft PR does not require that review. Extra review was requested only for a named high-risk boundary or a reproduced finding that warranted follow-up.
 
 ### Safety
 
@@ -48,7 +48,7 @@ For stacked pull requests, review and fix the bottom PR before its children. Re-
 - [ ] New behavior has focused tests, including negative policy tests where relevant.
 - [ ] Documentation and examples match the implemented command surface.
 - [ ] Documentation command blocks preserve their caller's working directory when steps run sequentially.
-- [ ] CI check handling follows [`docs/ci-taxonomy.md`](docs/ci-taxonomy.md): Class A/B/C actions, no empty retrigger commits, `skipping` non-blocking, `pending` without rerun spam. Keep required-check failures distinct from advisory findings, pending, external-access/`ACTION_REQUIRED`, and unknown requiredness; a provider name is not a merge gate.
+- [ ] CI check handling follows the Class A/B/C summary in [`SKILL.md`](SKILL.md#ci-taxonomy-class-a--b--c). That bullet is classifier guidance, not an extra checkpoint gate: no empty retrigger commits, `skipping` is not a pass, `pending` without rerun spam. Keep required-check failures distinct from advisory findings, pending, external-access/`ACTION_REQUIRED`, and unknown requiredness; a provider name is not a merge gate. Do not require `docs/ci-taxonomy.md` or `writ ci classify` on a tree that does not contain them; those land with RM-125.
 
 ## Language-specific review notes
 

@@ -55,7 +55,8 @@ as passed.
 Before claiming merge or release readiness, obtain one independent review
 matched to the change's risk (extra review only for a named high-risk boundary
 or a reproduced finding) and run appropriate integrated validation on the exact
-`HEAD`. Do not require a full workspace suite for every checkpoint.
+`HEAD`. That review belongs to the merge-ready claim. Checkpoint commits,
+checkpoint pushes, and draft PRs use the focused-check status above.
 
 Before first publication of an unpublished assigned branch, fetch the verified
 remote base and complete final alignment or rebase. For a published branch,
@@ -176,7 +177,7 @@ See [`docs/watchlist-schema.md`](docs/watchlist-schema.md).
 
 ### CI taxonomy (Class A / B / C)
 
-When monitoring PR checks, classify each row from `gh pr checks --json name,state,bucket,workflow,link` (and `statusCheckRollup` when `ACTION_REQUIRED` is needed) using [`docs/ci-taxonomy.md`](docs/ci-taxonomy.md) or `writ --json ci classify`. Summary:
+Classifier guidance for PR-check monitoring. It is not a checkpoint gate and not a second store. The taxonomy document and `writ ci classify` belong to [RM-125](https://linear.app/rpd-34/issue/RM-125/ci-taxonomy-actions-vs-codacy-vs-third-party) / [#183](https://github.com/rmems/writ/pull/183); they are not on this branch. Until that command is present, classify each row from `gh pr checks --json name,state,bucket,workflow,link` (and `statusCheckRollup` when `ACTION_REQUIRED` is needed) with the table below. A missing classifier is unavailable; it is neither a failed check nor a pass.
 
 | Class | Meaning | Do | Do not |
 | --- | --- | --- | --- |
@@ -186,7 +187,7 @@ When monitoring PR checks, classify each row from `gh pr checks --json name,stat
 
 `skipping` is non-blocking and is **not** a performed pass (skip-only is `unknown`, not `pass`). `pending` means continue other work without rerun spam. **Prefer a real fix or `gh run rerun` over noise commits.** Residual codes belong in watchlist notes and the final report.
 
-`writ --json ci classify` emits a compact `data.collaboration` object (`ci_class`, observation counts, `residual_codes`, `blocks_unrelated_workers: false`). Copy that into existing RM-139 / RM-127 status views. Do **not** write `watched.json`, a second store, or a lease row for CI. An externally blocked service must not freeze unrelated workers.
+Do **not** write `watched.json`, a second store, or a lease row for CI. When `writ ci classify` from RM-125 is available, copy its compact `data.collaboration` object (`ci_class`, observation counts, `residual_codes`, `blocks_unrelated_workers: false`) into existing RM-139 / RM-127 status views. An externally blocked service must not freeze unrelated workers.
 
 Requiredness is **not** the Class A/B/C letter and is **not** inferred from a provider name. Pass `isRequired` from GraphQL when available. Count `required_failure` separately from advisory findings, pending results, `ACTION_REQUIRED` external-access/configuration problems, and unknown requiredness. Unknown is a report, not a writ merge gate and not a pass. Do not disable checks, fabricate success, or empty-commit to retrigger a bot.
 

@@ -71,14 +71,17 @@ gh label edit safety --description "Never-merge, force-with-lease, fix caps, own
 
 Follow [Safe Issue → Verified Commit](docs/workflows/safe-issue-verified-commit.md)
 then [Safe Verified Commit → PR](docs/workflows/safe-verified-commit-to-pr.md)
-when using those portable worker contracts. Checkpoints and draft PRs are not
-merge-ready claims. Never merge from those workflows. Review checklist:
-[`REVIEW.md`](REVIEW.md).
+when using those portable worker contracts. A contributor with neither a Linear
+task nor a GitHub issue still opens the PR; omit `task` or pass `none`.
+Checkpoints and draft PRs are not merge-ready claims. Never merge from those
+workflows. Review checklist: [`REVIEW.md`](REVIEW.md).
 
-Native gates (canonical; see README):
+Integrated native gates for a merge-ready claim (canonical; see README):
 
 ```bash
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
+
+A checkpoint or draft PR reports the focused checks that actually ran. An unrun or failed command stays a residual.

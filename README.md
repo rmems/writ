@@ -299,7 +299,7 @@ The shared store carries intent, dependency-ready, blocker, overlap, help-reques
 | **GitHub** | Source of truth for code, PRs, reviews, checks, and protected-branch merges. |
 | **writ** | Same-host coordination state only. No task-tracker clone, no merge authority. |
 
-GitHub issue twins or Beads mirrors are not a required workflow.
+Do not create a GitHub issue twin or a Beads mirror for new work. Existing GitHub issues and Beads data stay.
 
 ## Safety invariants
 
