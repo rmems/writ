@@ -1146,36 +1146,60 @@ async fn read_pipe_probed<R: AsyncReadExt + Unpin>(
     spawn_at: Instant,
     last_activity_ms: Arc<AtomicU64>,
 ) -> Vec<u8> {
-    match pipe.as_mut() {
-        Some(reader) => {
-            let mut buf = Vec::new();
-            let mut chunk = [0u8; 8192];
-            let mut capped = false;
-            loop {
-                match reader.read(&mut chunk).await {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        let elapsed =
-                            u64::try_from(spawn_at.elapsed().as_millis()).unwrap_or(u64::MAX);
-                        last_activity_ms.store(elapsed, Ordering::Relaxed);
-                        if !capped {
-                            let room = MAX_CAPTURE_BYTES.saturating_sub(buf.len());
-                            if room > 0 {
-                                buf.extend_from_slice(&chunk[..n.min(room)]);
-                            }
-                            if n > room || buf.len() >= MAX_CAPTURE_BYTES {
-                                capped = true;
-                            }
-                        }
-                        // When capped, keep draining so the child does not get SIGPIPE/EPIPE.
-                    }
-                    Err(_) => break,
-                }
-            }
-            buf
-        }
-        None => Vec::new(),
+    let Some(reader) = pipe.as_mut() else {
+        return Vec::new();
+    };
+    read_captured_pipe(reader, spawn_at, &last_activity_ms).await
+}
+
+/// Drain one child pipe, recording activity and retaining bytes up to the cap.
+///
+/// The read loop stays flat: end-of-stream and I/O errors return, and each
+/// captured chunk is handled by [`retain_capped_chunk`]. Once capped, the pipe
+/// is still drained so the child does not see SIGPIPE/EPIPE.
+enum PipeRead {
+    Eof,
+    Bytes(usize),
+}
+
+async fn read_chunk<R: AsyncReadExt + Unpin>(reader: &mut R, chunk: &mut [u8]) -> PipeRead {
+    match reader.read(chunk).await {
+        Ok(0) | Err(_) => PipeRead::Eof,
+        Ok(n) => PipeRead::Bytes(n),
     }
+}
+
+async fn read_captured_pipe<R: AsyncReadExt + Unpin>(
+    reader: &mut R,
+    spawn_at: Instant,
+    last_activity_ms: &AtomicU64,
+) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    let mut capped = false;
+    loop {
+        let PipeRead::Bytes(n) = read_chunk(reader, &mut chunk).await else {
+            return buf;
+        };
+        note_pipe_activity(spawn_at, last_activity_ms);
+        capped = retain_capped_chunk(&mut buf, &chunk[..n], capped);
+    }
+}
+
+fn note_pipe_activity(spawn_at: Instant, last_activity_ms: &AtomicU64) {
+    let elapsed = u64::try_from(spawn_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+    last_activity_ms.store(elapsed, Ordering::Relaxed);
+}
+
+/// Append `chunk` until [`MAX_CAPTURE_BYTES`]. Returns whether the cap is now hit.
+///
+/// A capped pipe still accepts the call so the reader can keep draining; no
+/// further bytes are retained.
+fn retain_capped_chunk(buf: &mut Vec<u8>, chunk: &[u8], capped: bool) -> bool {
+    let room = MAX_CAPTURE_BYTES.saturating_sub(buf.len());
+    let kept = if capped { 0 } else { room.min(chunk.len()) };
+    buf.extend_from_slice(&chunk[..kept]);
+    capped || chunk.len() > room || buf.len() >= MAX_CAPTURE_BYTES
 }
 
 #[cfg(unix)]
