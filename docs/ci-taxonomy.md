@@ -117,7 +117,9 @@ Then apply bucket/conclusion policy. Class B/C name matches override an Actions 
 2. If the job is a **flake** (`timed_out` / `startup_failure` / `cancel`) and a
    run id exists: `gh run rerun <id>` **once** (or `writ gh-safe run rerun <id>`).
    `writ gh-safe` allowlists `run view|list|watch|rerun|download` and **rejects**
-   `run delete` / `run cancel`.
+   `run delete` / `run cancel`. `run download --dir` / `-D` must be a relative
+   path under the worktree (default `.`). `--name` and `--pattern` select
+   artifacts; they are not output paths.
 3. If the log shows a real defect: edit source, commit, push. That counts as a
    code-fix commit; do not invent an empty commit to retrigger.
 4. Never create `chore: retrigger CI` / empty-tree commits for Class B or C.
@@ -162,5 +164,5 @@ gh pr checks <n> --json name,state,bucket,workflow,link \
   | writ --json ci classify
 ```
 
-Envelope command is `ci.classify`. Invalid input uses `ok: false` and
-`error.code: CLASSIFY_INPUT_INVALID`.
+Envelope command is `ci.classify`. Invalid JSON, a missing or unreadable file,
+and input over 4 MiB use `ok: false` and `error.code: CLASSIFY_INPUT_INVALID`.

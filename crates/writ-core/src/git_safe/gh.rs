@@ -20,10 +20,12 @@ const ALLOWED_GH_SUBCOMMANDS: &[&str] = &[
     "ssh-key", "variable", "workflow",
 ];
 
-/// `gh run` verbs that fetch logs or perform an official rerun.
+/// `gh run` verbs that fetch logs, download artifacts, or perform an official rerun.
 ///
 /// `delete` and `cancel` stay blocked: they are destructive and are not the
 /// Class A flake path (`gh run rerun` / `gh run view --log-failed`).
+/// `download` stays allowlisted, but [`gh_reject_external_download_destination`]
+/// refuses a `--dir` / `-D` that leaves the worktree.
 const ALLOWED_GH_RUN_SUBSUBCOMMANDS: &[&str] = &["download", "list", "rerun", "view", "watch"];
 
 /// `gh pr` sub-subcommands that are blocked (merge / merge-like updates).
@@ -74,6 +76,7 @@ impl SafeGhCommand {
         let subcommand = gh_subcommand(args)?;
         gh_reject_blocked_pr_subsubcommand(subcommand, args)?;
         gh_reject_disallowed_run_verb(subcommand, args)?;
+        gh_reject_external_download_destination(subcommand, args)?;
         gh_reject_external_clone_destination(subcommand, args)?;
         gh_enforce_clone_target_owner(subcommand, args, allowlist)?;
         gh_reject_blocked_flags(args)?;
@@ -168,6 +171,125 @@ fn gh_reject_disallowed_run_verb(subcommand: &str, args: &[String]) -> Result<()
         }
     }
     Ok(())
+}
+
+/// `gh run download` extracts artifacts into `--dir` / `-D` (default `.`).
+///
+/// Reject destinations that leave the worktree. `--name` and `--pattern` select
+/// artifacts; they are not output paths. `gh` rejects artifact-name traversal
+/// when it joins the name onto that directory.
+fn gh_reject_external_download_destination(subcommand: &str, args: &[String]) -> Result<()> {
+    if subcommand != "run" || first_positional_after(&args[1..]) != Some("download") {
+        return Ok(());
+    }
+    for dest in gh_run_download_dirs(args)? {
+        reject_external_path(Some(dest), "gh run download destination")?;
+    }
+    Ok(())
+}
+
+/// Destination directories from `gh run download --dir` / `-D`, in any spelling
+/// `gh` accepts (`--dir value`, `--dir=value`, `-D value`, `-D=value`, `-Dvalue`,
+/// and a short cluster whose `D` is not consumed by `-n`, `-p`, or `-R`).
+fn gh_run_download_dirs(args: &[String]) -> Result<Vec<&str>> {
+    let mut dirs = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if arg == "--" {
+            break;
+        }
+        let next = args.get(i + 1).map(String::as_str);
+        if let Some((value, consume_next)) = gh_download_dir_flag(arg, next) {
+            if value.is_empty() {
+                return Err(Error::PolicyViolation {
+                    code: PolicyCode::PathNotAllowed,
+                    message:
+                        "`gh run download destination` requires a relative path under the worktree"
+                            .to_owned(),
+                });
+            }
+            dirs.push(value);
+            i += if consume_next { 2 } else { 1 };
+            continue;
+        }
+        if gh_download_skips_next_value(arg) {
+            i += 2;
+            continue;
+        }
+        i += 1;
+    }
+    Ok(dirs)
+}
+
+fn gh_download_dir_flag<'a>(arg: &'a str, next: Option<&'a str>) -> Option<(&'a str, bool)> {
+    if arg == "--dir" || arg == "-D" {
+        return Some((next.unwrap_or(""), true));
+    }
+    if let Some(value) = arg.strip_prefix("--dir=") {
+        return Some((value, false));
+    }
+    if let Some(value) = arg.strip_prefix("-D=") {
+        return Some((value, false));
+    }
+    if let Some(value) = arg.strip_prefix("-D")
+        && !value.is_empty()
+    {
+        return Some((value, false));
+    }
+    clustered_short_download_dir(arg, next)
+}
+
+/// `D` inside a short cluster is `--dir` unless an earlier value-taking short
+/// (`-n`, `-p`, `-R`) already consumed the rest of the token as its value.
+fn clustered_short_download_dir<'a>(
+    arg: &'a str,
+    next: Option<&'a str>,
+) -> Option<(&'a str, bool)> {
+    if !arg.starts_with('-') || arg.starts_with("--") {
+        return None;
+    }
+    let (cluster, eq_value) = match arg[1..].split_once('=') {
+        Some((cluster, value)) => (cluster, Some(value)),
+        None => (&arg[1..], None),
+    };
+    if cluster.is_empty() {
+        return None;
+    }
+    let mut rest = cluster;
+    while let Some(c) = rest.chars().next() {
+        if !c.is_ascii_alphabetic() {
+            return None;
+        }
+        rest = &rest[c.len_utf8()..];
+        if c == 'D' {
+            if !rest.is_empty() {
+                return Some((rest, false));
+            }
+            if let Some(value) = eq_value {
+                return Some((value, false));
+            }
+            return Some((next.unwrap_or(""), true));
+        }
+        // Value-taking shorts consume the remainder, so a later `D` is data.
+        if matches!(c, 'n' | 'p' | 'R') {
+            return None;
+        }
+    }
+    None
+}
+
+/// Skip the following token when it is the value of a non-destination flag, so
+/// `gh run download --name --dir` does not treat the artifact selector as `--dir`.
+fn gh_download_skips_next_value(arg: &str) -> bool {
+    if !arg.starts_with('-') || arg.contains('=') {
+        return false;
+    }
+    if matches!(arg, "--name" | "-n" | "--pattern" | "-p") || GH_VALUE_TAKING_OPTIONS.contains(&arg)
+    {
+        return true;
+    }
+    matches!(gh_repo_flag(arg, Some("x")), Some((_, true)))
 }
 
 /// `gh repo clone <repo> [<dir>]` can write outside the worktree; reject an

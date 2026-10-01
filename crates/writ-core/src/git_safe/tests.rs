@@ -1360,6 +1360,88 @@ fn gh_run_rerun_and_view_allowed() {
 }
 
 #[test]
+fn gh_run_download_relative_dir_allowed() {
+    let relative = SafeGhCommand::new(&[
+        "run".to_owned(),
+        "download".to_owned(),
+        "123".to_owned(),
+        "--dir".to_owned(),
+        "artifacts".to_owned(),
+    ])
+    .unwrap();
+    assert_eq!(
+        relative.args(),
+        &["run", "download", "123", "--dir", "artifacts"]
+    );
+
+    SafeGhCommand::new(&[
+        "run".to_owned(),
+        "download".to_owned(),
+        "-D".to_owned(),
+        "artifacts".to_owned(),
+    ])
+    .unwrap();
+    SafeGhCommand::new(&[
+        "run".to_owned(),
+        "download".to_owned(),
+        "--dir=artifacts".to_owned(),
+    ])
+    .unwrap();
+    SafeGhCommand::new(&[
+        "run".to_owned(),
+        "download".to_owned(),
+        "-Dartifacts".to_owned(),
+    ])
+    .unwrap();
+    // `--name` / `--pattern` select artifacts; they are not filesystem destinations.
+    SafeGhCommand::new(&[
+        "run".to_owned(),
+        "download".to_owned(),
+        "--name".to_owned(),
+        "coverage".to_owned(),
+        "--pattern".to_owned(),
+        "cov-*".to_owned(),
+    ])
+    .unwrap();
+    SafeGhCommand::new(&[
+        "run".to_owned(),
+        "download".to_owned(),
+        "-n".to_owned(),
+        "../selector-not-a-path".to_owned(),
+    ])
+    .unwrap();
+    SafeGhCommand::new(&["run".to_owned(), "download".to_owned(), "123".to_owned()]).unwrap();
+}
+
+#[test]
+fn gh_run_download_external_dir_rejected() {
+    let cases = [
+        vec!["run", "download", "--dir", "/tmp/outside"],
+        vec!["run", "download", "--dir=../outside"],
+        vec!["run", "download", "-D", "/tmp/outside"],
+        vec!["run", "download", "-D/tmp/outside"],
+        vec!["run", "download", "-D=../outside"],
+        vec!["run", "download", "--dir"],
+        vec!["run", "download", "-hD/tmp/outside"],
+        vec!["run", "download", "-xD", "/tmp/outside"],
+    ];
+    for args in cases {
+        let owned: Vec<String> = args.into_iter().map(str::to_owned).collect();
+        let err = SafeGhCommand::new(&owned).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::PolicyViolation {
+                    code: PolicyCode::PathNotAllowed,
+                    ..
+                }
+            ),
+            "expected PathNotAllowed for {owned:?}, got {err:?}"
+        );
+    }
+}
+
+#[test]
 fn gh_run_delete_and_cancel_rejected() {
     for verb in ["delete", "cancel"] {
         let err =

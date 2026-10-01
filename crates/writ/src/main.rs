@@ -1,3 +1,4 @@
+use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -1224,46 +1225,78 @@ fn exit_code_from_i32(code: i32) -> ExitCode {
     }
 }
 
+/// Cap `ci classify` input so a missing file, a huge file, or a never-ending
+/// stdin pipe fails as `CLASSIFY_INPUT_INVALID` instead of growing without bound.
+const MAX_CLASSIFY_INPUT_BYTES: u64 = 4 * 1024 * 1024;
+
 fn run_ci_classify(
     file: Option<PathBuf>,
     json: bool,
     stdout: &mut impl Write,
 ) -> writ_core::error::Result<ExitCode> {
-    let bytes = read_classify_input(file.as_deref())?;
+    let bytes = match read_classify_input(file.as_deref()) {
+        Ok(bytes) => bytes,
+        Err(err) => return classify_input_error(json, stdout, err.to_string()),
+    };
     match writ_core::ci_taxonomy::classify_from_slice(&bytes) {
         Ok(report) => {
             write_classify_result(&report, json, stdout)?;
             Ok(ExitCode::SUCCESS)
         }
-        Err(message) => {
-            if json {
-                let response = writ_core::contract::Response {
-                    ok: false,
-                    schema_version: writ_core::contract::SCHEMA_VERSION,
-                    command: "ci.classify",
-                    data: serde_json::json!({}),
-                    error: Some(writ_core::contract::ErrorData {
-                        code: "CLASSIFY_INPUT_INVALID".to_owned(),
-                        message: message.clone(),
-                    }),
-                };
-                serde_json::to_writer(&mut *stdout, &response).map_err(io::Error::other)?;
-                stdout.write_all(b"\n")?;
-            }
-            Err(io::Error::other(message).into())
-        }
+        Err(message) => classify_input_error(json, stdout, message),
     }
+}
+
+fn classify_input_error(
+    json: bool,
+    stdout: &mut impl Write,
+    message: String,
+) -> writ_core::error::Result<ExitCode> {
+    if json {
+        let response = writ_core::contract::Response {
+            ok: false,
+            schema_version: writ_core::contract::SCHEMA_VERSION,
+            command: "ci.classify",
+            data: serde_json::json!({}),
+            error: Some(writ_core::contract::ErrorData {
+                code: "CLASSIFY_INPUT_INVALID".to_owned(),
+                message: message.clone(),
+            }),
+        };
+        serde_json::to_writer(&mut *stdout, &response).map_err(io::Error::other)?;
+        stdout.write_all(b"\n")?;
+    }
+    Err(io::Error::other(message).into())
 }
 
 fn read_classify_input(file: Option<&std::path::Path>) -> io::Result<Vec<u8>> {
     match file {
-        Some(path) => std::fs::read(path),
-        None => {
-            let mut buf = Vec::new();
-            io::stdin().read_to_end(&mut buf)?;
-            Ok(buf)
+        Some(path) => {
+            let reader = File::open(path).map_err(|err| {
+                io::Error::new(
+                    err.kind(),
+                    format!("failed to read {}: {err}", path.display()),
+                )
+            })?;
+            read_bounded(reader, MAX_CLASSIFY_INPUT_BYTES, "classify input")
         }
+        None => read_bounded(io::stdin(), MAX_CLASSIFY_INPUT_BYTES, "classify input"),
     }
+}
+
+/// Read at most `max_bytes`. One extra byte distinguishes "exactly the cap"
+/// from "still more input", including a pipe that never reaches EOF.
+fn read_bounded(mut reader: impl Read, max_bytes: u64, label: &str) -> io::Result<Vec<u8>> {
+    let mut limited = (&mut reader).take(max_bytes.saturating_add(1));
+    let mut buf = Vec::new();
+    limited.read_to_end(&mut buf)?;
+    if u64::try_from(buf.len()).unwrap_or(u64::MAX) > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{label} exceeds {max_bytes} bytes"),
+        ));
+    }
+    Ok(buf)
 }
 
 fn write_classify_result(
@@ -1486,6 +1519,77 @@ mod tests {
             v.pointer("/error/code").expect("code"),
             "CLASSIFY_INPUT_INVALID"
         );
+    }
+
+    #[tokio::test]
+    async fn ci_classify_missing_file_sets_classify_input_invalid() {
+        let cli = classify_cli(PathBuf::from(
+            "/tmp/writ-ci-classify-missing-does-not-exist.json",
+        ));
+        let mut stdout = Vec::new();
+        let err = run(cli, &mut stdout).await.unwrap_err();
+        assert_eq!(err.exit_code(), 1);
+        let v: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+        assert_eq!(v.get("ok").expect("ok"), false);
+        assert_eq!(v.get("command").expect("command"), "ci.classify");
+        assert_eq!(
+            v.pointer("/error/code").expect("code"),
+            "CLASSIFY_INPUT_INVALID"
+        );
+        let message = v
+            .pointer("/error/message")
+            .and_then(|m| m.as_str())
+            .expect("message");
+        assert!(
+            message.contains("failed to read"),
+            "missing-file message should name the read failure, got {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ci_classify_oversized_file_sets_classify_input_invalid() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge.json");
+        std::fs::write(
+            &path,
+            vec![b'x'; (super::MAX_CLASSIFY_INPUT_BYTES as usize) + 1],
+        )
+        .unwrap();
+        let cli = classify_cli(path);
+        let mut stdout = Vec::new();
+        let err = run(cli, &mut stdout).await.unwrap_err();
+        assert_eq!(err.exit_code(), 1);
+        let v: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+        assert_eq!(
+            v.pointer("/error/code").expect("code"),
+            "CLASSIFY_INPUT_INVALID"
+        );
+        let message = v
+            .pointer("/error/message")
+            .and_then(|m| m.as_str())
+            .expect("message");
+        assert!(
+            message.contains("exceeds"),
+            "oversized input should report the byte cap, got {message}"
+        );
+    }
+
+    #[test]
+    fn read_bounded_stops_a_never_ending_reader() {
+        struct Forever;
+        impl std::io::Read for Forever {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if buf.is_empty() {
+                    return Ok(0);
+                }
+                buf.fill(b'x');
+                Ok(buf.len())
+            }
+        }
+
+        let err = super::read_bounded(Forever, 32, "classify input").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("exceeds 32 bytes"));
     }
 
     fn parse_format(args: &[&str]) -> super::AttributionAction {

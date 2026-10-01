@@ -8,6 +8,7 @@
 //! - `gh pr merge` and merge-related flags are blocked; `gh api` is not allowlisted.
 //! - `gh run` is allowlisted only for `view`, `list`, `watch`, `rerun`, and `download`
 //!   (Class A log fetch and official flake rerun). `run delete` / `run cancel` are rejected.
+//!   `run download --dir` / `-D` must be a relative path under the worktree.
 //! - Mutating commands verify the current branch when `expected_branch` is provided to `run`.
 //! - `gh -R` / `--repo` selectors are checked against the configured owner allowlist.
 //! - All policy violations carry stable structured error codes.
