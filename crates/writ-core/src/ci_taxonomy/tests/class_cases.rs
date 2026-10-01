@@ -75,7 +75,11 @@ fn class_b_action_required_is_residual() {
         },
         Some("class_b:codacy_action_required"),
     );
-    assert_policies(&gate, &[Policy::MarkResidual], &[]);
+    assert_policies(
+        &gate,
+        &[Policy::MarkResidual, Policy::ForbidEmptyCommit],
+        &[Policy::FixSource, Policy::ReplyWithSha],
+    );
     assert!(!should_rerun(&gate));
 }
 
@@ -191,5 +195,45 @@ fn kilo_overrides_nonempty_workflow() {
             classified.policies.contains(&Policy::Rerun),
         ),
         (CheckClass::C, false)
+    );
+}
+
+#[test]
+fn vendor_word_in_actions_url_path_stays_class_a() {
+    // Owner/repo path contains a vendor word, but it is a GitHub Actions URL.
+    let kilo_path = classify_named(&sample!(
+        "build",
+        "CI",
+        "fail",
+        "https://github.com/kilo/app/actions/runs/5"
+    ));
+    let codacy_org = classify_named(&sample!(
+        "build",
+        "CI",
+        "fail",
+        "https://github.com/codacy-tools/app/actions/runs/9"
+    ));
+    assert_eq!(
+        (kilo_path.check_class, codacy_org.check_class),
+        (CheckClass::A, CheckClass::A)
+    );
+}
+
+#[test]
+fn genuine_vendor_checks_still_classify_b_and_c() {
+    // Genuine Kilo by name and by host-specific URL.
+    let kilo_name = classify_named(&sample!("Kilo Code Review", "", "fail", ""));
+    let kilo_url = classify_named(&sample!("review", "", "fail", KILO_URL));
+    // Genuine Codacy by name and by host-specific URL.
+    let codacy_name = classify_named(&sample!("Codacy Static Code Analysis", "", "fail", ""));
+    let codacy_url = classify_named(&sample!("quality", "", "fail", CODACY_URL));
+    assert_eq!(
+        (
+            kilo_name.check_class,
+            kilo_url.check_class,
+            codacy_name.check_class,
+            codacy_url.check_class,
+        ),
+        (CheckClass::C, CheckClass::C, CheckClass::B, CheckClass::B)
     );
 }

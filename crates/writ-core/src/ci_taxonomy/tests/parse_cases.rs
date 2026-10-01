@@ -140,6 +140,51 @@ fn extract_nodes_from_array_and_checks_wrapper() {
 }
 
 #[test]
+fn top_level_status_check_rollup_array_is_classified() {
+    // `gh pr view --json statusCheckRollup` top-level array shape.
+    let array_shape = json!({
+        "statusCheckRollup": [
+            {"name": "Build & Test", "workflow": "CI", "bucket": "pass", "link": ACTIONS_URL},
+            {"name": "Lint", "workflow": "CI", "bucket": "fail", "link": ACTIONS_URL},
+        ]
+    });
+    // Existing GraphQL object shape still works.
+    let object_shape = json!({
+        "statusCheckRollup": {
+            "contexts": {
+                "nodes": [
+                    {"name": "Build & Test", "workflow": "CI", "bucket": "pass", "link": ACTIONS_URL},
+                ]
+            }
+        }
+    });
+    assert_eq!(
+        (
+            classify_checks_json(&array_shape).unwrap().checks.len(),
+            classify_checks_json(&object_shape).unwrap().checks.len(),
+        ),
+        (2, 1)
+    );
+}
+
+#[test]
+fn actions_run_id_requires_github_host() {
+    // Non-GitHub host must not yield a run id to rerun.
+    let non_github = parse_check_entry(&json!({
+        "name": "vendor check",
+        "conclusion": "failure",
+        "detailsUrl": "https://vendor.example/actions/runs/123",
+    }));
+    let github = parse_check_entry(&json!({
+        "name": "Build & Test",
+        "workflow": "CI",
+        "conclusion": "failure",
+        "detailsUrl": "https://github.com/acme/x/actions/runs/123",
+    }));
+    assert_eq!((non_github.run_id, github.run_id), (None, Some(123)));
+}
+
+#[test]
 fn status_check_rollup_checkrun_and_status_context() {
     let rollup = json!({
         "statusCheckRollup": {

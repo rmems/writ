@@ -18,9 +18,12 @@ impl Probe {
     }
 
     pub(super) fn from_entry_text(entry: &CheckEntry) -> Self {
+        // Only check-owned metadata. The details URL is matched separately via
+        // `from_details_url` with host-specific needles, so an Actions run URL
+        // whose owner/repo path contains a vendor word is not misclassified.
         Self::lowercased(&format!(
-            "{} {} {} {}",
-            entry.name, entry.workflow_name, entry.description, entry.details_url
+            "{} {} {}",
+            entry.name, entry.workflow_name, entry.description
         ))
     }
 
@@ -65,8 +68,14 @@ impl Probe {
         trimmed.chars().take(40).collect()
     }
 
-    /// GitHub Actions run id from `/actions/runs/<digits>`.
+    /// GitHub Actions run id from `/actions/runs/<digits>` on a GitHub host.
+    ///
+    /// Requires `github.com` (consistent with `is_github_actions_url`) so a
+    /// non-GitHub `/actions/runs/<id>` path never yields a run id to rerun.
     pub(super) fn actions_run_id(&self) -> Option<u64> {
+        if !self.lower.contains("github.com") {
+            return None;
+        }
         let marker = "/actions/runs/";
         let idx = self.lower.find(marker)?;
         let rest = &self.lower[idx + marker.len()..];

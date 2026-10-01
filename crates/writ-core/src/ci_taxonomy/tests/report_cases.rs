@@ -462,3 +462,59 @@ fn empty_report_ci_class_is_unknown() {
         CiClass::Unknown
     );
 }
+
+#[test]
+fn required_pass_with_unknown_requiredness_fail_is_unknown_not_pass() {
+    let report = classify_checks_json(&json!([
+        {
+            "name": "Build & Test",
+            "workflow": "CI",
+            "bucket": "pass",
+            "link": ACTIONS_URL,
+            "isRequired": true,
+        },
+        {
+            "name": "Codacy Static Code Analysis",
+            "bucket": "fail",
+            "link": CODACY_URL,
+        }
+    ]))
+    .unwrap();
+    assert_eq!(
+        (
+            report.job_ci_class(),
+            report.collaboration_status().ci_class,
+            report.required_failures().is_empty(),
+            report.unknown_requiredness().len(),
+        ),
+        (CiClass::Unknown, CiClass::Unknown, true, 1)
+    );
+}
+
+#[test]
+fn all_required_pass_still_reports_pass() {
+    let report = classify_checks_json(&json!([
+        {
+            "name": "Build & Test",
+            "workflow": "CI",
+            "bucket": "pass",
+            "link": ACTIONS_URL,
+            "isRequired": true,
+        },
+        {
+            "name": "Lint",
+            "workflow": "CI",
+            "bucket": "pass",
+            "link": ACTIONS_URL,
+            "isRequired": true,
+        }
+    ]))
+    .unwrap();
+    assert_eq!(
+        (
+            report.job_ci_class(),
+            report.collaboration_status().ci_class
+        ),
+        (CiClass::Pass, CiClass::Pass)
+    );
+}

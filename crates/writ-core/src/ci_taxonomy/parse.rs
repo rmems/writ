@@ -54,6 +54,11 @@ fn extract_object_nodes(value: &Value) -> Result<Vec<Value>, String> {
     if let Some(Value::Array(items)) = value.get("checks") {
         return Ok(items.clone());
     }
+    // `gh pr view --json statusCheckRollup` emits a top-level array
+    // (GhPrView.status_check_rollup: Option<Vec<GhCheck>>).
+    if let Some(Value::Array(items)) = value.get("statusCheckRollup") {
+        return Ok(items.clone());
+    }
     if let Some(nodes) = nested_nodes(
         value,
         &FieldKeys(&["statusCheckRollup", "contexts", "nodes"]),

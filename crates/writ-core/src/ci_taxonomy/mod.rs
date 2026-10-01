@@ -433,6 +433,9 @@ impl ClassificationReport {
         if self.all_passed() {
             return CiClass::Pass;
         }
+        if !self.unknown_requiredness().is_empty() {
+            return CiClass::Unknown;
+        }
         if self.has_performed_required_pass() {
             return CiClass::Pass;
         }

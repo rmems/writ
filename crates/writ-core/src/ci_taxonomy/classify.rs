@@ -255,11 +255,14 @@ fn insert_class_a_policies(
 
 fn insert_class_b_policies(policies: &mut BTreeSet<Policy>, conclusion: CheckConclusion) {
     policies.insert(Policy::ForbidIgnore);
+    if conclusion == CheckConclusion::ActionRequired {
+        // Human-only gate: record a residual, do not direct a source fix or an
+        // SHA reply push.
+        policies.insert(Policy::MarkResidual);
+        return;
+    }
     policies.insert(Policy::FixSource);
     policies.insert(Policy::ReplyWithSha);
-    if conclusion == CheckConclusion::ActionRequired {
-        policies.insert(Policy::MarkResidual);
-    }
 }
 
 fn is_flake_conclusion(conclusion: CheckConclusion) -> bool {
