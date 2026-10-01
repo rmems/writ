@@ -433,24 +433,40 @@ fn configure_writer_connection(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Bound grant plus the path strings the writer insert and occupant check share.
+struct WriterRefresh<'a> {
+    grant: LeaseGrant<'a>,
+    now: i64,
+    repo: &'a str,
+    worktree_path: &'a str,
+    branch_ref: &'a str,
+}
+
 fn grant_on(conn: &mut Connection, grant: LeaseGrant<'_>) -> Result<()> {
     let now = now_secs();
     let repo = path_text(grant.repo);
     let worktree_path = path_text(grant.worktree_path);
     let branch_ref = format!("refs/heads/{}", grant.branch);
+    let refresh = WriterRefresh {
+        grant,
+        now,
+        repo: &repo,
+        worktree_path: &worktree_path,
+        branch_ref: &branch_ref,
+    };
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|e| lease_err("grant lease", e))?;
-    if let Some(job_id) = live_path_occupant(&tx, &worktree_path, grant)? {
+    if let Some(job_id) = live_path_occupant(&tx, &refresh)? {
         return Err(path_held_conflict(&job_id));
     }
-    let changed = insert_or_refresh_writer(&tx, grant, now, &repo, &worktree_path, &branch_ref)?;
+    let changed = insert_or_refresh_writer(&tx, &refresh)?;
     if changed == 0 {
         return Err(Error::PolicyViolation {
             code: PolicyCode::LeaseConflict,
             message: format!(
                 "job `{}` already holds an active lease for a different worktree path",
-                grant.job_id
+                refresh.grant.job_id
             ),
         });
     }
@@ -458,11 +474,7 @@ fn grant_on(conn: &mut Connection, grant: LeaseGrant<'_>) -> Result<()> {
     Ok(())
 }
 
-fn live_path_occupant(
-    conn: &Connection,
-    worktree_path: &str,
-    grant: LeaseGrant<'_>,
-) -> Result<Option<String>> {
+fn live_path_occupant(conn: &Connection, refresh: &WriterRefresh<'_>) -> Result<Option<String>> {
     conn.query_row(
         "
                 SELECT job_id FROM leases
@@ -470,39 +482,37 @@ fn live_path_occupant(
                   AND released_at IS NULL
                   AND NOT (owner = ?2 AND repo_name = ?3 AND job_id = ?4)
                 ",
-        params![worktree_path, grant.owner, grant.repo_name, grant.job_id],
+        params![
+            refresh.worktree_path,
+            refresh.grant.owner,
+            refresh.grant.repo_name,
+            refresh.grant.job_id
+        ],
         |row| row.get(0),
     )
     .optional()
     .map_err(|e| lease_err("grant lease", e))
 }
 
-fn insert_or_refresh_writer(
-    conn: &Connection,
-    grant: LeaseGrant<'_>,
-    now: i64,
-    repo: &str,
-    worktree_path: &str,
-    branch_ref: &str,
-) -> Result<usize> {
+fn insert_or_refresh_writer(conn: &Connection, refresh: &WriterRefresh<'_>) -> Result<usize> {
     match conn.execute(
         GRANT_INSERT_SQL,
         params![
-            repo,
-            grant.owner,
-            grant.repo_name,
-            grant.job_id,
-            grant.branch,
-            branch_ref,
-            worktree_path,
-            grant.start_commit,
+            refresh.repo,
+            refresh.grant.owner,
+            refresh.grant.repo_name,
+            refresh.grant.job_id,
+            refresh.grant.branch,
+            refresh.branch_ref,
+            refresh.worktree_path,
+            refresh.grant.start_commit,
             LeaseMode::WriterLocked.as_str(),
-            now,
+            refresh.now,
         ],
     ) {
         Ok(changed) => Ok(changed),
         Err(err) if is_unique_constraint(&err) => {
-            let occupant = live_path_occupant(conn, worktree_path, grant)?;
+            let occupant = live_path_occupant(conn, refresh)?;
             Err(path_held_conflict(occupant.as_deref().unwrap_or("unknown")))
         }
         Err(err) => Err(lease_err("grant lease", err)),
@@ -893,58 +903,15 @@ mod tests {
     fn select_then_insert_without_constraint_admits_two_live_owners() {
         let tmp = tempdir().unwrap();
         let db = tmp.path().join("race.db");
-        {
-            let conn = Connection::open(&db).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE leases (
-                    id INTEGER PRIMARY KEY,
-                    job_id TEXT NOT NULL,
-                    worktree_path TEXT NOT NULL,
-                    released_at INTEGER
-                );",
-            )
-            .unwrap();
-        }
+        open_unconstrained_lease_table(&db);
         let barrier = Arc::new(Barrier::new(2));
-        let spawn = |job: &'static str| {
-            let db = db.clone();
-            let barrier = barrier.clone();
-            thread::spawn(move || {
-                let conn = Connection::open(db).unwrap();
-                let occupant: Option<String> = conn
-                    .query_row(
-                        "SELECT job_id FROM leases WHERE worktree_path = 'p' AND released_at IS NULL",
-                        [],
-                        |row| row.get(0),
-                    )
-                    .optional()
-                    .unwrap();
-                assert!(
-                    occupant.is_none(),
-                    "both connections must observe an empty path"
-                );
-                barrier.wait();
-                conn.execute(
-                    "INSERT INTO leases (job_id, worktree_path, released_at) VALUES (?1, 'p', NULL)",
-                    [job],
-                )
-                .unwrap();
-            })
-        };
-        let a = spawn("job-a");
-        let b = spawn("job-b");
+        let a = spawn_select_then_insert(&db, &barrier, "job-a");
+        let b = spawn_select_then_insert(&db, &barrier, "job-b");
         a.join().unwrap();
         b.join().unwrap();
-        let conn = Connection::open(&db).unwrap();
-        let live: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM leases WHERE released_at IS NULL",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
         assert_eq!(
-            live, 2,
+            count_unreleased(&db),
+            2,
             "occupant SELECT then INSERT without a live-path constraint is not atomic"
         );
     }
@@ -956,47 +923,18 @@ mod tests {
         let repo = tmp.path().join("repo");
         let wt = tmp.path().join("checkouts/shared");
         drop(LeaseStore::open(&db).unwrap());
-
         let start = Arc::new(Barrier::new(2));
-        let spawn = |job: &'static str, branch: &'static str| {
-            let db = db.clone();
-            let repo = repo.clone();
-            let wt = wt.clone();
-            let start = start.clone();
-            thread::spawn(move || {
-                let store = LeaseStore::open(db).unwrap();
-                start.wait();
-                store.grant(LeaseGrant {
-                    repo: &repo,
-                    owner: "local",
-                    repo_name: "repo",
-                    job_id: job,
-                    branch,
-                    worktree_path: &wt,
-                    start_commit: "abc123",
-                })
-            })
+        let race = GrantRace {
+            db: &db,
+            repo: &repo,
+            worktree: &wt,
+            start: &start,
         };
-        let a = spawn("job-a", "hive/job-a");
-        let b = spawn("job-b", "hive/job-b");
+        let a = spawn_grant(&race, "job-a", "hive/job-a");
+        let b = spawn_grant(&race, "job-b", "hive/job-b");
         let ra = a.join().expect("job-a thread");
         let rb = b.join().expect("job-b thread");
-        let wins = [&ra, &rb].iter().filter(|r| r.is_ok()).count();
-        let losses = [&ra, &rb]
-            .iter()
-            .filter(|r| {
-                matches!(
-                    r,
-                    Err(Error::PolicyViolation {
-                        code: PolicyCode::LeaseConflict,
-                        ..
-                    })
-                )
-            })
-            .count();
-        assert_eq!(wins, 1, "exactly one grant must become the live owner");
-        assert_eq!(losses, 1, "the other grant must be a typed LEASE_CONFLICT");
-
+        assert_exactly_one_lease_conflict(&ra, &rb);
         let store = LeaseStore::open(&db).unwrap();
         let active = store.list_active().unwrap();
         assert_eq!(active.len(), 1);
@@ -1073,5 +1011,110 @@ mod tests {
         assert_eq!(lease.mode, LeaseMode::Unknown);
         assert_eq!(lease.mode_raw, "NOT_A_MODE");
         assert_ne!(lease.mode, LeaseMode::Unassigned);
+    }
+
+    fn open_unconstrained_lease_table(db: &Path) {
+        let conn = Connection::open(db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE leases (
+                id INTEGER PRIMARY KEY,
+                job_id TEXT NOT NULL,
+                worktree_path TEXT NOT NULL,
+                released_at INTEGER
+            );",
+        )
+        .unwrap();
+    }
+
+    fn spawn_select_then_insert(
+        db: &Path,
+        barrier: &Arc<Barrier>,
+        job: &'static str,
+    ) -> thread::JoinHandle<()> {
+        let db = db.to_path_buf();
+        let barrier = Arc::clone(barrier);
+        thread::spawn(move || {
+            let conn = Connection::open(db).unwrap();
+            assert!(
+                unconstrained_occupant(&conn).is_none(),
+                "both connections must observe an empty path"
+            );
+            barrier.wait();
+            conn.execute(
+                "INSERT INTO leases (job_id, worktree_path, released_at) VALUES (?1, 'p', NULL)",
+                [job],
+            )
+            .unwrap();
+        })
+    }
+
+    fn unconstrained_occupant(conn: &Connection) -> Option<String> {
+        conn.query_row(
+            "SELECT job_id FROM leases WHERE worktree_path = 'p' AND released_at IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap()
+    }
+
+    fn count_unreleased(db: &Path) -> i64 {
+        let conn = Connection::open(db).unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM leases WHERE released_at IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    struct GrantRace<'a> {
+        db: &'a Path,
+        repo: &'a Path,
+        worktree: &'a Path,
+        start: &'a Arc<Barrier>,
+    }
+
+    fn spawn_grant(
+        race: &GrantRace<'_>,
+        job: &'static str,
+        branch: &'static str,
+    ) -> thread::JoinHandle<Result<Lease>> {
+        let db = race.db.to_path_buf();
+        let repo = race.repo.to_path_buf();
+        let wt = race.worktree.to_path_buf();
+        let start = Arc::clone(race.start);
+        thread::spawn(move || {
+            let store = LeaseStore::open(db).unwrap();
+            start.wait();
+            store.grant(LeaseGrant {
+                repo: &repo,
+                owner: "local",
+                repo_name: "repo",
+                job_id: job,
+                branch,
+                worktree_path: &wt,
+                start_commit: "abc123",
+            })
+        })
+    }
+
+    fn assert_exactly_one_lease_conflict(left: &Result<Lease>, right: &Result<Lease>) {
+        let results = [left, right];
+        let wins = results.iter().filter(|result| result.is_ok()).count();
+        let losses = results
+            .iter()
+            .filter(|result| {
+                matches!(
+                    result,
+                    Err(Error::PolicyViolation {
+                        code: PolicyCode::LeaseConflict,
+                        ..
+                    })
+                )
+            })
+            .count();
+        assert_eq!(wins, 1, "exactly one grant must become the live owner");
+        assert_eq!(losses, 1, "the other grant must be a typed LEASE_CONFLICT");
     }
 }
