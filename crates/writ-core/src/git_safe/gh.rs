@@ -176,8 +176,8 @@ fn gh_reject_disallowed_run_verb(subcommand: &str, args: &[String]) -> Result<()
 /// `gh run download` extracts artifacts into `--dir` / `-D` (default `.`).
 ///
 /// Reject destinations that leave the worktree. `--name` and `--pattern` select
-/// artifacts; they are not output paths. `gh` rejects artifact-name traversal
-/// when it joins the name onto that directory.
+/// artifacts; they are not output paths. Unknown download flags are rejected so
+/// a clustered short cannot hide an outside destination.
 fn gh_reject_external_download_destination(subcommand: &str, args: &[String]) -> Result<()> {
     if subcommand != "run" || first_positional_after(&args[1..]) != Some("download") {
         return Ok(());
@@ -188,38 +188,71 @@ fn gh_reject_external_download_destination(subcommand: &str, args: &[String]) ->
     Ok(())
 }
 
-/// Destination directories from `gh run download --dir` / `-D`, in any spelling
-/// `gh` accepts (`--dir value`, `--dir=value`, `-D value`, `-D=value`, `-Dvalue`,
-/// and a short cluster whose `D` is not consumed by `-n`, `-p`, or `-R`).
+enum DownloadStep<'a> {
+    Done,
+    Advance(usize),
+    Dir(&'a str, usize),
+}
+
+/// Collect `--dir` / `-D` values. One step per token keeps the scan flat.
 fn gh_run_download_dirs(args: &[String]) -> Result<Vec<&str>> {
     let mut dirs = Vec::new();
     let mut i = 0;
     while i < args.len() {
-        let arg = args[i].as_str();
-        if arg == "--" {
-            break;
-        }
-        let next = args.get(i + 1).map(String::as_str);
-        if let Some((value, consume_next)) = gh_download_dir_flag(arg, next) {
-            if value.is_empty() {
-                return Err(Error::PolicyViolation {
-                    code: PolicyCode::PathNotAllowed,
-                    message:
-                        "`gh run download destination` requires a relative path under the worktree"
-                            .to_owned(),
-                });
+        match download_argv_step(args, i)? {
+            DownloadStep::Done => break,
+            DownloadStep::Advance(next) => i = next,
+            DownloadStep::Dir(value, next) => {
+                dirs.push(value);
+                i = next;
             }
-            dirs.push(value);
-            i += if consume_next { 2 } else { 1 };
-            continue;
         }
-        if gh_download_skips_next_value(arg) {
-            i += 2;
-            continue;
-        }
-        i += 1;
     }
     Ok(dirs)
+}
+
+fn download_argv_step(args: &[String], i: usize) -> Result<DownloadStep<'_>> {
+    let arg = args[i].as_str();
+    if arg == "--" {
+        return Ok(DownloadStep::Done);
+    }
+    let next = args.get(i + 1).map(String::as_str);
+    if let Some(step) = download_dir_step(arg, next, i)? {
+        return Ok(step);
+    }
+    if let Some(next_i) = download_known_skip(arg, i) {
+        return Ok(DownloadStep::Advance(next_i));
+    }
+    if arg.starts_with('-') {
+        return Err(Error::PolicyViolation {
+            code: PolicyCode::GhFlagNotAllowed,
+            message: format!("`gh run download` flag `{arg}` is not allowed"),
+        });
+    }
+    Ok(DownloadStep::Advance(i + 1))
+}
+
+fn download_dir_step<'a>(
+    arg: &'a str,
+    next: Option<&'a str>,
+    i: usize,
+) -> Result<Option<DownloadStep<'a>>> {
+    let Some((value, consume_next)) = gh_download_dir_flag(arg, next) else {
+        return Ok(None);
+    };
+    if value.is_empty() {
+        return Err(missing_download_destination());
+    }
+    let next_i = if consume_next { i + 2 } else { i + 1 };
+    Ok(Some(DownloadStep::Dir(value, next_i)))
+}
+
+fn missing_download_destination() -> Error {
+    Error::PolicyViolation {
+        code: PolicyCode::PathNotAllowed,
+        message: "`gh run download destination` requires a relative path under the worktree"
+            .to_owned(),
+    }
 }
 
 fn gh_download_dir_flag<'a>(arg: &'a str, next: Option<&'a str>) -> Option<(&'a str, bool)> {
@@ -232,64 +265,48 @@ fn gh_download_dir_flag<'a>(arg: &'a str, next: Option<&'a str>) -> Option<(&'a 
     if let Some(value) = arg.strip_prefix("-D=") {
         return Some((value, false));
     }
-    if let Some(value) = arg.strip_prefix("-D")
-        && !value.is_empty()
-    {
-        return Some((value, false));
-    }
-    clustered_short_download_dir(arg, next)
+    attached_short_d(arg).map(|value| (value, false))
 }
 
-/// `D` inside a short cluster is `--dir` unless an earlier value-taking short
-/// (`-n`, `-p`, `-R`) already consumed the rest of the token as its value.
-fn clustered_short_download_dir<'a>(
-    arg: &'a str,
-    next: Option<&'a str>,
-) -> Option<(&'a str, bool)> {
-    if !arg.starts_with('-') || arg.starts_with("--") {
-        return None;
+fn attached_short_d(arg: &str) -> Option<&str> {
+    let value = arg.strip_prefix("-D")?;
+    (!value.is_empty() && !value.starts_with('-')).then_some(value)
+}
+
+/// Advance past a known non-destination download flag and its value, if any.
+fn download_known_skip(arg: &str, i: usize) -> Option<usize> {
+    if is_download_bool_flag(arg) || is_attached_download_value(arg) {
+        return Some(i + 1);
     }
-    let (cluster, eq_value) = match arg[1..].split_once('=') {
-        Some((cluster, value)) => (cluster, Some(value)),
-        None => (&arg[1..], None),
-    };
-    if cluster.is_empty() {
-        return None;
-    }
-    let mut rest = cluster;
-    while let Some(c) = rest.chars().next() {
-        if !c.is_ascii_alphabetic() {
-            return None;
-        }
-        rest = &rest[c.len_utf8()..];
-        if c == 'D' {
-            if !rest.is_empty() {
-                return Some((rest, false));
-            }
-            if let Some(value) = eq_value {
-                return Some((value, false));
-            }
-            return Some((next.unwrap_or(""), true));
-        }
-        // Value-taking shorts consume the remainder, so a later `D` is data.
-        if matches!(c, 'n' | 'p' | 'R') {
-            return None;
-        }
+    if is_separate_download_value(arg) {
+        return Some(i + 2);
     }
     None
 }
 
-/// Skip the following token when it is the value of a non-destination flag, so
-/// `gh run download --name --dir` does not treat the artifact selector as `--dir`.
-fn gh_download_skips_next_value(arg: &str) -> bool {
-    if !arg.starts_with('-') || arg.contains('=') {
+fn is_download_bool_flag(arg: &str) -> bool {
+    matches!(arg, "--help" | "-h")
+}
+
+fn is_separate_download_value(arg: &str) -> bool {
+    if arg.contains('=') || !arg.starts_with('-') {
         return false;
     }
-    if matches!(arg, "--name" | "-n" | "--pattern" | "-p") || GH_VALUE_TAKING_OPTIONS.contains(&arg)
-    {
-        return true;
-    }
-    matches!(gh_repo_flag(arg, Some("x")), Some((_, true)))
+    matches!(arg, "--name" | "-n" | "--pattern" | "-p")
+        || GH_VALUE_TAKING_OPTIONS.contains(&arg)
+        || matches!(gh_repo_flag(arg, Some("x")), Some((_, true)))
+}
+
+fn is_attached_download_value(arg: &str) -> bool {
+    arg.starts_with("--name=")
+        || arg.starts_with("--pattern=")
+        || attached_nonempty_short(arg, "-n")
+        || attached_nonempty_short(arg, "-p")
+        || matches!(gh_repo_flag(arg, None), Some((_, false)))
+}
+
+fn attached_nonempty_short(arg: &str, flag: &str) -> bool {
+    arg.strip_prefix(flag).is_some_and(|rest| !rest.is_empty())
 }
 
 /// `gh repo clone <repo> [<dir>]` can write outside the worktree; reject an

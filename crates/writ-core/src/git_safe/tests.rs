@@ -1422,8 +1422,6 @@ fn gh_run_download_external_dir_rejected() {
         vec!["run", "download", "-D/tmp/outside"],
         vec!["run", "download", "-D=../outside"],
         vec!["run", "download", "--dir"],
-        vec!["run", "download", "-hD/tmp/outside"],
-        vec!["run", "download", "-xD", "/tmp/outside"],
     ];
     for args in cases {
         let owned: Vec<String> = args.into_iter().map(str::to_owned).collect();
@@ -1437,6 +1435,28 @@ fn gh_run_download_external_dir_rejected() {
                 }
             ),
             "expected PathNotAllowed for {owned:?}, got {err:?}"
+        );
+    }
+}
+
+#[test]
+fn gh_run_download_unknown_flag_rejected() {
+    for args in [
+        vec!["run", "download", "-hD/tmp/outside"],
+        vec!["run", "download", "-xD", "/tmp/outside"],
+        vec!["run", "download", "--output", "/tmp/outside"],
+    ] {
+        let owned: Vec<String> = args.into_iter().map(str::to_owned).collect();
+        let err = SafeGhCommand::new(&owned).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::PolicyViolation {
+                    code: PolicyCode::GhFlagNotAllowed,
+                    ..
+                }
+            ),
+            "expected GhFlagNotAllowed for {owned:?}, got {err:?}"
         );
     }
 }
