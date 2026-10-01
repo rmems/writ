@@ -183,9 +183,85 @@ fn gh_reject_external_download_destination(subcommand: &str, args: &[String]) ->
         return Ok(());
     }
     for dest in gh_run_download_dirs(args)? {
+        // First gate: the pure-string check rejects absolute / `..` / drive /
+        // UNC spellings.
         reject_external_path(Some(dest), "gh run download destination")?;
+        // Second gate: a plain relative name can still be (or traverse) a
+        // symlink that escapes the worktree. Resolve it fail-closed.
+        reject_symlinked_download_destination(dest)?;
     }
     Ok(())
+}
+
+/// Reject a `gh run download --dir` destination that escapes the worktree via a
+/// symlink, which the pure-string [`reject_external_path`] gate cannot see.
+///
+/// The destination may not exist yet, so this resolves the nearest existing
+/// ancestor (walking up component by component), canonicalizes it, and confirms
+/// it stays within the canonicalized current working directory (the `gh`
+/// process cwd / worktree root). It also rejects when any existing leading
+/// component is itself a symlink. Fails closed on any IO error that prevents
+/// validating an existing component.
+fn reject_symlinked_download_destination(dest: &str) -> Result<()> {
+    use std::path::Path;
+
+    let cwd = std::env::current_dir().map_err(|e| Error::Io {
+        context: "resolve cwd for gh run download destination",
+        source: e,
+    })?;
+    let cwd_root = cwd.canonicalize().map_err(|e| Error::Io {
+        context: "canonicalize cwd for gh run download destination",
+        source: e,
+    })?;
+
+    let joined = cwd.join(Path::new(dest));
+
+    // Walk the full path toward the root until a component exists on disk.
+    let mut existing = joined.as_path();
+    loop {
+        match std::fs::symlink_metadata(existing) {
+            Ok(meta) => {
+                // A symlink anywhere along the existing prefix can redirect the
+                // extraction outside the worktree; reject without following it.
+                if meta.file_type().is_symlink() {
+                    return Err(symlinked_download_escape(dest));
+                }
+                let canon = existing.canonicalize().map_err(|e| Error::Io {
+                    context: "canonicalize gh run download destination ancestor",
+                    source: e,
+                })?;
+                if !canon.starts_with(&cwd_root) {
+                    return Err(symlinked_download_escape(dest));
+                }
+                return Ok(());
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                // This component does not exist yet; step up to its parent.
+                match existing.parent() {
+                    Some(parent) => existing = parent,
+                    // Reached the top without finding an existing ancestor; the
+                    // relative path has no on-disk prefix to escape through.
+                    None => return Ok(()),
+                }
+            }
+            Err(e) => {
+                // Any other IO error prevents validation: fail closed.
+                return Err(Error::Io {
+                    context: "inspect gh run download destination",
+                    source: e,
+                });
+            }
+        }
+    }
+}
+
+fn symlinked_download_escape(dest: &str) -> Error {
+    Error::PolicyViolation {
+        code: PolicyCode::PathNotAllowed,
+        message: format!(
+            "`gh run download destination` `{dest}` resolves outside the worktree via a symlink"
+        ),
+    }
 }
 
 enum DownloadStep<'a> {
@@ -520,19 +596,32 @@ pub fn first_positional_after(args: &[String]) -> Option<&str> {
     None
 }
 
-/// Whether a validated `gh` command mutates local checkout/worktree state.
+/// Whether a validated `gh` command mutates local checkout/worktree state (or an
+/// Actions run on a remote repo), so the supervisor must bind it to the verified
+/// origin and gate it behind the expected branch.
+///
+/// Covers mutating `gh pr` sub-subcommands and the mutating / worktree-affecting
+/// `gh run` verbs. `gh run rerun` re-triggers an Actions run and `gh run
+/// download` writes artifacts into the worktree; both must be origin-bound so a
+/// job cannot rerun or extract into a *different* allowed-owner repository
+/// without the branch gate. `cancel` / `delete` are treated as mutating for
+/// defense in depth even though [`ALLOWED_GH_RUN_SUBSUBCOMMANDS`] blocks them.
+/// Read-only `run view` / `list` / `watch` do not mutate and stay ungated.
 #[must_use]
 pub fn gh_requires_branch_check(args: &[String]) -> bool {
-    if args.first().map(String::as_str) != Some("pr") {
-        return false;
+    match args.first().map(String::as_str) {
+        Some("pr") => matches!(
+            first_positional_after(&args[1..]),
+            Some(
+                "checkout" | "create" | "close" | "reopen" | "edit" | "ready" | "merge" | "review"
+            )
+        ),
+        Some("run") => matches!(
+            first_positional_after(&args[1..]),
+            Some("rerun" | "download" | "cancel" | "delete")
+        ),
+        _ => false,
     }
-    let Some(pr_sub) = first_positional_after(&args[1..]) else {
-        return false;
-    };
-    matches!(
-        pr_sub,
-        "checkout" | "create" | "close" | "reopen" | "edit" | "ready" | "merge" | "review"
-    )
 }
 const GH_REPO_CLONE_VALUE_OPTIONS: &[&str] = &["-u", "--upstream-remote-name"];
 

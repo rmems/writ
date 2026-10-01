@@ -1794,3 +1794,218 @@ fn pull_on_default_branch_is_blocked() {
     expect_merge_blocked(&cmd, &repo, None, "default branch");
     remove_all(&repo, &worker_a, &worker_b);
 }
+
+// ---- FEAT-002 / PR #183 finding #2: gh run mutations require branch check ----
+
+#[test]
+fn gh_run_mutating_verbs_require_branch_check() {
+    // `gh run rerun` / `download` mutate an Actions run or write artifacts into
+    // the worktree, so the supervisor must origin-bind and branch-gate them.
+    for args in [
+        vec!["run", "rerun", "123"],
+        vec!["run", "rerun", "--failed", "123"],
+        vec!["run", "download", "123"],
+        vec!["run", "download", "--dir", "sub", "123"],
+    ] {
+        let owned: Vec<String> = args.iter().map(|s| (*s).to_owned()).collect();
+        assert!(
+            gh_requires_branch_check(&owned),
+            "expected {args:?} to require the branch check"
+        );
+    }
+}
+
+#[test]
+fn gh_run_readonly_verbs_skip_branch_check() {
+    // Read-only run verbs do not mutate; they must stay ungated.
+    for args in [
+        vec!["run", "view", "123"],
+        vec!["run", "view", "--log-failed", "123"],
+        vec!["run", "list"],
+        vec!["run", "watch", "123"],
+    ] {
+        let owned: Vec<String> = args.iter().map(|s| (*s).to_owned()).collect();
+        assert!(
+            !gh_requires_branch_check(&owned),
+            "expected {args:?} to skip the branch check"
+        );
+    }
+}
+
+#[test]
+fn gh_pr_branch_check_behaviour_unchanged() {
+    // pr mutations still require the check; pr reads still do not.
+    for args in [
+        vec!["pr", "create"],
+        vec!["pr", "close", "1"],
+        vec!["pr", "merge", "1"],
+        vec!["pr", "checkout", "1"],
+    ] {
+        let owned: Vec<String> = args.iter().map(|s| (*s).to_owned()).collect();
+        assert!(
+            gh_requires_branch_check(&owned),
+            "expected {args:?} to require the branch check"
+        );
+    }
+    for args in [
+        vec!["pr", "view", "1"],
+        vec!["pr", "list"],
+        vec!["pr", "diff", "1"],
+    ] {
+        let owned: Vec<String> = args.iter().map(|s| (*s).to_owned()).collect();
+        assert!(
+            !gh_requires_branch_check(&owned),
+            "expected {args:?} to skip the branch check"
+        );
+    }
+}
+
+#[test]
+fn gh_run_rerun_mismatched_selector_rejected_by_origin_bind() {
+    // A `gh run rerun` targeting a different (still allowed-owner) repo via -R
+    // must be rejected when bound to the verified origin, exactly like pr
+    // mutations. This is the gate that extending gh_requires_branch_check wires
+    // in through supervisor_cmd::prepare_gh_command.
+    let args = vec![
+        "run".to_owned(),
+        "rerun".to_owned(),
+        "-R".to_owned(),
+        "other/repo".to_owned(),
+        "123".to_owned(),
+    ];
+    let err = bind_gh_repo_selector_to_origin(&args, None, "acme/repo").unwrap_err();
+    assert!(
+        matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::PathNotAllowed,
+                ..
+            }
+        ),
+        "expected PathNotAllowed for mismatched run rerun selector, got {err:?}"
+    );
+    // A matching selector is accepted.
+    bind_gh_repo_selector_to_origin(&args, None, "other/repo").unwrap();
+    // No selector falls back to the working directory (accepted); the pin step
+    // in the supervisor then injects the verified origin.
+    let bare = vec!["run".to_owned(), "rerun".to_owned(), "123".to_owned()];
+    bind_gh_repo_selector_to_origin(&bare, None, "acme/repo").unwrap();
+    let pinned = pin_gh_repo_selector(bare, "acme/repo");
+    assert_eq!(gh_repo_selector(&pinned), Some("acme/repo"));
+}
+
+// ---- FEAT-002 / PR #183 finding #7: symlinked download destination escape ----
+
+/// Serialize the chdir-based symlink tests: `std::env::current_dir` is a
+/// process-global, so these tests cannot run concurrently with each other.
+#[cfg(unix)]
+static CWD_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(unix)]
+struct CwdReset {
+    original: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl Drop for CwdReset {
+    fn drop(&mut self) {
+        let _ = std::env::set_current_dir(&self.original);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn gh_run_download_symlinked_dir_rejected() {
+    use std::os::unix::fs::symlink;
+
+    let _guard = CWD_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    let original = std::env::current_dir().unwrap();
+    let _reset = CwdReset {
+        original: original.clone(),
+    };
+
+    // Worktree root the gh process runs in.
+    let worktree = tempfile::tempdir().unwrap();
+    // External directory the symlink escapes to.
+    let outside = tempfile::tempdir().unwrap();
+    let worktree_root = worktree.path().canonicalize().unwrap();
+    std::env::set_current_dir(&worktree_root).unwrap();
+
+    // `evil` is a relative name that passes the string check but points outside.
+    symlink(outside.path(), worktree_root.join("evil")).unwrap();
+
+    let err = SafeGhCommand::new(&[
+        "run".to_owned(),
+        "download".to_owned(),
+        "--dir".to_owned(),
+        "evil".to_owned(),
+        "123".to_owned(),
+    ])
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::PathNotAllowed,
+                ..
+            }
+        ),
+        "expected PathNotAllowed for symlinked download dir, got {err:?}"
+    );
+
+    // A symlink used as a leading component of a deeper destination is also
+    // rejected (the extraction would still land outside).
+    let err = SafeGhCommand::new(&[
+        "run".to_owned(),
+        "download".to_owned(),
+        "--dir".to_owned(),
+        "evil/artifacts".to_owned(),
+        "123".to_owned(),
+    ])
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::PathNotAllowed,
+                ..
+            }
+        ),
+        "expected PathNotAllowed for symlink-prefixed download dir, got {err:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn gh_run_download_plain_relative_dir_accepted() {
+    let _guard = CWD_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    let original = std::env::current_dir().unwrap();
+    let _reset = CwdReset {
+        original: original.clone(),
+    };
+
+    let worktree = tempfile::tempdir().unwrap();
+    let worktree_root = worktree.path().canonicalize().unwrap();
+    std::env::set_current_dir(&worktree_root).unwrap();
+
+    // A plain in-worktree relative destination (nonexistent nested dir) is fine.
+    SafeGhCommand::new(&[
+        "run".to_owned(),
+        "download".to_owned(),
+        "--dir".to_owned(),
+        "sub/artifacts".to_owned(),
+        "123".to_owned(),
+    ])
+    .unwrap();
+
+    // An existing real (non-symlink) in-worktree directory is also accepted.
+    std::fs::create_dir_all(worktree_root.join("real")).unwrap();
+    SafeGhCommand::new(&[
+        "run".to_owned(),
+        "download".to_owned(),
+        "--dir".to_owned(),
+        "real".to_owned(),
+        "123".to_owned(),
+    ])
+    .unwrap();
+}
