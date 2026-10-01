@@ -1,6 +1,6 @@
 # Safe Issue → Verified Commit
 
-Portable worker contract for any coding agent (Codex, Claude, Grok, Hermes, Devin, or later). Stops at a verified push and a comment on the supplied tracker. Does not open a PR — that is [Safe Verified Commit → PR](safe-verified-commit-to-pr.md).
+Portable worker contract for any coding agent (Codex, Claude, Grok, Hermes, Devin, or later). Stops at a verified push and, when a tracker was supplied, a comment on that tracker. Does not open a PR — that is [Safe Verified Commit → PR](safe-verified-commit-to-pr.md).
 
 Safety rules live in [`AGENTS.md`](../../AGENTS.md) and [`SKILL.md`](../../SKILL.md). This file does not relax them.
 
@@ -10,7 +10,7 @@ Contracts: isolation [#6](https://github.com/rmems/writ/issues/6), skill/procedu
 
 | Input | Required | Notes |
 | --- | --- | --- |
-| `task` | yes | Linear `RM-*` (maintainers) and/or GitHub issue URL/number. Do not create a GitHub issue twin for Linear-only work. |
+| `task` | no | Linear `RM-*` and/or a GitHub issue when one was supplied. `none` or omitted when neither exists; scope and acceptance then come from the assigned request. Do not invent a tracker. |
 | `owner` / `repo` | no | If omitted, resolve from `git remote` in the current repository |
 | `dry_run` | no | Intake + isolate + plan only. No commit, push, or issue comment |
 
@@ -20,7 +20,7 @@ Do not hard-code an owner. Multi-repo discovery and scheduling still use `WRIT_A
 
 Abort and report if any of these fail:
 
-- Task is closed, is a pull request, or has no actionable acceptance criteria
+- A supplied task is closed, is a pull request, or has no actionable acceptance criteria. With no tracker, stop when the assigned request has no actionable acceptance criteria
 - Owner is outside the configured allowlist (unless the operator named this repo/job explicitly).
 - Unsafe identity or path mismatch, a genuine ownership collision, or a non-recoverable cleanliness/remote check. Exact remote-base equality applies only to a newly created, unpublished assigned branch. A published branch must have the expected upstream and local/remote relationship instead. Repair a clean bootstrap source or unpublished verified-base alignment before editing; do not abort isolated work because a primary checkout is dirty or stale.
 - `writ` is missing and no enforcing wrapper is available (mutating runs). An "enforcing wrapper" means a wrapper that routes the mutation through `writ-core`'s allowlist and branch verification; a wrapper that merely calls `git` directly is not one, and does not satisfy this check.
@@ -32,10 +32,10 @@ Abort and report if any of these fail:
 
 ### 1. Intake (read-only)
 
-1. Read the Linear task and/or GitHub issue (GitHub **MCP first** for GitHub). Shell `gh` only if MCP is unavailable.
+1. Read the supplied Linear task and/or GitHub issue (GitHub **MCP first** for GitHub). With no tracker, read the assigned request. Shell `gh` only if MCP is unavailable.
 2. Read `AGENTS.md` or `CLAUDE.md`, `README.md`, and [`REVIEW.md`](../../REVIEW.md).
-3. Extract acceptance criteria. Preserve them. Do not invent extra scope.
-4. Do not create a GitHub issue twin for Linear work, or a Linear task for a GitHub-only contribution.
+3. Extract acceptance criteria from the supplied tracker or, when none exists, from the assigned request. Preserve them. Do not invent extra scope.
+4. Do not create a GitHub issue twin for Linear work, or a Linear task for a GitHub-only or tracker-free contribution.
 
 ### 2. Isolate
 
@@ -116,6 +116,7 @@ Report on the tracker that was supplied. Do not create a GitHub issue or a Linea
 - Linear task: comment on that task.
 - Existing GitHub issue: comment on that issue (MCP first).
 - Linear-only work stops at the Linear comment.
+- No tracker: skip the comment. The pushed branch is the record, and the PR workflow carries handoff.
 
 Include:
 
@@ -133,4 +134,4 @@ Stop after isolate + a written implementation plan. No commits, push, or issue c
 
 ## Done when
 
-Branch is pushed (remote accepted), status is truthful (checkpoint vs merge-ready), and the supplied tracker has a SHA-bearing comment only after that successful push.
+Branch is pushed (remote accepted) and status is truthful (checkpoint vs merge-ready). When a tracker was supplied, it has a SHA-bearing comment only after that successful push. With no tracker, there is no tracker comment.
