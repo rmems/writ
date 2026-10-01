@@ -1361,6 +1361,11 @@ fn gh_run_rerun_and_view_allowed() {
 
 #[test]
 fn gh_run_download_relative_dir_allowed() {
+    // `--dir artifacts` resolves against the process cwd via
+    // `reject_symlinked_download_destination`; pin to a clean worktree so a
+    // sibling chdir test cannot make this spuriously fail or pass.
+    let (_guard, _reset, _worktree) = pin_cwd_to_clean_worktree();
+
     let relative = SafeGhCommand::new(&[
         "run".to_owned(),
         "download".to_owned(),
@@ -1415,6 +1420,11 @@ fn gh_run_download_relative_dir_allowed() {
 
 #[test]
 fn gh_run_download_external_dir_rejected() {
+    // These exercise the download-destination validator; serialize and pin cwd
+    // so a sibling chdir test cannot interfere. The string gate rejects these
+    // before the symlink check, but pinning removes the cross-test race.
+    let (_guard, _reset, _worktree) = pin_cwd_to_clean_worktree();
+
     let cases = [
         vec!["run", "download", "--dir", "/tmp/outside"],
         vec!["run", "download", "--dir=../outside"],
@@ -1441,6 +1451,9 @@ fn gh_run_download_external_dir_rejected() {
 
 #[test]
 fn gh_run_download_unknown_flag_rejected() {
+    // Serialize and pin cwd for the same reason as the sibling download tests.
+    let (_guard, _reset, _worktree) = pin_cwd_to_clean_worktree();
+
     for args in [
         vec!["run", "download", "-hD/tmp/outside"],
         vec!["run", "download", "-xD", "/tmp/outside"],
@@ -1896,21 +1909,44 @@ fn gh_run_rerun_mismatched_selector_rejected_by_origin_bind() {
 
 // ---- FEAT-002 / PR #183 finding #7: symlinked download destination escape ----
 
-/// Serialize the chdir-based symlink tests: `std::env::current_dir` is a
-/// process-global, so these tests cannot run concurrently with each other.
-#[cfg(unix)]
+/// Serialize every test that resolves a download `--dir` against the
+/// process-global `std::env::current_dir`. The symlink tests chdir the whole
+/// process, so any sibling test that also runs `reject_symlinked_download_destination`
+/// must hold this lock too, otherwise it observes a foreign or disappearing cwd
+/// under cargo's parallel execution. This is cross-platform on purpose: the
+/// sibling download tests are not `#[cfg(unix)]`, so the lock and cwd pinning
+/// must compile and serialize on every platform.
 static CWD_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-#[cfg(unix)]
+/// Restores the original working directory on drop so later tests are
+/// unaffected by the chdir performed while a `CWD_GUARD` lock is held.
 struct CwdReset {
     original: std::path::PathBuf,
 }
 
-#[cfg(unix)]
 impl Drop for CwdReset {
     fn drop(&mut self) {
         let _ = std::env::set_current_dir(&self.original);
     }
+}
+
+/// Lock `CWD_GUARD` and pin the process cwd to a fresh, canonicalized temp
+/// worktree root so download-destination validation is deterministic and free
+/// of stray symlinks. Returns the lock guard, the cwd-restoring guard, and the
+/// kept-alive tempdir; hold all three for the duration of the test.
+fn pin_cwd_to_clean_worktree() -> (
+    std::sync::MutexGuard<'static, ()>,
+    CwdReset,
+    tempfile::TempDir,
+) {
+    let guard = CWD_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    let reset = CwdReset {
+        original: std::env::current_dir().unwrap(),
+    };
+    let worktree = tempfile::tempdir().unwrap();
+    let worktree_root = worktree.path().canonicalize().unwrap();
+    std::env::set_current_dir(&worktree_root).unwrap();
+    (guard, reset, worktree)
 }
 
 #[cfg(unix)]
@@ -1978,15 +2014,8 @@ fn gh_run_download_symlinked_dir_rejected() {
 #[cfg(unix)]
 #[test]
 fn gh_run_download_plain_relative_dir_accepted() {
-    let _guard = CWD_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-    let original = std::env::current_dir().unwrap();
-    let _reset = CwdReset {
-        original: original.clone(),
-    };
-
-    let worktree = tempfile::tempdir().unwrap();
+    let (_guard, _reset, worktree) = pin_cwd_to_clean_worktree();
     let worktree_root = worktree.path().canonicalize().unwrap();
-    std::env::set_current_dir(&worktree_root).unwrap();
 
     // A plain in-worktree relative destination (nonexistent nested dir) is fine.
     SafeGhCommand::new(&[
