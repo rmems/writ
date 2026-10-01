@@ -1188,7 +1188,9 @@ async fn read_captured_pipe<R: AsyncReadExt + Unpin>(
 
 fn note_pipe_activity(spawn_at: Instant, last_activity_ms: &AtomicU64) {
     let elapsed = u64::try_from(spawn_at.elapsed().as_millis()).unwrap_or(u64::MAX);
-    last_activity_ms.store(elapsed, Ordering::Relaxed);
+    // Stdout and stderr readers share this stamp. Keep the newer observation
+    // so a slower pipe cannot rewind idle detection.
+    last_activity_ms.fetch_max(elapsed, Ordering::Relaxed);
 }
 
 /// Append `chunk` until [`MAX_CAPTURE_BYTES`]. Returns whether the cap is now hit.
