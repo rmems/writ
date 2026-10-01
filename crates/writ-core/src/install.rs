@@ -343,6 +343,14 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    #[cfg(unix)]
+    fn repo_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("repo root")
+    }
+
     #[test]
     fn install_is_idempotent_and_preserves_existing_hooks() {
         let tmp = tempdir().unwrap();
@@ -392,6 +400,118 @@ mod tests {
         assert_eq!(
             parsed["hooks"]["SubagentStart"][0]["hooks"][0]["args"],
             json!(["hook"])
+        );
+    }
+
+    #[test]
+    fn install_preserves_unrelated_hooks_and_beads_data() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join(".claude/settings.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            r#"{
+  "hooks": {
+    "SessionStart": [
+      { "matcher": "", "hooks": [{ "type": "command", "command": "bd prime" }] }
+    ],
+    "Notification": [
+      { "matcher": "", "hooks": [{ "type": "command", "command": "echo keep-me" }] }
+    ]
+  }
+}
+"#,
+        )
+        .unwrap();
+        let beads = tmp.path().join(".beads");
+        fs::create_dir_all(&beads).unwrap();
+        fs::write(beads.join("issues.jsonl"), "keep\n").unwrap();
+
+        install_settings(&path, WritCommand("/opt/writ")).unwrap();
+
+        let parsed: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(
+            parsed["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .contains("bd prime")
+        );
+        assert_eq!(
+            parsed["hooks"]["Notification"][0]["hooks"][0]["command"],
+            "echo keep-me"
+        );
+        assert_eq!(
+            fs::read_to_string(beads.join("issues.jsonl")).unwrap(),
+            "keep\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn optional_bd_prime_succeeds_when_bd_is_missing_or_failing() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let root = repo_root();
+        let script = root.join(".claude/hooks/optional-bd-prime.sh");
+        let settings: Value =
+            serde_json::from_str(&fs::read_to_string(root.join(".claude/settings.json")).unwrap())
+                .unwrap();
+        for event in ["SessionStart", "PreCompact"] {
+            let groups = settings["hooks"][event]
+                .as_array()
+                .unwrap_or_else(|| panic!("{event} missing"));
+            assert!(!groups.is_empty(), "{event} has no hooks");
+            for group in groups {
+                for handler in group["hooks"].as_array().unwrap() {
+                    let command = handler["command"].as_str().unwrap();
+                    assert!(
+                        command.contains("optional-bd-prime.sh"),
+                        "{event} must call the optional Beads hook, got {command}"
+                    );
+                    let status = Command::new("sh")
+                        .arg("-c")
+                        .arg(command)
+                        .current_dir(&root)
+                        .env("CLAUDE_PROJECT_DIR", &root)
+                        .env("PATH", "/usr/bin:/bin")
+                        .status()
+                        .unwrap();
+                    assert!(
+                        status.success(),
+                        "{event} hook failed without bd: {command}"
+                    );
+                }
+            }
+        }
+
+        let missing = Command::new(&script)
+            .env("PATH", "/usr/bin:/bin")
+            .status()
+            .unwrap();
+        assert!(missing.success(), "hook must exit 0 when bd is absent");
+
+        let tmp = tempdir().unwrap();
+        let bd = tmp.path().join("bd");
+        fs::write(&bd, "#!/bin/sh\necho primed > \"$BD_MARK\"\nexit 1\n").unwrap();
+        let mut perms = fs::metadata(&bd).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&bd, perms).unwrap();
+        let mark = tmp.path().join("mark");
+        let beads = tmp.path().join(".beads");
+        fs::create_dir_all(&beads).unwrap();
+        fs::write(beads.join("issues.jsonl"), "keep\n").unwrap();
+        let failing = Command::new(&script)
+            .current_dir(tmp.path())
+            .env("PATH", format!("{}:/usr/bin:/bin", tmp.path().display()))
+            .env("BD_MARK", &mark)
+            .status()
+            .unwrap();
+        assert!(failing.success(), "failing bd prime must not fail the hook");
+        assert_eq!(fs::read_to_string(&mark).unwrap(), "primed\n");
+        assert_eq!(
+            fs::read_to_string(beads.join("issues.jsonl")).unwrap(),
+            "keep\n"
         );
     }
 

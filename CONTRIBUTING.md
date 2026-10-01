@@ -1,13 +1,23 @@
 # Contributing
 
-[`AGENTS.md`](AGENTS.md) is the autonomy and safety contract. This file is the
-short filing guide so humans and agents share one label vocabulary and one
-issue shape.
+[`AGENTS.md`](AGENTS.md) is the contribution and safety contract. This file is
+the short filing guide: one task record, one pull request, and one label
+vocabulary.
+
+Maintainers track the task in Linear and open a GitHub pull request. They do
+not file a GitHub issue twin, child issue, or duplicate checklist. Contributors
+use a GitHub issue or pull request and do not need Linear, Beads, or any other
+maintainer service. Existing GitHub issues stay as history.
+
+Beads and the host's own task list are optional. A checkpoint or draft pull
+request is not merge or release readiness. State which checks ran. Required
+GitHub checks still govern readiness when you claim it. Details:
+[Contribution](AGENTS.md#contribution).
 
 ## Issue templates
 
-Pick one from [`.github/ISSUE_TEMPLATE/`](.github/ISSUE_TEMPLATE/) (GitHub
-forms; blank issues stay enabled):
+Optional forms live in [`.github/ISSUE_TEMPLATE/`](.github/ISSUE_TEMPLATE/)
+(GitHub forms; blank issues stay enabled). Use one when filing a GitHub issue:
 
 | Template | Use when |
 | --- | --- |
@@ -16,17 +26,10 @@ forms; blank issues stay enabled):
 | **Chore** | Hygiene, packaging, or docs-only work |
 
 Each template asks for **Summary**, **Problem / context** (or a repro),
-**Acceptance criteria** (checkboxes), a **canonical label**, and a **Linear**
-footer. Keep the write-up short. Do not add extra required fields.
-
-Footer pattern (replace the placeholders when a twin exists):
-
-```text
-Linear: <url> (`RM-N`)
-```
-
-GitHub is the execution surface. Linear stays the planning twin via that
-footer. Do not invent a second Linear issue when one is already linked.
+**Acceptance criteria** (checkboxes), and a **canonical label**. A Linear
+footer is optional for maintainers who already have an `RM-*` id. Contributors
+leave it blank. Do not add extra required fields, and do not invent a Linear
+issue or a GitHub twin to fill the footer.
 
 ## Canonical labels
 
@@ -66,11 +69,12 @@ gh label edit safety --description "Never-merge, force-with-lease, fix caps, own
 
 ## Pull requests
 
-Follow [Safe Issue → Verified Commit](docs/workflows/safe-issue-verified-commit.md)
-then [Safe Verified Commit → PR](docs/workflows/safe-verified-commit-to-pr.md).
-Never merge from those workflows. Review checklist: [`REVIEW.md`](REVIEW.md).
+Follow [checkpoint push](docs/workflows/safe-issue-verified-commit.md) then
+[pull request](docs/workflows/safe-verified-commit-to-pr.md). Never merge from
+those workflows. Review checklist: [`REVIEW.md`](REVIEW.md).
 
-Native gates (canonical; see README):
+Focused checks while working. This workspace suite is for merge or release
+readiness, not for every checkpoint:
 
 ```bash
 cargo fmt --all -- --check

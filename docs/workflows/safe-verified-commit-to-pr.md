@@ -1,48 +1,38 @@
-# Safe Verified Commit → PR
+# Checkpoint → pull request
 
-Portable worker contract for any coding agent. Runs **after** [Safe Issue → Verified Commit](safe-issue-verified-commit.md). Opens or updates a human-reviewable pull request. Does not merge the pull request.
+Runs after [Checkpoint: scoped work to a push](safe-issue-verified-commit.md). Opens or updates a pull request. Does not merge it, and opening it does not declare merge or release readiness.
 
-Safety rules live in [`AGENTS.md`](../../AGENTS.md), [`SKILL.md`](../../SKILL.md), and [`REVIEW.md`](../../REVIEW.md). This file does not relax them.
+Safety rules live in [`AGENTS.md`](../../AGENTS.md), [`SKILL.md`](../../SKILL.md), and [`REVIEW.md`](../../REVIEW.md).
 
-Contract: Issue → PR [#8](https://github.com/rmems/writ/issues/8) / Linear [RM-123](https://linear.app/rpd-34/issue/RM-123/issue-pr-workflow-never-auto-merge). Isolation prerequisite [#6](https://github.com/rmems/writ/issues/6). Interactive monitoring, when needed after handoff, belongs to the installed companion `babysit-pr` skill rather than this workflow.
+Historical contract: Issue → PR [#8](https://github.com/rmems/writ/issues/8) / Linear [RM-123](https://linear.app/rpd-34/issue/RM-123/issue-pr-workflow-never-auto-merge). That history is not a required GitHub issue twin. Interactive monitoring, when needed, belongs to the installed companion `babysit-pr` skill.
 
 ## Inputs
 
 | Input | Required | Notes |
 | --- | --- | --- |
-| Verified push | yes | Branch already pushed; local gates already passed or residuals already reported |
-| `issue` | yes | GitHub issue this PR implements |
-| `owner` / `repo` | no | Resolve from `git remote` if omitted |
-| `dry_run` | no | Describe the PR you would open. Do not create or update it |
-
-One issue → one PR unless the issue explicitly groups work.
+| Pushed branch | yes | The remote accepted the push. Test status is honest, including checks not run. |
+| Task | yes | The Linear task or GitHub issue you already have. |
+| `owner` / `repo` | no | Resolve from `git remote` when omitted. |
+| `dry_run` | no | Describe the pull request. Do not create or update it. |
 
 ## Hard stops
 
-- No verified push yet — run the commit workflow first.
-- Shared `main`/`master` checkout — work only in the job worktree/branch.
+- No accepted push yet.
+- Shared `main`/`master` checkout. Work only in the assigned checkout.
 - Owner outside the configured allowlist unless the operator named this job.
-- Any GitHub PR merge command, merge API, auto-merge, or merge-queue enablement. Local feature-branch integration is not this stop.
+- Any GitHub pull-request merge command, merge API, auto-merge, or merge-queue enablement.
 - Bare `git push --force` / `git push -f`.
-- Opening a no-op “kick CI” PR.
+- A pull request with zero commits.
 
-## Stages
+## Open or update
 
-### 8. Open or update the PR
+Use the host's authorized GitHub tools.
 
-GitHub **MCP first**. Shell `gh` only if MCP is unavailable.
-
-1. Confirm you are still on the job branch inside the job worktree (`git rev-parse --show-toplevel`, `git branch --show-current`).
-2. `git fetch`. Re-read `HEAD` after any last rebase/push: `git rev-parse HEAD`.
-3. Base = repository default branch, or the stack parent if this is a stacked PR. Process stacks **bottom-up**.
-4. If a PR already exists for this branch, update it. Do not open a second PR for the same issue.
-5. Otherwise create the PR:
-
-   - title reflects the issue
-   - body links the GitHub issue (`Fixes #<n>` only when the issue is fully done; otherwise `Refs #<n>`)
-   - if a Linear `RM-*` twin already exists, body also includes that issue’s URL or id; validate it matches the existing twin (do not invent one)
-   - no merge flags
-   - do not enable auto-merge
+1. Confirm the job checkout and branch (`git rev-parse --show-toplevel`, `git branch --show-current`).
+2. `git fetch`. Read `HEAD` after the last successful push.
+3. Base is the repository default branch, or the stack parent. Process stacks bottom-up.
+4. If a pull request already exists for this branch, update it. Do not open a second one for the same task.
+5. Otherwise create it. The title reflects the task. Link the Linear id when that is the maintainer task. Link a GitHub issue only when one already exists (`Fixes #<n>` only when that issue is fully done; otherwise `Refs #<n>`). Leave auto-merge off. A checkpoint stays **draft** until readiness is claimed.
 
 Suggested body:
 
@@ -51,67 +41,54 @@ Suggested body:
 
 <what changed>
 
-## Issue
-Fixes #<n>   <!-- or Refs #<n> if partial -->
-Linear: RM-<n>  <!-- omit this line if no twin exists -->
+## Task
+
+Linear: RM-<n>
+Refs #<n>
 
 ## Test plan
-- [ ] Local gates from README.md
-- [ ] CI on PR
+
+- [ ] Focused checks: <what ran, and the result>
+- [ ] Not run: <what you did not run>
+- [ ] Required GitHub checks: <pending, green, or failing. Do not mark a pass you did not see>
 
 ## Notes for review
-- Known residuals: ...
+
+- Checkpoint or merge-ready:
+- Residuals:
 ```
 
-### Partial / blocked
+Omit the Linear line when the contributor has no Linear id. Omit the GitHub issue line when no issue exists.
 
-- Code exists but the issue is incomplete: open a **draft** or clearly partial PR with a Remaining section.
-- Zero commits: do **not** open an empty PR. Comment residuals on the issue instead.
+## Handoff
 
-### 9. Handoff
+Record the repository, task id, pull-request number and URL, branch, `head_sha` after the last successful push, status (`draft`, `open`, or `blocked`), and the honest test note.
 
-After the create/update call, record at least:
+Before calling the handoff done, confirm with the host's authorized GitHub tools:
 
-| Field | Rule |
-| --- | --- |
-| `repo` | `owner/repo` |
-| `issue` | GitHub issue number |
-| `linear` | existing `RM-*` id/URL, or explicit none |
-| `pr` | PR number |
-| `url` | PR URL |
-| `branch` | job branch |
-| `head_sha` | `git rev-parse HEAD` **after** the last push |
-| `status` | open / draft / blocked |
-| `notes` | residuals |
+1. The pull request is open or draft.
+2. Auto-merge is disabled and the pull request is not in the merge queue.
+3. The recorded `head_sha` matches the pull-request head and the remote branch tip.
+4. Any GitHub issue link points at an issue that already existed. A missing issue link is not a failure when the task is Linear-only.
 
-Before treating the PR as handed off, validate **all** of the following via GitHub **MCP first** (do not invoke merge commands or APIs):
+If a check fails, report the residual. Do not merge, and do not call a draft merge-ready.
 
-1. The PR is still **open** or **draft**. Query this state through GitHub MCP.
-2. Auto-merge is **disabled** and the PR is **not** in the merge queue. Query both through GitHub MCP.
-3. The PR’s GitHub `Fixes` or `Refs` reference **targets the input issue** and uses the required completion keyword (`Fixes` only when the issue is fully done; otherwise `Refs`). Absent, wrong number, or the wrong keyword fails.
-4. If a Linear twin exists, the PR body contains that `RM-*` link and it matches the twin.
-5. Query the remote source branch tip and the PR head SHA via GitHub MCP. Both must equal the recorded `head_sha` (the `git rev-parse HEAD` value after the last successful push).
+Comment on the existing task with the pull-request URL, the validated pushed SHA, residuals, and agent attribution. Do not create a GitHub issue to hold that comment.
 
-Abort the handoff and report a residual (do **not** merge, do not claim handoff complete) if any check fails — including a closed/merged PR, auto-merge or merge-queue enabled, a GitHub issue reference that is missing or points elsewhere, or a remote SHA that differs from `head_sha`.
+## Readiness
 
-Comment on the GitHub issue with PR URL, the **validated** pushed commit SHA, residuals, and agent name using the [reply attribution](../../SKILL.md#reply-attribution) templates. Mention the Linear twin only if it already exists.
-
-If interactive monitoring is needed after handoff, invoke the installed companion `babysit-pr` skill. This workflow itself only creates or updates the PR and hands it off.
-
-### 10. Do not merge the pull request
-
-Success is **PR opened (or updated) and handoff ready**, not “landed on main.”
+Call the pull request merge-ready only when the validation and review the change needs are done, required GitHub checks are green, conflicts are absent, and review threads that block the change are resolved. That status is advisory. A human merges on GitHub. This workflow does not merge.
 
 Never:
 
 - `gh pr merge` (including `--auto`)
 - GraphQL `mergePullRequest`
 - REST `PUT /repos/.../merge`
-- merge-queue / auto-merge enablement
-- claiming the agent merged the PR
+- merge-queue or auto-merge enablement
+- claiming the agent merged the pull request
 
-If the PR is already merged, report that a human merged it and stop.
+If the pull request is already merged, report that a human merged it and stop.
 
 ## Done when
 
-An open (or draft) PR has auto-merge and merge-queue disabled, `Fixes`/`Refs` the **input** GitHub issue with the required keyword, includes a matching Linear `RM-*` link when a twin exists, remote source-branch tip and PR head both equal the recorded `head_sha`, the issue comment includes URL + validated SHA + agent, and no GitHub PR merge path was invoked.
+An open or draft pull request exists, auto-merge and the merge queue are off, the head SHA matches the accepted push, and the task comment includes the URL, SHA, and honest test status. Readiness is separate and is not implied by opening the pull request.

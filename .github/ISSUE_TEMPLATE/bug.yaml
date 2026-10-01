@@ -62,8 +62,6 @@ body:
     id: linear
     attributes:
       label: Linear
-      description: Planning twin. Keep this footer even when no twin exists yet; replace the placeholders when it does.
+      description: Optional. Maintainers may paste an existing RM-* URL. Contributors leave this blank; Linear access is not required.
       value: |
-        Linear: <url> (`RM-N`)
-    validations:
-      required: true
+        Linear:

@@ -5,6 +5,8 @@
 - Linear: [RM-169](https://linear.app/rpd-34/issue/RM-169/v1-record-rust-only-architecture-and-codex-babysit-pr-boundary) (parent [RM-168](https://linear.app/rpd-34/issue/RM-168/epic-worktree-hive-v1-rust-only-control-plane))
 - Follow-on command/state model: [RM-170](https://linear.app/rpd-34/issue/RM-170/v1-define-unified-wh-command-and-rust-state-model)
 
+> **Historical record.** Accepted 2026-09-15. Current contribution rules are in [`AGENTS.md`](../../AGENTS.md). Sentences below that prefer GitHub MCP over other authorized GitHub tools, and sentences that treat `writ worktree create` / `remove` / `prune` as the production checkout path, record this decision as it was accepted. They are not active contribution requirements. Hosts use the GitHub tools they already authorize. Checkouts are harness-owned and registered. The Rust-only runtime and companion `babysit-pr` boundary remain the decision.
+
 ## Context
 
 v1 started as Worktree Hive, with CLI name `wh`. The GitHub repository and binary are now `writ`. This decision applies to that single runtime regardless of the rename; `wh` and Worktree Hive are historical names for the same product.
