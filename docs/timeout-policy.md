@@ -71,8 +71,12 @@ Mutating commands are still allowlisted **before spawn**; `gh pr merge` and bare
 `git push --force` remain blocked during a timed run.
 
 Pipe drain is always bounded by the wall-clock deadline, or **30s** when unlimited,
-so inherited pipes cannot hang the supervisor. Progress callbacks run off the wait
-loop so a blocking host sink cannot freeze recovery.
+so inherited pipes cannot hang the supervisor. Cancelling a library run during
+pipe drain terminates remaining Unix process-group members and releases both
+pipe-reader tasks. The exited Unix group leader remains unreaped until drain or
+containment finishes, reserving its PID against reuse during cancellation.
+Progress callbacks run off the wait loop so a blocking host sink cannot freeze
+recovery.
 
 ## Fix-cap interaction
 

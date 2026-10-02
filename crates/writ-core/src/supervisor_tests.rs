@@ -193,6 +193,212 @@ async fn timeout_remains_active_while_draining_inherited_pipes() {
     );
 }
 
+#[cfg(unix)]
+struct DrainCancellationFixture {
+    pid_file: tempfile::NamedTempFile,
+    run: tokio::task::JoinHandle<SupervisedOutput>,
+    needs_cleanup: bool,
+}
+
+#[cfg(unix)]
+impl DrainCancellationFixture {
+    fn descendant_pid(&self) -> Option<String> {
+        let value = std::fs::read_to_string(self.pid_file.path()).ok()?;
+        value
+            .split_whitespace()
+            .next()?
+            .parse::<u32>()
+            .ok()
+            .map(|pid| pid.to_string())
+    }
+}
+
+#[cfg(unix)]
+impl Drop for DrainCancellationFixture {
+    fn drop(&mut self) {
+        self.run.abort();
+        if self.needs_cleanup
+            && let Some(pid) = self.descendant_pid()
+        {
+            // Also clean up the deliberately surviving child on the failing baseline.
+            let _ = std::process::Command::new("kill")
+                .args(["-KILL", &pid])
+                .output();
+        }
+    }
+}
+
+#[cfg(unix)]
+fn process_state(pid: &str) -> String {
+    let output = std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", pid])
+        .output()
+        .expect("inspect descendant state");
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+#[cfg(unix)]
+fn descendant_is_running(pid: &str) -> bool {
+    let state = process_state(pid);
+    // An orphan may briefly remain a zombie until the host init reaps it.
+    !state.is_empty() && !state.starts_with('Z')
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancellation_during_inherited_pipe_drain_stops_descendants() {
+    let supervisor = Arc::new(Supervisor::new(1));
+    let draining = Arc::new(tokio::sync::Notify::new());
+    let options = RunOptions {
+        on_progress: Some(Arc::new({
+            let draining = Arc::clone(&draining);
+            move |snapshot| {
+                if snapshot.step == SupervisorStep::Draining {
+                    draining.notify_one();
+                }
+            }
+        })),
+        ..RunOptions::default()
+    };
+    let pid_file = tempfile::NamedTempFile::new().expect("PID fixture");
+    let pid_path = pid_file
+        .path()
+        .to_str()
+        .expect("UTF-8 fixture path")
+        .to_owned();
+    let run = tokio::spawn({
+        let supervisor = Arc::clone(&supervisor);
+        async move {
+            supervisor
+                .run_unchecked_with_policy(
+                    "sh",
+                    &[
+                        "-c",
+                        "sleep 60 & printf '%s %s\n' \"$!\" \"$$\" > \"$1\"",
+                        "sh",
+                        &pid_path,
+                    ],
+                    &TimeoutPolicy::from_worker_timeout(None),
+                    &options,
+                )
+                .await
+        }
+    });
+    let mut fixture = DrainCancellationFixture {
+        pid_file,
+        run,
+        needs_cleanup: true,
+    };
+    tokio::time::timeout(Duration::from_secs(5), draining.notified())
+        .await
+        .expect("direct child exited and inherited-pipe drain started");
+    let pid = fixture.descendant_pid().expect("descendant PID recorded");
+    assert!(
+        descendant_is_running(&pid),
+        "fixture child must still be alive"
+    );
+    let pids = std::fs::read_to_string(fixture.pid_file.path()).expect("read process IDs");
+    let leader = pids.split_whitespace().nth(1).expect("group leader PID");
+    assert!(
+        process_state(leader).starts_with('Z'),
+        "exited leader must remain unreaped to reserve its PID during drain"
+    );
+
+    fixture.run.abort();
+    assert!(
+        (&mut fixture.run)
+            .await
+            .expect_err("run was cancelled")
+            .is_cancelled(),
+        "run task should be aborted"
+    );
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while descendant_is_running(&pid) && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        !descendant_is_running(&pid),
+        "cancelling inherited-pipe drain left descendant {pid} running"
+    );
+    fixture.needs_cleanup = false;
+    assert_eq!(
+        supervisor.active(),
+        0,
+        "cancelled run must release its permit"
+    );
+    let next = supervisor
+        .run(
+            "true",
+            &[],
+            Some(Duration::from_secs(1)),
+            &RunOptions::default(),
+        )
+        .await
+        .expect("successor run");
+    assert!(
+        next.succeeded(),
+        "released permit must admit the next run: {next:?}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn signal_fallback_observes_exit_without_reaping_the_leader() {
+    let mut child = tokio::process::Command::new("sh")
+        .args(["-c", "exit 23"])
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn exit fixture");
+    tokio::time::timeout(Duration::from_secs(2), wait_for_child_signal(child.id()))
+        .await
+        .expect("fallback must observe exit even when SIGCHLD is masked")
+        .expect("observe child exit");
+    // Reaping here must still succeed and preserve the original exit status.
+    assert_eq!(
+        child.wait().await.expect("reap observed child").code(),
+        Some(23)
+    );
+}
+
+#[tokio::test]
+async fn cancelled_drain_closes_both_inherited_pipe_readers() {
+    use tokio::io::AsyncWriteExt;
+
+    let (stdout_reader, mut stdout_writer) = tokio::io::duplex(64);
+    let (stderr_reader, mut stderr_writer) = tokio::io::duplex(64);
+    let activity = Arc::new(AtomicU64::new(0));
+    let spawn_at = Instant::now();
+    let pipes = PipePair {
+        stdout: tokio::spawn({
+            let activity = Arc::clone(&activity);
+            async move { read_pipe_probed(&mut Some(stdout_reader), spawn_at, activity).await }
+        }),
+        stderr: tokio::spawn(async move {
+            read_pipe_probed(&mut Some(stderr_reader), spawn_at, activity).await
+        }),
+    };
+    let drain = tokio::spawn(drain_pipes_until(
+        Instant::now() + Duration::from_secs(60),
+        None,
+        pipes,
+    ));
+    tokio::task::yield_now().await;
+    drain.abort();
+    assert!(drain.await.expect_err("drain cancelled").is_cancelled());
+    for writer in [&mut stdout_writer, &mut stderr_writer] {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if writer.write_all(b"still open").await.is_err() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelling drain must close inherited pipe readers");
+    }
+}
+
 #[tokio::test]
 async fn propagates_nonzero_exit_code() {
     let supervisor = Supervisor::new(4);
