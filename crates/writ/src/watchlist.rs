@@ -1,6 +1,7 @@
 //! `writ watchlist` CLI: collaboration view over `leases.db`.
 
 use std::io::{self, Write};
+use std::path::Path;
 use std::process::ExitCode;
 
 use clap::Subcommand;
@@ -165,7 +166,7 @@ fn render_view(
     let path = lease_store_path();
     let query = request.query();
     // A view never creates the store: a missing leases.db is an empty view.
-    let data = if path.exists() {
+    let data = if store_exists(&path)? {
         let store = LeaseStore::open_read_only(&path)?;
         let probe = GhPrProbe::new(request.allowlist.clone());
         let github = query.probe_github.then_some(&probe as _);
@@ -175,6 +176,31 @@ fn render_view(
     };
     write_output(request.json, request.command(), &data, stdout)?;
     Ok(ExitCode::SUCCESS)
+}
+
+fn store_exists(path: &Path) -> io::Result<bool> {
+    if path.try_exists()? {
+        return Ok(true);
+    }
+    // Windows can report NotFound when an ancestor is a regular file. Only
+    // treat the store as absent after reaching an existing directory.
+    for ancestor in path.ancestors().skip(1) {
+        match ancestor.metadata() {
+            Ok(metadata) if metadata.is_dir() => return Ok(false),
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotADirectory,
+                    format!(
+                        "lease store ancestor is not a directory: {}",
+                        ancestor.display()
+                    ),
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(false)
 }
 
 fn write_output(
