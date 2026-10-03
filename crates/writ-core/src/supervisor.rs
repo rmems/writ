@@ -1294,20 +1294,6 @@ fn output_to_supervised(
 
 #[cfg(unix)]
 async fn wait_for_unreaped_exit(pid: Option<u32>) -> std::io::Result<()> {
-    // Linux pidfds also work when the embedding host masks SIGCHLD. Failure to
-    // open one (older kernels, restricted hosts) falls back to portable signals.
-    #[cfg(target_os = "linux")]
-    if let Some(pid) = pid
-        && let Ok(fd) = child_exit_fd(pid)
-    {
-        loop {
-            let mut ready = fd.readable().await?;
-            if observe_child_exit(Some(pid))? {
-                return Ok(());
-            }
-            ready.clear_ready();
-        }
-    }
     wait_for_child_signal(pid).await
 }
 
@@ -1330,22 +1316,6 @@ async fn wait_for_child_signal(pid: Option<u32>) -> std::io::Result<()> {
             Err(error) => return Err(error),
         }
     }
-}
-
-#[cfg(target_os = "linux")]
-#[allow(unsafe_code)]
-fn child_exit_fd(pid: u32) -> std::io::Result<tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>> {
-    use std::os::fd::FromRawFd;
-
-    // SAFETY: pidfd_open has no pointer arguments; success returns a new owned
-    // descriptor. The syscall keeps compatibility with pre-glibc-2.36 hosts.
-    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-    if raw == -1 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: this is the newly opened descriptor, transferred exactly once.
-    let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw as std::os::fd::RawFd) };
-    tokio::io::unix::AsyncFd::new(fd)
 }
 
 /// Observe terminal status without releasing the leader PID/PGID reservation.

@@ -74,11 +74,13 @@ impl ProcessTreeFixture {
 
     async fn assert_descendant_stopped(&mut self, pid: &str) {
         let deadline = Instant::now() + Duration::from_secs(2);
-        while descendant_is_running(pid) && Instant::now() < deadline {
+        while process_state(pid).is_some_and(|state| !state.starts_with('Z'))
+            && Instant::now() < deadline
+        {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(
-            !descendant_is_running(pid),
+            !process_state(pid).is_some_and(|state| !state.starts_with('Z')),
             "supervisor left descendant {pid} running"
         );
         self.needs_cleanup = false;
@@ -123,19 +125,14 @@ impl Drop for ProcessTreeFixture {
 }
 
 #[cfg(unix)]
-fn process_state(pid: &str) -> String {
+fn process_state(pid: &str) -> Option<String> {
     let output = std::process::Command::new("ps")
         .args(["-o", "stat=", "-p", pid])
         .output()
         .expect("inspect descendant state");
-    String::from_utf8_lossy(&output.stdout).trim().to_owned()
-}
-
-#[cfg(unix)]
-fn descendant_is_running(pid: &str) -> bool {
-    let state = process_state(pid);
-    // An orphan may briefly remain a zombie until the host init reaps it.
-    !state.is_empty() && !state.starts_with('Z')
+    let state = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    // `ps` emits an empty state once the process is gone.
+    (!state.is_empty()).then_some(state)
 }
 
 #[cfg(unix)]
@@ -163,12 +160,12 @@ async fn cancellation_during_inherited_pipe_drain_stops_descendants() {
         .expect("direct child exited and inherited-pipe drain started");
     let pid = fixture.recorded_pid(0).expect("descendant PID recorded");
     assert!(
-        descendant_is_running(&pid),
+        process_state(&pid).is_some_and(|state| !state.starts_with('Z')),
         "fixture child must still be alive"
     );
     let leader = fixture.recorded_pid(1).expect("group leader PID recorded");
     assert!(
-        process_state(&leader).starts_with('Z'),
+        process_state(&leader).is_some_and(|state| state.starts_with('Z')),
         "exited leader must remain unreaped to reserve its PID during drain"
     );
 
