@@ -269,43 +269,38 @@ fn reject_symlinked_download_destination_in(
 
     let joined = root.join(Path::new(dest));
 
-    // Walk the full path toward the root until a component exists on disk.
-    let mut existing = joined.as_path();
-    loop {
-        match std::fs::symlink_metadata(existing) {
-            Ok(meta) => {
-                // A symlink anywhere along the existing prefix can redirect the
-                // extraction outside the worktree; reject without following it.
-                if meta.file_type().is_symlink() {
-                    return Err(symlinked_download_escape(dest));
-                }
-                let canon = existing.canonicalize().map_err(|e| Error::Io {
-                    context: "canonicalize gh run download destination ancestor",
-                    source: e,
-                })?;
-                if !canon.starts_with(&root) {
-                    return Err(symlinked_download_escape(dest));
-                }
-                return Ok(());
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                // This component does not exist yet; step up to its parent.
-                match existing.parent() {
-                    Some(parent) => existing = parent,
-                    // Reached the top without finding an existing ancestor; the
-                    // relative path has no on-disk prefix to escape through.
-                    None => return Ok(()),
-                }
-            }
-            Err(e) => {
-                // Any other IO error prevents validation: fail closed.
+    let Some((existing, metadata)) = nearest_existing_download_ancestor(&joined)? else {
+        return Ok(());
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(symlinked_download_escape(dest));
+    }
+    let canonical = existing.canonicalize().map_err(|e| Error::Io {
+        context: "canonicalize gh run download destination ancestor",
+        source: e,
+    })?;
+    if !canonical.starts_with(&root) {
+        return Err(symlinked_download_escape(dest));
+    }
+    Ok(())
+}
+
+fn nearest_existing_download_ancestor(
+    path: &std::path::Path,
+) -> Result<Option<(std::path::PathBuf, std::fs::Metadata)>> {
+    for candidate in path.ancestors() {
+        match std::fs::symlink_metadata(candidate) {
+            Ok(metadata) => return Ok(Some((candidate.to_path_buf(), metadata))),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
                 return Err(Error::Io {
                     context: "inspect gh run download destination",
-                    source: e,
+                    source,
                 });
             }
         }
     }
+    Ok(None)
 }
 
 fn symlinked_download_escape(dest: &str) -> Error {

@@ -1362,11 +1362,8 @@ fn gh_run_rerun_and_view_allowed() {
 #[test]
 fn gh_run_download_relative_dir_allowed() {
     // `SafeGhCommand::new` applies only the cwd-independent string gate to a
-    // download `--dir` (the symlink gate is rooted at the worktree in the
-    // supervisor path), so these are not cwd-dependent. Pin a clean cwd anyway
-    // to keep the sibling download tests mutually isolated under cargo's
-    // parallel execution.
-    let (_guard, _reset, _worktree) = pin_cwd_to_clean_worktree();
+    // download `--dir`; the symlink gate is rooted at the worktree in the
+    // supervisor path, so this test must not mutate the process-global cwd.
 
     let relative = SafeGhCommand::new(&[
         "run".to_owned(),
@@ -1422,11 +1419,6 @@ fn gh_run_download_relative_dir_allowed() {
 
 #[test]
 fn gh_run_download_external_dir_rejected() {
-    // These exercise the download-destination validator; serialize and pin cwd
-    // so a sibling chdir test cannot interfere. The string gate rejects these
-    // before the symlink check, but pinning removes the cross-test race.
-    let (_guard, _reset, _worktree) = pin_cwd_to_clean_worktree();
-
     let cases = [
         vec!["run", "download", "--dir", "/tmp/outside"],
         vec!["run", "download", "--dir=../outside"],
@@ -1453,9 +1445,6 @@ fn gh_run_download_external_dir_rejected() {
 
 #[test]
 fn gh_run_download_unknown_flag_rejected() {
-    // Serialize and pin cwd for the same reason as the sibling download tests.
-    let (_guard, _reset, _worktree) = pin_cwd_to_clean_worktree();
-
     for args in [
         vec!["run", "download", "-hD/tmp/outside"],
         vec!["run", "download", "-xD", "/tmp/outside"],
@@ -1910,50 +1899,6 @@ fn gh_run_rerun_mismatched_selector_rejected_by_origin_bind() {
 }
 
 // ---- FEAT-002 / PR #183 finding #7: symlinked download destination escape ----
-
-/// Serialize the sibling download tests that resolve a `--dir` against the
-/// process-global `std::env::current_dir`. [`SafeGhCommand::new`] /
-/// `with_allowlist` apply only the cwd-independent *string* gate, so these do
-/// not actually depend on the cwd for correctness; pinning here removes any
-/// cross-test chdir flake while keeping the tests deterministic. Cross-platform
-/// on purpose: the sibling download tests are not `#[cfg(unix)]`, so the lock
-/// and cwd pinning must compile and serialize on every platform.
-///
-/// The worktree-root-aware symlink tests below do NOT use this guard: they call
-/// [`reject_external_gh_download_destination_in`] with an explicit root and need
-/// no `set_current_dir`, so they are free of the `CWD_GUARD` serialization.
-static CWD_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// Restores the original working directory on drop so later tests are
-/// unaffected by the chdir performed while a `CWD_GUARD` lock is held.
-struct CwdReset {
-    original: std::path::PathBuf,
-}
-
-impl Drop for CwdReset {
-    fn drop(&mut self) {
-        let _ = std::env::set_current_dir(&self.original);
-    }
-}
-
-/// Lock `CWD_GUARD` and pin the process cwd to a fresh, canonicalized temp
-/// worktree root so download-destination validation is deterministic and free
-/// of stray symlinks. Returns the lock guard, the cwd-restoring guard, and the
-/// kept-alive tempdir; hold all three for the duration of the test.
-fn pin_cwd_to_clean_worktree() -> (
-    std::sync::MutexGuard<'static, ()>,
-    CwdReset,
-    tempfile::TempDir,
-) {
-    let guard = CWD_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-    let reset = CwdReset {
-        original: std::env::current_dir().unwrap(),
-    };
-    let worktree = tempfile::tempdir().unwrap();
-    let worktree_root = worktree.path().canonicalize().unwrap();
-    std::env::set_current_dir(&worktree_root).unwrap();
-    (guard, reset, worktree)
-}
 
 /// A `gh run download --dir <symlink>` whose destination escapes the worktree
 /// via a symlink is rejected by the worktree-root-aware validator, and crucially

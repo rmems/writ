@@ -65,7 +65,12 @@ impl Probe {
         if trimmed.is_empty() {
             return "check".to_owned();
         }
-        trimmed.chars().take(40).collect()
+        trimmed
+            .chars()
+            .take(40)
+            .collect::<String>()
+            .trim_end_matches('_')
+            .to_owned()
     }
 
     /// GitHub Actions run id from `/actions/runs/<digits>` on a GitHub host.
