@@ -715,11 +715,10 @@ pub fn enforce_gh_repo_targets(
     for selector in &positionals {
         allowlist.enforce_repo_selector(selector)?;
     }
-    let api_owner = gh_api_owner_target(args);
-    if let Some(owner) = api_owner {
-        allowlist.enforce_owner(owner)?;
+    if let Some(owner) = gh_api_owner_target(args) {
+        return allowlist.enforce_owner(owner);
     }
-    if !selectors.is_empty() || !positionals.is_empty() || api_owner.is_some() {
+    if !selectors.is_empty() || !positionals.is_empty() {
         return Ok(());
     }
     // The implicit GH_REPO selector only applies to commands that actually
