@@ -8,7 +8,7 @@ use serde::Deserialize;
 use super::WatchlistError;
 use super::ops::AddReport;
 use super::schema::{WatchEntry, WatchKind, WatchStatus, Watchlist, owner_of_repo};
-use super::stack::detect_stacks;
+use super::stack::{detect_stacks, rebuild_groups};
 use super::store::{mutate_watchlist, utc_now_rfc3339};
 
 /// Read-only import from a pr-babysit `watched-prs.json`. The source file is
@@ -28,6 +28,11 @@ pub fn import_pr_babysit(
         number: 0,
         message: format!("failed to parse pr-babysit JSON: {err}"),
     })?;
+    let annotations: Vec<_> = parsed
+        .prs
+        .iter()
+        .filter_map(imported_stack_annotation)
+        .collect();
     let now = utc_now_rfc3339();
     let mut report = AddReport {
         added: Vec::new(),
@@ -38,7 +43,36 @@ pub fn import_pr_babysit(
         apply_babysit_row(list, &incoming, &now, &mut report);
     }
     detect_stacks(list);
+    restore_partial_stack_annotations(list, &annotations);
+    rebuild_groups(list);
     Ok(report)
+}
+
+type StackAnnotation = (String, u64, Option<String>, Option<String>, Option<u32>);
+
+fn imported_stack_annotation(incoming: &PrBabysitEntry) -> Option<StackAnnotation> {
+    let repo = incoming.repo.clone()?;
+    owner_of_repo(&repo)?;
+    Some((
+        repo,
+        incoming.number,
+        incoming.stack_id.clone(),
+        incoming.stack_type.clone(),
+        incoming.stack_position,
+    ))
+}
+
+fn restore_partial_stack_annotations(list: &mut Watchlist, annotations: &[StackAnnotation]) {
+    for (repo, number, stack_id, stack_type, stack_position) in annotations {
+        let Some(entry) = list.get_mut(repo, *number) else {
+            continue;
+        };
+        if entry.stack_id.is_none() && stack_id.is_some() {
+            entry.stack_id.clone_from(stack_id);
+            entry.stack_type.clone_from(stack_type);
+            entry.stack_position = *stack_position;
+        }
+    }
 }
 
 fn apply_babysit_row(
@@ -123,7 +157,47 @@ fn new_entry_from_babysit(
 
 /// Persist [`import_pr_babysit`] against `path`.
 pub fn import_pr_babysit_at(path: &Path, source_path: &Path) -> Result<AddReport, WatchlistError> {
+    if paths_resolve_to_same_file(path, source_path) {
+        return Err(WatchlistError::InvalidInput(
+            "pr-babysit source must differ from the watchlist destination".to_owned(),
+        ));
+    }
     mutate_watchlist(path, |list| import_pr_babysit(list, source_path))
+}
+
+fn paths_resolve_to_same_file(left: &Path, right: &Path) -> bool {
+    match (fs::canonicalize(left), fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right || metadata_identifies_same_file(&left, &right),
+        _ => left == right,
+    }
+}
+
+#[cfg(unix)]
+fn metadata_identifies_same_file(left: &Path, right: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    match (fs::metadata(left), fs::metadata(right)) {
+        (Ok(left), Ok(right)) => left.dev() == right.dev() && left.ino() == right.ino(),
+        _ => false,
+    }
+}
+
+#[cfg(windows)]
+fn metadata_identifies_same_file(left: &Path, right: &Path) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    match (fs::metadata(left), fs::metadata(right)) {
+        (Ok(left), Ok(right)) => {
+            left.volume_serial_number() == right.volume_serial_number()
+                && left.file_index() == right.file_index()
+        }
+        _ => false,
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn metadata_identifies_same_file(_left: &Path, _right: &Path) -> bool {
+    false
 }
 
 /// Default pr-babysit path under the user data directory (read-only).
@@ -230,5 +304,52 @@ mod tests {
         let err =
             import_pr_babysit(&mut list, std::path::Path::new("/no/such/file.json")).unwrap_err();
         assert!(matches!(err, WatchlistError::Io { .. }));
+    }
+
+    #[test]
+    fn import_rejects_destination_as_source() {
+        let path = scratch_path("same-source-destination");
+        fs::write(&path, r#"{"version":1,"prs":[],"groups":{}}"#).unwrap();
+
+        let err = import_pr_babysit_at(&path, &path).unwrap_err();
+
+        assert!(matches!(err, WatchlistError::InvalidInput(_)));
+        assert!(path.exists());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn import_rejects_hard_link_alias_of_destination() {
+        let path = scratch_path("hard-link-destination");
+        let alias = path.with_file_name("source-alias.json");
+        fs::write(&path, r#"{"version":1,"prs":[],"groups":{}}"#).unwrap();
+        fs::hard_link(&path, &alias).unwrap();
+
+        let err = import_pr_babysit_at(&path, &alias).unwrap_err();
+
+        assert!(matches!(err, WatchlistError::InvalidInput(_)));
+        assert!(path.exists());
+        let _ = fs::remove_file(alias);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn partial_import_preserves_source_stack_annotations() {
+        let path = scratch_path("partial-stack");
+        fs::write(
+            &path,
+            r#"{"prs":[{"number":2,"repo":"acme/widgets","branch":"feat/top","base":"feat/base","stack_id":"stack-a","stack_type":"feature","stack_position":1}]}"#,
+        )
+        .unwrap();
+        let mut list = Watchlist::default();
+
+        import_pr_babysit(&mut list, &path).unwrap();
+
+        let entry = list.get("acme/widgets", 2).unwrap();
+        assert_eq!(entry.stack_id.as_deref(), Some("stack-a"));
+        assert_eq!(entry.stack_type.as_deref(), Some("feature"));
+        assert_eq!(entry.stack_position, Some(1));
+        assert_eq!(list.groups["stack-a"].numbers, vec![2]);
+        let _ = fs::remove_file(path);
     }
 }

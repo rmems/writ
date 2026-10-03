@@ -26,6 +26,11 @@ pub(crate) fn run(
     stdout: &mut impl Write,
 ) -> io::Result<ExitCode> {
     let path = state_path(action.state());
+    let mut context = RunContext {
+        path: path.as_path(),
+        json,
+        stdout,
+    };
     match action {
         WatchlistAction::Add {
             repo,
@@ -34,13 +39,13 @@ pub(crate) fn run(
             targets,
             ..
         } => run_add(
-            path.as_path(),
-            repo.as_deref(),
-            reset,
-            kind,
-            &targets,
-            json,
-            stdout,
+            &mut context,
+            AddArgs {
+                repo: repo.as_deref(),
+                reset,
+                kind,
+                targets: &targets,
+            },
         ),
         WatchlistAction::Remove {
             repo,
@@ -48,34 +53,43 @@ pub(crate) fn run(
             targets,
             ..
         } => run_remove(
-            path.as_path(),
-            repo.as_deref(),
-            number,
-            &targets,
-            json,
-            stdout,
+            &mut context,
+            RemoveArgs {
+                repo: repo.as_deref(),
+                number,
+                targets: &targets,
+            },
         ),
-        WatchlistAction::List { repo, owner, .. } => run_list(
-            path.as_path(),
-            owner.as_deref(),
-            repo.as_deref(),
-            json,
-            stdout,
-        ),
+        WatchlistAction::List { repo, owner, .. } => {
+            run_list(&mut context, owner.as_deref(), repo.as_deref())
+        }
         WatchlistAction::Check { repo, number, .. } => {
-            run_check(path.as_path(), repo.as_deref(), number, json, stdout)
+            run_check(&mut context, repo.as_deref(), number)
         }
-        WatchlistAction::CheckAll { repo, owner, .. } => run_check_all(
-            path.as_path(),
-            owner.as_deref(),
-            repo.as_deref(),
-            json,
-            stdout,
-        ),
-        WatchlistAction::ImportPrBabysit { path: source, .. } => {
-            run_import(path.as_path(), source, json, stdout)
+        WatchlistAction::CheckAll { repo, owner, .. } => {
+            run_check_all(&mut context, owner.as_deref(), repo.as_deref())
         }
+        WatchlistAction::ImportPrBabysit { path: source, .. } => run_import(&mut context, source),
     }
+}
+
+struct RunContext<'a, W: Write> {
+    path: &'a Path,
+    json: bool,
+    stdout: &'a mut W,
+}
+
+struct AddArgs<'a> {
+    repo: Option<&'a str>,
+    reset: bool,
+    kind: WatchlistKindArg,
+    targets: &'a [String],
+}
+
+struct RemoveArgs<'a> {
+    repo: Option<&'a str>,
+    number: Option<u64>,
+    targets: &'a [String],
 }
 
 trait WatchlistStatePath {
@@ -96,100 +110,85 @@ impl WatchlistStatePath for WatchlistAction {
 }
 
 fn run_remove(
-    path: &Path,
-    repo: Option<&str>,
-    number: Option<u64>,
-    targets: &[String],
-    json: bool,
-    stdout: &mut impl Write,
+    context: &mut RunContext<'_, impl Write>,
+    args: RemoveArgs<'_>,
 ) -> io::Result<ExitCode> {
-    match remove_command(path, repo, number, targets) {
-        Ok(entry) => write_remove(json, &entry, stdout).map(|()| ExitCode::SUCCESS),
-        Err(err) => write_error("watchlist.remove", json, err, stdout),
+    match remove_command(context.path, args) {
+        Ok(entry) => write_remove(context.json, &entry, context.stdout).map(|()| ExitCode::SUCCESS),
+        Err(err) => write_error("watchlist.remove", context.json, err, context.stdout),
     }
 }
 
 fn run_list(
-    path: &Path,
+    context: &mut RunContext<'_, impl Write>,
     owner: Option<&str>,
     repo: Option<&str>,
-    json: bool,
-    stdout: &mut impl Write,
 ) -> io::Result<ExitCode> {
-    match list_prs_at(path, owner, repo) {
-        Ok(entries) => write_list(json, &entries, stdout).map(|()| ExitCode::SUCCESS),
-        Err(err) => write_error("watchlist.list", json, err, stdout),
+    match list_prs_at(context.path, owner, repo) {
+        Ok(entries) => {
+            write_list(context.json, &entries, context.stdout).map(|()| ExitCode::SUCCESS)
+        }
+        Err(err) => write_error("watchlist.list", context.json, err, context.stdout),
     }
 }
 
 fn run_check(
-    path: &Path,
+    context: &mut RunContext<'_, impl Write>,
     repo: Option<&str>,
     number: u64,
-    json: bool,
-    stdout: &mut impl Write,
 ) -> io::Result<ExitCode> {
-    match check_one(path, repo, number) {
-        Ok(report) => {
-            write_check(json, "watchlist.check", &report, stdout).map(|()| ExitCode::SUCCESS)
-        }
-        Err(err) => write_error("watchlist.check", json, err, stdout),
+    match check_one(context.path, repo, number) {
+        Ok(report) => write_check(context.json, "watchlist.check", &report, context.stdout)
+            .map(|()| ExitCode::SUCCESS),
+        Err(err) => write_error("watchlist.check", context.json, err, context.stdout),
     }
 }
 
 fn run_check_all(
-    path: &Path,
+    context: &mut RunContext<'_, impl Write>,
     owner: Option<&str>,
     repo: Option<&str>,
-    json: bool,
-    stdout: &mut impl Write,
 ) -> io::Result<ExitCode> {
-    match check_prs_at(path, &GhPrProbe, owner, repo, None, None) {
-        Ok(report) => {
-            write_check(json, "watchlist.check_all", &report, stdout).map(|()| ExitCode::SUCCESS)
-        }
-        Err(err) => write_error("watchlist.check_all", json, err, stdout),
+    match check_prs_at(context.path, &GhPrProbe, owner, repo, None, None) {
+        Ok(report) => write_check(context.json, "watchlist.check_all", &report, context.stdout)
+            .map(|()| ExitCode::SUCCESS),
+        Err(err) => write_error("watchlist.check_all", context.json, err, context.stdout),
     }
 }
 
 fn run_import(
-    path: &Path,
+    context: &mut RunContext<'_, impl Write>,
     source: Option<PathBuf>,
-    json: bool,
-    stdout: &mut impl Write,
 ) -> io::Result<ExitCode> {
     let source = source.unwrap_or_else(default_pr_babysit_path);
-    match import_pr_babysit_at(path, &source) {
-        Ok(report) => write_add("watchlist.import_pr_babysit", json, &report, stdout)
-            .map(|()| ExitCode::SUCCESS),
-        Err(err) => write_error("watchlist.import_pr_babysit", json, err, stdout),
+    match import_pr_babysit_at(context.path, &source) {
+        Ok(report) => write_add(
+            "watchlist.import_pr_babysit",
+            context.json,
+            &report,
+            context.stdout,
+        )
+        .map(|()| ExitCode::SUCCESS),
+        Err(err) => write_error(
+            "watchlist.import_pr_babysit",
+            context.json,
+            err,
+            context.stdout,
+        ),
     }
 }
 
 /// Handle the `watchlist add` arm: resolve state path, add PRs, render output.
-fn run_add(
-    path: &Path,
-    repo_flag: Option<&str>,
-    reset: bool,
-    kind: WatchlistKindArg,
-    targets: &[String],
-    json: bool,
-    stdout: &mut impl Write,
-) -> io::Result<ExitCode> {
-    match add_command(path, repo_flag, reset, kind, targets) {
-        Ok(report) => write_add("watchlist.add", json, &report, stdout).map(|()| ExitCode::SUCCESS),
-        Err(err) => write_error("watchlist.add", json, err, stdout),
+fn run_add(context: &mut RunContext<'_, impl Write>, args: AddArgs<'_>) -> io::Result<ExitCode> {
+    match add_command(context.path, args) {
+        Ok(report) => write_add("watchlist.add", context.json, &report, context.stdout)
+            .map(|()| ExitCode::SUCCESS),
+        Err(err) => write_error("watchlist.add", context.json, err, context.stdout),
     }
 }
 
-fn add_command(
-    path: &Path,
-    repo_flag: Option<&str>,
-    reset: bool,
-    kind: WatchlistKindArg,
-    targets: &[String],
-) -> Result<AddReport, WatchlistError> {
-    let (repo, numbers) = parse_repo_and_numbers(repo_flag, targets)?;
+fn add_command(path: &Path, args: AddArgs<'_>) -> Result<AddReport, WatchlistError> {
+    let (repo, numbers) = parse_repo_and_numbers(args.repo, args.targets)?;
     if numbers.is_empty() {
         return Err(WatchlistError::InvalidInput(
             "add requires at least one pull-request number".to_owned(),
@@ -200,20 +199,15 @@ fn add_command(
         &GhPrProbe,
         &repo,
         &numbers,
-        kind.into_kind(),
-        reset,
+        args.kind.into_kind(),
+        args.reset,
         None,
     )
 }
 
-fn remove_command(
-    path: &Path,
-    repo_flag: Option<&str>,
-    number_flag: Option<u64>,
-    targets: &[String],
-) -> Result<WatchEntry, WatchlistError> {
-    let (repo, numbers) = parse_repo_and_numbers(repo_flag, targets)?;
-    let number = match (number_flag, numbers.as_slice()) {
+fn remove_command(path: &Path, args: RemoveArgs<'_>) -> Result<WatchEntry, WatchlistError> {
+    let (repo, numbers) = parse_repo_and_numbers(args.repo, args.targets)?;
+    let number = match (args.number, numbers.as_slice()) {
         (Some(number), []) => number,
         (None, [number]) => *number,
         (Some(number), [same]) if *same == number => number,

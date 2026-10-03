@@ -85,6 +85,7 @@ fn assign_positions(list: &mut Watchlist, parent: &[Option<usize>]) {
     for i in 0..n {
         if parent[i].is_none() && !has_child[i] {
             list.prs[i].stack_id = None;
+            list.prs[i].stack_type = None;
             list.prs[i].stack_position = None;
             continue;
         }

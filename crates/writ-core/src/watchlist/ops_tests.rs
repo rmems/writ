@@ -25,6 +25,20 @@ impl PrProbe for MapProbe {
     }
 }
 
+struct DelayedProbe {
+    inner: MapProbe,
+    delayed_number: u64,
+}
+
+impl PrProbe for DelayedProbe {
+    fn view(&self, repo: &str, number: u64) -> Result<PrSnapshot, WatchlistError> {
+        if number == self.delayed_number {
+            std::thread::sleep(std::time::Duration::from_millis(1_100));
+        }
+        self.inner.view(repo, number)
+    }
+}
+
 fn open_snap(repo: &str, number: u64, branch: &str, base: &str) -> PrSnapshot {
     PrSnapshot {
         repo: repo.to_owned(),
@@ -142,8 +156,12 @@ fn remove_keeps_stack_mates() {
     .unwrap();
     assert!(list.get("acme/widgets", 2).unwrap().stack_id.is_some());
     remove_pr(&mut list, "acme/widgets", 2).unwrap();
-    assert!(list.get("acme/widgets", 1).is_some());
+    let survivor = list.get("acme/widgets", 1).unwrap();
+    assert!(survivor.stack_id.is_none());
+    assert!(survivor.stack_type.is_none());
+    assert!(survivor.stack_position.is_none());
     assert!(list.get("acme/widgets", 2).is_none());
+    assert!(list.groups.is_empty());
 }
 
 #[test]
@@ -228,6 +246,48 @@ fn check_all_requires_allowlist_and_prunes_merged() {
     assert!(list.get("acme/widgets", 2).is_none());
     assert_eq!(list.get("acme/widgets", 1).unwrap().fix_count, 0);
     assert_eq!(list.get("acme/widgets", 1).unwrap().check_count, Some(1));
+}
+
+#[test]
+fn check_timestamps_each_entry_after_its_probe() {
+    let snaps = BTreeMap::from([
+        (
+            ("acme/widgets".to_owned(), 1),
+            open_snap("acme/widgets", 1, "feat/a", "main"),
+        ),
+        (
+            ("acme/widgets".to_owned(), 2),
+            open_snap("acme/widgets", 2, "feat/b", "main"),
+        ),
+    ]);
+    let mut list = Watchlist::default();
+    add_prs(
+        &mut list,
+        &MapProbe {
+            snaps: snaps.clone(),
+        },
+        "acme/widgets",
+        &[1, 2],
+        WatchKind::PrBabysit,
+        false,
+        &[],
+    )
+    .unwrap();
+
+    let report = check_prs(
+        &mut list,
+        &DelayedProbe {
+            inner: MapProbe { snaps },
+            delayed_number: 2,
+        },
+        None,
+        Some("acme/widgets"),
+        None,
+        &[],
+    )
+    .unwrap();
+
+    assert!(report.checked[0].last_checked < report.checked[1].last_checked);
 }
 
 #[test]
@@ -335,6 +395,20 @@ fn classify_empty_check_name_sanitizes_to_unnamed() {
     }];
     let (_, blockers) = classify_snapshot(&snap);
     assert!(blockers.iter().any(|b| b == "class_a:unnamed"));
+}
+
+#[test]
+fn classify_unrecognized_active_check_state_as_pending() {
+    let mut snap = open_snap("acme/widgets", 1, "feat/a", "main");
+    snap.checks = vec![CheckSnapshot {
+        name: "deploy".to_owned(),
+        state: "WAITING".to_owned(),
+    }];
+
+    let (status, blockers) = classify_snapshot(&snap);
+
+    assert_eq!(status, WatchStatus::Pending);
+    assert_eq!(blockers, vec!["class_c:deploy"]);
 }
 
 #[test]

@@ -6,10 +6,10 @@ use super::WatchlistError;
 use super::classify::classify_snapshot;
 use super::probe::{PrProbe, PrSnapshot};
 use super::schema::{WatchEntry, WatchKind, WatchStatus, Watchlist, owner_of_repo, repos_match};
-use super::stack::{detect_stacks, ordered_identities, rebuild_groups};
+use super::stack::{detect_stacks, ordered_identities};
 use super::store::{
     load_allowed_owners, load_watchlist, mutate_watchlist, owner_is_allowed, save_watchlist,
-    utc_now_rfc3339,
+    utc_now_rfc3339, with_watchlist_lock,
 };
 
 /// Result of adding one or more pull requests.
@@ -48,14 +48,7 @@ pub fn add_prs(
     allowed_owners: &[String],
 ) -> Result<AddReport, WatchlistError> {
     validate_repo(repo)?;
-    if let Some(owner) = owner_of_repo(repo)
-        && !allowed_owners.is_empty()
-        && !owner_is_allowed(owner, allowed_owners)
-    {
-        return Err(WatchlistError::OwnerNotAllowed {
-            owner: owner.to_owned(),
-        });
-    }
+    validate_add_owner(repo, allowed_owners)?;
     let now = utc_now_rfc3339();
     let mut report = AddReport {
         added: Vec::new(),
@@ -74,6 +67,17 @@ pub fn add_prs(
     }
     detect_stacks(list);
     Ok(report)
+}
+
+fn validate_add_owner(repo: &str, allowed_owners: &[String]) -> Result<(), WatchlistError> {
+    let allowed = allowed_owners.is_empty()
+        || owner_of_repo(repo).is_some_and(|owner| owner_is_allowed(owner, allowed_owners));
+    if allowed {
+        return Ok(());
+    }
+    Err(WatchlistError::OwnerNotAllowed {
+        owner: owner_of_repo(repo).unwrap_or_default().to_owned(),
+    })
 }
 
 /// Invariant context for one `add` pass. `repo` is the caller-supplied slug
@@ -161,7 +165,7 @@ pub fn remove_pr(
         });
     };
     let removed = list.prs.remove(index);
-    rebuild_groups(list);
+    detect_stacks(list);
     Ok(removed)
 }
 
@@ -229,17 +233,27 @@ fn select_check_targets(
                     .is_some_and(|have| owner_is_allowed(have, allowed_owners))
         })
         .collect();
-    if let Some(want) = scope.numbers {
-        for &number in want {
-            if !targets.iter().any(|(_, have)| *have == number) {
-                return Err(WatchlistError::NotFound {
-                    repo: scope.repo.unwrap_or("<unknown>").to_owned(),
-                    number,
-                });
-            }
-        }
-    }
+    ensure_requested_numbers_exist(scope, &targets)?;
     Ok(targets)
+}
+
+fn ensure_requested_numbers_exist(
+    scope: &CheckScope,
+    targets: &[(String, u64)],
+) -> Result<(), WatchlistError> {
+    let Some(numbers) = scope.numbers else {
+        return Ok(());
+    };
+    let missing = numbers
+        .iter()
+        .find(|number| !targets.iter().any(|(_, have)| have == *number));
+    match missing {
+        Some(number) => Err(WatchlistError::NotFound {
+            repo: scope.repo.unwrap_or("<unknown>").to_owned(),
+            number: *number,
+        }),
+        None => Ok(()),
+    }
 }
 
 /// Enforce repo validity and the owner allowlist for a check scope.
@@ -259,22 +273,28 @@ fn validate_check_scope(
     if allowed_owners.is_empty() {
         return Ok(());
     }
-    if let Some(repo) = scope.repo
-        && let Some(have) = owner_of_repo(repo)
-        && !owner_is_allowed(have, allowed_owners)
-    {
-        return Err(WatchlistError::OwnerNotAllowed {
-            owner: have.to_owned(),
-        });
-    }
-    if let Some(owner) = scope.owner
-        && !owner_is_allowed(owner, allowed_owners)
-    {
-        return Err(WatchlistError::OwnerNotAllowed {
+    validate_scoped_owner(scope, allowed_owners)
+}
+
+fn validate_scoped_owner(
+    scope: &CheckScope,
+    allowed_owners: &[String],
+) -> Result<(), WatchlistError> {
+    let repo_owner = scope
+        .repo
+        .and_then(owner_of_repo)
+        .filter(|owner| !owner_is_allowed(owner, allowed_owners));
+    let owner = repo_owner.or_else(|| {
+        scope
+            .owner
+            .filter(|owner| !owner_is_allowed(owner, allowed_owners))
+    });
+    match owner {
+        Some(owner) => Err(WatchlistError::OwnerNotAllowed {
             owner: owner.to_owned(),
-        });
+        }),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 fn refresh_targets(
@@ -282,11 +302,10 @@ fn refresh_targets(
     probe: &impl PrProbe,
     targets: &[(String, u64)],
 ) -> Result<CheckReport, WatchlistError> {
-    let now = utc_now_rfc3339();
     let mut pruned = Vec::new();
     let mut checked = Vec::new();
     for target in targets {
-        match refresh_one(list, probe, target, &now)? {
+        match refresh_one(list, probe, target)? {
             RefreshOutcome::Checked(entry) => checked.push(*entry),
             RefreshOutcome::Pruned {
                 repo,
@@ -312,11 +331,11 @@ fn refresh_one(
     list: &mut Watchlist,
     probe: &impl PrProbe,
     target: &(String, u64),
-    now: &str,
 ) -> Result<RefreshOutcome, WatchlistError> {
     let (target_repo, number) = (target.0.as_str(), target.1);
     match probe.view(target_repo, number) {
         Ok(snapshot) => {
+            let now = utc_now_rfc3339();
             let github_state = snapshot.state.to_ascii_uppercase();
             if github_state == "MERGED" || github_state == "CLOSED" {
                 let _ = remove_pr(list, target_repo, number);
@@ -339,11 +358,12 @@ fn refresh_one(
             entry.url = Some(snapshot.url);
             entry.status = status;
             entry.residual_blockers = blockers;
-            entry.last_checked = now.to_owned();
+            entry.last_checked = now;
             entry.check_count = Some(entry.check_count.unwrap_or(0).saturating_add(1));
             Ok(RefreshOutcome::Checked(Box::new(entry.clone())))
         }
         Err(WatchlistError::Timeout { .. }) => {
+            let now = utc_now_rfc3339();
             let Some(entry) = list.get_mut(target_repo, number) else {
                 return Err(WatchlistError::NotFound {
                     repo: target_repo.to_owned(),
@@ -352,7 +372,7 @@ fn refresh_one(
             };
             entry.status = WatchStatus::Timeout;
             entry.residual_blockers = vec!["timeout:gh".to_owned()];
-            entry.last_checked = now.to_owned();
+            entry.last_checked = now;
             entry.check_count = Some(entry.check_count.unwrap_or(0).saturating_add(1));
             Ok(RefreshOutcome::Checked(Box::new(entry.clone())))
         }
@@ -405,34 +425,37 @@ pub fn check_prs_at(
     let owners = allowed_owners
         .map(ToOwned::to_owned)
         .unwrap_or_else(load_allowed_owners);
-    let mut list = load_watchlist(path)?;
-    let scope = CheckScope {
-        owner,
-        repo,
-        numbers,
-    };
-    let targets = select_check_targets(&list, &scope, &owners)?;
-    let now = utc_now_rfc3339();
-    let mut pruned = Vec::new();
-    let mut checked = Vec::new();
-    for target in targets {
-        match refresh_one(&mut list, probe, &target, &now) {
-            Ok(RefreshOutcome::Checked(entry)) => checked.push(*entry),
-            Ok(RefreshOutcome::Pruned {
-                repo,
-                number,
-                state,
-            }) => pruned.push((repo, number, state)),
-            Err(err) => {
-                detect_stacks(&mut list);
-                save_watchlist(path, &list)?;
-                return Err(err);
+    with_watchlist_lock(path, || {
+        let mut list = load_watchlist(path)?;
+        let scope = CheckScope {
+            owner,
+            repo,
+            numbers,
+        };
+        let targets = select_check_targets(&list, &scope, &owners)?;
+        let mut pruned = Vec::new();
+        let mut checked = Vec::new();
+        for target in targets {
+            match refresh_one(&mut list, probe, &target) {
+                Ok(RefreshOutcome::Checked(entry)) => checked.push(*entry),
+                Ok(RefreshOutcome::Pruned {
+                    repo,
+                    number,
+                    state,
+                }) => pruned.push((repo, number, state)),
+                Err(err) => {
+                    detect_stacks(&mut list);
+                    save_watchlist(path, &list)?;
+                    return Err(err);
+                }
             }
+            // Persist every completed probe so an interrupted long cycle loses
+            // at most the currently running target.
+            detect_stacks(&mut list);
+            save_watchlist(path, &list)?;
         }
-        detect_stacks(&mut list);
-        save_watchlist(path, &list)?;
-    }
-    Ok(CheckReport { checked, pruned })
+        Ok(CheckReport { checked, pruned })
+    })
 }
 
 fn validate_repo(repo: &str) -> Result<(), WatchlistError> {

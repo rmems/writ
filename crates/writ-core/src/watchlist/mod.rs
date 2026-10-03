@@ -4,9 +4,8 @@
 //! job-status objects, read-only today). The watchlist lives in
 //! `watchlist.json` under the same state root, or `WRIT_WATCHLIST_PATH`.
 //!
-//! Single-writer: callers must not run two `check-all` processes against the
-//! same file. Writes are temp-file + rename; corrupt files are quarantined
-//! rather than silently overwritten.
+//! Mutations are serialized with a sidecar file lock. Writes are temp-file +
+//! rename; corrupt files are quarantined rather than silently overwritten.
 
 mod classify;
 mod import;

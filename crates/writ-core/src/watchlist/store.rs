@@ -57,7 +57,16 @@ pub fn owner_is_allowed(owner: &str, allowed: &[String]) -> bool {
 pub fn load_watchlist(path: &Path) -> Result<Watchlist, WatchlistError> {
     let data = match fs::read_to_string(path) {
         Ok(data) => data,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Watchlist::default()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            if !recover_replacement_backup(path)? {
+                return Ok(Watchlist::default());
+            }
+            fs::read_to_string(path).map_err(|source| WatchlistError::Io {
+                context: "read recovered watchlist",
+                path: path.to_path_buf(),
+                source,
+            })?
+        }
         Err(err) => {
             return Err(WatchlistError::Io {
                 context: "read watchlist",
@@ -106,17 +115,74 @@ pub fn save_watchlist(path: &Path, list: &Watchlist) -> Result<(), WatchlistErro
     atomic_write(path, &body)
 }
 
-/// Load, mutate, then save. Reloads immediately before `mutate` so a stale
-/// in-memory snapshot is less likely to clobber a newer file. Do not run two
-/// `check-all` writers against the same path.
+/// Load, mutate, then save while holding the path's cross-process lock.
 pub fn mutate_watchlist<T>(
     path: &Path,
     mutate: impl FnOnce(&mut Watchlist) -> Result<T, WatchlistError>,
 ) -> Result<T, WatchlistError> {
-    let mut list = load_watchlist(path)?;
-    let result = mutate(&mut list)?;
-    save_watchlist(path, &list)?;
-    Ok(result)
+    with_watchlist_lock(path, || {
+        let mut list = load_watchlist(path)?;
+        let result = mutate(&mut list)?;
+        save_watchlist(path, &list)?;
+        Ok(result)
+    })
+}
+
+/// Serialize a complete read/modify/write cycle across processes. The lock file
+/// stays in place: deleting it would let a new process lock a different inode
+/// while an existing writer still holds the old one.
+pub(crate) fn with_watchlist_lock<T>(
+    path: &Path,
+    action: impl FnOnce() -> Result<T, WatchlistError>,
+) -> Result<T, WatchlistError> {
+    let lock_path = path.with_extension(format!(
+        "{}lock",
+        path.extension()
+            .map(|extension| format!("{}.", extension.to_string_lossy()))
+            .unwrap_or_default()
+    ));
+    if let Some(parent) = lock_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).map_err(|source| WatchlistError::Io {
+            context: "create watchlist lock directory",
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|source| WatchlistError::Io {
+            context: "open watchlist lock",
+            path: lock_path.clone(),
+            source,
+        })?;
+    set_private_mode(&lock_path).map_err(|source| WatchlistError::Io {
+        context: "set watchlist lock mode",
+        path: lock_path.clone(),
+        source,
+    })?;
+    lock.lock().map_err(|source| WatchlistError::Io {
+        context: "lock watchlist",
+        path: lock_path.clone(),
+        source,
+    })?;
+    let result = action();
+    let unlock = lock.unlock().map_err(|source| WatchlistError::Io {
+        context: "unlock watchlist",
+        path: lock_path,
+        source,
+    });
+    match (result, unlock) {
+        (Err(err), _) => Err(err),
+        (Ok(_), Err(err)) => Err(err),
+        (Ok(value), Ok(())) => Ok(value),
+    }
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), WatchlistError> {
@@ -196,6 +262,32 @@ fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
     }
 }
 
+/// Recover a Windows replacement backup left by a crash between the two
+/// renames. `hard_link` reserves the canonical path without overwriting a file
+/// that another process may have restored concurrently.
+fn recover_replacement_backup(path: &Path) -> Result<bool, WatchlistError> {
+    let backup = path.with_extension("bak-replace");
+    match fs::hard_link(&backup, path) {
+        Ok(()) => {
+            let _ = fs::remove_file(backup);
+            Ok(true)
+        }
+        Err(err)
+            if matches!(
+                err.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::AlreadyExists
+            ) =>
+        {
+            Ok(path.exists())
+        }
+        Err(source) => Err(WatchlistError::Io {
+            context: "recover watchlist replacement backup",
+            path: backup,
+            source,
+        }),
+    }
+}
+
 /// Create the temp file with `create_new(true)` semantics. On Unix the file is
 /// created with mode `0o600` at creation time (via `OpenOptionsExt::mode`) so
 /// the private bytes are never briefly world/group-readable under the umask.
@@ -227,10 +319,6 @@ fn quarantine_corrupt(path: &Path) -> Result<PathBuf, WatchlistError> {
         .unwrap_or_else(|| std::ffi::OsStr::new("watchlist.json"))
         .to_string_lossy()
         .into_owned();
-    // Attempt the rename directly and only bump the suffix on AlreadyExists;
-    // an exists()-then-rename pre-check has a TOCTOU race. POSIX rename
-    // overwrites the destination, so this loop primarily hardens the
-    // Windows/edge path where rename refuses an existing target.
     let mut n = 0_u32;
     loop {
         let candidate = if n == 0 {
@@ -238,19 +326,27 @@ fn quarantine_corrupt(path: &Path) -> Result<PathBuf, WatchlistError> {
         } else {
             path.with_file_name(format!("{base}.corrupt.{stamp}.{n}"))
         };
-        match fs::rename(path, &candidate) {
-            Ok(()) => return Ok(candidate),
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
-                n += 1;
-            }
-            Err(err) => {
-                return Err(WatchlistError::Io {
-                    context: "quarantine corrupt watchlist",
-                    path: path.to_path_buf(),
-                    source: err,
-                });
-            }
+        if reserve_quarantine_path(path, &candidate)? {
+            fs::remove_file(path).map_err(|source| WatchlistError::Io {
+                context: "remove quarantined watchlist source",
+                path: path.to_path_buf(),
+                source,
+            })?;
+            return Ok(candidate);
         }
+        n += 1;
+    }
+}
+
+fn reserve_quarantine_path(path: &Path, candidate: &Path) -> Result<bool, WatchlistError> {
+    match fs::hard_link(path, candidate) {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+        Err(source) => Err(WatchlistError::Io {
+            context: "quarantine corrupt watchlist",
+            path: path.to_path_buf(),
+            source,
+        }),
     }
 }
 
@@ -388,6 +484,89 @@ mod tests {
             }
             other => panic!("expected corrupt, got {other}"),
         }
+    }
+
+    #[test]
+    fn same_second_quarantines_preserve_both_corrupt_files() {
+        let path = unique_path("watchlist-corrupt-collision");
+        fs::write(&path, "first corrupt body").unwrap();
+        let first = match load_watchlist(&path).unwrap_err() {
+            WatchlistError::Corrupt { quarantine, .. } => quarantine,
+            other => panic!("expected corrupt, got {other}"),
+        };
+        fs::write(&path, "second corrupt body").unwrap();
+        let second = match load_watchlist(&path).unwrap_err() {
+            WatchlistError::Corrupt { quarantine, .. } => quarantine,
+            other => panic!("expected corrupt, got {other}"),
+        };
+
+        assert_ne!(first, second);
+        assert_eq!(fs::read_to_string(&first).unwrap(), "first corrupt body");
+        assert_eq!(fs::read_to_string(&second).unwrap(), "second corrupt body");
+        let _ = fs::remove_file(first);
+        let _ = fs::remove_file(second);
+    }
+
+    #[test]
+    fn missing_canonical_path_recovers_windows_replacement_backup() {
+        let path = unique_path("watchlist-backup-recovery");
+        let backup = path.with_extension("bak-replace");
+        let mut list = Watchlist::default();
+        list.prs.push(sample_entry());
+        save_watchlist(&backup, &list).unwrap();
+
+        let loaded = load_watchlist(&path).unwrap();
+
+        assert_eq!(loaded.prs.len(), 1);
+        assert!(path.exists());
+        assert!(!backup.exists());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn concurrent_mutations_preserve_both_updates() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let path = unique_path("watchlist-concurrent-mutations");
+        let lock = path.with_extension("json.lock");
+        let (entered_tx, entered_rx) = mpsc::sync_channel(0);
+        let first_path = path.clone();
+        let first = std::thread::spawn(move || {
+            mutate_watchlist(&first_path, |list| {
+                entered_tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(100));
+                let mut entry = sample_entry();
+                entry.number = 1;
+                list.prs.push(entry);
+                Ok(())
+            })
+            .unwrap();
+        });
+        entered_rx.recv().unwrap();
+        let second_path = path.clone();
+        let second = std::thread::spawn(move || {
+            mutate_watchlist(&second_path, |list| {
+                let mut entry = sample_entry();
+                entry.number = 2;
+                list.prs.push(entry);
+                Ok(())
+            })
+            .unwrap();
+        });
+        first.join().unwrap();
+        second.join().unwrap();
+
+        let mut numbers: Vec<_> = load_watchlist(&path)
+            .unwrap()
+            .prs
+            .into_iter()
+            .map(|entry| entry.number)
+            .collect();
+        numbers.sort_unstable();
+        assert_eq!(numbers, vec![1, 2]);
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(lock);
     }
 
     #[test]

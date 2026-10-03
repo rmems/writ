@@ -53,8 +53,8 @@ as described above.
 
 The local coordination authority is one SQLite lease store (`leases` and
 `agents`) shared by processes on the **same host**. Matching filesystem paths on
-separate hosts do not make a shared store. `status`, `jobs`, `worktree list`, and
-`status` / `jobs` are views of that store. The separate PR watchlist is external
+separate hosts do not make a shared store. `status`, `jobs`, and `worktree list`
+are views of that store. The separate PR watchlist is external
 GitHub visibility, not an ownership or coordination registry.
 
 The harness owns checkout/worktree creation and deletion. Current writ commands

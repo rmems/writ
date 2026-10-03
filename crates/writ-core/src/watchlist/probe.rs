@@ -119,28 +119,30 @@ fn parse_probe_output(
         });
     }
     if output.exit_code != Some(0) {
-        let stderr = output.stderr.trim();
-        if looks_like_timeout(stderr) {
-            return Err(WatchlistError::Timeout {
-                repo: repo.to_owned(),
-                number,
-                message: stderr.to_owned(),
-            });
-        }
-        return Err(WatchlistError::Gh {
-            repo: repo.to_owned(),
-            number,
-            message: if stderr.is_empty() {
-                match output.exit_code {
-                    Some(code) => format!("gh pr view exited {code}"),
-                    None => "gh pr view was killed".to_owned(),
-                }
-            } else {
-                stderr.to_owned()
-            },
-        });
+        return Err(probe_failure(repo, number, &output));
     }
     Ok(output.stdout)
+}
+
+fn probe_failure(repo: &str, number: u64, output: &SupervisedOutput) -> WatchlistError {
+    let stderr = output.stderr.trim();
+    if looks_like_timeout(stderr) {
+        return WatchlistError::Timeout {
+            repo: repo.to_owned(),
+            number,
+            message: stderr.to_owned(),
+        };
+    }
+    let message = match (stderr.is_empty(), output.exit_code) {
+        (false, _) => stderr.to_owned(),
+        (true, Some(code)) => format!("gh pr view exited {code}"),
+        (true, None) => "gh pr view was killed".to_owned(),
+    };
+    WatchlistError::Gh {
+        repo: repo.to_owned(),
+        number,
+        message,
+    }
 }
 
 fn looks_like_timeout(message: &str) -> bool {

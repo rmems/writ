@@ -50,24 +50,40 @@ fn classify_checks(
 ) -> bool {
     let mut failed = false;
     for check in checks {
-        let state = check.state.to_ascii_uppercase();
-        if matches!(
-            state.as_str(),
-            "FAILURE" | "FAIL" | "ERROR" | "TIMED_OUT" | "CANCELLED" | "STARTUP_FAILURE" | "STALE"
-        ) {
-            failed = true;
-            blockers.push(format!("class_a:{}", sanitize_token(&check.name)));
-        } else if state == "ACTION_REQUIRED" {
-            blockers.push(format!("class_b:{}", sanitize_token(&check.name)));
-        } else if matches!(
-            state.as_str(),
-            "PENDING" | "IN_PROGRESS" | "QUEUED" | "EXPECTED" | "UNKNOWN"
-        ) {
-            *pending = true;
-            blockers.push(format!("class_c:{}", sanitize_token(&check.name)));
+        match check_class(&check.state) {
+            CheckClass::Failed => {
+                failed = true;
+                blockers.push(format!("class_a:{}", sanitize_token(&check.name)));
+            }
+            CheckClass::ActionRequired => {
+                blockers.push(format!("class_b:{}", sanitize_token(&check.name)));
+            }
+            CheckClass::Pending => {
+                *pending = true;
+                blockers.push(format!("class_c:{}", sanitize_token(&check.name)));
+            }
+            CheckClass::Successful => {}
         }
     }
     failed
+}
+
+enum CheckClass {
+    Failed,
+    ActionRequired,
+    Pending,
+    Successful,
+}
+
+fn check_class(state: &str) -> CheckClass {
+    match state.to_ascii_uppercase().as_str() {
+        "FAILURE" | "FAIL" | "ERROR" | "TIMED_OUT" | "CANCELLED" | "STARTUP_FAILURE" | "STALE" => {
+            CheckClass::Failed
+        }
+        "ACTION_REQUIRED" => CheckClass::ActionRequired,
+        "SUCCESS" | "NEUTRAL" | "SKIPPED" => CheckClass::Successful,
+        _ => CheckClass::Pending,
+    }
 }
 
 /// Push a `review:` blocker when the review decision still gates the merge.
@@ -87,9 +103,10 @@ fn resolve_status(
     failed: bool,
     pending: bool,
 ) -> (WatchStatus, Vec<String>) {
+    let no_check_signal = snapshot.checks.is_empty() && blockers.is_empty();
     let status = if failed {
         WatchStatus::Failed
-    } else if pending || (snapshot.checks.is_empty() && blockers.is_empty()) {
+    } else if pending || no_check_signal {
         WatchStatus::Pending
     } else if !blockers.is_empty() {
         WatchStatus::Residual
