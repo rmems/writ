@@ -18,22 +18,19 @@ fn shell_flag() -> &'static str {
     platform_pair("/C", "-c")
 }
 
-/// Assert the standard "supervisor killed the child on a timeout" outcome:
-/// the run timed out, the child was killed, the timeout class and error code
-/// match, and the supervisor never redispatched internally.
-fn assert_timeout_outcome(
+/// Standard "supervisor killed the child on a timeout" shape: the run timed
+/// out, the child was killed, the class and error code match, and the
+/// supervisor never redispatched internally.
+fn is_killed_timeout(
     output: &SupervisedOutput,
     expected_class: TimeoutClass,
     expected_code: SupervisorErrorCode,
-) {
-    assert!(
-        output.timed_out
-            && output.killed
-            && output.timeout_class == Some(expected_class)
-            && output.error_code == Some(expected_code)
-            && output.redispatch_count == 0,
-        "timeout outcome mismatch: {output:?}"
-    );
+) -> bool {
+    output.timed_out
+        && output.killed
+        && output.timeout_class == Some(expected_class)
+        && output.error_code == Some(expected_code)
+        && output.redispatch_count == 0
 }
 
 fn hanging_script() -> &'static str {
@@ -61,10 +58,8 @@ async fn run_hanging_with_policy(policy: &TimeoutPolicy, options: &RunOptions) -
         .await
 }
 
-fn assert_json_contains(json: &str, needles: &[&str]) {
-    for needle in needles {
-        assert!(json.contains(needle), "{json}");
-    }
+fn json_contains_all(json: &str, needles: &[&str]) -> bool {
+    needles.iter().all(|needle| json.contains(needle))
 }
 
 fn assert_completed_without_idle(output: &SupervisedOutput) {
@@ -76,17 +71,16 @@ fn assert_completed_without_idle(output: &SupervisedOutput) {
     );
 }
 
-fn assert_permit_wait_timeout(output: &SupervisedOutput) {
-    assert_eq!(output.timeout_class, Some(TimeoutClass::PermitWait));
-    assert_eq!(output.recovery_stage, Some(RecoveryStage::None));
-    assert!(output.timed_out && !output.killed);
-}
-
-fn assert_permit_wait_residual(output: &SupervisedOutput) {
-    let residual = output.residual.as_ref().expect("permit-wait residual");
-    assert_eq!(residual.timeout_class, TimeoutClass::PermitWait);
-    assert!(!residual.redispatch_forbidden());
-    assert!(output.stderr.contains("max-parallel permit"));
+fn is_permit_wait_timeout(output: &SupervisedOutput) -> bool {
+    let residual_ok = output.residual.as_ref().is_some_and(|residual| {
+        residual.timeout_class == TimeoutClass::PermitWait && !residual.redispatch_forbidden()
+    });
+    output.timeout_class == Some(TimeoutClass::PermitWait)
+        && output.recovery_stage == Some(RecoveryStage::None)
+        && output.timed_out
+        && !output.killed
+        && residual_ok
+        && output.stderr.contains("max-parallel permit")
 }
 
 fn occupy_script() -> &'static str {
@@ -164,15 +158,20 @@ async fn captures_stderr() {
         .run_unchecked(shell_program(), &[shell_flag(), script], None)
         .await;
 
-    assert_eq!(output.exit_code, Some(0), "stderr={}", output.stderr);
-    assert_eq!(output.stderr.trim(), "err");
+    assert!(
+        output.exit_code == Some(0) && output.stderr.trim() == "err",
+        "expected stderr err: {output:?}"
+    );
 }
 
 #[tokio::test]
 async fn timeout_kills_process_group() {
     let output = run_hanging(Duration::from_millis(200)).await;
-    assert_timeout_outcome(&output, TimeoutClass::Hard, SupervisorErrorCode::TimedOut);
-    assert!(output.exit_code.is_none());
+    assert!(
+        is_killed_timeout(&output, TimeoutClass::Hard, SupervisorErrorCode::TimedOut)
+            && output.exit_code.is_none(),
+        "process-group timeout mismatch: {output:?}"
+    );
 }
 
 #[cfg(unix)]
@@ -188,11 +187,9 @@ async fn timeout_remains_active_while_draining_inherited_pipes() {
         )
         .await;
 
-    assert!(output.timed_out, "output={output:?}");
-    assert!(output.killed, "output={output:?}");
     assert!(
-        started.elapsed() < Duration::from_secs(5),
-        "supervisor hung while draining inherited pipes"
+        output.timed_out && output.killed && started.elapsed() < Duration::from_secs(5),
+        "supervisor hung or failed to kill while draining inherited pipes: {output:?}"
     );
 }
 
@@ -258,32 +255,38 @@ async fn serializes_to_json_with_all_fields() {
     };
 
     let json = serde_json::to_string(&output).unwrap();
-    assert_json_contains(
-        &json,
-        &[
-            "\"exit_code\":0",
-            "\"timed_out\":false",
-            "\"killed\":false",
-            "\"stdout\":\"hello\\n\"",
-            "\"stderr\":\"\"",
-        ],
+    assert!(
+        json_contains_all(
+            &json,
+            &[
+                "\"exit_code\":0",
+                "\"timed_out\":false",
+                "\"killed\":false",
+                "\"stdout\":\"hello\\n\"",
+                "\"stderr\":\"\"",
+            ],
+        ),
+        "{json}"
     );
 }
 
 #[tokio::test]
 async fn timeout_output_serializes_correctly() {
     let output = run_hanging(Duration::from_millis(200)).await;
-    assert_timeout_outcome(&output, TimeoutClass::Hard, SupervisorErrorCode::TimedOut);
     let json = serde_json::to_string(&output).unwrap();
-    assert_json_contains(
-        &json,
-        &[
-            "\"timed_out\":true",
-            "\"killed\":true",
-            "\"exit_code\":null",
-            "TIMED_OUT",
-            "\"timeout_class\":\"hard\"",
-        ],
+    assert!(
+        is_killed_timeout(&output, TimeoutClass::Hard, SupervisorErrorCode::TimedOut)
+            && json_contains_all(
+                &json,
+                &[
+                    "\"timed_out\":true",
+                    "\"killed\":true",
+                    "\"exit_code\":null",
+                    "TIMED_OUT",
+                    "\"timeout_class\":\"hard\"",
+                ],
+            ),
+        "{json} {output:?}"
     );
 }
 
@@ -317,14 +320,13 @@ async fn idle_timeout_kills_silent_hang() {
     };
     let started = Instant::now();
     let output = run_hanging_with_policy(&policy, &RunOptions::default()).await;
-    assert_timeout_outcome(
-        &output,
-        TimeoutClass::Idle,
-        SupervisorErrorCode::IdleTimedOut,
-    );
     assert!(
-        started.elapsed() < Duration::from_secs(5),
-        "idle detector hung instead of recovering"
+        is_killed_timeout(
+            &output,
+            TimeoutClass::Idle,
+            SupervisorErrorCode::IdleTimedOut
+        ) && started.elapsed() < Duration::from_secs(5),
+        "idle detector hung instead of recovering: {output:?}"
     );
 }
 
@@ -360,22 +362,24 @@ async fn progress_ticks_while_waiting() {
         ..TimeoutPolicy::from_worker_timeout(None)
     };
     let output = run_hanging_with_policy(&policy, &options).await;
-    assert!(output.timed_out);
     let deadline = Instant::now() + Duration::from_secs(1);
     while hits.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
         tokio::task::yield_now().await;
     }
     assert!(
-        hits.load(Ordering::SeqCst) >= 1,
-        "expected progress ticks while waiting"
+        output.timed_out && hits.load(Ordering::SeqCst) >= 1,
+        "expected progress ticks while waiting: {output:?}"
     );
 }
 
 #[tokio::test]
 async fn supervisor_does_not_redispatch_on_timeout() {
     let output = run_hanging(Duration::from_millis(150)).await;
-    assert_timeout_outcome(&output, TimeoutClass::Hard, SupervisorErrorCode::TimedOut);
-    assert!(!TimeoutClass::Hard.counts_toward_fix_cap());
+    assert!(
+        is_killed_timeout(&output, TimeoutClass::Hard, SupervisorErrorCode::TimedOut)
+            && !TimeoutClass::Hard.counts_toward_fix_cap(),
+        "supervisor redispatched or counted a timeout as a fix: {output:?}"
+    );
 }
 
 #[tokio::test]
@@ -403,62 +407,83 @@ async fn wall_clock_includes_permit_wait() {
         )
         .await
         .unwrap();
-    assert_permit_wait_timeout(&output);
-    assert_permit_wait_residual(&output);
     assert!(
-        supervisor.active() == 1 && queued.elapsed() < Duration::from_secs(2),
-        "queued run should time out without waiting for the holder"
+        is_permit_wait_timeout(&output)
+            && supervisor.active() == 1
+            && queued.elapsed() < Duration::from_secs(2),
+        "queued run should time out without waiting for the holder: {output:?}"
     );
     let _ = holder.await;
 }
 
 #[cfg(unix)]
-#[tokio::test]
-async fn graceful_cancel_then_kill_when_term_ignored() {
-    let policy = TimeoutPolicy {
-        worker: Some(Duration::from_millis(200)),
-        grace: Duration::from_millis(200),
-        progress_every: None,
-        ..TimeoutPolicy::from_worker_timeout(None)
-    };
-    let output = Supervisor::new(1)
-        .run_unchecked_with_policy(
-            shell_program(),
-            &[shell_flag(), "trap '' TERM; while true; do :; done"],
-            &policy,
-            &RunOptions::default(),
-        )
-        .await;
-    assert_timeout_outcome(&output, TimeoutClass::Hard, SupervisorErrorCode::TimedOut);
-    assert_eq!(output.recovery_stage, Some(RecoveryStage::Kill));
+struct GraceCase {
+    worker_ms: u64,
+    grace_ms: u64,
+    script: &'static str,
+    stage: RecoveryStage,
+    killed: bool,
+    bound: Option<Duration>,
 }
 
 #[cfg(unix)]
-#[tokio::test]
-async fn grace_period_sends_term_before_kill() {
-    let policy = TimeoutPolicy {
-        worker: Some(Duration::from_millis(150)),
-        grace: Duration::from_millis(800),
-        progress_every: None,
-        ..TimeoutPolicy::from_worker_timeout(None)
+fn grace_case_matches(case: &GraceCase, output: &SupervisedOutput, elapsed: Duration) -> bool {
+    let within_bound = case.bound.is_none_or(|limit| elapsed < limit);
+    let killed_timeout = if case.killed {
+        is_killed_timeout(output, TimeoutClass::Hard, SupervisorErrorCode::TimedOut)
+    } else {
+        output.timed_out && output.timeout_class == Some(TimeoutClass::Hard) && !output.killed
     };
-    let started = Instant::now();
-    let output = Supervisor::new(1)
-        .run_unchecked_with_policy(
-            shell_program(),
-            &[shell_flag(), "trap 'exit 0' TERM; sleep 60"],
-            &policy,
-            &RunOptions::default(),
-        )
-        .await;
-    assert!(
-        output.timed_out
-            && output.timeout_class == Some(TimeoutClass::Hard)
-            && output.recovery_stage == Some(RecoveryStage::GracefulCancel)
-            && !output.killed
-            && started.elapsed() < Duration::from_secs(3),
-        "expected SIGTERM reap during grace: {output:?}"
-    );
+    killed_timeout && output.recovery_stage == Some(case.stage) && within_bound
+}
+
+/// TERM-ignored children escalate to kill; TERM-sensitive children exit in grace.
+///
+/// One scenario runner covers both so the two scripts are not duplicated tests.
+#[cfg(unix)]
+#[tokio::test]
+async fn graceful_cancel_follows_term_sensitivity() {
+    let cases = [
+        GraceCase {
+            worker_ms: 200,
+            grace_ms: 200,
+            script: "trap '' TERM; while true; do :; done",
+            stage: RecoveryStage::Kill,
+            killed: true,
+            bound: None,
+        },
+        GraceCase {
+            worker_ms: 150,
+            grace_ms: 800,
+            script: "trap 'exit 0' TERM; sleep 60",
+            stage: RecoveryStage::GracefulCancel,
+            killed: false,
+            bound: Some(Duration::from_secs(3)),
+        },
+    ];
+    for case in cases {
+        let policy = TimeoutPolicy {
+            worker: Some(Duration::from_millis(case.worker_ms)),
+            grace: Duration::from_millis(case.grace_ms),
+            progress_every: None,
+            ..TimeoutPolicy::from_worker_timeout(None)
+        };
+        let started = Instant::now();
+        let output = Supervisor::new(1)
+            .run_unchecked_with_policy(
+                shell_program(),
+                &[shell_flag(), case.script],
+                &policy,
+                &RunOptions::default(),
+            )
+            .await;
+        let elapsed = started.elapsed();
+        assert!(
+            grace_case_matches(&case, &output, elapsed),
+            "grace case mismatch script={} output={output:?}",
+            case.script
+        );
+    }
 }
 
 #[tokio::test]
@@ -471,29 +496,41 @@ async fn idle_detects_silent_child_without_wall_clock() {
     };
     let started = Instant::now();
     let output = run_hanging_with_policy(&policy, &RunOptions::default()).await;
-    assert_timeout_outcome(
-        &output,
-        TimeoutClass::Idle,
-        SupervisorErrorCode::IdleTimedOut,
-    );
     assert!(
-        policy.worker.is_none()
+        is_killed_timeout(
+            &output,
+            TimeoutClass::Idle,
+            SupervisorErrorCode::IdleTimedOut
+        ) && policy.worker.is_none()
             && output.recovery_stage == Some(RecoveryStage::Kill)
-            && started.elapsed() < Duration::from_secs(5)
+            && started.elapsed() < Duration::from_secs(5),
+        "idle stall without a wall clock mismatch: {output:?}"
     );
+}
+
+fn identity_field_keys(value: &serde_json::Value) -> Vec<String> {
+    let Some(obj) = value.as_object() else {
+        return vec!["missing-object".to_owned()];
+    };
+    obj.keys()
+        .filter(|key| {
+            let lower = key.to_ascii_lowercase();
+            lower.contains("sha") || lower.contains("commit") || lower.contains("head")
+        })
+        .cloned()
+        .collect()
 }
 
 #[tokio::test]
 async fn hang_residual_has_no_fake_sha_fields() {
     let output = run_hanging(Duration::from_millis(150)).await;
     let json = serde_json::to_value(&output).unwrap();
-    let residual = json.get("residual").expect("residual");
-    let obj = residual.as_object().expect("object");
-    for key in obj.keys() {
-        let lower = key.to_ascii_lowercase();
-        assert!(
-            !lower.contains("sha") && !lower.contains("commit") && !lower.contains("head"),
-            "timeout residual must not carry identity field `{key}`"
-        );
-    }
+    let keys = json
+        .get("residual")
+        .map(identity_field_keys)
+        .unwrap_or_else(|| vec!["missing-residual".to_owned()]);
+    assert!(
+        keys.is_empty(),
+        "timeout residual must not carry identity fields {keys:?}"
+    );
 }
