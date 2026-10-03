@@ -5,9 +5,6 @@ use rusqlite::{Connection, OptionalExtension, params};
 use super::{Error, Result, lease_err};
 
 pub(super) const INITIAL_SCHEMA: &str = r"
-            PRAGMA foreign_keys = ON;
-            PRAGMA journal_mode = WAL;
-            PRAGMA busy_timeout = 5000;
             CREATE TABLE IF NOT EXISTS leases (
                 id INTEGER PRIMARY KEY,
                 repo TEXT NOT NULL,
@@ -56,6 +53,12 @@ pub(super) const INITIAL_SCHEMA: &str = r"
                 started_at INTEGER NOT NULL,
                 stopped_at INTEGER
             );
+            ";
+
+const STORE_PRAGMAS: &str = r"
+            PRAGMA busy_timeout = 5000;
+            PRAGMA foreign_keys = ON;
+            PRAGMA journal_mode = WAL;
             ";
 
 pub(super) const GRANT_UPSERT: &str = r"
@@ -120,11 +123,26 @@ pub(super) const PREPARE_INSERT: &str = r"
             ";
 
 pub(super) fn apply(conn: &Connection) -> Result<()> {
-    conn.execute_batch(INITIAL_SCHEMA)
-        .map_err(|e| lease_err("initialize lease schema", e))?;
-    ensure_crash_consistency_columns(conn)?;
-    ensure_live_path_unique_index(conn)?;
-    crate::coord::ensure_schema(conn)
+    conn.execute_batch(STORE_PRAGMAS)
+        .map_err(|e| lease_err("configure lease store", e))?;
+    conn.execute_batch("BEGIN IMMEDIATE")
+        .map_err(|e| lease_err("begin lease schema migration", e))?;
+    let result = (|| {
+        conn.execute_batch(INITIAL_SCHEMA)
+            .map_err(|e| lease_err("initialize lease schema", e))?;
+        ensure_crash_consistency_columns(conn)?;
+        ensure_live_path_unique_index(conn)?;
+        crate::coord::ensure_schema(conn)
+    })();
+    match result {
+        Ok(()) => conn
+            .execute_batch("COMMIT")
+            .map_err(|e| lease_err("commit lease schema migration", e)),
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
 }
 
 pub(super) fn table_column_names(conn: &Connection) -> Result<Vec<String>> {
@@ -305,6 +323,7 @@ pub(super) fn update_op_phase(tx: &rusqlite::Transaction<'_>, phase: OpPhase<'_>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Barrier};
 
     fn create_legacy_leases(conn: &Connection) {
         conn.execute_batch(
@@ -370,6 +389,36 @@ mod tests {
             )
             .unwrap();
         assert!(index_exists);
+    }
+
+    #[test]
+    fn concurrent_legacy_migrations_all_succeed() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("leases.db");
+        let conn = Connection::open(&path).unwrap();
+        create_legacy_leases(&conn);
+        drop(conn);
+
+        let workers = 8;
+        let barrier = Arc::new(Barrier::new(workers));
+        let handles = (0..workers)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let conn = Connection::open(path).unwrap();
+                    barrier.wait();
+                    apply(&conn)
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let errors = handles
+            .into_iter()
+            .filter_map(|handle| handle.join().unwrap().err())
+            .collect::<Vec<_>>();
+        assert!(errors.is_empty(), "concurrent migration errors: {errors:?}");
+        assert!(has_crash_consistency_columns(&Connection::open(&path).unwrap()).unwrap());
     }
 
     #[test]
