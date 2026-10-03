@@ -213,6 +213,17 @@ fn clear_released_claim(
         params![grant.owner, grant.repo_name, grant.job_id],
     )
     .map_err(|e| lease_err("clear stale coord claim on regrant", e))?;
+    tx.execute(
+        "
+        DELETE FROM coord_messages
+        WHERE kind = 'handoff' AND acked_at IS NULL AND (
+            (from_owner = ?1 AND from_repo_name = ?2 AND from_job_id = ?3)
+            OR (to_owner = ?1 AND to_repo_name = ?2 AND to_job_id = ?3)
+        )
+        ",
+        params![grant.owner, grant.repo_name, grant.job_id],
+    )
+    .map_err(|e| lease_err("clear stale coord messages on regrant", e))?;
     Ok(())
 }
 

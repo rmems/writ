@@ -117,19 +117,9 @@ impl CheckoutRegistry {
         existing: &Lease,
     ) -> Result<bool> {
         if !registration_matches_lease(info, existing) {
-            return Err(Error::PolicyViolation {
-                code: PolicyCode::LeaseConflict,
-                message: format!(
-                    "interrupted lease for {}/{}/{job_id} protects `{}` on `{}`; refusing to resume it for `{}` on `{}`",
-                    info.owner,
-                    info.repo_name,
-                    existing.worktree_path,
-                    existing.branch,
-                    info.path.display(),
-                    info.branch.as_deref().unwrap_or(DETACHED_BRANCH)
-                ),
-            });
+            return Err(interrupted_identity_error(info, job_id, existing));
         }
+        let expected_operation_id = existing.operation_id.clone();
         let Some(outcome) = self
             .leases
             .reconcile(registration_job_key(info, job_id), &info.common_dir)?
@@ -137,17 +127,43 @@ impl CheckoutRegistry {
             return Ok(false);
         };
         match outcome {
-            ReconcileOutcome::Promoted { .. } | ReconcileOutcome::AlreadyActive { .. } => Ok(true),
+            ReconcileOutcome::Promoted { lease, .. }
+            | ReconcileOutcome::AlreadyActive { lease, .. } => {
+                self.ensure_reconciled_identity(info, job_id, &expected_operation_id, &lease)?;
+                Ok(true)
+            }
             ReconcileOutcome::Retry { .. } => Ok(false),
             ReconcileOutcome::NeedsAttention { lease, inspection } => {
                 Err(attention_error(&lease, &inspection))
             }
-            ReconcileOutcome::Released { .. } => {
+            ReconcileOutcome::Released { lease, .. } => {
+                self.ensure_reconciled_identity(info, job_id, &expected_operation_id, &lease)?;
                 self.leases.grant(registration_grant(info, job_id))?;
                 Ok(true)
             }
             ReconcileOutcome::Tombstoned { lease, .. } => Err(tombstoned_op_error(&lease)),
         }
+    }
+
+    fn ensure_reconciled_identity(
+        &self,
+        info: &CheckoutInfo,
+        job_id: &str,
+        expected_operation_id: &str,
+        outcome_lease: &Lease,
+    ) -> Result<()> {
+        let current = self.leases.find_job(registration_job_key(info, job_id))?;
+        if reconciled_identity_matches(info, expected_operation_id, outcome_lease)
+            && current.as_ref().is_some_and(|lease| {
+                reconciled_identity_matches(info, expected_operation_id, lease)
+            })
+        {
+            return Ok(());
+        }
+        Err(current.as_ref().map_or_else(
+            || changed_during_reconcile_error(info, job_id, expected_operation_id),
+            |lease| interrupted_identity_error(info, job_id, lease),
+        ))
     }
 
     fn commit_new_registration(&self, info: &CheckoutInfo, job_id: &str) -> Result<()> {
@@ -203,6 +219,49 @@ fn registration_matches_lease(info: &CheckoutInfo, lease: &Lease) -> bool {
     let repo_matches = crate::paths::same_existing_path(Path::new(&lease.repo), &info.common_dir)
         || lease.repo == info.common_dir.to_string_lossy();
     path_matches && repo_matches && lease.branch == branch
+}
+
+/// A reconciled outcome still authorizes success only when it carries the
+/// interrupted operation the caller validated and still describes this
+/// checkout. Operation binding catches a replacement row that happens to
+/// share the same path/branch.
+fn reconciled_identity_matches(
+    info: &CheckoutInfo,
+    expected_operation_id: &str,
+    lease: &Lease,
+) -> bool {
+    lease.operation_id == expected_operation_id && registration_matches_lease(info, lease)
+}
+
+fn interrupted_identity_error(info: &CheckoutInfo, job_id: &str, existing: &Lease) -> Error {
+    Error::PolicyViolation {
+        code: PolicyCode::LeaseConflict,
+        message: format!(
+            "interrupted lease for {}/{}/{job_id} protects `{}` on `{}`; refusing to resume it for `{}` on `{}`",
+            info.owner,
+            info.repo_name,
+            existing.worktree_path,
+            existing.branch,
+            info.path.display(),
+            info.branch.as_deref().unwrap_or(DETACHED_BRANCH)
+        ),
+    }
+}
+
+fn changed_during_reconcile_error(
+    info: &CheckoutInfo,
+    job_id: &str,
+    expected_operation_id: &str,
+) -> Error {
+    Error::PolicyViolation {
+        code: PolicyCode::LeaseConflict,
+        message: format!(
+            "interrupted lease for {}/{}/{job_id} changed during reconcile (expected operation `{expected_operation_id}`); refusing to report success for `{}`",
+            info.owner,
+            info.repo_name,
+            info.path.display(),
+        ),
+    }
 }
 
 fn registration_grant<'a>(info: &'a CheckoutInfo, job_id: &'a str) -> LeaseGrant<'a> {
@@ -759,6 +818,34 @@ mod tests {
             stored.worktree_path
         );
         assert_eq!(stored.allocation_state, AllocationState::Prepared);
+
+        let replacement = rusqlite::Connection::open(&store_path).unwrap();
+        replacement
+            .execute(
+                "UPDATE leases SET operation_id = 'replacement-operation' WHERE job_id = 'shared-job'",
+                [],
+            )
+            .unwrap();
+        drop(replacement);
+        let replacement = registry
+            .leases
+            .find_job(JobKey {
+                owner: &info.owner,
+                repo_name: &info.repo_name,
+                job_id: "shared-job",
+            })
+            .unwrap()
+            .unwrap();
+        let err = registry
+            .ensure_reconciled_identity(&info, "shared-job", &stored.operation_id, &replacement)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::LeaseConflict,
+                ..
+            }
+        ));
     }
 
     #[test]

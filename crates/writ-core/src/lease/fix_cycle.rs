@@ -202,6 +202,12 @@ impl LeaseStore {
             params![now, operation_id],
         )
         .map_err(|e| lease_err("abort fix-cycle", e))?;
+        if tx.changes() != 1 {
+            return Err(Error::LeaseStore {
+                context: "abort fix-cycle",
+                message: "released or tombstoned lease cannot abort fix_cycles".to_owned(),
+            });
+        }
         tx.commit()
             .map_err(|e| lease_err("commit fix-cycle abort", e))?;
         Ok(true)

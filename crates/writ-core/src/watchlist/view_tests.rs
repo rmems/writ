@@ -216,6 +216,14 @@ fn unacked_help_without_pause_is_waiting() {
                 'acme','sample','job-1','hive/job-1','checkout','agent-a',
                 NULL,NULL,'[]',1,NULL,1,1
             );
+            INSERT INTO coord_claims (
+                owner, repo_name, job_id, branch, worktree_path, agent_id,
+                session_id, intent, declared_paths, owner_generation, paused_at,
+                created_at, updated_at
+            ) VALUES (
+                'acme','sample','job-2','hive/job-2','checkout-2','agent-b',
+                NULL,NULL,'[]',1,NULL,1,1
+            );
             INSERT INTO coord_messages (
                 created_at, kind, from_agent_id, from_owner, from_repo_name, from_job_id,
                 to_agent_id, to_owner, to_repo_name, to_job_id, owner_generation,

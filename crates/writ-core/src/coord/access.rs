@@ -44,13 +44,6 @@ pub(super) fn require_active_lease_tx(
     require_active(lease)
 }
 
-pub(super) fn live_lease(store: &LeaseStore, key: JobKey<'_>) -> Result<Lease> {
-    let lease = store
-        .find_job(key)?
-        .ok_or_else(|| missing_lease_error(key))?;
-    require_active(lease)
-}
-
 fn missing_lease_error(key: JobKey<'_>) -> Error {
     Error::PolicyViolation {
         code: PolicyCode::CoordClaimMissing,

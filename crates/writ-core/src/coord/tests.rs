@@ -743,3 +743,162 @@ fn prepared_lease_cannot_announce() {
         .unwrap_err();
     assert!(err.to_string().contains("ACTIVE"));
 }
+
+#[test]
+fn regrant_deletes_stale_handoff_so_it_cannot_transfer_fresh_assignment() {
+    let harness = Harness::new();
+    let worktree = harness.seed_job("job-a", "hive/job-a");
+    announce(&harness.store, "job-a", "agent-a", &[]);
+    let stale = sample_handoff(&harness.store, "gen-1 offer", Some("job-a"));
+    let conn = rusqlite::Connection::open(&harness.path).unwrap();
+    conn.execute(
+        "
+        INSERT INTO coord_messages (
+            created_at, kind, from_agent_id, from_owner, from_repo_name, from_job_id,
+            to_agent_id, to_owner, to_repo_name, to_job_id, owner_generation, body,
+            paths, acked_at
+        ) VALUES (1, 'help', 'agent-a', 'acme', 'sample', 'job-a', NULL, NULL,
+                  NULL, NULL, 1, 'preserved help', '[]', NULL)
+        ",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE coord_messages SET acked_at = 1 WHERE id = ?1",
+        [stale.id],
+    )
+    .unwrap();
+    let stale = sample_handoff(&harness.store, "stale unacked offer", Some("job-a"));
+    harness.store.release_by_path(&worktree).unwrap();
+    harness
+        .store
+        .grant(crate::lease::LeaseGrant {
+            repo: &harness.repo,
+            owner: "acme",
+            repo_name: "sample",
+            job_id: "job-a",
+            branch: "hive/job-a",
+            worktree_path: &worktree,
+            start_commit: &harness.start,
+        })
+        .unwrap();
+    let fresh = announce(&harness.store, "job-a", "agent-c", &[]);
+    assert_eq!(fresh.claim.owner_generation, 1);
+    let peer = LeaseStore::open(&harness.path).unwrap();
+    let err = peer
+        .ack_message(AckRequest {
+            message_id: stale.id,
+            owner: "acme",
+            repo_name: "sample",
+            job_id: "job-a",
+            agent_id: "agent-b",
+            session_id: Some("session-b"),
+        })
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("unknown message"),
+        "stale handoff must not transfer, got {err}"
+    );
+    let bodies = harness
+        .store
+        .inbox(job_key_a())
+        .unwrap()
+        .into_iter()
+        .map(|message| message.body)
+        .collect::<Vec<_>>();
+    assert!(bodies.iter().any(|body| body == "gen-1 offer"));
+    assert!(bodies.iter().any(|body| body == "preserved help"));
+    assert!(!bodies.iter().any(|body| body == "stale unacked offer"));
+    let claim = harness.store.find_claim(job_key_a()).unwrap().unwrap();
+    assert_eq!(
+        (claim.agent_id.as_str(), claim.owner_generation),
+        ("agent-c", 1)
+    );
+}
+
+#[test]
+fn pause_rejects_released_lease_and_transferred_claim() {
+    let harness = Harness::new();
+    let worktree = harness.seed_job("job-a", "hive/job-a");
+    announce(&harness.store, "job-a", "agent-a", &[]);
+    harness.store.release_by_path(&worktree).unwrap();
+    let err = harness
+        .store
+        .pause_claim(PauseRequest {
+            key: job_key_a(),
+            agent_id: "agent-a",
+            body: None,
+        })
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("ACTIVE")
+            || err.to_string().contains("no lease")
+            || err.to_string().contains("released"),
+        "released lease must block pause, got {err}"
+    );
+
+    let harness = Harness::new();
+    harness.seed_job("job-a", "hive/job-a");
+    announce(&harness.store, "job-a", "agent-a", &[]);
+    let peer = LeaseStore::open(&harness.path).unwrap();
+    let handoff = sample_handoff(&harness.store, "transfer to b", Some("job-a"));
+    sample_ack(&peer, handoff.id).unwrap();
+    let err = harness
+        .store
+        .pause_claim(PauseRequest {
+            key: job_key_a(),
+            agent_id: "agent-a",
+            body: None,
+        })
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("owned by"),
+        "transferred claim must reject the prior owner, got {err}"
+    );
+}
+
+#[test]
+fn pause_rechecks_lease_after_waiting_for_the_write_lock() {
+    let harness = Harness::new();
+    harness.seed_job("job-a", "hive/job-a");
+    announce(&harness.store, "job-a", "agent-a", &[]);
+
+    let peer = LeaseStore::open(&harness.path).unwrap();
+    let lock = rusqlite::Connection::open(&harness.path).unwrap();
+    lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let pause = std::thread::spawn(move || {
+        peer.pause_claim(PauseRequest {
+            key: job_key_a(),
+            agent_id: "agent-a",
+            body: None,
+        })
+    });
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    lock.execute(
+        "UPDATE leases SET allocation_state = 'RELEASED', released_at = 1 WHERE job_id = 'job-a'",
+        [],
+    )
+    .unwrap();
+    lock.execute_batch("COMMIT").unwrap();
+
+    let err = pause.join().unwrap().unwrap_err();
+    assert!(err.to_string().contains("ACTIVE"), "got {err}");
+    let claim = harness.store.find_claim(job_key_a()).unwrap().unwrap();
+    assert!(claim.paused_at.is_none());
+}
+
+#[test]
+fn legacy_store_without_coord_tables_has_empty_reads() {
+    let harness = Harness::new();
+    harness.seed_job("job-a", "hive/job-a");
+    drop(harness.store);
+    let conn = rusqlite::Connection::open(&harness.path).unwrap();
+    conn.execute_batch("DROP TABLE coord_messages; DROP TABLE coord_claims;")
+        .unwrap();
+    drop(conn);
+
+    let store = LeaseStore::open_read_only(&harness.path).unwrap();
+    assert!(store.find_claim(job_key_a()).unwrap().is_none());
+    assert!(store.list_claims().unwrap().is_empty());
+    assert!(store.inbox(job_key_a()).unwrap().is_empty());
+}

@@ -109,3 +109,31 @@ fn commit_fix_cycle_requires_mutate() {
     );
     assert_eq!(stored_fix_cycles(&harness), Some(0));
 }
+
+#[test]
+fn abort_after_release_fails_closed_without_false_abort() {
+    let harness = active_job();
+    let token = harness.store.prepare_fix_cycle(harness.key()).unwrap();
+    harness.store.release_by_path(&harness.worktree).unwrap();
+    let err = harness
+        .store
+        .reconcile_fix_cycle(harness.key(), Some(false))
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("released or tombstoned"),
+        "expected fail-closed abort, got {err}"
+    );
+    // Rollback: the allocation op must not read ABORTED, so a later commit
+    // attempt still fails on the released lease rather than silently succeeding.
+    let commit_err = harness
+        .store
+        .commit_fix_cycle(&token.operation_id)
+        .unwrap_err();
+    assert!(
+        commit_err.to_string().contains("released or tombstoned")
+            || commit_err.to_string().contains("unknown pending")
+            || commit_err.to_string().contains("refusing to resurrect"),
+        "expected no inconsistent commit, got {commit_err}"
+    );
+    assert_eq!(stored_fix_cycles(&harness), Some(0));
+}

@@ -26,9 +26,8 @@ pub use types::{
 };
 
 use access::{
-    CLAIM_SELECT, MESSAGE_SELECT, NewMessage, claim_from_row, insert_message, live_lease,
-    load_claim_locked, load_claim_tx, load_message_tx, message_from_row, require_active_lease_tx,
-    require_agent_claim,
+    CLAIM_SELECT, MESSAGE_SELECT, NewMessage, claim_from_row, insert_message, load_claim_locked,
+    load_claim_tx, load_message_tx, message_from_row, require_active_lease_tx, require_agent_claim,
 };
 use ack::{require_ack_recipient, require_complete_recipient, transfer_on_handoff_ack};
 use announce::{AnnounceTx, MailboxDraft, announce_tx, mailbox_from_send, route_generic_ack};
@@ -124,12 +123,18 @@ impl LeaseStore {
     /// Read one claim without mutating it.
     pub fn find_claim(&self, key: JobKey<'_>) -> Result<Option<CoordClaim>> {
         let conn = self.lock()?;
+        if !coord_table_exists(&conn, "coord_claims")? {
+            return Ok(None);
+        }
         load_claim_locked(&conn, key)
     }
 
     /// List claims joined to non-deleted lease rows.
     pub fn list_claims(&self) -> Result<Vec<CoordClaim>> {
         let conn = self.lock()?;
+        if !coord_table_exists(&conn, "coord_claims")? {
+            return Ok(Vec::new());
+        }
         let mut stmt = conn
             .prepare(&format!(
                 "{CLAIM_SELECT} WHERE l.released_at IS NULL AND l.tombstoned_at IS NULL \
@@ -146,6 +151,9 @@ impl LeaseStore {
     /// Inbox for a job: messages it sent, received, or that were broadcast.
     pub fn inbox(&self, key: JobKey<'_>) -> Result<Vec<CoordMessage>> {
         let conn = self.lock()?;
+        if !coord_table_exists(&conn, "coord_messages")? {
+            return Ok(Vec::new());
+        }
         let mut stmt = conn
             .prepare(&format!(
                 "{MESSAGE_SELECT} WHERE \
@@ -201,24 +209,49 @@ impl LeaseStore {
     pub fn pause_claim(&self, request: PauseRequest<'_>) -> Result<(CoordClaim, CoordMessage)> {
         let key = request.key;
         let agent_id = request.agent_id;
-        let lease = live_lease(self, key)?;
-        let claim = require_agent_claim(self, key, agent_id)?;
         let now = now_secs();
         let mut conn = self.lock()?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| coord_err("begin coord pause", e))?;
+        // Authoritative checks run inside the transaction so a concurrent
+        // release or handoff transfer cannot slip between a read and the write.
+        let lease = require_active_lease_tx(&tx, key)?;
+        let claim = load_claim_tx(&tx, key)?
+            .ok_or_else(|| coord_missing("no coordination claim for pause"))?;
+        if claim.agent_id != agent_id {
+            return Err(held_error(&claim));
+        }
+        if claim.worktree_path != lease.worktree_path {
+            return Err(Error::LeaseStore {
+                context: "pause coord claim",
+                message: "pause must not move the leased worktree path".to_owned(),
+            });
+        }
         tx.execute(
             "
             UPDATE coord_claims
             SET paused_at = ?1, updated_at = ?1
-            WHERE owner = ?2 AND repo_name = ?3 AND job_id = ?4 AND agent_id = ?5
+            WHERE owner = ?2 AND repo_name = ?3 AND job_id = ?4
+              AND agent_id = ?5 AND owner_generation = ?6
             ",
-            params![now, key.owner, key.repo_name, key.job_id, agent_id],
+            params![
+                now,
+                key.owner,
+                key.repo_name,
+                key.job_id,
+                agent_id,
+                claim.owner_generation
+            ],
         )
         .map_err(|e| coord_err("pause coord claim", e))?;
         if tx.changes() != 1 {
-            return Err(coord_missing("pause did not update the expected claim"));
+            let current = load_claim_tx(&tx, key)?;
+            return Err(match current {
+                Some(current) if current.agent_id != agent_id => held_error(&current),
+                Some(current) => stale_error(&current, claim.owner_generation),
+                None => coord_missing("pause did not update the expected claim"),
+            });
         }
         let help = insert_message(
             &tx,
@@ -376,4 +409,13 @@ impl LeaseStore {
         tx.commit().map_err(|e| coord_err("commit coord ack", e))?;
         Ok((ack, transferred))
     }
+}
+
+fn coord_table_exists(conn: &rusqlite::Connection, table: &str) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+        [table],
+        |row| row.get(0),
+    )
+    .map_err(|e| coord_err("inspect coord schema", e))
 }

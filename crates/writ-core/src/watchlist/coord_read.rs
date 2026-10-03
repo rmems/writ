@@ -49,6 +49,8 @@ struct ClaimRow {
 struct MessageRow {
     kind: String,
     from_agent_id: String,
+    from_owner: String,
+    from_repo_name: String,
     from_job_id: String,
     to_owner: Option<String>,
     to_repo_name: Option<String>,
@@ -61,7 +63,7 @@ struct MessageRow {
 impl CoordSnapshot {
     pub(crate) fn overlay_for(&self, key: &JobId) -> CoordOverlay {
         let claim = self.claims.get(key);
-        let waiting_on = waiting_on_for(&self.messages, key, claim.map(|c| c.owner_generation));
+        let waiting_on = waiting_on_for(&self.messages, key, &self.claims);
         let overlaps = overlaps_for(&self.messages, key);
         CoordOverlay {
             agent_id: claim.map(|c| c.agent_id.clone()),
@@ -160,7 +162,8 @@ fn claim_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(JobId, ClaimRow)
 
 fn load_messages(conn: &Connection) -> rusqlite::Result<Vec<MessageRow>> {
     let mut stmt = conn.prepare(
-        "SELECT kind, from_agent_id, from_job_id, to_owner, to_repo_name,
+        "SELECT kind, from_agent_id, from_owner, from_repo_name, from_job_id,
+                to_owner, to_repo_name,
                 to_job_id, body, acked_at, owner_generation FROM coord_messages",
     )?;
     let rows = stmt.query_map([], message_from_row)?;
@@ -171,13 +174,15 @@ fn message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageRow> {
     Ok(MessageRow {
         kind: row.get(0)?,
         from_agent_id: row.get(1)?,
-        from_job_id: row.get(2)?,
-        to_owner: row.get(3)?,
-        to_repo_name: row.get(4)?,
-        to_job_id: row.get(5)?,
-        body: row.get(6)?,
-        acked_at: row.get(7)?,
-        owner_generation: row.get(8)?,
+        from_owner: row.get(2)?,
+        from_repo_name: row.get(3)?,
+        from_job_id: row.get(4)?,
+        to_owner: row.get(5)?,
+        to_repo_name: row.get(6)?,
+        to_job_id: row.get(7)?,
+        body: row.get(8)?,
+        acked_at: row.get(9)?,
+        owner_generation: row.get(10)?,
     })
 }
 
@@ -188,25 +193,39 @@ fn parse_paths(raw: &str) -> Vec<String> {
 fn waiting_on_for(
     messages: &[MessageRow],
     key: &JobId,
-    owner_generation: Option<i64>,
+    claims: &BTreeMap<JobId, ClaimRow>,
 ) -> Option<String> {
     messages.iter().find_map(|msg| {
         if msg.acked_at.is_some() || !msg.targets(key) {
             return None;
         }
-        waiting_label(msg, owner_generation)
+        waiting_label(msg, claims)
     })
 }
 
-fn waiting_label(msg: &MessageRow, owner_generation: Option<i64>) -> Option<String> {
+fn waiting_label(msg: &MessageRow, claims: &BTreeMap<JobId, ClaimRow>) -> Option<String> {
     match msg.kind.as_str() {
-        "handoff" if owner_generation != Some(msg.owner_generation) => None,
+        // Handoffs are stamped with the source claim's generation; compare
+        // against the source claim so cross-job handoffs are not filtered by
+        // the recipient's unrelated generation. Same-job handoffs resolve to
+        // the same row, preserving the existing stale filter.
+        "handoff" if source_generation(claims, msg) != Some(msg.owner_generation) => None,
         "help" | "handoff" | "dependency" | "blocker" => Some(format!(
             "{}:{}:{}",
             msg.kind, msg.from_agent_id, msg.from_job_id
         )),
         _ => None,
     }
+}
+
+fn source_generation(claims: &BTreeMap<JobId, ClaimRow>, msg: &MessageRow) -> Option<i64> {
+    claims
+        .get(&JobId::new(
+            &msg.from_owner,
+            &msg.from_repo_name,
+            &msg.from_job_id,
+        ))
+        .map(|claim| claim.owner_generation)
 }
 
 fn overlaps_for(messages: &[MessageRow], key: &JobId) -> Vec<String> {
@@ -255,8 +274,8 @@ mod tests {
                 owner_generation INTEGER, paused_at INTEGER
             );
             CREATE TABLE coord_messages (
-                kind TEXT, from_agent_id TEXT, from_job_id TEXT,
-                to_owner TEXT, to_repo_name TEXT, to_job_id TEXT,
+                kind TEXT, from_agent_id TEXT, from_owner TEXT, from_repo_name TEXT,
+                from_job_id TEXT, to_owner TEXT, to_repo_name TEXT, to_job_id TEXT,
                 body TEXT, acked_at INTEGER, owner_generation INTEGER
             );
             INSERT INTO coord_claims VALUES (
@@ -264,10 +283,12 @@ mod tests {
                 '[\"crates/writ-core\"]', 2, 99
             );
             INSERT INTO coord_messages VALUES (
-                'help','agent-b','job-2','acme','sample','job-1','need review', NULL, 2
+                'help','agent-b','acme','sample','job-2','acme','sample','job-1',
+                'need review', NULL, 2
             );
             INSERT INTO coord_messages VALUES (
-                'overlap','agent-b','job-2','acme','sample','job-1','crates/a', NULL, 2
+                'overlap','agent-b','acme','sample','job-2','acme','sample','job-1',
+                'crates/a', NULL, 2
             );
             ",
         )
@@ -295,15 +316,16 @@ mod tests {
                 owner_generation INTEGER, paused_at INTEGER
             );
             CREATE TABLE coord_messages (
-                kind TEXT, from_agent_id TEXT, from_job_id TEXT,
-                to_owner TEXT, to_repo_name TEXT, to_job_id TEXT,
+                kind TEXT, from_agent_id TEXT, from_owner TEXT, from_repo_name TEXT,
+                from_job_id TEXT, to_owner TEXT, to_repo_name TEXT, to_job_id TEXT,
                 body TEXT, acked_at INTEGER, owner_generation INTEGER
             );
             INSERT INTO coord_claims VALUES (
                 'acme','sample','job-1','agent-a',NULL,NULL,'[]', 1, NULL
             );
             INSERT INTO coord_messages VALUES (
-                'blocker','agent-b','job-2','acme','sample','job-1','blocked', NULL, 1
+                'blocker','agent-b','acme','sample','job-2','acme','sample','job-1',
+                'blocked', NULL, 1
             );
             ",
         )
@@ -327,15 +349,90 @@ mod tests {
                 owner_generation INTEGER, paused_at INTEGER
             );
             CREATE TABLE coord_messages (
-                kind TEXT, from_agent_id TEXT, from_job_id TEXT,
-                to_owner TEXT, to_repo_name TEXT, to_job_id TEXT,
+                kind TEXT, from_agent_id TEXT, from_owner TEXT, from_repo_name TEXT,
+                from_job_id TEXT, to_owner TEXT, to_repo_name TEXT, to_job_id TEXT,
                 body TEXT, acked_at INTEGER, owner_generation INTEGER
             );
             INSERT INTO coord_claims VALUES (
                 'acme','sample','job-1','agent-a',NULL,NULL,'[]', 2, NULL
             );
             INSERT INTO coord_messages VALUES (
-                'handoff','agent-b','job-2','acme','sample','job-1','take over', NULL, 1
+                'handoff','agent-a','acme','sample','job-1','acme','sample','job-1',
+                'take over', NULL, 1
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+        let snap = load_coord_snapshot(&path);
+        let overlay = snap.overlay_for(&JobId::new("acme", "sample", "job-1"));
+        assert!(overlay.waiting_on.is_none());
+    }
+
+    #[test]
+    fn cross_job_handoff_uses_source_generation() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("leases.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE coord_claims (
+                owner TEXT, repo_name TEXT, job_id TEXT, agent_id TEXT,
+                session_id TEXT, intent TEXT, declared_paths TEXT,
+                owner_generation INTEGER, paused_at INTEGER
+            );
+            CREATE TABLE coord_messages (
+                kind TEXT, from_agent_id TEXT, from_owner TEXT, from_repo_name TEXT,
+                from_job_id TEXT, to_owner TEXT, to_repo_name TEXT, to_job_id TEXT,
+                body TEXT, acked_at INTEGER, owner_generation INTEGER
+            );
+            INSERT INTO coord_claims VALUES (
+                'acme','sample','job-1','agent-a',NULL,NULL,'[]', 7, NULL
+            );
+            INSERT INTO coord_claims VALUES (
+                'acme','sample','job-2','agent-b',NULL,NULL,'[]', 3, NULL
+            );
+            INSERT INTO coord_messages VALUES (
+                'handoff','agent-b','acme','sample','job-2','acme','sample','job-1',
+                'take over', NULL, 3
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+        let snap = load_coord_snapshot(&path);
+        // Recipient generation (7) differs from the message (3), but the source
+        // claim generation matches, so the handoff stays visible.
+        let overlay = snap.overlay_for(&JobId::new("acme", "sample", "job-1"));
+        assert_eq!(overlay.waiting_on.as_deref(), Some("handoff:agent-b:job-2"));
+    }
+
+    #[test]
+    fn stale_source_generation_hides_cross_job_handoff() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("leases.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE coord_claims (
+                owner TEXT, repo_name TEXT, job_id TEXT, agent_id TEXT,
+                session_id TEXT, intent TEXT, declared_paths TEXT,
+                owner_generation INTEGER, paused_at INTEGER
+            );
+            CREATE TABLE coord_messages (
+                kind TEXT, from_agent_id TEXT, from_owner TEXT, from_repo_name TEXT,
+                from_job_id TEXT, to_owner TEXT, to_repo_name TEXT, to_job_id TEXT,
+                body TEXT, acked_at INTEGER, owner_generation INTEGER
+            );
+            INSERT INTO coord_claims VALUES (
+                'acme','sample','job-1','agent-a',NULL,NULL,'[]', 7, NULL
+            );
+            INSERT INTO coord_claims VALUES (
+                'acme','sample','job-2','agent-b',NULL,NULL,'[]', 4, NULL
+            );
+            INSERT INTO coord_messages VALUES (
+                'handoff','agent-b','acme','sample','job-2','acme','sample','job-1',
+                'take over', NULL, 3
             );
             ",
         )
