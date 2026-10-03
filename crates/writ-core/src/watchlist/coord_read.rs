@@ -249,6 +249,29 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    const COORD_SCHEMA: &str = "
+        CREATE TABLE coord_claims (
+            owner TEXT, repo_name TEXT, job_id TEXT, agent_id TEXT,
+            session_id TEXT, intent TEXT, declared_paths TEXT,
+            owner_generation INTEGER, paused_at INTEGER
+        );
+        CREATE TABLE coord_messages (
+            kind TEXT, from_agent_id TEXT, from_owner TEXT, from_repo_name TEXT,
+            from_job_id TEXT, to_owner TEXT, to_repo_name TEXT, to_job_id TEXT,
+            body TEXT, acked_at INTEGER, owner_generation INTEGER
+        );
+    ";
+
+    fn snapshot_with(rows: &str) -> CoordSnapshot {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("leases.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(COORD_SCHEMA).unwrap();
+        conn.execute_batch(rows).unwrap();
+        drop(conn);
+        load_coord_snapshot(&path)
+    }
+
     #[test]
     fn missing_tables_are_unavailable_not_an_error() {
         let tmp = tempdir().unwrap();
@@ -263,21 +286,8 @@ mod tests {
 
     #[test]
     fn reads_paused_claim_and_unacked_help() {
-        let tmp = tempdir().unwrap();
-        let path = tmp.path().join("leases.db");
-        let conn = Connection::open(&path).unwrap();
-        conn.execute_batch(
+        let snap = snapshot_with(
             "
-            CREATE TABLE coord_claims (
-                owner TEXT, repo_name TEXT, job_id TEXT, agent_id TEXT,
-                session_id TEXT, intent TEXT, declared_paths TEXT,
-                owner_generation INTEGER, paused_at INTEGER
-            );
-            CREATE TABLE coord_messages (
-                kind TEXT, from_agent_id TEXT, from_owner TEXT, from_repo_name TEXT,
-                from_job_id TEXT, to_owner TEXT, to_repo_name TEXT, to_job_id TEXT,
-                body TEXT, acked_at INTEGER, owner_generation INTEGER
-            );
             INSERT INTO coord_claims VALUES (
                 'acme','sample','job-1','agent-a','sess-1','fix',
                 '[\"crates/writ-core\"]', 2, 99
@@ -291,10 +301,7 @@ mod tests {
                 'crates/a', NULL, 2
             );
             ",
-        )
-        .unwrap();
-        drop(conn);
-        let snap = load_coord_snapshot(&path);
+        );
         assert!(snap.available);
         let overlay = snap.overlay_for(&JobId::new("acme", "sample", "job-1"));
         assert_eq!(overlay.agent_id.as_deref(), Some("agent-a"));
@@ -305,21 +312,8 @@ mod tests {
 
     #[test]
     fn blocker_messages_shape_waiting_on() {
-        let tmp = tempdir().unwrap();
-        let path = tmp.path().join("leases.db");
-        let conn = Connection::open(&path).unwrap();
-        conn.execute_batch(
+        let snap = snapshot_with(
             "
-            CREATE TABLE coord_claims (
-                owner TEXT, repo_name TEXT, job_id TEXT, agent_id TEXT,
-                session_id TEXT, intent TEXT, declared_paths TEXT,
-                owner_generation INTEGER, paused_at INTEGER
-            );
-            CREATE TABLE coord_messages (
-                kind TEXT, from_agent_id TEXT, from_owner TEXT, from_repo_name TEXT,
-                from_job_id TEXT, to_owner TEXT, to_repo_name TEXT, to_job_id TEXT,
-                body TEXT, acked_at INTEGER, owner_generation INTEGER
-            );
             INSERT INTO coord_claims VALUES (
                 'acme','sample','job-1','agent-a',NULL,NULL,'[]', 1, NULL
             );
@@ -328,31 +322,15 @@ mod tests {
                 'blocked', NULL, 1
             );
             ",
-        )
-        .unwrap();
-        drop(conn);
-        let snap = load_coord_snapshot(&path);
+        );
         let overlay = snap.overlay_for(&JobId::new("acme", "sample", "job-1"));
         assert_eq!(overlay.waiting_on.as_deref(), Some("blocker:agent-b:job-2"));
     }
 
     #[test]
     fn stale_generation_handoffs_are_excluded() {
-        let tmp = tempdir().unwrap();
-        let path = tmp.path().join("leases.db");
-        let conn = Connection::open(&path).unwrap();
-        conn.execute_batch(
+        let snap = snapshot_with(
             "
-            CREATE TABLE coord_claims (
-                owner TEXT, repo_name TEXT, job_id TEXT, agent_id TEXT,
-                session_id TEXT, intent TEXT, declared_paths TEXT,
-                owner_generation INTEGER, paused_at INTEGER
-            );
-            CREATE TABLE coord_messages (
-                kind TEXT, from_agent_id TEXT, from_owner TEXT, from_repo_name TEXT,
-                from_job_id TEXT, to_owner TEXT, to_repo_name TEXT, to_job_id TEXT,
-                body TEXT, acked_at INTEGER, owner_generation INTEGER
-            );
             INSERT INTO coord_claims VALUES (
                 'acme','sample','job-1','agent-a',NULL,NULL,'[]', 2, NULL
             );
@@ -361,31 +339,15 @@ mod tests {
                 'take over', NULL, 1
             );
             ",
-        )
-        .unwrap();
-        drop(conn);
-        let snap = load_coord_snapshot(&path);
+        );
         let overlay = snap.overlay_for(&JobId::new("acme", "sample", "job-1"));
         assert!(overlay.waiting_on.is_none());
     }
 
     #[test]
     fn cross_job_handoff_uses_source_generation() {
-        let tmp = tempdir().unwrap();
-        let path = tmp.path().join("leases.db");
-        let conn = Connection::open(&path).unwrap();
-        conn.execute_batch(
+        let snap = snapshot_with(
             "
-            CREATE TABLE coord_claims (
-                owner TEXT, repo_name TEXT, job_id TEXT, agent_id TEXT,
-                session_id TEXT, intent TEXT, declared_paths TEXT,
-                owner_generation INTEGER, paused_at INTEGER
-            );
-            CREATE TABLE coord_messages (
-                kind TEXT, from_agent_id TEXT, from_owner TEXT, from_repo_name TEXT,
-                from_job_id TEXT, to_owner TEXT, to_repo_name TEXT, to_job_id TEXT,
-                body TEXT, acked_at INTEGER, owner_generation INTEGER
-            );
             INSERT INTO coord_claims VALUES (
                 'acme','sample','job-1','agent-a',NULL,NULL,'[]', 7, NULL
             );
@@ -397,10 +359,7 @@ mod tests {
                 'take over', NULL, 3
             );
             ",
-        )
-        .unwrap();
-        drop(conn);
-        let snap = load_coord_snapshot(&path);
+        );
         // Recipient generation (7) differs from the message (3), but the source
         // claim generation matches, so the handoff stays visible.
         let overlay = snap.overlay_for(&JobId::new("acme", "sample", "job-1"));
@@ -409,21 +368,8 @@ mod tests {
 
     #[test]
     fn stale_source_generation_hides_cross_job_handoff() {
-        let tmp = tempdir().unwrap();
-        let path = tmp.path().join("leases.db");
-        let conn = Connection::open(&path).unwrap();
-        conn.execute_batch(
+        let snap = snapshot_with(
             "
-            CREATE TABLE coord_claims (
-                owner TEXT, repo_name TEXT, job_id TEXT, agent_id TEXT,
-                session_id TEXT, intent TEXT, declared_paths TEXT,
-                owner_generation INTEGER, paused_at INTEGER
-            );
-            CREATE TABLE coord_messages (
-                kind TEXT, from_agent_id TEXT, from_owner TEXT, from_repo_name TEXT,
-                from_job_id TEXT, to_owner TEXT, to_repo_name TEXT, to_job_id TEXT,
-                body TEXT, acked_at INTEGER, owner_generation INTEGER
-            );
             INSERT INTO coord_claims VALUES (
                 'acme','sample','job-1','agent-a',NULL,NULL,'[]', 7, NULL
             );
@@ -435,10 +381,7 @@ mod tests {
                 'take over', NULL, 3
             );
             ",
-        )
-        .unwrap();
-        drop(conn);
-        let snap = load_coord_snapshot(&path);
+        );
         let overlay = snap.overlay_for(&JobId::new("acme", "sample", "job-1"));
         assert!(overlay.waiting_on.is_none());
     }

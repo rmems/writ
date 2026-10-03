@@ -269,6 +269,43 @@ fn sample_ack(
     })
 }
 
+fn seed_preserved_coord_history(path: &Path, handoff_id: i64) {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.execute(
+        "
+        INSERT INTO coord_messages (
+            created_at, kind, from_agent_id, from_owner, from_repo_name, from_job_id,
+            to_agent_id, to_owner, to_repo_name, to_job_id, owner_generation, body,
+            paths, acked_at
+        ) VALUES (1, 'help', 'agent-a', 'acme', 'sample', 'job-a', NULL, NULL,
+                  NULL, NULL, 1, 'preserved help', '[]', NULL)
+        ",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE coord_messages SET acked_at = 1 WHERE id = ?1",
+        [handoff_id],
+    )
+    .unwrap();
+}
+
+fn regrant_job_a(harness: &Harness, worktree: &Path) {
+    harness.store.release_by_path(worktree).unwrap();
+    harness
+        .store
+        .grant(crate::lease::LeaseGrant {
+            repo: &harness.repo,
+            owner: "acme",
+            repo_name: "sample",
+            job_id: "job-a",
+            branch: "hive/job-a",
+            worktree_path: worktree,
+            start_commit: &harness.start,
+        })
+        .unwrap();
+}
+
 #[test]
 fn pause_does_not_release_or_delete_wip_and_requires_handoff_ack() {
     let harness = Harness::new();
@@ -750,38 +787,9 @@ fn regrant_deletes_stale_handoff_so_it_cannot_transfer_fresh_assignment() {
     let worktree = harness.seed_job("job-a", "hive/job-a");
     announce(&harness.store, "job-a", "agent-a", &[]);
     let stale = sample_handoff(&harness.store, "gen-1 offer", Some("job-a"));
-    let conn = rusqlite::Connection::open(&harness.path).unwrap();
-    conn.execute(
-        "
-        INSERT INTO coord_messages (
-            created_at, kind, from_agent_id, from_owner, from_repo_name, from_job_id,
-            to_agent_id, to_owner, to_repo_name, to_job_id, owner_generation, body,
-            paths, acked_at
-        ) VALUES (1, 'help', 'agent-a', 'acme', 'sample', 'job-a', NULL, NULL,
-                  NULL, NULL, 1, 'preserved help', '[]', NULL)
-        ",
-        [],
-    )
-    .unwrap();
-    conn.execute(
-        "UPDATE coord_messages SET acked_at = 1 WHERE id = ?1",
-        [stale.id],
-    )
-    .unwrap();
+    seed_preserved_coord_history(&harness.path, stale.id);
     let stale = sample_handoff(&harness.store, "stale unacked offer", Some("job-a"));
-    harness.store.release_by_path(&worktree).unwrap();
-    harness
-        .store
-        .grant(crate::lease::LeaseGrant {
-            repo: &harness.repo,
-            owner: "acme",
-            repo_name: "sample",
-            job_id: "job-a",
-            branch: "hive/job-a",
-            worktree_path: &worktree,
-            start_commit: &harness.start,
-        })
-        .unwrap();
+    regrant_job_a(&harness, &worktree);
     let fresh = announce(&harness.store, "job-a", "agent-c", &[]);
     assert_eq!(fresh.claim.owner_generation, 1);
     let peer = LeaseStore::open(&harness.path).unwrap();

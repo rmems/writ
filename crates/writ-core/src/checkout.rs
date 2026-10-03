@@ -129,7 +129,7 @@ impl CheckoutRegistry {
         match outcome {
             ReconcileOutcome::Promoted { lease, .. }
             | ReconcileOutcome::AlreadyActive { lease, .. } => {
-                self.ensure_reconciled_identity(info, job_id, &expected_operation_id, &lease)?;
+                self.ensure_reconciled_identity(info, &expected_operation_id, &lease)?;
                 Ok(true)
             }
             ReconcileOutcome::Retry { .. } => Ok(false),
@@ -137,7 +137,7 @@ impl CheckoutRegistry {
                 Err(attention_error(&lease, &inspection))
             }
             ReconcileOutcome::Released { lease, .. } => {
-                self.ensure_reconciled_identity(info, job_id, &expected_operation_id, &lease)?;
+                self.ensure_reconciled_identity(info, &expected_operation_id, &lease)?;
                 self.leases.grant(registration_grant(info, job_id))?;
                 Ok(true)
             }
@@ -148,10 +148,10 @@ impl CheckoutRegistry {
     fn ensure_reconciled_identity(
         &self,
         info: &CheckoutInfo,
-        job_id: &str,
         expected_operation_id: &str,
         outcome_lease: &Lease,
     ) -> Result<()> {
+        let job_id = &outcome_lease.job_id;
         let current = self.leases.find_job(registration_job_key(info, job_id))?;
         if reconciled_identity_matches(info, expected_operation_id, outcome_lease)
             && current.as_ref().is_some_and(|lease| {
@@ -837,7 +837,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let err = registry
-            .ensure_reconciled_identity(&info, "shared-job", &stored.operation_id, &replacement)
+            .ensure_reconciled_identity(&info, &stored.operation_id, &replacement)
             .unwrap_err();
         assert!(matches!(
             err,

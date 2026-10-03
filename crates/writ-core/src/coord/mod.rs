@@ -208,79 +208,21 @@ impl LeaseStore {
     /// Mark the current owner paused and emit help. Never deletes WIP.
     pub fn pause_claim(&self, request: PauseRequest<'_>) -> Result<(CoordClaim, CoordMessage)> {
         let key = request.key;
-        let agent_id = request.agent_id;
         let now = now_secs();
         let mut conn = self.lock()?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| coord_err("begin coord pause", e))?;
-        // Authoritative checks run inside the transaction so a concurrent
-        // release or handoff transfer cannot slip between a read and the write.
-        let lease = require_active_lease_tx(&tx, key)?;
-        let claim = load_claim_tx(&tx, key)?
-            .ok_or_else(|| coord_missing("no coordination claim for pause"))?;
-        if claim.agent_id != agent_id {
-            return Err(held_error(&claim));
-        }
-        if claim.worktree_path != lease.worktree_path {
-            return Err(Error::LeaseStore {
-                context: "pause coord claim",
-                message: "pause must not move the leased worktree path".to_owned(),
-            });
-        }
-        tx.execute(
-            "
-            UPDATE coord_claims
-            SET paused_at = ?1, updated_at = ?1
-            WHERE owner = ?2 AND repo_name = ?3 AND job_id = ?4
-              AND agent_id = ?5 AND owner_generation = ?6
-            ",
-            params![
-                now,
-                key.owner,
-                key.repo_name,
-                key.job_id,
-                agent_id,
-                claim.owner_generation
-            ],
-        )
-        .map_err(|e| coord_err("pause coord claim", e))?;
-        if tx.changes() != 1 {
-            let current = load_claim_tx(&tx, key)?;
-            return Err(match current {
-                Some(current) if current.agent_id != agent_id => held_error(&current),
-                Some(current) => stale_error(&current, claim.owner_generation),
-                None => coord_missing("pause did not update the expected claim"),
-            });
-        }
-        let help = insert_message(
-            &tx,
-            NewMessage {
-                kind: MessageKind::Help,
-                from_agent_id: agent_id,
-                from_owner: key.owner,
-                from_repo_name: key.repo_name,
-                from_job_id: key.job_id,
-                to_agent_id: None,
-                to_owner: None,
-                to_repo_name: None,
-                to_job_id: None,
-                owner_generation: claim.owner_generation,
-                body: request
-                    .body
-                    .unwrap_or("owner paused; help needed without seizing WIP"),
-                paths: &[],
-                ack_of: None,
-                now,
-            },
-        )?;
+        let (worktree_path, generation) = pause_context(&tx, &request)?;
+        mark_paused(&tx, &request, generation, now)?;
+        let help = insert_pause_help(&tx, &request, generation, now)?;
         tx.commit()
             .map_err(|e| coord_err("commit coord pause", e))?;
         drop(conn);
         let paused = self
             .find_claim(key)?
             .ok_or_else(|| coord_missing("claim missing after pause"))?;
-        if paused.worktree_path != lease.worktree_path {
+        if paused.worktree_path != worktree_path {
             return Err(Error::LeaseStore {
                 context: "pause coord claim",
                 message: "pause must not move the leased worktree path".to_owned(),
@@ -418,4 +360,88 @@ fn coord_table_exists(conn: &rusqlite::Connection, table: &str) -> Result<bool> 
         |row| row.get(0),
     )
     .map_err(|e| coord_err("inspect coord schema", e))
+}
+
+fn pause_context(
+    tx: &rusqlite::Transaction<'_>,
+    request: &PauseRequest<'_>,
+) -> Result<(String, i64)> {
+    let lease = require_active_lease_tx(tx, request.key)?;
+    let claim = load_claim_tx(tx, request.key)?
+        .ok_or_else(|| coord_missing("no coordination claim for pause"))?;
+    if claim.agent_id != request.agent_id {
+        return Err(held_error(&claim));
+    }
+    if claim.worktree_path != lease.worktree_path {
+        return Err(Error::LeaseStore {
+            context: "pause coord claim",
+            message: "pause must not move the leased worktree path".to_owned(),
+        });
+    }
+    Ok((lease.worktree_path, claim.owner_generation))
+}
+
+fn mark_paused(
+    tx: &rusqlite::Transaction<'_>,
+    request: &PauseRequest<'_>,
+    generation: i64,
+    now: i64,
+) -> Result<()> {
+    let key = request.key;
+    tx.execute(
+        "
+        UPDATE coord_claims
+        SET paused_at = ?1, updated_at = ?1
+        WHERE owner = ?2 AND repo_name = ?3 AND job_id = ?4
+          AND agent_id = ?5 AND owner_generation = ?6
+        ",
+        params![
+            now,
+            key.owner,
+            key.repo_name,
+            key.job_id,
+            request.agent_id,
+            generation
+        ],
+    )
+    .map_err(|e| coord_err("pause coord claim", e))?;
+    if tx.changes() == 1 {
+        return Ok(());
+    }
+    let current = load_claim_tx(tx, key)?;
+    Err(match current {
+        Some(current) if current.agent_id != request.agent_id => held_error(&current),
+        Some(current) => stale_error(&current, generation),
+        None => coord_missing("pause did not update the expected claim"),
+    })
+}
+
+fn insert_pause_help(
+    tx: &rusqlite::Transaction<'_>,
+    request: &PauseRequest<'_>,
+    generation: i64,
+    now: i64,
+) -> Result<CoordMessage> {
+    let key = request.key;
+    insert_message(
+        tx,
+        NewMessage {
+            kind: MessageKind::Help,
+            from_agent_id: request.agent_id,
+            from_owner: key.owner,
+            from_repo_name: key.repo_name,
+            from_job_id: key.job_id,
+            to_agent_id: None,
+            to_owner: None,
+            to_repo_name: None,
+            to_job_id: None,
+            owner_generation: generation,
+            body: request
+                .body
+                .unwrap_or("owner paused; help needed without seizing WIP"),
+            paths: &[],
+            ack_of: None,
+            now,
+        },
+    )
 }
