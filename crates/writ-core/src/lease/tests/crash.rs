@@ -219,6 +219,33 @@ fn matching_interrupted_allocation_is_promoted_with_canonical_commit() {
 }
 
 #[test]
+fn interrupted_allocation_on_a_different_branch_stays_fail_closed() {
+    let harness = RepoHarness::new();
+    harness.prepare_and_add_worktree();
+    git(&harness.worktree, &["switch", "-c", "hive/job-2"]);
+    assert_eq!(
+        git(&harness.worktree, &["rev-parse", "HEAD"]),
+        harness.start
+    );
+
+    let outcome = assert_outcome(
+        &harness.store,
+        harness.key(),
+        &harness.repo,
+        "needs_attention",
+    );
+    let ReconcileOutcome::NeedsAttention { inspection, .. } = outcome else {
+        panic!("expected needs attention, got {outcome:?}");
+    };
+    assert!(
+        inspection
+            .conflicts
+            .iter()
+            .any(|conflict| conflict.contains("worker branch"))
+    );
+}
+
+#[test]
 fn conflicting_head_stays_fail_closed() {
     let harness = RepoHarness::new();
     harness.prepare_and_add_worktree();

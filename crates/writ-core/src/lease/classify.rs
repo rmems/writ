@@ -13,6 +13,7 @@ pub(super) struct GitEvidence {
     pub branch_ref: String,
     pub branch_commit: Option<String>,
     pub head_commit: Option<String>,
+    pub head_branch: Option<String>,
     pub worktree_registered: bool,
     pub checkout_common_dir: Option<std::path::PathBuf>,
     pub repo_root_common_dir: Option<std::path::PathBuf>,
@@ -66,6 +67,10 @@ pub(super) fn inspect_git(repo_root: &Path, worktree_path: &Path, branch: &str) 
         worktree_path,
         &["rev-parse", "--verify", "--end-of-options", "HEAD^{commit}"],
     );
+    let head_branch = optional_git_stdout(
+        worktree_path,
+        &["symbolic-ref", "--quiet", "--short", "HEAD"],
+    );
     let listed = optional_git_bytes(repo_root, &["worktree", "list", "--porcelain", "-z"])
         .is_some_and(|listing| porcelain_lists_worktree(&listing, worktree_path));
     // Harness-owned standalone clones are not in another repo's `worktree list`.
@@ -75,6 +80,7 @@ pub(super) fn inspect_git(repo_root: &Path, worktree_path: &Path, branch: &str) 
         branch_ref,
         branch_commit,
         head_commit,
+        head_branch,
         worktree_registered,
         checkout_common_dir: git_common_dir(worktree_path),
         repo_root_common_dir: git_common_dir(repo_root),
@@ -196,6 +202,19 @@ fn identity_conflicts(lease: &Lease, evidence: &GitEvidence, repo_root: &Path) -
         )
     {
         conflicts.push(conflict);
+    }
+    if named_git_branch(&lease.branch) {
+        match evidence.head_branch.as_deref() {
+            Some(branch) if branch == lease.branch => {}
+            Some(branch) => conflicts.push(format!(
+                "worker branch {branch} != recorded branch {}",
+                lease.branch
+            )),
+            None => conflicts.push(format!(
+                "worker branch is detached; expected recorded branch {}",
+                lease.branch
+            )),
+        }
     }
     if let Some(conflict) = commit_conflict(
         evidence.head_commit.as_deref(),
