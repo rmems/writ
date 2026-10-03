@@ -896,6 +896,51 @@ fn pause_rechecks_lease_after_waiting_for_the_write_lock() {
 }
 
 #[test]
+fn send_rechecks_lease_after_waiting_for_the_write_lock() {
+    let harness = Harness::new();
+    harness.seed_job("job-a", "hive/job-a");
+    announce(&harness.store, "job-a", "agent-a", &[]);
+
+    let peer = LeaseStore::open(&harness.path).unwrap();
+    let lock = rusqlite::Connection::open(&harness.path).unwrap();
+    lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let send = std::thread::spawn(move || {
+        peer.send_message(SendRequest {
+            owner: "acme",
+            repo_name: "sample",
+            job_id: "job-a",
+            agent_id: "agent-a",
+            kind: MessageKind::Help,
+            body: "stale help",
+            to_agent_id: None,
+            to_owner: Some("acme"),
+            to_repo_name: Some("sample"),
+            to_job_id: Some("job-a"),
+            paths: &[],
+            ack_of: None,
+        })
+    });
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    lock.execute(
+        "UPDATE leases SET allocation_state = 'RELEASED', released_at = 1 WHERE job_id = 'job-a'",
+        [],
+    )
+    .unwrap();
+    lock.execute_batch("COMMIT").unwrap();
+
+    let err = send.join().unwrap().unwrap_err();
+    assert!(err.to_string().contains("ACTIVE"), "got {err}");
+    assert!(
+        harness
+            .store
+            .inbox(job_key_a())
+            .unwrap()
+            .iter()
+            .all(|message| message.body != "stale help")
+    );
+}
+
+#[test]
 fn legacy_store_without_coord_tables_has_empty_reads() {
     let harness = Harness::new();
     harness.seed_job("job-a", "hive/job-a");

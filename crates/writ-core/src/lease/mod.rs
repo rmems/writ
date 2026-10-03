@@ -33,7 +33,8 @@ pub use types::*;
 pub use util::attention_error;
 pub(super) use util::*;
 
-use query::{LIVE_PATH_LOOKUP, LeaseLookup, list_leases_on, lookup_lease};
+pub(crate) use query::list_leases_on;
+use query::{LIVE_PATH_LOOKUP, LeaseLookup, lookup_lease};
 
 pub(super) static OPERATION_SEQ: AtomicU64 = AtomicU64::new(0);
 

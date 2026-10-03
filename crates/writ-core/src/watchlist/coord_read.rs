@@ -3,9 +3,12 @@
 //! Missing tables are not an error: this consumer never creates them.
 
 use std::collections::BTreeMap;
+#[cfg(test)]
 use std::path::Path;
 
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+#[cfg(test)]
+use rusqlite::OpenFlags;
+use rusqlite::{Connection, OptionalExtension, params};
 
 use super::types::CoordOverlay;
 
@@ -74,15 +77,24 @@ impl CoordSnapshot {
     }
 }
 
-/// Open the lease DB read-only and load coord rows when the tables exist.
-pub(crate) fn load_coord_snapshot(path: &Path) -> CoordSnapshot {
+/// Load coord rows from an existing lease-store snapshot.
+pub(crate) fn load_coord_snapshot_on(conn: &Connection) -> CoordSnapshot {
+    load_coord_snapshot_from(conn)
+}
+
+#[cfg(test)]
+fn load_coord_snapshot(path: &Path) -> CoordSnapshot {
     let Ok(conn) = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY) else {
         return CoordSnapshot::default();
     };
-    if !table_exists(&conn, "coord_claims") {
+    load_coord_snapshot_from(&conn)
+}
+
+fn load_coord_snapshot_from(conn: &Connection) -> CoordSnapshot {
+    if !table_exists(conn, "coord_claims") {
         return CoordSnapshot::default();
     }
-    let claims = match load_claims(&conn) {
+    let claims = match load_claims(conn) {
         Ok(claims) => claims,
         Err(err) => {
             return CoordSnapshot {
@@ -92,8 +104,8 @@ pub(crate) fn load_coord_snapshot(path: &Path) -> CoordSnapshot {
             };
         }
     };
-    let messages = if table_exists(&conn, "coord_messages") {
-        match load_messages(&conn) {
+    let messages = if table_exists(conn, "coord_messages") {
+        match load_messages(conn) {
             Ok(messages) => messages,
             Err(err) => {
                 return CoordSnapshot {

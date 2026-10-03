@@ -55,7 +55,7 @@ pub(super) fn lookup_lease<P: rusqlite::Params>(
         .map_err(|e| lease_err(lookup.context, e))
 }
 
-pub(super) fn list_leases_on(
+pub(crate) fn list_leases_on(
     conn: &Connection,
     suffix: &str,
     context: &'static str,

@@ -4,13 +4,13 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::git_safe::origin_github_repo_selector;
-use crate::lease::{AllocationState, Lease, LeaseMode, LeaseStore};
+use crate::lease::{AllocationState, Lease, LeaseMode, LeaseStore, list_leases_on};
 use crate::owners::OwnerAllowlist;
 
 use super::classify::classify_snapshot;
-use super::coord_read::{CoordSnapshot, JobId, load_coord_snapshot};
+use super::coord_read::{CoordSnapshot, JobId, load_coord_snapshot_on};
 use super::github::{BranchRef, GithubProbe, PrSnapshot, ProbeError};
 use super::types::{
     CollabStatus, CoordOverlay, GithubState, RecoveryStatus, WatchEntry, WatchlistData,
@@ -42,12 +42,23 @@ pub struct ViewLoad<'a> {
 /// the caller. This function never writes leases, coordination tables, or JSON
 /// state.
 pub fn load_view(request: ViewLoad<'_>) -> Result<WatchlistData> {
+    let conn = request.store.lock()?;
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|error| watchlist_read_error("begin watchlist snapshot", error))?;
     let leases = if request.query.include_released {
-        request.store.list_all()?
+        list_leases_on(&tx, "ORDER BY id", "list leases")?
     } else {
-        request.store.list_live()?
+        list_leases_on(
+            &tx,
+            "WHERE released_at IS NULL AND tombstoned_at IS NULL ORDER BY id",
+            "list live leases",
+        )?
     };
-    let coord = load_coord_snapshot(request.store.path());
+    let coord = load_coord_snapshot_on(&tx);
+    tx.commit()
+        .map_err(|error| watchlist_read_error("commit watchlist snapshot", error))?;
+    drop(conn);
     let mut entries = Vec::new();
     let mut pr_cache: HashMap<String, std::result::Result<Vec<PrSnapshot>, ProbeError>> =
         HashMap::new();
@@ -65,6 +76,13 @@ pub fn load_view(request: ViewLoad<'_>) -> Result<WatchlistData> {
         coord_available: coord.available,
         github_probed: request.query.probe_github,
     })
+}
+
+fn watchlist_read_error(context: &'static str, error: rusqlite::Error) -> Error {
+    Error::LeaseStore {
+        context,
+        message: error.to_string(),
+    }
 }
 
 fn matches_filter(lease: &Lease, query: &WatchQuery) -> bool {

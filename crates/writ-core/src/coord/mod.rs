@@ -27,7 +27,7 @@ pub use types::{
 
 use access::{
     CLAIM_SELECT, MESSAGE_SELECT, NewMessage, claim_from_row, insert_message, load_claim_locked,
-    load_claim_tx, load_message_tx, message_from_row, require_active_lease_tx, require_agent_claim,
+    load_claim_tx, load_message_tx, message_from_row, require_active_lease_tx,
 };
 use ack::{require_ack_recipient, require_complete_recipient, transfer_on_handoff_ack};
 use announce::{AnnounceTx, MailboxDraft, announce_tx, mailbox_from_send, route_generic_ack};
@@ -185,13 +185,18 @@ impl LeaseStore {
             repo_name: request.repo_name,
             job_id: request.job_id,
         };
-        let claim = require_agent_claim(self, key, request.agent_id)?;
         let paths = normalize_paths(request.paths)?;
         let now = now_secs();
         let mut conn = self.lock()?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| coord_err("begin coord send", e))?;
+        require_active_lease_tx(&tx, key)?;
+        let claim = load_claim_tx(&tx, key)?
+            .ok_or_else(|| coord_missing("no coordination claim for send"))?;
+        if claim.agent_id != request.agent_id {
+            return Err(held_error(&claim));
+        }
         let message = insert_message(
             &tx,
             mailbox_from_send(MailboxDraft {

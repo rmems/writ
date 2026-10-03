@@ -3,11 +3,11 @@
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::error::{Error, PolicyCode, Result};
-use crate::lease::{AgentIdentity, AllocationState, JobKey, Lease, LeaseStore};
+use crate::lease::{AgentIdentity, AllocationState, JobKey, Lease};
 
 use super::declared_paths::{decode_paths_row, encode_paths};
 use super::types::{CoordClaim, CoordMessage, MessageKind};
-use super::util::{coord_err, coord_missing, held_error};
+use super::util::{coord_err, coord_missing};
 
 pub(super) const CLAIM_SELECT: &str = "SELECT c.owner, c.repo_name, c.job_id, c.branch, c.worktree_path, \
      c.agent_id, c.session_id, c.intent, c.declared_paths, c.owner_generation, \
@@ -68,26 +68,6 @@ fn require_active(lease: Lease) -> Result<Lease> {
             lease.allocation_state.as_str()
         ),
     })
-}
-
-pub(super) fn require_agent_claim(
-    store: &LeaseStore,
-    key: JobKey<'_>,
-    agent_id: &str,
-) -> Result<CoordClaim> {
-    let claim = store
-        .find_claim(key)?
-        .ok_or_else(|| Error::PolicyViolation {
-            code: PolicyCode::CoordClaimMissing,
-            message: format!(
-                "no coordination claim for {}/{}/{}",
-                key.owner, key.repo_name, key.job_id
-            ),
-        })?;
-    if claim.agent_id != agent_id {
-        return Err(held_error(&claim));
-    }
-    Ok(claim)
 }
 
 pub(super) fn upsert_agent(
