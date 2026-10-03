@@ -289,19 +289,23 @@ struct ShortOptions {
 }
 
 fn short_options(arg: &str) -> Option<ShortOptions> {
+    short_options_with_booleans(arg, &[])
+}
+
+fn short_options_with_booleans(arg: &str, boolean_flags: &[&str]) -> Option<ShortOptions> {
     let body = arg
         .strip_prefix('-')
         .filter(|body| !body.starts_with('-') && !body.is_empty())?;
     let mut delete_branch = None;
     for (index, flag) in body.char_indices() {
         let suffix = &body[index + flag.len_utf8()..];
-        if short_option_takes_value(flag) {
+        if short_value_in_context(flag, boolean_flags) {
             return Some(ShortOptions {
                 tokens: if suffix.is_empty() { 2 } else { 1 },
                 delete_branch,
             });
         }
-        if !matches!(flag, 'h' | 'i' | 'w' | 'd' | 'm' | 'r' | 's') {
+        if !short_boolean_in_context(flag, boolean_flags) {
             return None;
         }
         if flag == 'd' {
@@ -315,6 +319,20 @@ fn short_options(arg: &str) -> Option<ShortOptions> {
         tokens: 1,
         delete_branch,
     })
+}
+
+fn short_boolean_in_context(flag: char, boolean_flags: &[&str]) -> bool {
+    matches!(flag, 'h' | 'i' | 'w' | 'd' | 'm' | 'r' | 's') || has_short_flag(boolean_flags, flag)
+}
+
+fn short_value_in_context(flag: char, boolean_flags: &[&str]) -> bool {
+    short_option_takes_value(flag) && !has_short_flag(boolean_flags, flag)
+}
+
+fn has_short_flag(flags: &[&str], flag: char) -> bool {
+    flags
+        .iter()
+        .any(|option| option.len() == 2 && char::from(option.as_bytes()[1]) == flag)
 }
 
 fn short_option_takes_value(flag: char) -> bool {
@@ -570,9 +588,10 @@ pub fn gh_repo_selector(args: &[String]) -> Option<&str> {
 
 fn gh_repo_selectors(args: &[String]) -> Vec<&str> {
     let mut selectors = Vec::new();
+    let boolean_flags = command_boolean_flags(args);
     let mut i = 0;
     while i < args.len() {
-        match gh_selector_scan_step(args, i) {
+        match gh_selector_scan_step(args, i, boolean_flags) {
             GhSelectorStep::Done => break,
             GhSelectorStep::Advance(next) => i = next,
             GhSelectorStep::Found { selector, next } => {
@@ -584,15 +603,46 @@ fn gh_repo_selectors(args: &[String]) -> Vec<&str> {
     selectors
 }
 
+/// Only known overloaded flags need command context; other option rules stay shared.
+fn command_boolean_flags(args: &[String]) -> &'static [&'static str] {
+    let verb = args.get(1..).and_then(first_positional_after);
+    match (args.first().map(String::as_str), verb) {
+        (Some("pr"), Some("review")) => &["-c", "--comment"],
+        (Some("pr" | "issue"), Some("view")) => &["-c", "--comments"],
+        (Some("release"), Some("create")) => &["-p", "--prerelease"],
+        _ => &[],
+    }
+}
+
+fn selector_option_tokens(arg: &str, next: Option<&str>, boolean_flags: &[&str]) -> Option<usize> {
+    let flag = arg.split('=').next().unwrap_or(arg);
+    if boolean_flags.contains(&flag) {
+        return Some(1);
+    }
+    short_options_with_booleans(arg, boolean_flags)
+        .map(|options| options.tokens)
+        .or_else(|| positional_option_tokens(arg, next))
+}
+
 enum GhSelectorStep<'a> {
     Done,
     Advance(usize),
     Found { selector: &'a str, next: usize },
 }
 
-fn gh_selector_scan_step(args: &[String], i: usize) -> GhSelectorStep<'_> {
+fn gh_selector_scan_step<'a>(
+    args: &'a [String],
+    i: usize,
+    boolean_flags: &[&str],
+) -> GhSelectorStep<'a> {
     let a = args[i].as_str();
     if a == "--" {
+        let previous_tokens = i.checked_sub(1).and_then(|previous| {
+            selector_option_tokens(&args[previous], Some("--"), boolean_flags)
+        });
+        if previous_tokens == Some(1) {
+            return GhSelectorStep::Done;
+        }
         // A `--` that a preceding value-taking option consumes as its value
         // is not the options terminator; gh keeps parsing, so a later
         // `-R other/repo` must still be detected. Fail closed by continuing.
@@ -601,7 +651,8 @@ fn gh_selector_scan_step(args: &[String], i: usize) -> GhSelectorStep<'_> {
         }
         return GhSelectorStep::Done;
     }
-    if let Some((selector, consume_next)) = gh_repo_flag(a, args.get(i + 1).map(String::as_str)) {
+    let next = args.get(i + 1).map(String::as_str);
+    if let Some((selector, consume_next)) = gh_repo_flag_with_booleans(a, next, boolean_flags) {
         return GhSelectorStep::Found {
             selector,
             next: if consume_next { i + 2 } else { i + 1 },
@@ -609,10 +660,7 @@ fn gh_selector_scan_step(args: &[String], i: usize) -> GhSelectorStep<'_> {
     }
     // Skip a non-selector value-taking option together with its value so a
     // `--` value cannot terminate scanning prematurely.
-    if a.starts_with('-') && !a.contains('=') && GH_VALUE_TAKING_OPTIONS.contains(&a) {
-        return GhSelectorStep::Advance(i + 2);
-    }
-    GhSelectorStep::Advance(i + 1)
+    GhSelectorStep::Advance(i + selector_option_tokens(a, next, boolean_flags).unwrap_or(1))
 }
 
 /// Parse one argv token as a `gh` repo selector flag.
@@ -621,6 +669,14 @@ fn gh_selector_scan_step(args: &[String], i: usize) -> GhSelectorStep<'_> {
 /// accepted spelling. A missing required value is an empty selector so callers
 /// can fail closed.
 fn gh_repo_flag<'a>(arg: &'a str, next: Option<&'a str>) -> Option<(&'a str, bool)> {
+    gh_repo_flag_with_booleans(arg, next, &[])
+}
+
+fn gh_repo_flag_with_booleans<'a>(
+    arg: &'a str,
+    next: Option<&'a str>,
+    boolean_flags: &[&str],
+) -> Option<(&'a str, bool)> {
     if arg == "--repo" || arg == "-R" {
         return Some((next.unwrap_or(""), true));
     }
@@ -635,10 +691,14 @@ fn gh_repo_flag<'a>(arg: &'a str, next: Option<&'a str>) -> Option<(&'a str, boo
     {
         return Some((value, false));
     }
-    clustered_short_repo_flag(arg, next)
+    clustered_short_repo_flag(arg, next, boolean_flags)
 }
 
-fn clustered_short_repo_flag<'a>(arg: &'a str, next: Option<&'a str>) -> Option<(&'a str, bool)> {
+fn clustered_short_repo_flag<'a>(
+    arg: &'a str,
+    next: Option<&'a str>,
+    boolean_flags: &[&str],
+) -> Option<(&'a str, bool)> {
     if !arg.starts_with('-') || arg.starts_with("--") {
         return None;
     }
@@ -648,7 +708,10 @@ fn clustered_short_repo_flag<'a>(arg: &'a str, next: Option<&'a str>) -> Option<
         None => (body, None),
     };
     let r_idx = letters.find('R')?;
-    if !letters[..r_idx].chars().all(|c| c.is_ascii_alphabetic()) {
+    if !letters[..r_idx]
+        .chars()
+        .all(|c| c.is_ascii_alphabetic() && !short_value_in_context(c, boolean_flags))
+    {
         return None;
     }
     let after = &letters[r_idx + 1..];

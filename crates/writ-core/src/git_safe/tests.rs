@@ -776,6 +776,85 @@ fn gh_repo_delete_positional_is_enforced_against_allowlist() {
 }
 
 #[test]
+fn gh_repo_selector_respects_command_specific_boolean_flags() {
+    let allowlist = crate::owners::OwnerAllowlist::parse("acme");
+    for prefix in [
+        vec!["pr", "review", "-c"],
+        vec!["pr", "review", "--comment"],
+        vec!["pr", "view", "-c"],
+        vec!["issue", "view", "-c"],
+        vec!["release", "create", "v1", "-p"],
+        vec!["release", "create", "v1", "--prerelease"],
+    ] {
+        for (owner, expected) in [("acme", Ok(())), ("other", Err("OWNER_NOT_ALLOWED"))] {
+            let mut args: Vec<String> = prefix.iter().map(|arg| (*arg).to_owned()).collect();
+            args.push(format!("-R{owner}/project"));
+            let result = enforce_gh_repo_targets(&args, &allowlist, None);
+            assert_eq!(result.map_err(|error| error.code()), expected, "{args:?}");
+        }
+    }
+}
+
+#[test]
+fn gh_repo_selector_preserves_option_values_and_real_end_markers() {
+    for (args, expected) in [
+        (vec!["pr", "close", "1", "-c", "-Rother/project"], None),
+        (vec!["api", "-p", "--repo=other/project"], None),
+        (
+            vec!["pr", "create", "-tRelease", "-Racme/project"],
+            Some("acme/project"),
+        ),
+        (
+            vec!["pr", "review", "-ctRelease", "-Racme/project"],
+            Some("acme/project"),
+        ),
+        (
+            vec!["pr", "review", "-cRother/project"],
+            Some("other/project"),
+        ),
+        (
+            vec!["release", "create", "v1", "-pRother/project"],
+            Some("other/project"),
+        ),
+        (
+            vec!["pr", "close", "-c", "--", "-Rother/project"],
+            Some("other/project"),
+        ),
+        (
+            vec!["api", "-p", "--", "-Rother/project"],
+            Some("other/project"),
+        ),
+        (vec!["pr", "review", "-c", "--", "-Rother/project"], None),
+        (
+            vec!["release", "create", "v1", "-p", "--", "-Rother/project"],
+            None,
+        ),
+        (
+            vec!["pr", "create", "-tRelease", "--", "-Rother/project"],
+            None,
+        ),
+    ] {
+        let args: Vec<String> = args.into_iter().map(str::to_owned).collect();
+        assert_eq!(gh_repo_selector(&args), expected, "{args:?}");
+    }
+}
+
+#[test]
+fn gh_repo_selector_ignores_repo_letters_in_attached_option_values() {
+    let allowlist = crate::owners::OwnerAllowlist::parse("acme");
+    for args in [
+        vec!["pr", "create", "-tRelease"],
+        vec!["pr", "close", "1", "-cRelease"],
+        vec!["pr", "review", "-ctRelease"],
+        vec!["api", "-pRelease", "repos/acme/project"],
+    ] {
+        let args: Vec<String> = args.into_iter().map(str::to_owned).collect();
+        assert_eq!(gh_repo_selector(&args), None, "{args:?}");
+        enforce_gh_repo_targets(&args, &allowlist, None).unwrap();
+    }
+}
+
+#[test]
 fn gh_pr_url_positional_is_enforced_against_allowlist() {
     let allowlist = crate::owners::OwnerAllowlist::from_owners(["acme"]);
     let err = SafeGhCommand::with_allowlist(

@@ -7,7 +7,7 @@ This guide defines the review and pull-request lifecycle for `writ`. It applies 
 ```text
 authorized task -> suitable checkout -> focused checks -> checkpoint or pull request
       -> independent review and relevant validation -> truthful readiness report
-      -> human merges on GitHub (repository protection owns the merge)
+      -> authorized merge on GitHub (repository protection owns the merge)
 ```
 
 Checkpoints may be published with honest focused-test status. Readiness needs relevant validation and review. GitHub owns remote permissions and merge rules; an agent acts only within operator authorization. Read-only review needs no new checkout or task record. Missing GitHub protection is an operator gap to report, not a reason to implement a second merge-permission system.
