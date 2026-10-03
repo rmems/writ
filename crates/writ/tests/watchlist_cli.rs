@@ -23,20 +23,35 @@ fn writ_with_store(path: &Path, args: &[&str]) -> (i32, String, String) {
     )
 }
 
-const VIEW_COMMANDS: [(&str, &str); 3] = [
-    ("list", "cli.watchlist.list"),
-    ("check", "cli.watchlist.check"),
-    ("check-all", "cli.watchlist.check_all"),
+struct ViewCase {
+    verb: &'static str,
+    envelope_command: &'static str,
+}
+
+const VIEW_COMMANDS: [ViewCase; 3] = [
+    ViewCase {
+        verb: "list",
+        envelope_command: "cli.watchlist.list",
+    },
+    ViewCase {
+        verb: "check",
+        envelope_command: "cli.watchlist.check",
+    },
+    ViewCase {
+        verb: "check-all",
+        envelope_command: "cli.watchlist.check_all",
+    },
 ];
 
 fn assert_store_error(path: &Path, error_code: &str) {
-    for (verb, command) in VIEW_COMMANDS {
-        assert_json_store_error(path, verb, command, error_code);
-        assert_human_store_error(path, verb);
+    for view in &VIEW_COMMANDS {
+        assert_json_store_error(path, view, error_code);
+        assert_human_store_error(path, view);
     }
 }
 
-fn assert_json_store_error(path: &Path, verb: &str, command: &str, error_code: &str) {
+fn assert_json_store_error(path: &Path, view: &ViewCase, error_code: &str) {
+    let verb = view.verb;
     let (code, stdout, stderr) = writ_with_store(path, &["--json", "watchlist", verb]);
     assert_eq!(code, 1, "{verb}: stdout={stdout}; stderr={stderr}");
     let envelope: serde_json::Value = serde_json::from_str(&stdout).unwrap();
@@ -46,7 +61,7 @@ fn assert_json_store_error(path: &Path, verb: &str, command: &str, error_code: &
             envelope["command"].as_str(),
             envelope["error"]["code"].as_str(),
         ),
-        (Some(false), Some(command), Some(error_code)),
+        (Some(false), Some(view.envelope_command), Some(error_code)),
         "{verb}: {envelope}"
     );
     assert!(
@@ -56,7 +71,8 @@ fn assert_json_store_error(path: &Path, verb: &str, command: &str, error_code: &
     );
 }
 
-fn assert_human_store_error(path: &Path, verb: &str) {
+fn assert_human_store_error(path: &Path, view: &ViewCase) {
+    let verb = view.verb;
     let (code, stdout, stderr) = writ_with_store(path, &["watchlist", verb]);
     assert_eq!(code, 1, "{verb}: stdout={stdout}; stderr={stderr}");
     assert!(stdout.is_empty(), "{verb}: {stdout}");
@@ -107,8 +123,9 @@ fn watchlist_missing_store_is_empty_without_creating_files() {
         root.path().join("leases.db"),
         root.path().join("missing/nested/leases.db"),
     ] {
-        for (verb, command) in VIEW_COMMANDS {
-            let envelope = successful_json(writ_with_store(&path, &["--json", "watchlist", verb]));
+        for view in &VIEW_COMMANDS {
+            let envelope =
+                successful_json(writ_with_store(&path, &["--json", "watchlist", view.verb]));
             let snapshot = serde_json::json!({
                 "command": envelope["command"],
                 "entries": envelope["data"]["entries"],
@@ -119,10 +136,10 @@ fn watchlist_missing_store_is_empty_without_creating_files() {
             assert_eq!(
                 snapshot,
                 serde_json::json!({
-                    "command": command,
+                    "command": view.envelope_command,
                     "entries": [],
                     "coord_available": false,
-                    "github_probed": verb != "list",
+                    "github_probed": view.verb != "list",
                     "error": null,
                 })
             );
@@ -179,10 +196,10 @@ fn watchlist_missing_store_under_valid_directory_symlink_is_empty() {
     let link = root.path().join("directory-link");
     std::os::unix::fs::symlink("empty-directory", &link).unwrap();
 
-    for (verb, _) in VIEW_COMMANDS {
+    for view in &VIEW_COMMANDS {
         let envelope = successful_json(writ_with_store(
             &link.join("nested/leases.db"),
-            &["--json", "watchlist", verb],
+            &["--json", "watchlist", view.verb],
         ));
         assert_eq!(envelope["data"]["entries"], serde_json::json!([]));
     }
