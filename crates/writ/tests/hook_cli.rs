@@ -23,10 +23,22 @@ impl Drop for TestDir {
     }
 }
 
-fn writ_hook(root: &std::path::Path, payload: &str) -> std::process::Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_writ"))
-        .env("WRIT_WORKTREE_BASE", root.join("worktrees"))
-        .env("WRIT_LEASE_PATH", root.join("leases.db"))
+fn writ_hook(
+    root: &std::path::Path,
+    payload: &str,
+    allowed_owners: Option<&str>,
+) -> std::process::Output {
+    let worktree_base = root.join("worktrees");
+    let lease_path = root.join("leases.db");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_writ"));
+    cmd.env("WRIT_WORKTREE_BASE", &worktree_base)
+        .env("WRIT_LEASE_PATH", &lease_path)
+        .env_remove("WRIT_ALLOWED_OWNERS")
+        .env_remove("WH_ALLOWED_OWNERS");
+    if let Some(owners) = allowed_owners {
+        cmd.args(["--allowed-owners", owners]);
+    }
+    let mut child = cmd
         .args(["hook"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -42,16 +54,21 @@ fn writ_hook(root: &std::path::Path, payload: &str) -> std::process::Output {
     child.wait_with_output().unwrap()
 }
 
-#[test]
-fn hook_blocks_git_force_push_with_exit_2() {
+fn assert_hook_rejects(payload: &str, allowed_owners: Option<&str>, needle: &str) {
     let root = TestDir::new();
-    let output = writ_hook(
-        &root.0,
-        r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"git push --force origin main"}}"#,
-    );
+    let output = writ_hook(&root.0, payload, allowed_owners);
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("BARE_FORCE_PUSH"), "stderr={stderr}");
+    assert!(stderr.contains(needle), "stderr={stderr}");
+}
+
+#[test]
+fn hook_blocks_git_force_push_with_exit_2() {
+    assert_hook_rejects(
+        r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"git push --force origin main"}}"#,
+        None,
+        "BARE_FORCE_PUSH",
+    );
 }
 
 #[test]
@@ -60,6 +77,7 @@ fn hook_blocks_quoted_force_push_and_config_injection() {
     let quoted = writ_hook(
         &root.0,
         r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"git push \"--force\""}}"#,
+        None,
     );
     assert_eq!(quoted.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&quoted.stderr);
@@ -68,6 +86,7 @@ fn hook_blocks_quoted_force_push_and_config_injection() {
     let config = writ_hook(
         &root.0,
         r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"git -c alias.status='!git push --force' status"}}"#,
+        None,
     );
     assert_eq!(config.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&config.stderr);
@@ -81,6 +100,7 @@ fn hook_worktree_create_is_coordination_only() {
     let output = writ_hook(
         &root.0,
         r#"{"hook_event_name":"WorktreeCreate","worktree_path":"/nonexistent/wt","name":"wt"}"#,
+        None,
     );
     assert_eq!(output.status.code(), Some(0));
     assert!(output.stdout.is_empty(), "no path may be claimed");
@@ -115,6 +135,7 @@ fn hook_worktree_events_register_and_release_without_deleting() {
             "worktree_name": "job-1",
         })
         .to_string(),
+        None,
     );
     assert_eq!(create.status.code(), Some(0));
     assert!(!create.stdout.is_empty(), "existing checkout registered");
@@ -126,6 +147,7 @@ fn hook_worktree_events_register_and_release_without_deleting() {
             "worktree_path": repo,
         })
         .to_string(),
+        None,
     );
     assert_eq!(remove.status.code(), Some(0));
     assert!(
@@ -140,6 +162,7 @@ fn hook_allows_git_status() {
     let output = writ_hook(
         &root.0,
         r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"git status"}}"#,
+        None,
     );
     assert_eq!(output.status.code(), Some(0));
 }
@@ -200,11 +223,50 @@ fn hook_boundary_fail_closed_cases() {
         ),
         (r#"{"hook_event_name":"SessionStart"}"#, 0, ""),
     ] {
-        let output = writ_hook(&root.0, payload);
+        let output = writ_hook(&root.0, payload, None);
         assert_eq!(output.status.code(), Some(exit), "payload={payload}");
         if !needle.is_empty() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             assert!(stderr.contains(needle), "needle={needle} stderr={stderr}");
         }
     }
+}
+
+#[test]
+fn hook_global_allowed_owners_flag_enforces_gh_repo_targets() {
+    assert_hook_rejects(
+        r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"gh repo delete other/project --yes"}}"#,
+        Some("acme"),
+        "OWNER_NOT_ALLOWED",
+    );
+}
+
+#[test]
+fn hook_allowed_owners_cli_overrides_env_for_gh_checks() {
+    let root = TestDir::new();
+    let worktree_base = root.0.join("worktrees");
+    let lease_path = root.0.join("leases.db");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_writ"))
+        .env("WRIT_WORKTREE_BASE", &worktree_base)
+        .env("WRIT_LEASE_PATH", &lease_path)
+        .env("WRIT_ALLOWED_OWNERS", "acme")
+        .args(["--allowed-owners", "other-org", "hook"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // CLI `other-org` wins over env `acme`; acme target must be rejected.
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(
+            br#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"gh repo delete acme/project --yes"}}"#,
+        )
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("OWNER_NOT_ALLOWED"), "stderr={stderr}");
 }

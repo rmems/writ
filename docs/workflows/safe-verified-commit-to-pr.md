@@ -21,7 +21,7 @@ One issue → one PR unless the issue explicitly groups work.
 
 - No verified push yet — run the commit workflow first.
 - Shared `main`/`master` checkout — work only in the job worktree/branch.
-- Owner outside the configured allowlist unless the operator named this job.
+- Owner outside the configured allowlist unless the operator named this job. Rust enforcement applies to writ-supervised `git`/`gh` and the registered `writ hook` path; GitHub MCP and other non-writ PR transports are outside that boundary, so agents must still verify owner scope before MCP mutations.
 - Any GitHub PR merge command, merge API, auto-merge, or merge-queue enablement. Local feature-branch integration is not this stop.
 - Bare `git push --force` / `git push -f`.
 - Opening a no-op “kick CI” PR.
