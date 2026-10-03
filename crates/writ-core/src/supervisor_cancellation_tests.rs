@@ -221,6 +221,85 @@ async fn signal_fallback_observes_exit_without_reaping_the_leader() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_exit_readiness_does_not_depend_on_sigchld() {
+    const ISOLATED: &str = "WRIT_TEST_BLOCKED_SIGCHLD";
+    if std::env::var_os(ISOLATED).is_some() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(assert_signal_independent_exit_readiness());
+        return;
+    }
+    // GNU env masks only this subprocess, before the test harness creates any
+    // threads. The main test runner's signal mask is never changed.
+    let output = std::process::Command::new("env")
+        .arg("--block-signal=CHLD")
+        .arg(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "supervisor::cancellation_tests::linux_exit_readiness_does_not_depend_on_sigchld",
+            "--nocapture",
+        ])
+        .env(ISOLATED, "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "isolated exit-readiness regression failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(target_os = "linux")]
+async fn assert_signal_independent_exit_readiness() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut child = tokio::process::Command::new("sh")
+        .args(["-c", "printf R; read line; exit 23"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut ready = [0_u8; 1];
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        child.stdout.as_mut().unwrap().read_exact(&mut ready),
+    )
+    .await
+    .expect("child startup completes before the readiness deadline")
+    .unwrap();
+    let observation = wait_for_unreaped_exit(child.id());
+    tokio::pin!(observation);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(5), &mut observation)
+            .await
+            .is_err(),
+        "child is still blocked on stdin"
+    );
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"exit\n")
+        .await
+        .unwrap();
+    let observed = tokio::time::timeout(Duration::from_millis(80), &mut observation).await;
+    // Reap even on the failing baseline before asserting the observation result.
+    let status = tokio::time::timeout(Duration::from_secs(2), child.wait())
+        .await
+        .expect("child exits after stdin release")
+        .unwrap();
+    observed
+        .expect("exit readiness must not wait for the 100ms signal-poll fallback")
+        .unwrap();
+    assert_eq!(status.code(), Some(23), "exit observation must not reap");
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn observing_a_reaped_child_releases_group_ownership() {

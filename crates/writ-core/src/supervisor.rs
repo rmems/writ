@@ -1294,7 +1294,35 @@ fn output_to_supervised(
 
 #[cfg(unix)]
 async fn wait_for_unreaped_exit(pid: Option<u32>) -> std::io::Result<()> {
+    // pidfd readiness observes Linux exits even when the host masks SIGCHLD.
+    // Unsupported kernels or denied descriptors retain the portable fallback.
+    #[cfg(target_os = "linux")]
+    if let Some(pid) = pid
+        && let Ok(fd) = child_exit_fd(pid)
+    {
+        loop {
+            let mut ready = fd.readable().await?;
+            match observe_child_exit(Some(pid)) {
+                Ok(true) => return Ok(()),
+                Ok(false) => ready.clear_ready(),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
     wait_for_child_signal(pid).await
+}
+
+#[cfg(target_os = "linux")]
+fn child_exit_fd(pid: u32) -> std::io::Result<tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>> {
+    use rustix::process::{Pid, PidfdFlags, pidfd_open};
+
+    let pid = i32::try_from(pid)
+        .ok()
+        .and_then(Pid::from_raw)
+        .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ECHILD))?;
+    let fd = pidfd_open(pid, PidfdFlags::empty())?;
+    tokio::io::unix::AsyncFd::new(fd)
 }
 
 #[cfg(unix)]
