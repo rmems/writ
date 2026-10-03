@@ -116,6 +116,7 @@ fn insert_or_refresh_entry(
         existing.base = Some(snapshot.base.clone());
         existing.title = Some(snapshot.title.clone());
         existing.url = Some(snapshot.url.clone());
+        existing.kind = Some(kind);
         if reset {
             existing.fix_count = 0;
             existing.check_count = Some(0);

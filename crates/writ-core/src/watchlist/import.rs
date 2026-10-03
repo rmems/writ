@@ -23,10 +23,11 @@ pub fn import_pr_babysit(
         path: source_path.to_path_buf(),
         source: err,
     })?;
-    let parsed: PrBabysitFile = serde_json::from_str(&data).map_err(|err| WatchlistError::Gh {
-        repo: source_path.display().to_string(),
-        number: 0,
-        message: format!("failed to parse pr-babysit JSON: {err}"),
+    let parsed: PrBabysitFile = serde_json::from_str(&data).map_err(|err| {
+        WatchlistError::InvalidInput(format!(
+            "failed to parse pr-babysit JSON at {}: {err}",
+            source_path.display()
+        ))
     })?;
     let annotations: Vec<_> = parsed
         .prs
@@ -304,6 +305,19 @@ mod tests {
         let err =
             import_pr_babysit(&mut list, std::path::Path::new("/no/such/file.json")).unwrap_err();
         assert!(matches!(err, WatchlistError::Io { .. }));
+    }
+
+    #[test]
+    fn malformed_import_is_invalid_input_not_github_failure() {
+        let path = scratch_path("malformed");
+        fs::write(&path, "not json").unwrap();
+        let mut list = Watchlist::default();
+
+        let err = import_pr_babysit(&mut list, &path).unwrap_err();
+
+        assert!(matches!(&err, WatchlistError::InvalidInput(_)));
+        assert_eq!(err.code(), "INVALID_INPUT");
+        let _ = fs::remove_file(path);
     }
 
     #[test]

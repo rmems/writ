@@ -109,23 +109,25 @@ Residual codes prefer `#10` prefixes: `class_a:`, `class_b:`, `class_c:`,
 `list` shows every owner in the file. `--owner` / `--repo` are optional filters.
 
 `check-all` without `--repo`/`--owner` is a multi-owner walk and requires
-`WRIT_ALLOWED_OWNERS` (comma-separated). An empty allowlist denies that walk
+`WRIT_ALLOWED_OWNERS` or `--allowed-owners` (comma-separated). An empty allowlist denies that walk
 (`OWNER_ALLOWLIST_REQUIRED`, exit 2). There is no built-in owner list.
 
-`add` of an explicit `owner/name` is a single-repository operation: it is
-allowed when the allowlist is empty, and rejected with `OWNER_NOT_ALLOWED` when
-the allowlist is set and does not include that owner.
+`add` and `check` call GitHub for an explicit `owner/name`, so that owner must be
+present in `WRIT_ALLOWED_OWNERS` or `--allowed-owners`. An empty allowlist denies
+the probe, and a non-matching list returns `OWNER_NOT_ALLOWED`.
 
 ## Integrity
 
-- Writes are a temp file in the same directory plus `rename`. On Windows the
-  destination is removed first so an existing file can be replaced.
+- Mutations are serialized across processes with a sidecar lock file.
+- Writes are a temp file in the same directory plus `rename`. On Windows a
+  recoverable backup protects the prior file during replacement.
 - Missing file → empty watchlist (not an error).
 - Corrupt JSON → quarantine to `watchlist.json.corrupt.<stamp>`, warn, exit
   non-zero. The next command sees a missing file (empty list). The original
   bytes are not overwritten.
-- Do not run two `check-all` writers against the same file.
 
 ## Kind
 
 `kind` is `pr_babysit` (default) or `issue_to_pr`.
+Re-adding an existing entry applies the requested kind, including the default
+when `--kind` is omitted.

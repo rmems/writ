@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use writ_core::contract::{ErrorData, Response, SCHEMA_VERSION};
+use writ_core::owners::OwnerAllowlist;
 use writ_core::watchlist::{
     AddReport, CheckReport, GhPrProbe, WatchEntry, WatchKind, WatchlistError, add_prs_at,
     check_prs_at, default_pr_babysit_path, import_pr_babysit_at, list_prs_at, owner_of_repo,
@@ -22,12 +23,14 @@ fn state_path(explicit: Option<&PathBuf>) -> PathBuf {
 /// Run a `writ watchlist` subcommand.
 pub(crate) fn run(
     action: WatchlistAction,
+    allowlist: &OwnerAllowlist,
     json: bool,
     stdout: &mut impl Write,
 ) -> io::Result<ExitCode> {
     let path = state_path(action.state());
     let mut context = RunContext {
         path: path.as_path(),
+        allowlist,
         json,
         stdout,
     };
@@ -75,8 +78,19 @@ pub(crate) fn run(
 
 struct RunContext<'a, W: Write> {
     path: &'a Path,
+    allowlist: &'a OwnerAllowlist,
     json: bool,
     stdout: &'a mut W,
+}
+
+impl<W: Write> RunContext<'_, W> {
+    fn probe(&self) -> GhPrProbe {
+        GhPrProbe::new(self.allowlist.clone())
+    }
+
+    fn allowed_owners(&self) -> Vec<String> {
+        self.allowlist.iter().map(str::to_owned).collect()
+    }
 }
 
 struct AddArgs<'a> {
@@ -137,7 +151,7 @@ fn run_check(
     repo: Option<&str>,
     number: u64,
 ) -> io::Result<ExitCode> {
-    match check_one(context.path, repo, number) {
+    match check_one(context, repo, number) {
         Ok(report) => write_check(context.json, "watchlist.check", &report, context.stdout)
             .map(|()| ExitCode::SUCCESS),
         Err(err) => write_error("watchlist.check", context.json, err, context.stdout),
@@ -149,7 +163,9 @@ fn run_check_all(
     owner: Option<&str>,
     repo: Option<&str>,
 ) -> io::Result<ExitCode> {
-    match check_prs_at(context.path, &GhPrProbe, owner, repo, None, None) {
+    let probe = context.probe();
+    let owners = context.allowed_owners();
+    match check_prs_at(context.path, &probe, owner, repo, None, Some(&owners)) {
         Ok(report) => write_check(context.json, "watchlist.check_all", &report, context.stdout)
             .map(|()| ExitCode::SUCCESS),
         Err(err) => write_error("watchlist.check_all", context.json, err, context.stdout),
@@ -180,28 +196,33 @@ fn run_import(
 
 /// Handle the `watchlist add` arm: resolve state path, add PRs, render output.
 fn run_add(context: &mut RunContext<'_, impl Write>, args: AddArgs<'_>) -> io::Result<ExitCode> {
-    match add_command(context.path, args) {
+    match add_command(context, args) {
         Ok(report) => write_add("watchlist.add", context.json, &report, context.stdout)
             .map(|()| ExitCode::SUCCESS),
         Err(err) => write_error("watchlist.add", context.json, err, context.stdout),
     }
 }
 
-fn add_command(path: &Path, args: AddArgs<'_>) -> Result<AddReport, WatchlistError> {
+fn add_command(
+    context: &RunContext<'_, impl Write>,
+    args: AddArgs<'_>,
+) -> Result<AddReport, WatchlistError> {
     let (repo, numbers) = parse_repo_and_numbers(args.repo, args.targets)?;
     if numbers.is_empty() {
         return Err(WatchlistError::InvalidInput(
             "add requires at least one pull-request number".to_owned(),
         ));
     }
+    let probe = context.probe();
+    let owners = context.allowed_owners();
     add_prs_at(
-        path,
-        &GhPrProbe,
+        context.path,
+        &probe,
         &repo,
         &numbers,
         args.kind.into_kind(),
         args.reset,
-        None,
+        Some(&owners),
     )
 }
 
@@ -221,21 +242,23 @@ fn remove_command(path: &Path, args: RemoveArgs<'_>) -> Result<WatchEntry, Watch
 }
 
 fn check_one(
-    path: &Path,
+    context: &RunContext<'_, impl Write>,
     repo_flag: Option<&str>,
     number: u64,
 ) -> Result<CheckReport, WatchlistError> {
     let repo = match repo_flag {
         Some(repo) => repo.to_owned(),
-        None => infer_repo_for_number(path, number)?,
+        None => infer_repo_for_number(context.path, number)?,
     };
+    let probe = context.probe();
+    let owners = context.allowed_owners();
     check_prs_at(
-        path,
-        &GhPrProbe,
+        context.path,
+        &probe,
         None,
         Some(repo.as_str()),
         Some(&[number]),
-        None,
+        Some(&owners),
     )
 }
 
@@ -521,7 +544,7 @@ impl WatchlistKindArg {
 
 #[cfg(test)]
 mod cli_unit_tests {
-    use super::{WatchlistAction, WatchlistKindArg, run};
+    use super::{OwnerAllowlist, WatchlistAction, WatchlistKindArg, run};
     use std::fs;
     use std::io::Cursor;
     use std::path::PathBuf;
@@ -586,6 +609,7 @@ mod cli_unit_tests {
                 repo: None,
                 owner: None,
             },
+            &OwnerAllowlist::from_owners(["acme"]),
             false,
             &mut human,
         )
@@ -601,6 +625,7 @@ mod cli_unit_tests {
                 repo: None,
                 owner: None,
             },
+            &OwnerAllowlist::from_owners(["acme"]),
             true,
             &mut json_out,
         )
@@ -621,6 +646,7 @@ mod cli_unit_tests {
                 kind: WatchlistKindArg::PrBabysit,
                 targets: vec!["7".to_owned()],
             },
+            &OwnerAllowlist::from_owners(["acme"]),
             true,
             &mut out,
         )
@@ -641,6 +667,7 @@ mod cli_unit_tests {
                 number: None,
                 targets: vec!["7".to_owned()],
             },
+            &OwnerAllowlist::from_owners(["acme"]),
             false,
             &mut out,
         )

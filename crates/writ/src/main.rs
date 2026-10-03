@@ -1039,7 +1039,7 @@ async fn run(cli: Cli, stdout: &mut impl Write) -> writ_core::error::Result<Exit
             run_install(settings, writ_bin, cli.json, stdout)
         }
         Some(Command::Watchlist { action }) => {
-            watchlist::run(action, cli.json, stdout).map_err(Into::into)
+            watchlist::run(action, &allowlist, cli.json, stdout).map_err(Into::into)
         }
         None => {
             if cli.json {

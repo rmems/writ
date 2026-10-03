@@ -56,8 +56,24 @@ pub trait PrProbe {
 }
 
 /// Probe that runs allowlisted `gh pr view --json …`.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct GhPrProbe;
+#[derive(Debug, Clone)]
+pub struct GhPrProbe {
+    allowlist: OwnerAllowlist,
+}
+
+impl GhPrProbe {
+    /// Build a probe using the caller's already-resolved owner allowlist.
+    #[must_use]
+    pub fn new(allowlist: OwnerAllowlist) -> Self {
+        Self { allowlist }
+    }
+}
+
+impl Default for GhPrProbe {
+    fn default() -> Self {
+        Self::new(OwnerAllowlist::from_env())
+    }
+}
 
 impl PrProbe for GhPrProbe {
     fn view(&self, repo: &str, number: u64) -> Result<PrSnapshot, WatchlistError> {
@@ -71,13 +87,16 @@ impl PrProbe for GhPrProbe {
             "number,title,url,state,headRefName,baseRefName,mergeable,reviewDecision,isDraft,statusCheckRollup"
                 .to_owned(),
         ];
-        let output = run_gh_supervised(args)?;
+        let output = run_gh_supervised(args, self.allowlist.clone())?;
         let stdout = parse_probe_output(repo, number, output)?;
         parse_pr_view(repo, &stdout)
     }
 }
 
-fn run_gh_supervised(args: [String; 7]) -> Result<SupervisedOutput, WatchlistError> {
+fn run_gh_supervised(
+    args: [String; 7],
+    allowlist: OwnerAllowlist,
+) -> Result<SupervisedOutput, WatchlistError> {
     let worker = std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -89,7 +108,7 @@ fn run_gh_supervised(args: [String; 7]) -> Result<SupervisedOutput, WatchlistErr
             })?;
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let options = RunOptions {
-            allowlist: Some(OwnerAllowlist::from_env()),
+            allowlist: Some(allowlist),
             ..RunOptions::default()
         };
         runtime
@@ -226,6 +245,14 @@ fn non_empty(value: Option<String>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_allowlist_is_retained_by_probe() {
+        let probe = GhPrProbe::new(OwnerAllowlist::from_owners(["acme"]));
+
+        assert!(probe.allowlist.allows("acme"));
+        assert!(!probe.allowlist.allows("other"));
+    }
 
     #[test]
     fn parse_uses_context_when_name_missing() {

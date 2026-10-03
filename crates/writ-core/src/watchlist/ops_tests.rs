@@ -98,7 +98,7 @@ fn add_skips_merged_and_dedupes() {
         &probe,
         "acme/widgets",
         &[1],
-        WatchKind::PrBabysit,
+        WatchKind::IssueToPr,
         false,
         &[],
     )
@@ -109,6 +109,10 @@ fn add_skips_merged_and_dedupes() {
         "feat/a-renamed"
     );
     assert_eq!(list.get("acme/widgets", 1).unwrap().fix_count, 2);
+    assert_eq!(
+        list.get("acme/widgets", 1).unwrap().kind,
+        Some(WatchKind::IssueToPr)
+    );
 }
 
 #[test]
