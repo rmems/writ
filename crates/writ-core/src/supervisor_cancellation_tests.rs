@@ -71,42 +71,6 @@ impl ProcessTreeFixture {
             .ok()
             .map(|pid| pid.to_string())
     }
-
-    async fn assert_descendant_stopped(&mut self, pid: &str) {
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while process_state(pid).is_some_and(|state| !state.starts_with('Z'))
-            && Instant::now() < deadline
-        {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(
-            !process_state(pid).is_some_and(|state| !state.starts_with('Z')),
-            "supervisor left descendant {pid} running"
-        );
-        self.needs_cleanup = false;
-    }
-
-    async fn assert_permit_released(&self) {
-        assert_eq!(
-            self.supervisor.active(),
-            0,
-            "cancelled run must release its permit"
-        );
-        let next = self
-            .supervisor
-            .run(
-                "true",
-                &[],
-                Some(Duration::from_secs(1)),
-                &RunOptions::default(),
-            )
-            .await
-            .expect("successor run");
-        assert!(
-            next.succeeded(),
-            "released permit must admit the next run: {next:?}"
-        );
-    }
 }
 
 #[cfg(unix)]
@@ -406,6 +370,45 @@ async fn graceful_cancel_follows_term_sensitivity() {
                 && output.error_code == Some(SupervisorErrorCode::TimedOut)
                 && output.redispatch_count == 0,
             "group containment mismatch for {script}: {output:?}"
+        );
+    }
+}
+
+#[cfg(unix)]
+impl ProcessTreeFixture {
+    async fn assert_descendant_stopped(&mut self, pid: &str) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while process_state(pid).is_some_and(|state| !state.starts_with('Z'))
+            && Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !process_state(pid).is_some_and(|state| !state.starts_with('Z')),
+            "supervisor left descendant {pid} running"
+        );
+        self.needs_cleanup = false;
+    }
+
+    async fn assert_permit_released(&self) {
+        assert_eq!(
+            self.supervisor.active(),
+            0,
+            "cancelled run must release its permit"
+        );
+        let next = self
+            .supervisor
+            .run(
+                "true",
+                &[],
+                Some(Duration::from_secs(1)),
+                &RunOptions::default(),
+            )
+            .await
+            .expect("successor run");
+        assert!(
+            next.succeeded(),
+            "released permit must admit the next run: {next:?}"
         );
     }
 }
