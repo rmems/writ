@@ -1,0 +1,9 @@
+{
+  "ok": true,
+  "schema_version": 1,
+  "command": "watchlist.list",
+  "data": {
+    "prs": []
+  },
+  "error": null
+}

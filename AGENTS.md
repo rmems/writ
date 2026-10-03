@@ -31,7 +31,7 @@ Interactive PR monitoring belongs to the installed companion `babysit-pr` skill.
 In an **assigned feature-branch worktree**, workers may integrate compatible peer work:
 
 - `git merge`, `git rebase`, and `git cherry-pick` of another job's branch into the assigned branch are routine. Conflict repair (`merge --continue` / `--abort` / `--quit`, editing contended files) is expected.
-- Negotiate overlapping writes: identify the current owner and hand off; do not silently diverge. Shared visibility lives in the existing lease store and watchlist — do **not** invent another database.
+- Negotiate overlapping writes: identify the current owner and hand off; do not silently diverge. Shared coordination visibility lives in the existing lease store — do **not** invent another coordination database. The PR watchlist is external GitHub visibility only, never ownership authority.
 - Refuse a local merge that would overwrite uncommitted WIP; commit, stash, or abort first.
 - Do not merge into `main`/`master` locally. Default-branch writes belong to GitHub policy.
 

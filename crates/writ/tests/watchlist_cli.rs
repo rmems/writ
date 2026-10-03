@@ -3,8 +3,6 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use writ_core::lease::{LeaseGrant, LeaseStore};
-
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
 struct TestDir(PathBuf);
@@ -25,100 +23,306 @@ impl Drop for TestDir {
     }
 }
 
-fn writ(root: &TestDir, args: &[&str]) -> (i32, String, String) {
-    let output = Command::new(env!("CARGO_BIN_EXE_writ"))
+fn writ(args: &[&str], state: &PathBuf) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_writ"))
         .args(args)
-        .env("WRIT_LEASE_PATH", root.0.join("leases.db"))
-        .env("WRIT_ALLOWED_OWNERS", "acme")
+        .arg("--state")
+        .arg(state)
         .output()
-        .unwrap();
-    (
-        output.status.code().unwrap_or(1),
-        String::from_utf8_lossy(&output.stdout).into_owned(),
-        String::from_utf8_lossy(&output.stderr).into_owned(),
-    )
+        .unwrap()
 }
 
-fn seed_lease(root: &TestDir) {
-    let store = LeaseStore::open(root.0.join("leases.db")).unwrap();
-    let wt = root.0.join("checkout");
-    fs::create_dir_all(&wt).unwrap();
-    store
-        .grant(LeaseGrant {
-            repo: &root.0.join("repo"),
-            owner: "acme",
-            repo_name: "sample",
-            job_id: "job-1",
-            branch: "hive/job-1",
-            worktree_path: &wt,
-            start_commit: "abc123",
-        })
-        .unwrap();
+/// Run `writ <args> --state <state>` and parse stdout as a JSON envelope.
+/// Returns `(exit_code, payload)`.
+fn run_json(args: &[&str], state: &PathBuf) -> (Option<i32>, serde_json::Value) {
+    let out = writ(args, state);
+    let payload = serde_json::from_slice(&out.stdout).unwrap();
+    (out.status.code(), payload)
 }
 
-struct CliCase {
-    args: &'static [&'static str],
-    seed: bool,
-    needles: &'static [&'static str],
-    no_json_store: bool,
+/// Write the shared two-entry sample watchlist to `state`.
+fn write_sample(state: &PathBuf) {
+    fs::write(state, sample_watchlist()).unwrap();
+}
+
+fn sample_watchlist() -> String {
+    r#"{
+  "version": 1,
+  "prs": [
+    {
+      "repo": "acme/widgets",
+      "number": 7,
+      "branch": "feat/a",
+      "status": "pending",
+      "last_checked": "2026-01-01T00:00:00Z",
+      "fix_count": 1,
+      "residual_blockers": ["class_b:review"],
+      "stack_id": "s1",
+      "stack_type": "feature",
+      "stack_position": 0,
+      "base": "main",
+      "title": "Add widgets"
+    },
+    {
+      "repo": "example-org/core",
+      "number": 9,
+      "branch": "fix/b",
+      "status": "healthy",
+      "last_checked": "2026-01-02T00:00:00Z",
+      "fix_count": 0,
+      "residual_blockers": []
+    }
+  ],
+  "groups": {
+    "s1": { "repo": "acme/widgets", "numbers": [7] }
+  }
+}
+"#
+    .to_owned()
 }
 
 #[test]
-fn watchlist_cli_cases() {
-    let cases = [
-        CliCase {
-            args: &["--json", "watchlist", "list"],
-            seed: true,
-            needles: &["cli.watchlist.list", "job-1", "running"],
-            no_json_store: true,
-        },
-        CliCase {
-            args: &["--json", "watchlist", "add"],
-            seed: false,
-            needles: &["\"persisted\":false"],
-            no_json_store: true,
-        },
-        CliCase {
-            args: &["watchlist", "list"],
-            seed: false,
-            needles: &["writ worktree register"],
-            no_json_store: false,
-        },
-        CliCase {
-            args: &["--json", "watchlist", "check-all"],
-            seed: false,
-            needles: &["cli.watchlist.check_all", "\"github_probed\":true"],
-            no_json_store: false,
-        },
-        CliCase {
-            args: &["watchlist", "remove"],
-            seed: false,
-            needles: &["leases.db"],
-            no_json_store: false,
-        },
-        CliCase {
-            args: &["watchlist", "list"],
-            seed: true,
-            needles: &["job-1", "running", "live"],
-            no_json_store: false,
-        },
-    ];
-    for case in cases {
-        let root = TestDir::new();
-        if case.seed {
-            seed_lease(&root);
-        }
-        let (code, stdout, stderr) = writ(&root, case.args);
-        assert_eq!(code, 0, "args={:?} stderr={stderr}", case.args);
-        for needle in case.needles {
-            assert!(
-                stdout.contains(needle),
-                "missing {needle} in {stdout} for {:?}",
-                case.args
-            );
-        }
-        if case.no_json_store {
-            assert!(!root.0.join("watchlist.json").exists());
-        }
-    }
+fn list_prints_all_owners_and_json_envelope() {
+    let dir = TestDir::new();
+    let state = dir.0.join("watchlist.json");
+    fs::write(&state, sample_watchlist()).unwrap();
+
+    let human = writ(&["watchlist", "list"], &state);
+    assert!(
+        human.status.success(),
+        "{}",
+        String::from_utf8_lossy(&human.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&human.stdout);
+    assert!(stdout.contains("acme/widgets"));
+    assert!(stdout.contains("example-org/core"));
+    assert!(stdout.contains("class_b:review"));
+
+    let json = Command::new(env!("CARGO_BIN_EXE_writ"))
+        .args(["--json", "watchlist", "list", "--state"])
+        .arg(&state)
+        .output()
+        .unwrap();
+    assert!(json.status.success());
+    let payload: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(payload["ok"], true);
+    assert_eq!(payload["command"], "watchlist.list");
+    let prs = payload["data"]["prs"].as_array().unwrap();
+    assert_eq!(prs.len(), 2);
+    // stack_type persisted on disk must surface in the list JSON (additive,
+    // v1-compatible field).
+    let stacked = prs
+        .iter()
+        .find(|pr| pr["number"] == 7)
+        .expect("entry 7 present");
+    assert_eq!(stacked["stack_type"], "feature");
+}
+
+#[test]
+fn import_pr_babysit_json_uses_import_command_name() {
+    let dir = TestDir::new();
+    let source = dir.0.join("watched-prs.json");
+    let state = dir.0.join("watchlist.json");
+    fs::write(
+        &source,
+        r#"{
+          "prs": [{
+            "repo": "acme/widgets",
+            "number": 3,
+            "branch": "feat/import",
+            "last_status": "failed",
+            "fix_count": 2
+          }]
+        }"#,
+    )
+    .unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_writ"))
+        .args(["--json", "watchlist", "import-pr-babysit", "--path"])
+        .arg(&source)
+        .arg("--state")
+        .arg(&state)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(payload["ok"], true);
+    assert_eq!(payload["command"], "watchlist.import_pr_babysit");
+}
+
+#[test]
+fn list_filters_by_owner() {
+    let dir = TestDir::new();
+    let state = dir.0.join("watchlist.json");
+    write_sample(&state);
+    let out = writ(&["watchlist", "list", "--owner", "acme"], &state);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("acme/widgets"));
+    assert!(!stdout.contains("example-org/core"));
+}
+
+#[test]
+fn remove_one_entry_keeps_the_other() {
+    let dir = TestDir::new();
+    let state = dir.0.join("watchlist.json");
+    fs::write(&state, sample_watchlist()).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_writ"))
+        .args([
+            "watchlist",
+            "remove",
+            "--repo",
+            "acme/widgets",
+            "7",
+            "--state",
+        ])
+        .arg(&state)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let listed = writ(&["watchlist", "list"], &state);
+    let stdout = String::from_utf8_lossy(&listed.stdout);
+    assert!(!stdout.contains("acme/widgets"));
+    assert!(stdout.contains("example-org/core"));
+}
+
+#[test]
+fn missing_file_lists_empty() {
+    let dir = TestDir::new();
+    let state = dir.0.join("missing.json");
+    let out = writ(&["watchlist", "list"], &state);
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "No watched pull requests.\n"
+    );
+}
+
+#[test]
+fn corrupt_file_exits_nonzero_and_quarantines() {
+    let dir = TestDir::new();
+    let state = dir.0.join("watchlist.json");
+    fs::write(&state, "{nope").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_writ"))
+        .args(["--json", "watchlist", "list", "--state"])
+        .arg(&state)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(payload["ok"], false);
+    assert_eq!(payload["error"]["code"], "CORRUPT_STATE");
+    assert!(!state.exists());
+    let quarantined = fs::read_dir(&dir.0)
+        .unwrap()
+        .filter_map(Result::ok)
+        .any(|e| e.file_name().to_string_lossy().contains("corrupt"));
+    assert!(quarantined);
+}
+
+#[test]
+fn import_pr_babysit_is_read_only_on_source() {
+    let dir = TestDir::new();
+    let source = dir.0.join("watched-prs.json");
+    let state = dir.0.join("watchlist.json");
+    fs::write(
+        &source,
+        r#"{
+          "prs": [{
+            "repo": "acme/widgets",
+            "number": 3,
+            "branch": "feat/import",
+            "last_status": "failed",
+            "fix_count": 2
+          }]
+        }"#,
+    )
+    .unwrap();
+    let original = fs::read_to_string(&source).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_writ"))
+        .args(["watchlist", "import-pr-babysit", "--path"])
+        .arg(&source)
+        .arg("--state")
+        .arg(&state)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(fs::read_to_string(&source).unwrap(), original);
+    let listed = writ(&["watchlist", "list"], &state);
+    let stdout = String::from_utf8_lossy(&listed.stdout);
+    assert!(stdout.contains("acme/widgets"));
+    assert!(stdout.contains("feat/import"));
+}
+
+#[test]
+fn check_missing_entry_with_repo_is_not_found() {
+    let dir = TestDir::new();
+    let state = dir.0.join("watchlist.json");
+    write_sample(&state);
+    let (code, payload) = run_json(
+        &[
+            "--json",
+            "watchlist",
+            "check",
+            "--repo",
+            "acme/widgets",
+            "999",
+        ],
+        &state,
+    );
+    assert_eq!(code, Some(1));
+    assert_eq!(payload["ok"], false);
+    assert_eq!(payload["error"]["code"], "NOT_FOUND");
+}
+
+#[test]
+fn check_malformed_repo_is_invalid_input() {
+    let dir = TestDir::new();
+    let state = dir.0.join("watchlist.json");
+    write_sample(&state);
+    let (code, payload) = run_json(
+        &["--json", "watchlist", "check", "--repo", "not-a-slug", "7"],
+        &state,
+    );
+    assert_eq!(code, Some(1));
+    assert_eq!(payload["ok"], false);
+    assert_eq!(payload["error"]["code"], "INVALID_INPUT");
+}
+
+#[test]
+fn list_repo_filter_ignores_slug_case() {
+    let dir = TestDir::new();
+    let state = dir.0.join("watchlist.json");
+    write_sample(&state);
+    let out = writ(&["watchlist", "list", "--repo", "ACME/widgets"], &state);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("acme/widgets"));
+    assert!(!stdout.contains("example-org/core"));
+}
+
+#[test]
+fn check_all_without_allowlist_is_policy_exit() {
+    let dir = TestDir::new();
+    let state = dir.0.join("watchlist.json");
+    fs::write(&state, sample_watchlist()).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_writ"))
+        .env_remove("WRIT_ALLOWED_OWNERS")
+        .env_remove("WH_ALLOWED_OWNERS")
+        .args(["--json", "watchlist", "check-all", "--state"])
+        .arg(&state)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(payload["error"]["code"], "OWNER_ALLOWLIST_REQUIRED");
 }

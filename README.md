@@ -239,7 +239,7 @@ Register with `writ install`. Matcher scope starts at `Bash(git *)` and `Bash(gh
 | **Worker** | A subagent bound to one assigned worktree and branch. Workers may integrate peer work locally; they never merge a GitHub pull request. |
 | **Worktree** | An isolated git checkout created by the harness (or plain `git worktree add`), registered with `writ worktree register`. Any path; no writ-specific root required. |
 
-| **Watchlist / hive** | Legacy name. Live visibility is `writ status` / `writ worktree list` over the SQLite lease store. |
+| **Watchlist** | Persistent external PR/check visibility. It does not grant ownership or replace the SQLite lease store. |
 | **Merge-ready** | CI green, conflict-free, required checks successful, review threads resolved. Report it; do not merge. |
 | **Lease** | SQLite coordination row for a registered checkout (`WRITER_LOCKED` / `UNASSIGNED` today). |
 
@@ -253,7 +253,7 @@ Implemented `writ` surface (`writ --help` is authoritative):
 | `writ git-safe …` | Implemented | Run a git command after the allowlist and, for mutations, expected-branch checks. |
 | `writ gh-safe …` | Implemented | Run a `gh` command after the allowlist. GitHub PR merge operations are rejected. |
 | `writ supervisor run --timeout <secs> …` | Implemented | Spawn a child with wall-clock, idle, and grace recovery (`--idle`/`--stall`, `--grace`, `--progress-secs`, env `WRIT_SUPERVISOR_*`; see [`docs/timeout-policy.md`](docs/timeout-policy.md)). Timeout is a handoff residual: Unix SIGTERM-then-SIGKILL on the process group; Windows kills only the direct child (grandchildren may survive). Never deletes a harness checkout. |
-| `writ watchlist list\|check\|check-all` | Implemented (view) | Collaboration status over `leases.db` plus optional live GitHub overlay. Does not persist a watchlist file. |
+| `writ watchlist add\|remove\|list\|check\|check-all\|import-pr-babysit` | Implemented (visibility) | Persistent external PR/check view in `watchlist.json`. It is not a scheduler, ownership store, or merge gate. |
 | `writ worktree register\|unregister\|inspect\|list` | Implemented | Coordination records for harness-owned checkouts. Register/unregister never touch files or branches. |
 | `writ worktree create\|remove\|prune` | Deprecated | Managed lifecycle kept for caller compatibility during the transition. `create` requires `--schema-version 2` and `--start-point`. |
 | `writ attribution format` | Implemented | Render review and collaboration replies with real agent/task/branch/session identity. Include a SHA only when one exists; never invent one. |
@@ -363,6 +363,7 @@ This is not `writ install`, which writes the `writ` hook block into `.claude/set
 | Job worktree | `{worktree root}/{owner}/{repo}/{job_id}` | Deprecated managed lifecycle only; `register` accepts any path |
 | Lease store | platform user-data `writ/leases.db` | `WRIT_LEASE_PATH` |
 | Watched state (legacy reader) | platform user-data `writ/watched.json` | `WRIT_STATE_PATH`, else `WH_STATE_PATH` |
+| PR watchlist | platform user-data `writ/watchlist.json` | `WRIT_WATCHLIST_PATH`, else `WH_WATCHLIST_PATH` |
 | Rust binary | `writ` on `PATH` | `WRIT_BIN` |
 
 If the new `writ` data root is absent and a pre-rename `worktrees-hives` root still exists, the path resolver keeps using the legacy root so an upgrade does not hide existing state. That is a read/fallback, not an automatic directory move.
@@ -374,7 +375,7 @@ If the new `writ` data root is absent and a pre-rename `worktrees-hives` root st
 | Agent does not see the `writ` skill | `ls "$HOME/.agents/skills/writ/SKILL.md"`; confirm the host's actual skill root; recreate the symlink. |
 | `writ: command not found` | `cargo install --path crates/writ` from the clone, or set `WRIT_BIN`. |
 
-| `writ status` / `writ jobs` is empty | Expected until a checkout is registered. Register with `writ worktree register`. See [`docs/status-schema.md`](docs/status-schema.md); for the live GitHub overlay use `writ watchlist` ([`docs/watchlist-schema.md`](docs/watchlist-schema.md)). |
+| `writ status` / `writ jobs` is empty | Expected until a checkout is registered. Register with `writ worktree register`. See [`docs/status-schema.md`](docs/status-schema.md); external PR visibility is available through `writ watchlist` ([`docs/watchlist-schema.md`](docs/watchlist-schema.md)). |
 | `policy violation [BARE_FORCE_PUSH]` or `[MERGE_BLOCKED]` | Exit 2 is the safety boundary working. Use `--force-with-lease` only when allowed. `MERGE_BLOCKED` covers `gh pr merge`, `git mergetool`, default-branch local merge, and dirty-WIP merge — not routine feature-branch integration. |
 | Owner allowlist did not block another org | Confirm `WRIT_ALLOWED_OWNERS` / `--allowed-owners` is set. Empty lists deny. The gate covers worktree create and `gh` repo selectors, not host MCP calls. |
 
@@ -421,7 +422,7 @@ criteria checkboxes, and the Linear footer documented in
 - [`docs/workflows/safe-verified-commit-to-pr.md`](docs/workflows/safe-verified-commit-to-pr.md) — verified push → PR handoff
 - [`docs/status-schema.md`](docs/status-schema.md) — `status` / `jobs` JSON
 - [`docs/timeout-policy.md`](docs/timeout-policy.md) — supervisor hang recovery (hard/idle/lost-child, grace kill, redispatch budget)
-- [`docs/watchlist-schema.md`](docs/watchlist-schema.md) — `watchlist` collaboration view
+- [`docs/watchlist-schema.md`](docs/watchlist-schema.md) — persistent external PR watchlist
 - [`docs/examples/`](docs/examples/) — captured response envelopes
 - [`docs/hook-boundary.md`](docs/hook-boundary.md) — hook-boundary contract tests and two-hook burn-in (#81)
 

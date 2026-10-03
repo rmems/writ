@@ -115,6 +115,11 @@ impl OwnerAllowlist {
         github_owner_name(owner).is_some_and(|o| self.owners.contains(&o))
     }
 
+    /// Iterate over normalized configured owners.
+    pub fn iter(&self) -> impl Iterator<Item = &str> {
+        self.owners.iter().map(String::as_str)
+    }
+
     /// Reject `owner` unless it normalizes to an allowlisted owner.
     pub fn enforce_owner(&self, owner: &str) -> Result<()> {
         self.enforce_spec(OwnerSpecKind::Owner, owner)

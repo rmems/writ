@@ -37,9 +37,9 @@ version of every payload.
 | `attribution format …` | Current | Rendered text or JSON result. | `attribution.format`; v1 / v1. | 0 success; 1 invalid/operational input. | Pure formatting; no persistence or network access. |
 | `install` | Current | Human changed/unchanged line or JSON result. | `cli.install`; v1 on success; installation errors have no envelope. | 0 success; 1 operational error. | Idempotently creates or rewrites the selected Claude Code settings file (default `.claude/settings.json` relative to the current working directory when `--settings` is omitted). Does not mutate git metadata or lease rows, but can dirty the checkout tree. |
 | `hook` | Current | Hook protocol output; `--json` does **not** add a CLI envelope. Input is hook JSON on stdin. | No envelope identifier/version. | 0 allow/no-op; 2 block. | `PreToolUse` validates commands at the process boundary. Worktree lifecycle events may register/release lease rows but never create/remove checkout files. `SubagentStart`/`SubagentStop` upsert/retire rows in the `agents` table via a writable lease-store connection (creating the store when absent). |
-| `watchlist list` | Current view | Human table or JSON. | `cli.watchlist.list`; v1 / v1. | 0 success; 1 operational error. | Read-only lease-store view; a missing store remains missing. |
-| `watchlist check`, `check-all` | Current view | Human table or JSON with an ephemeral GitHub overlay. | `cli.watchlist.check`, `cli.watchlist.check_all`; v1 / v1. | 0 success; 1 operational error. Policy-denied GitHub probes do **not** exit 2: disallowed owners are filtered before probing, and probe policy failures become `github:owner_not_allowed` (or similar) residuals inside a successful view. | Reads the lease store read-only when present (missing file → empty view) and queries GitHub. The overlay is not persisted. |
-| `watchlist add`, `remove` | Compatibility no-op | Human migration hint or JSON `{ "persisted": false, … }`. | `cli.watchlist.add`, `cli.watchlist.remove`; v1 / v1. | 0 | Never mutate state; use `worktree register` / `unregister`. |
+| `watchlist list` | Current visibility view | Human table or JSON. | `watchlist.list`; v1 / v1. | 0 success; 1 operational error. | Reads `watchlist.json`; a missing file is an empty view. |
+| `watchlist check`, `check-all` | Current visibility view | Human table or JSON with refreshed GitHub state. | `watchlist.check`, `watchlist.check_all`; v1 / v1. | 0 success; 1 operational error; 2 policy error. | Queries GitHub and persists refreshed external PR visibility. `check-all` requires an owner allowlist. |
+| `watchlist add`, `remove`, `import-pr-babysit` | Current visibility mutation | Human result or JSON envelope. | `watchlist.add`, `watchlist.remove`, `watchlist.import_pr_babysit`; v1 / v1. | 0 success; 1 operational error; 2 policy error. | Mutates only `watchlist.json`; never leases, claims, messages, branches, or PRs. |
 
 For worktree, attribution, and watchlist commands, JSON dispatch errors use the
 listed envelope and a structured error. Status has its dedicated v2 error path.
@@ -53,8 +53,9 @@ as described above.
 
 The local coordination authority is one SQLite lease store (`leases` and
 `agents`) shared by processes on the **same host**. Matching filesystem paths on
-separate hosts do not make a shared store. `status`, `jobs`, `worktree list`, and
-the watchlist are views of that store, not independent registries.
+separate hosts do not make a shared store. `status`, `jobs`, and `worktree list`
+are views of that store. The separate PR watchlist is external
+GitHub visibility, not an ownership or coordination registry.
 
 The harness owns checkout/worktree creation and deletion. Current writ commands
 register and inspect those checkouts; the managed `create`, `remove`, and `prune`

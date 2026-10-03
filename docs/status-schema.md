@@ -3,7 +3,8 @@
 `writ status --json` and `writ jobs --json` report **local collaboration state**
 from the SQLite lease store (`leases` + `agents`). Human output is formatted from
 the same snapshot. This is not a GitHub PR/check/merge gate and does not revive
-the deleted Python orchestrator or `watched.json`.
+the deleted Python orchestrator or `watched.json`. The separate `watchlist.json`
+schema records external PR visibility only; see [watchlist-schema.md](watchlist-schema.md).
 
 ## Envelope
 

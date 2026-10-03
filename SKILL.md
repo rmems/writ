@@ -159,16 +159,19 @@ writ agent: fixed in abc1234
 
 SHA policy: include `--commit-sha` only when referring to committed or pushed work, and only with a real object id. Review replies that report a code fix must use the SHA from a successful push; do not omit it after that push, and do not invent one. Coordination messages and replies with no code change omit `--commit-sha`. If a SHA is passed to the formatter, it is always rendered so a real fix cannot be dropped. Peers do not need a push before they can talk.
 
-### Collaboration watchlist (view only)
+### PR watchlist (visibility only)
 
-`writ watchlist list|check|check-all` reads the shared lease store (`WRIT_LEASE_PATH`, default `{user_data}/writ/leases.db`). It does **not** write `watchlist.json`, `watched.json`, or `pr-babysit` state.
+`writ watchlist` persists external PR/check visibility in `watchlist.json`. It is
+not a scheduler, ownership store, coordination inbox, or merge gate; RM-825's
+SQLite lease/message state remains the coordination authority.
 
-- **Source of ownership:** lease rows from `writ worktree register` (and later RM-825 `coord_claims` / `coord_messages` when those tables exist).
-- **Local collab status:** `running`, `waiting`, `paused`, `conflicted`, `ready_for_integration`.
-- **Recovery:** `live`, `released`, `stale_heartbeat`, `missing_checkout`.
-- **GitHub:** `check` / `check-all` probe PRs live (`gh pr list --head`). That overlay is not a merge gate. `--repo` / `--owner` filters are optional; probes still honour `WRIT_ALLOWED_OWNERS`.
-- **`add` / `remove`:** do not persist. Register or unregister a checkout instead.
-- Same-host SQLite is not cross-host coordination. Linear remains the required task tracker.
+- `add` resolves PR metadata and stores `(repo, number)` identities.
+- `remove` deletes one identity without treating stack-mates as owned work.
+- `list` reads the persisted visibility snapshot.
+- `check` / `check-all` refresh GitHub state; multi-owner walks require
+  `WRIT_ALLOWED_OWNERS` and process stacks bottom-up.
+- `import-pr-babysit` reads legacy PR visibility without writing to that source.
+- `check-all` never increments `fix_count`, spawns workers, or merges.
 
 See [`docs/watchlist-schema.md`](docs/watchlist-schema.md).
 

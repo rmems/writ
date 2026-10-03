@@ -21,8 +21,7 @@ All of them, under `--json`:
 | --- | --- |
 | no subcommand | `cli.bootstrap` |
 | `status` / `jobs` | `cli.status` / `cli.jobs` |
-| `watchlist list\|check\|check-all` | `cli.watchlist.list` / `cli.watchlist.check` / `cli.watchlist.check_all` |
-| `watchlist add\|remove` | `cli.watchlist.add` / `cli.watchlist.remove` (never persist) |
+| `watchlist add\|remove\|list\|check\|check-all\|import-pr-babysit` | `watchlist.add` etc. |
 | `git-safe` / `gh-safe` | `git.safe` / `gh.safe` |
 | `worktree register\|unregister\|inspect\|list` | `worktree.register` etc. |
 | `worktree create\|remove\|prune` | `worktree.create` etc. (deprecated) |
@@ -31,8 +30,8 @@ All of them, under `--json`:
 | `install` | `cli.install` |
 | `hook` | no envelope even under `--json`: PreToolUse is allow/block via exit code; a WorktreeCreate event prints the registered checkout path only when the path is an existing git checkout — missing, nonexistent, or non-git paths produce no stdout |
 
-**The exception is the policy-violation path**, which prints plain text on stderr
-with exit code 2 instead of an envelope:
+**The exception is policy validation in `git-safe` and `gh-safe`**, which prints
+plain text on stderr with exit code 2 instead of an envelope:
 
 ```console
 $ writ --json git-safe push --force
@@ -45,6 +44,7 @@ writ: policy violation [MERGE_BLOCKED]: `gh pr merge` is not allowed
 So `git-safe` and `gh-safe` *do* emit `git.safe` / `gh.safe` envelopes on success —
 see `git-safe-success.json` — but a rejected command is not reported that way. The
 bracketed token is the stable `PolicyCode`; parse that rather than the prose.
+Watchlist policy errors still emit their command's JSON error envelope.
 
 An earlier revision of this file claimed those two commands never emit an envelope
 at all, and that `cli.bootstrap` did not exist. Both were wrong: `writ --json` with
@@ -60,6 +60,7 @@ writ --json git-safe --repo <repo> rev-parse --is-inside-work-tree   # git.safe
 writ --json worktree list                     # worktree.list
 writ --json worktree register <path>          # worktree.register
 writ --json attribution format --body "Looks good!"   # attribution.format
+writ --json watchlist list --state /tmp/missing.json   # watchlist.list (empty)
 # error envelope, no repository mutation:
 writ --json worktree create --schema-version 2 --repo <repo> <owner> <repo-name> <job> <branch>  # deprecated
 ```

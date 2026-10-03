@@ -1,59 +1,133 @@
-# Watchlist view schema
+# Watchlist JSON schema
 
-`writ watchlist` is a **consumer** of shared coordination state. RM-825 owns `leases.db` (leases, and later `coord_claims` / `coord_messages`). This command never writes those tables and never creates `watchlist.json`.
+`writ watchlist` persists a **multi-owner PR watchlist** so check cycles can
+`add` / `remove` / `list` / `check-all` without rediscovering work each session.
 
-Path: `{user_data}/writ/leases.db`, overridable with `WRIT_LEASE_PATH`. The resolver still falls back to a pre-rename `worktrees-hives` root when `writ/` is absent. This process does not write into `pr-babysit/`. `list`/`check` open the lease store through the existing `LeaseStore` helper (which may create an empty `leases`/`agents` schema if the file is missing). Coord overlay opens the same file **read-only** and never creates `coord_*` tables.
+This file is **not** [`watched.json`](status-schema.md). `writ status` / `writ jobs`
+read a JSON *array* of job-status objects from `watched.json` (read path only).
+The watchlist is a versioned *object* in `watchlist.json`. Mixing the two schemas
+would break status output.
+
+## Location
+
+| | Path |
+| --- | --- |
+| Default file | `{user_data}/writ/watchlist.json` |
+| User data (Unix) | `$XDG_DATA_HOME` or `~/.local/share` |
+| User data (macOS) | `~/Library/Application Support` |
+| User data (Windows) | `%APPDATA%` |
+| Legacy root | `{user_data}/worktrees-hives/watchlist.json` if that directory exists and `writ/` does not |
+| Override | `WRIT_WATCHLIST_PATH`, then `WH_WATCHLIST_PATH` |
+
+The parent directory is created on first write (self-bootstrapping). File mode on
+Unix is `0600` because titles are stored locally.
+
+`WRIT_STATE_PATH` / `WH_STATE_PATH` point at job-status `watched.json` and are
+**never** used as the watchlist path.
+
+The store never writes into `pr-babysit/`. `writ watchlist import-pr-babysit`
+reads that tree if you ask it to.
 
 ## Commands
 
-| Command | GitHub probes | Persistence |
+| Command | Envelope `command` | Effect |
 | --- | --- | --- |
-| `writ watchlist list` | no | none |
-| `writ watchlist check` / `check-all` | live `gh pr list --head` | none |
-| `writ watchlist add` / `remove` | no | none — prints a hint to use `worktree register` / `unregister` |
+| `writ watchlist add [--repo owner/name] <number>…` | `watchlist.add` | `gh pr view`; skip MERGED/CLOSED; dedupe `(repo, number)` |
+| `writ watchlist remove [--repo owner/name] <number>` | `watchlist.remove` | Remove one entry; stack-mates stay |
+| `writ watchlist list [--owner] [--repo]` | `watchlist.list` | All owners by default |
+| `writ watchlist check [--repo owner/name] <number>` | `watchlist.check` | One GitHub refresh |
+| `writ watchlist check-all [--owner] [--repo]` | `watchlist.check_all` | Full walk in stack order |
+| `writ watchlist import-pr-babysit [--path FILE]` | `watchlist.import_pr_babysit` | Read-only copy from pr-babysit JSON |
 
-Filters: `--owner`, `--repo`, `--job`, `--include-released`. Multi-owner rows coexist; identity is `(owner, repo_name, job_id)` from the lease store. GitHub `--repo` selectors still require `WRIT_ALLOWED_OWNERS`.
+`--state FILE` on each subcommand overrides the path (tests and operators).
 
-## Envelope
+`--json` uses the shared v1 envelope. Diagnostics go to stderr.
+
+## Schema
 
 ```json
 {
-  "ok": true,
-  "schema_version": 1,
-  "command": "cli.watchlist.list",
-  "data": {
-    "entries": [],
-    "coord_available": false,
-    "github_probed": false
-  },
-  "error": null
+  "version": 1,
+  "prs": [
+    {
+      "repo": "acme/widgets",
+      "number": 41,
+      "branch": "fix-ci",
+      "base": "feat/stack-base",
+      "title": "Fix CI",
+      "stack_id": "ae-latency",
+      "stack_type": null,
+      "stack_position": 1,
+      "status": "residual",
+      "added_at": "2026-07-09T17:00:00Z",
+      "last_checked": "2026-07-09T18:00:00Z",
+      "check_count": 2,
+      "fix_count": 1,
+      "residual_blockers": ["class_b:codacy_action_required", "review:REVIEW_REQUIRED"],
+      "kind": "pr_babysit",
+      "url": "https://github.com/acme/widgets/pull/41"
+    }
+  ],
+  "groups": {
+    "ae-latency": {
+      "repo": "acme/widgets",
+      "numbers": [36, 41]
+    }
+  }
 }
 ```
 
-`coord_available` is true only when `coord_claims` exists in the same SQLite file. Missing tables are not an error.
+Identity is `(repo, number)`. `add` refreshes branch/base/title and preserves
+`fix_count` unless `--reset`.
 
-## `collab_status` (local)
+`groups` is `stack_id → { repo, numbers }` with numbers in bottom-up order.
 
-Distinct from GitHub check status. Not a merge gate.
+Unknown additive fields on the document or on an entry are preserved on write.
 
-| Value | Meaning |
-| --- | --- |
-| `running` | Held writer lock, not paused or blocked |
-| `waiting` | Unacked help/handoff/dependency, or `BLOCKED` / `REVIEW_ONLY` |
-| `paused` | Coord claim `paused_at` set; WIP is preserved |
-| `conflicted` | `NEEDS_HUMAN` or GitHub `mergeable=CONFLICTING` |
-| `ready_for_integration` | Lease mode `MERGE_READY` (local integration, not GitHub-merged) |
-| `released` | Lease released or `UNASSIGNED`; retained history row, not an active writer |
-
-## `recovery_status`
+## Status enum
 
 | Value | Meaning |
 | --- | --- |
-| `live` | Unreleased lease, checkout path exists, and heartbeat is fresh (or no `ttl`) |
-| `released` | Identity row kept after unregister |
-| `stale_heartbeat` | `ttl` elapsed since last heartbeat |
-| `missing_checkout` | Worktree/checkout path is gone; harness owns cleanup |
+| `healthy` | Checks passed, no residuals |
+| `pending` | Checks still running, or GitHub returned no status checks yet |
+| `failed` | At least one failing check (`class_a:…`) |
+| `residual` | Leftovers such as review (`review:…`) or class B/C |
+| `conflict` | GitHub `mergeable=CONFLICTING` |
+| `timeout` | `gh pr view` timed out (`timeout:gh`) |
 
-## GitHub overlay
+MERGED/CLOSED PRs are skipped on `add` and pruned on `check` / `check-all`.
 
-Present only after `check` / `check-all`. `check_status` values: `healthy`, `pending`, `failed`, `residual`, `conflict`, `merged`, `closed`, `unknown`. Residuals use prefixed codes (`class_a:…`, `class_b:…`, `class_c:…`, `review:…`, `conflict:mergeable`). Locally integrated/tested (`ready_for_integration`) is independent of GitHub `MERGED`.
+`check-all` updates `last_checked`, `status`, `residual_blockers`, and
+`check_count`. It does **not** increment `fix_count` (babysit / #9 owns that
+budget). It does not spawn workers; that remains orchestrator work.
+
+Residual codes prefer `#10` prefixes: `class_a:`, `class_b:`, `class_c:`,
+`review:`, `conflict:`, `timeout:`.
+
+## Multi-owner and allowlist
+
+`list` shows every owner in the file. `--owner` / `--repo` are optional filters.
+
+`check-all` without `--repo`/`--owner` is a multi-owner walk and requires
+`WRIT_ALLOWED_OWNERS` or `--allowed-owners` (comma-separated). An empty allowlist denies that walk
+(`OWNER_ALLOWLIST_REQUIRED`, exit 2). There is no built-in owner list.
+
+`add` and `check` call GitHub for an explicit `owner/name`, so that owner must be
+present in `WRIT_ALLOWED_OWNERS` or `--allowed-owners`. An empty allowlist denies
+the probe, and a non-matching list returns `OWNER_NOT_ALLOWED`.
+
+## Integrity
+
+- Mutations are serialized across processes with a sidecar lock file.
+- Writes are a temp file in the same directory plus `rename`. On Windows a
+  recoverable backup protects the prior file during replacement.
+- Missing file → empty watchlist (not an error).
+- Corrupt JSON → quarantine to `watchlist.json.corrupt.<stamp>`, warn, exit
+  non-zero. The next command sees a missing file (empty list). The original
+  bytes are not overwritten.
+
+## Kind
+
+`kind` is `pr_babysit` (default) or `issue_to_pr`.
+Re-adding an existing entry applies the requested kind, including the default
+when `--kind` is omitted.

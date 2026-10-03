@@ -3,6 +3,10 @@
 //! `writ status` / `writ jobs` no longer use this file. Collaboration status is
 //! loaded from the SQLite lease store (`crates/writ-core/src/status.rs`).
 //! There is still no writer for `watched.json`; do not add one.
+//!
+//! The external PR visibility watchlist is a separate versioned file
+//! (`watchlist.json`) owned by [`crate::watchlist`]. It is not coordination
+//! authority and must not share this path or schema.
 
 use std::fs;
 use std::path::Path;

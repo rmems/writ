@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 mod watchlist;
 
@@ -86,10 +86,99 @@ enum Command {
         writ_bin: Option<PathBuf>,
     },
 
-    /// Collaboration status view over the shared lease store (not a second store).
+    /// Persistent external PR visibility (not shared coordination authority).
     Watchlist {
         #[command(subcommand)]
-        action: watchlist::WatchlistAction,
+        action: WatchlistAction,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum WatchlistKindArg {
+    /// Tracked for babysit / check-all cycles.
+    PrBabysit,
+    /// Added after issue-to-PR handoff.
+    IssueToPr,
+}
+
+#[derive(Debug, Subcommand)]
+enum WatchlistAction {
+    /// Resolve PR metadata via `gh pr view` and persist it.
+    Add {
+        /// Override `watchlist.json` path (`WRIT_WATCHLIST_PATH`).
+        #[arg(long)]
+        state: Option<PathBuf>,
+        /// Repository `owner/name`.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Reset `fix_count` / residuals when refreshing an existing entry.
+        #[arg(long)]
+        reset: bool,
+        /// Job kind stored on the entry.
+        #[arg(long, default_value = "pr-babysit", value_enum)]
+        kind: WatchlistKindArg,
+        /// `owner/name` and/or pull-request numbers.
+        targets: Vec<String>,
+    },
+    /// Remove one entry. Stack-mates stay on the watchlist.
+    Remove {
+        /// Override `watchlist.json` path (`WRIT_WATCHLIST_PATH`).
+        #[arg(long)]
+        state: Option<PathBuf>,
+        /// Repository `owner/name`.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Pull-request number (alternative to a positional target).
+        #[arg(long)]
+        number: Option<u64>,
+        /// `owner/name` and/or a single pull-request number.
+        targets: Vec<String>,
+    },
+    /// List watched pull requests (all owners by default).
+    List {
+        /// Override `watchlist.json` path (`WRIT_WATCHLIST_PATH`).
+        #[arg(long)]
+        state: Option<PathBuf>,
+        /// Filter by `owner/name`.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Filter by repository owner.
+        #[arg(long)]
+        owner: Option<String>,
+    },
+    /// Refresh one watchlist entry from GitHub.
+    Check {
+        /// Override `watchlist.json` path (`WRIT_WATCHLIST_PATH`).
+        #[arg(long)]
+        state: Option<PathBuf>,
+        /// Repository `owner/name` (required when the number is not unique).
+        #[arg(long)]
+        repo: Option<String>,
+        /// Pull-request number.
+        number: u64,
+    },
+    /// One cycle over the whole watchlist (allowlisted owners; stack order).
+    #[command(name = "check-all")]
+    CheckAll {
+        /// Override `watchlist.json` path (`WRIT_WATCHLIST_PATH`).
+        #[arg(long)]
+        state: Option<PathBuf>,
+        /// Limit the cycle to one `owner/name`.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Limit the cycle to one owner.
+        #[arg(long)]
+        owner: Option<String>,
+    },
+    /// Copy entries from pr-babysit JSON (read-only; never writes there).
+    #[command(name = "import-pr-babysit")]
+    ImportPrBabysit {
+        /// Override `watchlist.json` path (`WRIT_WATCHLIST_PATH`).
+        #[arg(long)]
+        state: Option<PathBuf>,
+        /// Source file (default: `$XDG_DATA_HOME/pr-babysit/watched-prs.json`).
+        #[arg(long)]
+        path: Option<PathBuf>,
     },
 }
 
@@ -476,11 +565,12 @@ fn json_error_command(cli: &Cli) -> Option<&'static str> {
     worktree_command_name(cli).or(match &cli.command {
         Some(Command::Attribution { .. }) => Some("attribution.format"),
         Some(Command::Watchlist { action }) => Some(match action {
-            watchlist::WatchlistAction::List { .. } => "cli.watchlist.list",
-            watchlist::WatchlistAction::Check { .. } => "cli.watchlist.check",
-            watchlist::WatchlistAction::CheckAll { .. } => "cli.watchlist.check_all",
-            watchlist::WatchlistAction::Add => "cli.watchlist.add",
-            watchlist::WatchlistAction::Remove => "cli.watchlist.remove",
+            WatchlistAction::Add { .. } => "watchlist.add",
+            WatchlistAction::Remove { .. } => "watchlist.remove",
+            WatchlistAction::List { .. } => "watchlist.list",
+            WatchlistAction::Check { .. } => "watchlist.check",
+            WatchlistAction::CheckAll { .. } => "watchlist.check_all",
+            WatchlistAction::ImportPrBabysit { .. } => "watchlist.import_pr_babysit",
         }),
         _ => None,
     })
@@ -948,7 +1038,9 @@ async fn run(cli: Cli, stdout: &mut impl Write) -> writ_core::error::Result<Exit
         Some(Command::Install { settings, writ_bin }) => {
             run_install(settings, writ_bin, cli.json, stdout)
         }
-        Some(Command::Watchlist { action }) => watchlist::run(action, &allowlist, cli.json, stdout),
+        Some(Command::Watchlist { action }) => {
+            watchlist::run(action, &allowlist, cli.json, stdout).map_err(Into::into)
+        }
         None => {
             if cli.json {
                 serde_json::to_writer(

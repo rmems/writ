@@ -1,402 +1,678 @@
-//! `writ watchlist` CLI: collaboration view over `leases.db`.
+//! CLI handlers for `writ watchlist`.
 
 use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use clap::Subcommand;
 use writ_core::contract::{ErrorData, Response, SCHEMA_VERSION};
-use writ_core::lease::LeaseStore;
 use writ_core::owners::OwnerAllowlist;
-use writ_core::paths::lease_store_path;
-use writ_core::watchlist::{GhPrProbe, WatchQuery, WatchlistData, load_view};
+use writ_core::watchlist::{
+    AddReport, CheckReport, GhPrProbe, WatchEntry, WatchKind, WatchlistError, add_prs_at,
+    check_prs_at, default_pr_babysit_path, import_pr_babysit_at, list_prs_at, owner_of_repo,
+    remove_pr_at,
+};
 
-#[derive(Debug, Subcommand)]
-pub enum WatchlistAction {
-    /// Show registered jobs from the lease store (no GitHub probes).
-    List {
-        #[arg(long)]
-        owner: Option<String>,
-        #[arg(long)]
-        repo: Option<String>,
-        #[arg(long)]
-        job: Option<String>,
-        #[arg(long)]
-        include_released: bool,
-    },
-    /// Refresh GitHub PR/check overlay for matching jobs. Does not persist.
-    Check {
-        #[arg(long)]
-        owner: Option<String>,
-        #[arg(long)]
-        repo: Option<String>,
-        #[arg(long)]
-        job: Option<String>,
-        #[arg(long)]
-        include_released: bool,
-    },
-    /// Same as `check` over the full filtered set.
-    CheckAll {
-        #[arg(long)]
-        owner: Option<String>,
-        #[arg(long)]
-        repo: Option<String>,
-        #[arg(long)]
-        include_released: bool,
-    },
-    /// Watchlist does not persist a second store. Register a checkout instead.
-    Add,
-    /// Watchlist does not persist a second store. Unregister a checkout instead.
-    Remove,
+use super::{WatchlistAction, WatchlistKindArg};
+
+fn state_path(explicit: Option<&PathBuf>) -> PathBuf {
+    explicit
+        .cloned()
+        .unwrap_or_else(writ_core::paths::watchlist_path)
 }
 
-/// Execute a watchlist action and write its human-readable or JSON response.
-pub fn run(
+/// Run a `writ watchlist` subcommand.
+pub(crate) fn run(
     action: WatchlistAction,
     allowlist: &OwnerAllowlist,
     json: bool,
     stdout: &mut impl Write,
-) -> writ_core::error::Result<ExitCode> {
+) -> io::Result<ExitCode> {
+    let path = state_path(action.state());
+    let mut context = RunContext {
+        path: path.as_path(),
+        allowlist,
+        json,
+        stdout,
+    };
     match action {
-        WatchlistAction::Add => persist_hint("add", json, stdout),
-        WatchlistAction::Remove => persist_hint("remove", json, stdout),
-        other => render_view(
-            ViewRequest {
-                action: other,
-                allowlist,
-                json,
+        WatchlistAction::Add {
+            repo,
+            reset,
+            kind,
+            targets,
+            ..
+        } => run_add(
+            &mut context,
+            AddArgs {
+                repo: repo.as_deref(),
+                reset,
+                kind,
+                targets: &targets,
             },
-            stdout,
+        ),
+        WatchlistAction::Remove {
+            repo,
+            number,
+            targets,
+            ..
+        } => run_remove(
+            &mut context,
+            RemoveArgs {
+                repo: repo.as_deref(),
+                number,
+                targets: &targets,
+            },
+        ),
+        WatchlistAction::List { repo, owner, .. } => {
+            run_list(&mut context, owner.as_deref(), repo.as_deref())
+        }
+        WatchlistAction::Check { repo, number, .. } => {
+            run_check(&mut context, repo.as_deref(), number)
+        }
+        WatchlistAction::CheckAll { repo, owner, .. } => {
+            run_check_all(&mut context, owner.as_deref(), repo.as_deref())
+        }
+        WatchlistAction::ImportPrBabysit { path: source, .. } => run_import(&mut context, source),
+    }
+}
+
+struct RunContext<'a, W: Write> {
+    path: &'a Path,
+    allowlist: &'a OwnerAllowlist,
+    json: bool,
+    stdout: &'a mut W,
+}
+
+impl<W: Write> RunContext<'_, W> {
+    fn probe(&self) -> GhPrProbe {
+        GhPrProbe::new(self.allowlist.clone())
+    }
+
+    fn allowed_owners(&self) -> Vec<String> {
+        self.allowlist.iter().map(str::to_owned).collect()
+    }
+}
+
+struct AddArgs<'a> {
+    repo: Option<&'a str>,
+    reset: bool,
+    kind: WatchlistKindArg,
+    targets: &'a [String],
+}
+
+struct RemoveArgs<'a> {
+    repo: Option<&'a str>,
+    number: Option<u64>,
+    targets: &'a [String],
+}
+
+trait WatchlistStatePath {
+    fn state(&self) -> Option<&PathBuf>;
+}
+
+impl WatchlistStatePath for WatchlistAction {
+    fn state(&self) -> Option<&PathBuf> {
+        match self {
+            Self::Add { state, .. }
+            | Self::Remove { state, .. }
+            | Self::List { state, .. }
+            | Self::Check { state, .. }
+            | Self::CheckAll { state, .. }
+            | Self::ImportPrBabysit { state, .. } => state.as_ref(),
+        }
+    }
+}
+
+fn run_remove(
+    context: &mut RunContext<'_, impl Write>,
+    args: RemoveArgs<'_>,
+) -> io::Result<ExitCode> {
+    match remove_command(context.path, args) {
+        Ok(entry) => write_remove(context.json, &entry, context.stdout).map(|()| ExitCode::SUCCESS),
+        Err(err) => write_error("watchlist.remove", context.json, err, context.stdout),
+    }
+}
+
+fn run_list(
+    context: &mut RunContext<'_, impl Write>,
+    owner: Option<&str>,
+    repo: Option<&str>,
+) -> io::Result<ExitCode> {
+    match list_prs_at(context.path, owner, repo) {
+        Ok(entries) => {
+            write_list(context.json, &entries, context.stdout).map(|()| ExitCode::SUCCESS)
+        }
+        Err(err) => write_error("watchlist.list", context.json, err, context.stdout),
+    }
+}
+
+fn run_check(
+    context: &mut RunContext<'_, impl Write>,
+    repo: Option<&str>,
+    number: u64,
+) -> io::Result<ExitCode> {
+    match check_one(context, repo, number) {
+        Ok(report) => write_check(context.json, "watchlist.check", &report, context.stdout)
+            .map(|()| ExitCode::SUCCESS),
+        Err(err) => write_error("watchlist.check", context.json, err, context.stdout),
+    }
+}
+
+fn run_check_all(
+    context: &mut RunContext<'_, impl Write>,
+    owner: Option<&str>,
+    repo: Option<&str>,
+) -> io::Result<ExitCode> {
+    let probe = context.probe();
+    let owners = context.allowed_owners();
+    match check_prs_at(context.path, &probe, owner, repo, None, Some(&owners)) {
+        Ok(report) => write_check(context.json, "watchlist.check_all", &report, context.stdout)
+            .map(|()| ExitCode::SUCCESS),
+        Err(err) => write_error("watchlist.check_all", context.json, err, context.stdout),
+    }
+}
+
+fn run_import(
+    context: &mut RunContext<'_, impl Write>,
+    source: Option<PathBuf>,
+) -> io::Result<ExitCode> {
+    let source = source.unwrap_or_else(default_pr_babysit_path);
+    match import_pr_babysit_at(context.path, &source) {
+        Ok(report) => write_add(
+            "watchlist.import_pr_babysit",
+            context.json,
+            &report,
+            context.stdout,
+        )
+        .map(|()| ExitCode::SUCCESS),
+        Err(err) => write_error(
+            "watchlist.import_pr_babysit",
+            context.json,
+            err,
+            context.stdout,
         ),
     }
 }
 
-struct ViewRequest<'a> {
-    action: WatchlistAction,
-    allowlist: &'a OwnerAllowlist,
-    json: bool,
+/// Handle the `watchlist add` arm: resolve state path, add PRs, render output.
+fn run_add(context: &mut RunContext<'_, impl Write>, args: AddArgs<'_>) -> io::Result<ExitCode> {
+    match add_command(context, args) {
+        Ok(report) => write_add("watchlist.add", context.json, &report, context.stdout)
+            .map(|()| ExitCode::SUCCESS),
+        Err(err) => write_error("watchlist.add", context.json, err, context.stdout),
+    }
 }
 
-impl ViewRequest<'_> {
-    fn command(&self) -> &'static str {
-        match self.action {
-            WatchlistAction::List { .. } => "cli.watchlist.list",
-            WatchlistAction::Check { .. } => "cli.watchlist.check",
-            WatchlistAction::CheckAll { .. } => "cli.watchlist.check_all",
-            WatchlistAction::Add | WatchlistAction::Remove => unreachable!(),
+fn add_command(
+    context: &RunContext<'_, impl Write>,
+    args: AddArgs<'_>,
+) -> Result<AddReport, WatchlistError> {
+    let (repo, numbers) = parse_repo_and_numbers(args.repo, args.targets)?;
+    if numbers.is_empty() {
+        return Err(WatchlistError::InvalidInput(
+            "add requires at least one pull-request number".to_owned(),
+        ));
+    }
+    let probe = context.probe();
+    let owners = context.allowed_owners();
+    add_prs_at(
+        context.path,
+        &probe,
+        &repo,
+        &numbers,
+        args.kind.into_kind(),
+        args.reset,
+        Some(&owners),
+    )
+}
+
+fn remove_command(path: &Path, args: RemoveArgs<'_>) -> Result<WatchEntry, WatchlistError> {
+    let (repo, numbers) = parse_repo_and_numbers(args.repo, args.targets)?;
+    let number = match (args.number, numbers.as_slice()) {
+        (Some(number), []) => number,
+        (None, [number]) => *number,
+        (Some(number), [same]) if *same == number => number,
+        _ => {
+            return Err(WatchlistError::InvalidInput(
+                "remove requires exactly one pull-request number".to_owned(),
+            ));
         }
-    }
+    };
+    remove_pr_at(path, &repo, number)
+}
 
-    fn query(&self) -> WatchQuery {
-        match &self.action {
-            WatchlistAction::List {
-                owner,
-                repo,
-                job,
-                include_released,
-            } => WatchQuery {
-                owner: owner.clone(),
-                repo: repo.clone(),
-                job_id: job.clone(),
-                include_released: *include_released,
-                probe_github: false,
-            },
-            WatchlistAction::Check {
-                owner,
-                repo,
-                job,
-                include_released,
-            } => WatchQuery {
-                owner: owner.clone(),
-                repo: repo.clone(),
-                job_id: job.clone(),
-                include_released: *include_released,
-                probe_github: true,
-            },
-            WatchlistAction::CheckAll {
-                owner,
-                repo,
-                include_released,
-            } => WatchQuery {
-                owner: owner.clone(),
-                repo: repo.clone(),
-                job_id: None,
-                include_released: *include_released,
-                probe_github: true,
-            },
-            WatchlistAction::Add | WatchlistAction::Remove => unreachable!(),
+fn check_one(
+    context: &RunContext<'_, impl Write>,
+    repo_flag: Option<&str>,
+    number: u64,
+) -> Result<CheckReport, WatchlistError> {
+    let repo = match repo_flag {
+        Some(repo) => repo.to_owned(),
+        None => infer_repo_for_number(context.path, number)?,
+    };
+    let probe = context.probe();
+    let owners = context.allowed_owners();
+    check_prs_at(
+        context.path,
+        &probe,
+        None,
+        Some(repo.as_str()),
+        Some(&[number]),
+        Some(&owners),
+    )
+}
+
+fn infer_repo_for_number(path: &Path, number: u64) -> Result<String, WatchlistError> {
+    let entries = list_prs_at(path, None, None)?;
+    let matches: Vec<_> = entries
+        .into_iter()
+        .filter(|entry| entry.number == number)
+        .collect();
+    match matches.as_slice() {
+        [entry] => Ok(entry.repo.clone()),
+        [] => Err(WatchlistError::NotFound {
+            repo: "<unknown>".to_owned(),
+            number,
+        }),
+        _ => Err(WatchlistError::InvalidInput(format!(
+            "PR #{number} exists in multiple repos; pass --repo owner/name"
+        ))),
+    }
+}
+
+fn parse_repo_and_numbers(
+    repo_flag: Option<&str>,
+    targets: &[String],
+) -> Result<(String, Vec<u64>), WatchlistError> {
+    let mut repo = repo_flag
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    let mut numbers = Vec::new();
+    for target in targets {
+        if target.contains('/') {
+            if repo
+                .as_deref()
+                .is_some_and(|have| !have.eq_ignore_ascii_case(target))
+            {
+                return Err(WatchlistError::InvalidInput(
+                    "conflicting repository arguments".to_owned(),
+                ));
+            }
+            repo = Some(target.clone());
+            continue;
         }
+        let number = target.parse::<u64>().map_err(|_| {
+            WatchlistError::InvalidInput(format!("not a pull-request number: `{target}`"))
+        })?;
+        numbers.push(number);
     }
-}
-
-fn persist_hint(
-    verb: &'static str,
-    json: bool,
-    stdout: &mut impl Write,
-) -> writ_core::error::Result<ExitCode> {
-    let command = match verb {
-        "add" => "cli.watchlist.add",
-        _ => "cli.watchlist.remove",
-    };
-    let hint = "Watchlist is a view over leases.db (RM-825), not a second store. \
-                Use `writ worktree register` / `unregister` to change ownership records.";
-    if json {
-        let response = Response {
-            ok: true,
-            schema_version: SCHEMA_VERSION,
-            command,
-            data: serde_json::json!({
-                "persisted": false,
-                "hint": hint,
-            }),
-            error: None::<ErrorData>,
-        };
-        serde_json::to_writer(&mut *stdout, &response).map_err(io::Error::other)?;
-        stdout.write_all(b"\n")?;
-    } else {
-        writeln!(stdout, "{hint}")?;
+    let repo = repo.ok_or_else(|| {
+        WatchlistError::InvalidInput(
+            "repository required: pass --repo owner/name or owner/name before the numbers"
+                .to_owned(),
+        )
+    })?;
+    if owner_of_repo(&repo).is_none() {
+        return Err(WatchlistError::InvalidInput(format!(
+            "repo must be owner/name, got `{repo}`"
+        )));
     }
-    Ok(ExitCode::SUCCESS)
+    Ok((repo, numbers))
 }
 
-fn render_view(
-    request: ViewRequest<'_>,
-    stdout: &mut impl Write,
-) -> writ_core::error::Result<ExitCode> {
-    let path = lease_store_path();
-    let query = request.query();
-    // A view never creates the store: a missing leases.db is an empty view.
-    let data = if path.exists() {
-        let store = LeaseStore::open_read_only(&path)?;
-        let probe = GhPrProbe::new(request.allowlist.clone());
-        let github = query.probe_github.then_some(&probe as _);
-        load_view(&store, &query, github, request.allowlist)?
-    } else {
-        WatchlistData::empty(query.probe_github, false)
-    };
-    write_output(request.json, request.command(), &data, stdout)?;
-    Ok(ExitCode::SUCCESS)
-}
-
-fn write_output(
-    json: bool,
+fn write_add(
     command: &'static str,
-    data: &WatchlistData,
+    json: bool,
+    report: &AddReport,
     stdout: &mut impl Write,
 ) -> io::Result<()> {
     if json {
-        return write_json(command, data, stdout);
-    }
-    if data.entries.is_empty() {
-        writeln!(
+        return write_envelope(
+            command,
+            serde_json::json!({
+                "added": identities(&report.added),
+                "refreshed": identities(&report.refreshed),
+                "skipped": report.skipped.iter().map(|(repo, number, state)| {
+                    serde_json::json!({ "repo": repo, "number": number, "state": state })
+                }).collect::<Vec<_>>(),
+            }),
+            None,
             stdout,
-            "No registered jobs. Harnesses own checkouts; register with `writ worktree register`."
-        )?;
+        );
+    }
+    if add_report_is_empty(report) {
+        writeln!(stdout, "No pull requests added.")?;
         return Ok(());
     }
-    write_table(data, stdout)
+    for (repo, number) in &report.added {
+        writeln!(stdout, "added {repo}#{number}")?;
+    }
+    for (repo, number) in &report.refreshed {
+        writeln!(stdout, "refreshed {repo}#{number}")?;
+    }
+    for (repo, number, state) in &report.skipped {
+        writeln!(stdout, "skipped {repo}#{number} ({state})")?;
+    }
+    Ok(())
 }
 
-fn write_json(
-    command: &'static str,
-    data: &WatchlistData,
-    stdout: &mut impl Write,
-) -> io::Result<()> {
-    let response = Response::success(command, data);
-    serde_json::to_writer(&mut *stdout, &response)?;
-    stdout.write_all(b"\n")
-}
-
-fn write_table(data: &WatchlistData, stdout: &mut impl Write) -> io::Result<()> {
+fn write_remove(json: bool, entry: &WatchEntry, stdout: &mut impl Write) -> io::Result<()> {
+    if json {
+        return write_envelope(
+            "watchlist.remove",
+            serde_json::json!({
+                "removed": true,
+                "repo": entry.repo,
+                "number": entry.number,
+            }),
+            None,
+            stdout,
+        );
+    }
     writeln!(
         stdout,
-        "job\towner/repo\tbranch\tcollab\trecovery\tgithub\tblockers"
+        "removed {}#{} (stack-mates, if any, stay on the watchlist)",
+        entry.repo, entry.number
+    )
+}
+
+fn write_list(json: bool, entries: &[WatchEntry], stdout: &mut impl Write) -> io::Result<()> {
+    if json {
+        return write_envelope(
+            "watchlist.list",
+            serde_json::json!({ "prs": entries.iter().map(entry_json).collect::<Vec<_>>() }),
+            None,
+            stdout,
+        );
+    }
+    if entries.is_empty() {
+        writeln!(stdout, "No watched pull requests.")?;
+        return Ok(());
+    }
+    writeln!(
+        stdout,
+        "REPO\tNUMBER\tBRANCH\tSTACK\tSTATUS\tLAST_CHECKED\tFIX\tBLOCKERS"
     )?;
-    for entry in &data.entries {
+    for entry in entries {
+        let stack = entry.stack_id.as_deref().unwrap_or("-");
+        let blockers = if entry.residual_blockers.is_empty() {
+            "-".to_owned()
+        } else {
+            entry.residual_blockers.join(",")
+        };
         writeln!(
             stdout,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
-            entry.job_id,
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             entry.repo,
+            entry.number,
             entry.branch,
-            entry.collab_status,
-            entry.recovery_status,
-            github_cell(entry.github.as_ref()),
-            blockers_cell(&entry.residual_blockers)
+            stack,
+            entry.status,
+            entry.last_checked,
+            entry.fix_count,
+            blockers
         )?;
     }
     Ok(())
 }
 
-fn github_cell(github: Option<&writ_core::watchlist::GithubState>) -> String {
-    match github {
-        None => "-".to_owned(),
-        Some(gh) if gh.number == 0 => gh.check_status.clone(),
-        Some(gh) => format!("#{}:{}", gh.number, gh.check_status),
+fn write_check(
+    json: bool,
+    command: &'static str,
+    report: &CheckReport,
+    stdout: &mut impl Write,
+) -> io::Result<()> {
+    if json {
+        return write_envelope(
+            command,
+            serde_json::json!({
+                "checked": report.checked.iter().map(entry_json).collect::<Vec<_>>(),
+                "pruned": report.pruned.iter().map(|(repo, number, state)| {
+                    serde_json::json!({ "repo": repo, "number": number, "state": state })
+                }).collect::<Vec<_>>(),
+            }),
+            None,
+            stdout,
+        );
     }
+    if report.checked.is_empty() && report.pruned.is_empty() {
+        writeln!(stdout, "No watched pull requests checked.")?;
+        return Ok(());
+    }
+    for entry in &report.checked {
+        writeln!(
+            stdout,
+            "checked {}#{} status={} blockers={}",
+            entry.repo,
+            entry.number,
+            entry.status,
+            if entry.residual_blockers.is_empty() {
+                "-".to_owned()
+            } else {
+                entry.residual_blockers.join(",")
+            }
+        )?;
+    }
+    for (repo, number, state) in &report.pruned {
+        writeln!(stdout, "pruned {repo}#{number} ({state})")?;
+    }
+    Ok(())
 }
 
-fn blockers_cell(blockers: &[String]) -> String {
-    if blockers.is_empty() {
-        "-".to_owned()
-    } else {
-        blockers.join(",")
+fn write_error(
+    command: &'static str,
+    json: bool,
+    err: WatchlistError,
+    stdout: &mut impl Write,
+) -> io::Result<ExitCode> {
+    let code = err.exit_code();
+    if json {
+        write_envelope(
+            command,
+            serde_json::json!({}),
+            Some(ErrorData {
+                code: err.code().to_owned(),
+                message: err.to_string(),
+            }),
+            stdout,
+        )?;
+    }
+    writeln!(io::stderr(), "writ: {err}")?;
+    Ok(ExitCode::from(code))
+}
+
+fn write_envelope(
+    command: &'static str,
+    data: serde_json::Value,
+    error: Option<ErrorData>,
+    stdout: &mut impl Write,
+) -> io::Result<()> {
+    let response = Response {
+        ok: error.is_none(),
+        schema_version: SCHEMA_VERSION,
+        command,
+        data,
+        error,
+    };
+    serde_json::to_writer(&mut *stdout, &response).map_err(io::Error::other)?;
+    stdout.write_all(b"\n")?;
+    Ok(())
+}
+
+/// True when an add/import produced no added, refreshed, or skipped entries.
+fn add_report_is_empty(report: &AddReport) -> bool {
+    report.added.is_empty() && report.refreshed.is_empty() && report.skipped.is_empty()
+}
+
+fn identities(items: &[(String, u64)]) -> Vec<serde_json::Value> {
+    items
+        .iter()
+        .map(|(repo, number)| serde_json::json!({ "repo": repo, "number": number }))
+        .collect()
+}
+
+fn entry_json(entry: &WatchEntry) -> serde_json::Value {
+    serde_json::json!({
+        "repo": entry.repo,
+        "number": entry.number,
+        "branch": entry.branch,
+        "status": entry.status,
+        "last_checked": entry.last_checked,
+        "fix_count": entry.fix_count,
+        "residual_blockers": entry.residual_blockers,
+        "stack_id": entry.stack_id,
+        "stack_type": entry.stack_type,
+        "stack_position": entry.stack_position,
+        "base": entry.base,
+        "title": entry.title,
+        "added_at": entry.added_at,
+        "check_count": entry.check_count,
+        "url": entry.url,
+        "kind": entry.kind,
+    })
+}
+
+impl WatchlistKindArg {
+    fn into_kind(self) -> WatchKind {
+        match self {
+            Self::PrBabysit => WatchKind::PrBabysit,
+            Self::IssueToPr => WatchKind::IssueToPr,
+        }
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use writ_core::owners::OwnerAllowlist;
-    use writ_core::watchlist::{
-        CollabStatus, CoordOverlay, RecoveryStatus, WatchEntry, WatchlistData,
-    };
+mod cli_unit_tests {
+    use super::{OwnerAllowlist, WatchlistAction, WatchlistKindArg, run};
+    use std::fs;
+    use std::io::Cursor;
+    use std::path::PathBuf;
+    use std::process::ExitCode;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    fn sample_entry() -> WatchEntry {
-        WatchEntry {
-            job_id: "job-1".to_owned(),
-            owner: "acme".to_owned(),
-            repo: "acme/sample".to_owned(),
-            branch: "hive/job-1".to_owned(),
-            worktree_path: "/tmp/wt".to_owned(),
-            lease_mode: "WRITER_LOCKED".to_owned(),
-            collab_status: CollabStatus::Running,
-            recovery_status: RecoveryStatus::Live,
-            coord: CoordOverlay {
-                agent_id: None,
-                session_id: None,
-                intent: None,
-                owner_generation: None,
-                paused: false,
-                declared_paths: Vec::new(),
-                overlaps: Vec::new(),
-                waiting_on: None,
-            },
-            github: None,
-            residual_blockers: vec!["recovery:stale_heartbeat".to_owned()],
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new() -> Self {
+            let id = NEXT.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::current_dir()
+                .unwrap()
+                .join("target")
+                .join(format!(
+                    "writ-watchlist-cli-unit-{}-{id}",
+                    std::process::id()
+                ));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
         }
     }
 
-    fn inspect(action: WatchlistAction) -> (&'static str, WatchQuery) {
-        let allowlist = OwnerAllowlist::parse("acme");
-        let request = ViewRequest {
-            action,
-            allowlist: &allowlist,
-            json: false,
-        };
-        (request.command(), request.query())
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn sample_state() -> (Scratch, PathBuf) {
+        let scratch = Scratch::new();
+        let path = scratch.0.join("watchlist.json");
+        fs::write(
+            &path,
+            r#"{
+              "version": 1,
+              "prs": [{
+                "repo": "acme/widgets",
+                "number": 7,
+                "branch": "feat/a",
+                "status": "pending",
+                "last_checked": "2026-01-01T00:00:00Z",
+                "fix_count": 0,
+                "residual_blockers": []
+              }],
+              "groups": {}
+            }"#,
+        )
+        .unwrap();
+        (scratch, path)
     }
 
     #[test]
-    fn add_does_not_persist() {
-        let mut out = Vec::new();
-        let code = persist_hint("add", true, &mut out).unwrap();
-        assert_eq!(code, ExitCode::SUCCESS);
-        let body = String::from_utf8(out).unwrap();
-        assert!(body.contains("\"persisted\":false"));
-        assert!(body.contains("cli.watchlist.add"));
-    }
-
-    #[test]
-    fn human_empty_mentions_register() {
-        let mut out = Vec::new();
-        write_output(
+    fn run_list_human_and_json_use_state_override() {
+        let (_scratch, path) = sample_state();
+        let mut human = Cursor::new(Vec::new());
+        let code = run(
+            WatchlistAction::List {
+                state: Some(path.clone()),
+                repo: None,
+                owner: None,
+            },
+            &OwnerAllowlist::from_owners(["acme"]),
             false,
-            "cli.watchlist.list",
-            &WatchlistData::empty(false, false),
-            &mut out,
+            &mut human,
         )
         .unwrap();
-        let body = String::from_utf8(out).unwrap();
-        assert!(body.contains("writ worktree register"));
-    }
+        assert_eq!(code, ExitCode::SUCCESS);
+        let text = String::from_utf8(human.into_inner()).unwrap();
+        assert!(text.contains("acme/widgets"));
 
-    #[test]
-    fn query_shapes() {
-        let (cmd, query) = inspect(WatchlistAction::List {
-            owner: Some("acme".to_owned()),
-            repo: Some("sample".to_owned()),
-            job: Some("job-1".to_owned()),
-            include_released: true,
-        });
-        assert_eq!(cmd, "cli.watchlist.list");
-        assert!(!query.probe_github);
-        assert!(query.include_released);
-
-        let (cmd, query) = inspect(WatchlistAction::Check {
-            owner: None,
-            repo: None,
-            job: Some("job-1".to_owned()),
-            include_released: false,
-        });
-        assert_eq!(cmd, "cli.watchlist.check");
-        assert!(query.probe_github);
-
-        let (cmd, query) = inspect(WatchlistAction::CheckAll {
-            owner: Some("acme".to_owned()),
-            repo: None,
-            include_released: false,
-        });
-        assert_eq!(cmd, "cli.watchlist.check_all");
-        assert!(query.job_id.is_none());
-    }
-
-    #[test]
-    fn write_output_table_includes_job_and_blockers() {
-        let mut out = Vec::new();
-        let data = WatchlistData {
-            entries: vec![sample_entry()],
-            coord_available: false,
-            github_probed: false,
-        };
-        write_output(false, "cli.watchlist.list", &data, &mut out).unwrap();
-        let body = String::from_utf8(out).unwrap();
-        assert!(body.contains("job-1"));
-        assert!(body.contains("running"));
-        assert!(body.contains("recovery:stale_heartbeat"));
-        assert!(body.contains("\t-\t"));
-    }
-
-    #[test]
-    fn github_cell_formats_numbered_and_unknown() {
-        assert_eq!(github_cell(None), "-");
-        let mut gh = writ_core::watchlist::GithubState {
-            number: 0,
-            title: String::new(),
-            url: String::new(),
-            branch: "b".to_owned(),
-            base: String::new(),
-            state: "UNKNOWN".to_owned(),
-            check_status: "unknown".to_owned(),
-            mergeable: None,
-            is_draft: false,
-            residual_blockers: Vec::new(),
-        };
-        assert_eq!(github_cell(Some(&gh)), "unknown");
-        gh.number = 12;
-        gh.check_status = "healthy".to_owned();
-        assert_eq!(github_cell(Some(&gh)), "#12:healthy");
-    }
-
-    #[test]
-    fn persist_hint_remove_human() {
-        let mut out = Vec::new();
-        persist_hint("remove", false, &mut out).unwrap();
-        let body = String::from_utf8(out).unwrap();
-        assert!(body.contains("leases.db"));
-    }
-
-    #[test]
-    fn write_json_envelope() {
-        let mut out = Vec::new();
-        write_output(
+        let mut json_out = Cursor::new(Vec::new());
+        run(
+            WatchlistAction::List {
+                state: Some(path),
+                repo: None,
+                owner: None,
+            },
+            &OwnerAllowlist::from_owners(["acme"]),
             true,
-            "cli.watchlist.check_all",
-            &WatchlistData::empty(true, false),
+            &mut json_out,
+        )
+        .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&json_out.into_inner()).unwrap();
+        assert_eq!(payload["command"], "watchlist.list");
+    }
+
+    #[test]
+    fn run_add_without_repo_is_invalid_input() {
+        let (_scratch, path) = sample_state();
+        let mut out = Cursor::new(Vec::new());
+        let code = run(
+            WatchlistAction::Add {
+                state: Some(path),
+                repo: None,
+                reset: false,
+                kind: WatchlistKindArg::PrBabysit,
+                targets: vec!["7".to_owned()],
+            },
+            &OwnerAllowlist::from_owners(["acme"]),
+            true,
             &mut out,
         )
         .unwrap();
-        let body = String::from_utf8(out).unwrap();
-        assert!(body.contains("cli.watchlist.check_all"));
-        assert!(body.contains("\"github_probed\":true"));
+        assert_eq!(code, ExitCode::from(1));
+        let payload: serde_json::Value = serde_json::from_slice(&out.into_inner()).unwrap();
+        assert_eq!(payload["error"]["code"], "INVALID_INPUT");
+    }
+
+    #[test]
+    fn run_remove_human_prints_stack_mate_note() {
+        let (_scratch, path) = sample_state();
+        let mut out = Cursor::new(Vec::new());
+        run(
+            WatchlistAction::Remove {
+                state: Some(path),
+                repo: Some("acme/widgets".to_owned()),
+                number: None,
+                targets: vec!["7".to_owned()],
+            },
+            &OwnerAllowlist::from_owners(["acme"]),
+            false,
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out.into_inner()).unwrap();
+        assert!(text.contains("stack-mates"));
     }
 }
