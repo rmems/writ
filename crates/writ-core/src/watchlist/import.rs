@@ -185,53 +185,22 @@ fn metadata_identifies_same_file(left: &Path, right: &Path) -> bool {
 
 #[cfg(windows)]
 fn metadata_identifies_same_file(left: &Path, right: &Path) -> bool {
-    use std::ffi::c_void;
-    use std::mem::MaybeUninit;
-    use std::os::windows::io::AsRawHandle;
-
-    #[repr(C)]
-    struct FileTime {
-        low: u32,
-        high: u32,
+    let (Ok(left), Ok(right)) = (fs::File::open(left), fs::File::open(right)) else {
+        return false;
+    };
+    if left.try_lock().is_err() {
+        return false;
     }
-
-    #[repr(C)]
-    struct FileInformation {
-        attributes: u32,
-        creation_time: FileTime,
-        last_access_time: FileTime,
-        last_write_time: FileTime,
-        volume_serial_number: u32,
-        file_size_high: u32,
-        file_size_low: u32,
-        number_of_links: u32,
-        file_index_high: u32,
-        file_index_low: u32,
-    }
-
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn GetFileInformationByHandle(handle: *mut c_void, info: *mut FileInformation) -> i32;
-    }
-
-    fn identity(path: &Path) -> Option<(u32, u64)> {
-        let file = fs::File::open(path).ok()?;
-        let mut info = MaybeUninit::<FileInformation>::uninit();
-        // SAFETY: `file` owns a valid Windows handle for the duration of the
-        // call, and `info` points to writable storage of the documented layout.
-        let succeeded =
-            unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), info.as_mut_ptr()) };
-        if succeeded == 0 {
-            return None;
+    let same = match right.try_lock() {
+        Err(std::fs::TryLockError::WouldBlock) => true,
+        Err(std::fs::TryLockError::Error(_)) => false,
+        Ok(()) => {
+            let _ = right.unlock();
+            false
         }
-        // SAFETY: a successful GetFileInformationByHandle initializes every
-        // field of BY_HANDLE_FILE_INFORMATION.
-        let info = unsafe { info.assume_init() };
-        let index = (u64::from(info.file_index_high) << 32) | u64::from(info.file_index_low);
-        Some((info.volume_serial_number, index))
-    }
-
-    matches!((identity(left), identity(right)), (Some(left), Some(right)) if left == right)
+    };
+    let _ = left.unlock();
+    same
 }
 
 #[cfg(not(any(unix, windows)))]
