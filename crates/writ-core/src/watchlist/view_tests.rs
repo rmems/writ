@@ -407,3 +407,41 @@ fn stale_closed_pr_is_skipped_for_open_match() {
     let github = data.entries[0].github.as_ref().unwrap();
     assert_eq!(github.number, 31);
 }
+
+#[test]
+fn exact_case_pr_is_selected_after_wrong_case_pr() {
+    struct CaseDistinctBranches;
+    impl GithubProbe for CaseDistinctBranches {
+        fn view(&self, _target: PrRef<'_>) -> std::result::Result<PrSnapshot, ProbeError> {
+            unimplemented!()
+        }
+
+        fn list_prs(&self, repo: &str) -> std::result::Result<Vec<PrSnapshot>, ProbeError> {
+            let mut exact = FakePr.list_prs(repo)?.remove(0);
+            let mut wrong_case = exact.clone();
+            wrong_case.number = 40;
+            wrong_case.branch = "hive/JOB-1".to_owned();
+            exact.mergeable = Some("MERGEABLE".to_owned());
+            Ok(vec![wrong_case, exact])
+        }
+    }
+
+    let seeded = seed_job();
+    let query = WatchQuery {
+        probe_github: true,
+        ..WatchQuery::default()
+    };
+    let data = load_view(
+        &seeded.store,
+        &query,
+        Some(&CaseDistinctBranches),
+        &allowlist(),
+    )
+    .unwrap();
+    let entry = &data.entries[0];
+    let github = entry.github.as_ref().unwrap();
+    assert_eq!(github.number, 41);
+    assert_eq!(github.branch, "hive/job-1");
+    assert_eq!(github.check_status, "healthy");
+    assert_eq!(entry.collab_status, CollabStatus::Running);
+}
