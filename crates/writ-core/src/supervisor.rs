@@ -1300,17 +1300,25 @@ async fn wait_for_unreaped_exit(pid: Option<u32>) -> std::io::Result<()> {
     if let Some(pid) = pid
         && let Ok(fd) = child_exit_fd(pid)
     {
-        loop {
-            let mut ready = fd.readable().await?;
-            match observe_child_exit(Some(pid)) {
-                Ok(true) => return Ok(()),
-                Ok(false) => ready.clear_ready(),
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(error) => return Err(error),
-            }
-        }
+        return wait_for_pidfd_exit(pid, fd).await;
     }
     wait_for_child_signal(pid).await
+}
+
+#[cfg(target_os = "linux")]
+async fn wait_for_pidfd_exit(
+    pid: u32,
+    fd: tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>,
+) -> std::io::Result<()> {
+    loop {
+        let mut ready = fd.readable().await?;
+        match observe_child_exit(Some(pid)) {
+            Ok(true) => return Ok(()),
+            Ok(false) => ready.clear_ready(),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
