@@ -7,6 +7,7 @@ pub mod attribution;
 mod bash_argv;
 pub mod checkout;
 pub mod contract;
+pub mod coord;
 pub mod error;
 mod git_cmd;
 pub mod git_safe;
