@@ -351,37 +351,39 @@ mod tests {
     }
 
     #[test]
-    fn blocker_messages_shape_waiting_on() {
-        let snap = snapshot_with(
-            "
-            INSERT INTO coord_claims VALUES (
-                'acme','sample','job-1','agent-a',NULL,NULL,'[]', 1, NULL
-            );
-            INSERT INTO coord_messages VALUES (
-                'blocker','agent-b','acme','sample','job-2','acme','sample','job-1',
-                'blocked', NULL, 1
-            );
-            ",
-        );
-        let overlay = snap.overlay_for(&JobId::new("acme", "sample", "job-1"));
-        assert_eq!(overlay.waiting_on.as_deref(), Some("blocker:agent-b:job-2"));
-    }
+    fn messages_shape_waiting_state() {
+        let cases = [
+            (
+                "
+                INSERT INTO coord_claims VALUES (
+                    'acme','sample','job-1','agent-a',NULL,NULL,'[]', 1, NULL
+                );
+                INSERT INTO coord_messages VALUES (
+                    'blocker','agent-b','acme','sample','job-2','acme','sample','job-1',
+                    'blocked', NULL, 1
+                );
+                ",
+                Some("blocker:agent-b:job-2"),
+            ),
+            (
+                "
+                INSERT INTO coord_claims VALUES (
+                    'acme','sample','job-1','agent-a',NULL,NULL,'[]', 2, NULL
+                );
+                INSERT INTO coord_messages VALUES (
+                    'handoff','agent-a','acme','sample','job-1','acme','sample','job-1',
+                    'take over', NULL, 1
+                );
+                ",
+                None,
+            ),
+        ];
 
-    #[test]
-    fn stale_generation_handoffs_are_excluded() {
-        let snap = snapshot_with(
-            "
-            INSERT INTO coord_claims VALUES (
-                'acme','sample','job-1','agent-a',NULL,NULL,'[]', 2, NULL
-            );
-            INSERT INTO coord_messages VALUES (
-                'handoff','agent-a','acme','sample','job-1','acme','sample','job-1',
-                'take over', NULL, 1
-            );
-            ",
-        );
-        let overlay = snap.overlay_for(&JobId::new("acme", "sample", "job-1"));
-        assert!(overlay.waiting_on.is_none());
+        for (rows, expected) in cases {
+            let snap = snapshot_with(rows);
+            let overlay = snap.overlay_for(&JobId::new("acme", "sample", "job-1"));
+            assert_eq!(overlay.waiting_on.as_deref(), expected);
+        }
     }
 
     #[test]
