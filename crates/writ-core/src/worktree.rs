@@ -429,8 +429,8 @@ fn validate_repo_root(repo_root: &Path) -> Result<()> {
 /// owner. Repositories without a parseable GitHub `origin` that previously
 /// succeeded at `create` will now be rejected here. This is intended: without a
 /// verifiable origin the ownership claim cannot be proven, so the tighter check
-/// is required and must not be loosened. The equivalent mutating `gh pr` path
-/// applies the same origin binding via `git_safe::bind_gh_repo_selector_to_origin`.
+/// is required for this managed-worktree operation. Remote GitHub operations
+/// use repository owner checks without requiring a local checkout.
 fn bind_owner_to_origin(repo_root: &Path, requested_owner: &str) -> Result<()> {
     let origin_slug = crate::git_safe::origin_github_slug(repo_root)?;
     let origin_owner = crate::git_safe::github_owner_name(&origin_slug);

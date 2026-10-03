@@ -1,5 +1,6 @@
 //! Allowlisted GitHub CLI (`gh`) policy.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::process::Command;
 
@@ -9,35 +10,15 @@ use crate::owners::OwnerAllowlist;
 use super::identity::{github_repo_slugs_match, normalize_github_repo_identity};
 use super::{GitOutput, reject_external_path};
 
-/// GitHub CLI subcommands allowed for hive jobs.
-///
-/// Note: `api` is intentionally excluded so merge-related REST/GraphQL cannot be
-/// invoked through `gh api` (e.g. `mergePullRequest` / REST merge endpoints).
+#[path = "gh_options.rs"]
+mod options;
+use options::{CommandOptions, GH_KNOWN_BOOLEAN_FLAGS, GH_VALUE_TAKING_OPTIONS};
+
+/// GitHub CLI command families supported by the helper. GitHub owns remote
+/// authorization; the helper checks explicit repository owners and local effects.
 const ALLOWED_GH_SUBCOMMANDS: &[&str] = &[
-    "auth", "browse", "gist", "issue", "label", "pr", "release", "repo", "secret", "ssh-key",
-    "variable", "workflow",
-];
-
-/// `gh pr` sub-subcommands that are blocked (merge / merge-like updates).
-///
-/// `update-branch` defaults to a merge commit unless `--rebase` is passed; hive policy
-/// rejects merge-style updates entirely (and `--rebase` is already a blocked flag).
-const BLOCKED_GH_PR_SUBSUBCOMMANDS: &[&str] = &[
-    "merge",
-    "ready",
-    "update-branch",
-    // Switches the worktree to the PR branch; leaves assigned job branch.
-    "checkout",
-];
-
-/// `gh pr` flags that are blocked (direct merge-related flags).
-const BLOCKED_GH_FLAGS: &[&str] = &[
-    "--merge",
-    "--squash",
-    "--rebase",
-    "--auto",
-    "--admin",
-    "--merge-queue",
+    "api", "auth", "browse", "gist", "issue", "label", "pr", "release", "repo", "secret",
+    "ssh-key", "variable", "workflow",
 ];
 
 /// Pre-validated GitHub CLI command ready for execution.
@@ -59,15 +40,13 @@ impl SafeGhCommand {
     ///
     /// `-R` / `--repo` selectors are rejected unless their owner is allowlisted.
     /// Commands without a repo selector are not multi-owner operations and skip
-    /// that check. The allowlist is enforced after argv policy so merge blocks
-    /// remain the more specific rejection when both would apply, and always
-    /// before [`Self::run`].
+    /// that check. Local checkout-changing commands are rejected before the
+    /// owner check; all validation completes before [`Self::run`].
     pub fn with_allowlist(args: &[String], allowlist: &OwnerAllowlist) -> Result<Self> {
         let subcommand = gh_subcommand(args)?;
-        gh_reject_blocked_pr_subsubcommand(subcommand, args)?;
+        gh_reject_local_checkout_changes(args)?;
         gh_reject_external_clone_destination(subcommand, args)?;
         gh_enforce_clone_target_owner(subcommand, args, allowlist)?;
-        gh_reject_blocked_flags(args)?;
         enforce_gh_repo_targets(args, allowlist, gh_repo_env_selector().as_deref())?;
 
         Ok(Self {
@@ -117,19 +96,15 @@ fn gh_subcommand(args: &[String]) -> Result<&str> {
     Ok(subcommand)
 }
 
-/// Block `gh pr merge` / `ready` / `update-branch` even when inherited flags
-/// precede the subcommand, e.g. `gh pr -R owner/repo merge 1`.
-fn gh_reject_blocked_pr_subsubcommand(subcommand: &str, args: &[String]) -> Result<()> {
-    if subcommand == "pr"
-        && let Some(pr_sub) = first_positional_after(&args[1..])
-    {
-        let blocked: HashSet<&str> = BLOCKED_GH_PR_SUBSUBCOMMANDS.iter().copied().collect();
-        if blocked.contains(pr_sub) {
-            return Err(Error::PolicyViolation {
-                code: PolicyCode::MergeBlocked,
-                message: format!("`gh pr {pr_sub}` is not allowed"),
-            });
-        }
+/// Remote PR changes belong to GitHub. Checkout switching and local branch
+/// deletion must instead use the assigned-checkout Git path.
+fn gh_reject_local_checkout_changes(args: &[String]) -> Result<()> {
+    if gh_requires_branch_check(args) {
+        return Err(Error::PolicyViolation {
+            code: PolicyCode::MergeBlocked,
+            message: "gh command changes the local checkout; use assigned-branch git operations"
+                .to_owned(),
+        });
     }
     Ok(())
 }
@@ -174,82 +149,6 @@ fn gh_enforce_clone_target_owner(
     let positionals = gh_repo_clone_positionals(&args[1..], start);
     allowlist.enforce_repo_selector(positionals.first().copied().unwrap_or(""))
 }
-
-/// Block merge-related flags anywhere in the argument list.
-fn gh_reject_blocked_flags(args: &[String]) -> Result<()> {
-    let blocked_flags: HashSet<&str> = BLOCKED_GH_FLAGS.iter().copied().collect();
-    for arg in &args[1..] {
-        if blocked_flags.contains(arg.as_str()) {
-            return Err(Error::PolicyViolation {
-                code: PolicyCode::GhFlagNotAllowed,
-                message: format!("gh flag `{arg}` is not allowed"),
-            });
-        }
-    }
-    Ok(())
-}
-
-/// Resolve the current branch name from a repository working tree.
-const GH_VALUE_TAKING_OPTIONS: &[&str] = &[
-    "--template",
-    "-t",
-    "--json",
-    "-q",
-    "--jq",
-    "--limit",
-    "-L",
-    "--search",
-    "-S",
-    "--state",
-    "--label",
-    "--assignee",
-    "--author",
-    "--base",
-    "--head",
-    "--milestone",
-    "--project",
-    "--body",
-    "-b",
-    "--body-file",
-    "-F",
-    "--title",
-    "-T",
-    "--comment",
-];
-
-/// `gh` boolean (non-value-taking) flags whose separate-token form does NOT
-/// consume the following argv token. When one of these immediately precedes a
-/// literal `--`, that `--` is genuinely the end-of-options terminator.
-///
-/// This list underpins the fail-closed arity decision in
-/// [`separate_token_option_may_consume_dashdash`]: only when the preceding option
-/// is *known* to be boolean can we be certain the `--` terminates options. Any
-/// other separate-token option (recognized value-taking, a repo selector, or an
-/// unrecognized one) is treated conservatively as possibly consuming the `--`, so
-/// a later `-R other/repo` is never skipped. Keeping this list to well-known
-/// flags is safe: an omission here only makes the scanner *more* conservative
-/// (it keeps scanning), never less.
-///
-/// Only unambiguous long-form booleans are listed. Short forms are deliberately
-/// excluded because a single letter is frequently overloaded across subcommands
-/// (e.g. `-c` is `--comment` for `gh pr close` but `--comments` for `gh pr view`,
-/// and `-d` is `--draft` for create but `--delete-branch`/other elsewhere).
-/// Treating any short form as boolean here would risk failing open, so short
-/// forms fall through to the conservative "may consume `--`" branch.
-const GH_KNOWN_BOOLEAN_FLAGS: &[&str] = &[
-    "--help",
-    "--web",
-    "--comments",
-    "--draft",
-    "--fill",
-    "--fill-first",
-    "--fill-verbose",
-    "--no-maintainer-edit",
-    "--delete-branch",
-    "--dry-run",
-    "--merged",
-    "--closed",
-];
 
 /// Whether a separate-token option `flag` may consume the following argv token as
 /// its value (fail-closed). Repo selectors that expect a value (`-R`, `--repo`,
@@ -302,6 +201,76 @@ enum PositionalScan {
     Stop(Option<usize>),
 }
 
+/// Arity of one supported pflag short-option cluster. Value-taking options
+/// consume the remaining suffix, so its letters are never interpreted as flags.
+struct ShortOptions {
+    tokens: usize,
+    delete_branch: Option<bool>,
+}
+
+fn short_options(arg: &str) -> Option<ShortOptions> {
+    short_options_with_context(arg, CommandOptions::default())
+}
+
+fn short_options_with_context(arg: &str, context: CommandOptions) -> Option<ShortOptions> {
+    let body = arg
+        .strip_prefix('-')
+        .filter(|body| !body.starts_with('-') && !body.is_empty())?;
+    let mut delete_branch = None;
+    for (index, flag) in body.char_indices() {
+        let suffix = &body[index + flag.len_utf8()..];
+        if short_value_in_context(flag, context) {
+            return Some(ShortOptions {
+                tokens: if suffix.is_empty() { 2 } else { 1 },
+                delete_branch,
+            });
+        }
+        if !short_boolean_in_context(flag, context) {
+            return None;
+        }
+        if flag == 'd' {
+            delete_branch = Some(suffix.strip_prefix('=').is_none_or(gh_boolean_enabled));
+        }
+        if suffix.starts_with('=') {
+            break;
+        }
+    }
+    Some(ShortOptions {
+        tokens: 1,
+        delete_branch,
+    })
+}
+
+fn short_boolean_in_context(flag: char, context: CommandOptions) -> bool {
+    matches!(flag, 'h' | 'i' | 'w' | 'd' | 'm' | 'r' | 's')
+        || has_short_flag(context.non_values, flag)
+}
+
+fn short_value_in_context(flag: char, context: CommandOptions) -> bool {
+    (short_option_takes_value(flag) || has_short_flag(context.values, flag))
+        && !has_short_flag(context.non_values, flag)
+}
+
+fn has_short_flag(flags: &[&str], flag: char) -> bool {
+    flags
+        .iter()
+        .any(|option| option.len() == 2 && char::from(option.as_bytes()[1]) == flag)
+}
+
+fn short_option_takes_value(flag: char) -> bool {
+    if flag == 'R' {
+        return true;
+    }
+    GH_VALUE_TAKING_OPTIONS
+        .iter()
+        .filter(|option| option.len() == 2)
+        .any(|option| char::from(option.as_bytes()[1]) == flag)
+}
+
+fn gh_boolean_enabled(value: &str) -> bool {
+    !matches!(value, "0" | "f" | "F" | "false" | "False" | "FALSE")
+}
+
 /// Classify the token at `args[idx]` for [`first_positional_after`], keeping the
 /// scan loop itself flat. `--` that is a preceding option's value is skipped
 /// (not treated as a terminator); unknown flags fail closed by stopping.
@@ -318,19 +287,30 @@ fn classify_positional_token(args: &[String], idx: usize) -> PositionalScan {
     if !a.starts_with('-') {
         return PositionalScan::Stop(Some(idx));
     }
-    // Only documented parent flags; anything else fails closed.
-    if a == "--help" || a == "-h" {
-        return PositionalScan::Skip(1);
+    match positional_option_tokens(a, args.get(idx + 1).map(String::as_str)) {
+        Some(tokens) => PositionalScan::Skip(tokens),
+        None => PositionalScan::Stop(None),
     }
-    if let Some((_, consume_next)) = gh_repo_flag(a, args.get(idx + 1).map(String::as_str)) {
-        return PositionalScan::Skip(if consume_next { 2 } else { 1 });
+}
+
+/// Number of argv tokens consumed by a supported option and its value.
+fn positional_option_tokens(arg: &str, next: Option<&str>) -> Option<usize> {
+    if let Some(options) = short_options(arg) {
+        return Some(options.tokens);
     }
-    // Value-taking option in separate-token form: skip it and its value so the
-    // value (which may be `--`) is not mistaken for a terminator.
-    if GH_VALUE_TAKING_OPTIONS.contains(&a) {
-        return PositionalScan::Skip(2);
+    if let Some((_, consume_next)) = gh_repo_flag(arg, next) {
+        return Some(1 + usize::from(consume_next));
     }
-    PositionalScan::Stop(None)
+    let (flag, attached) = match arg.split_once('=') {
+        Some((flag, _)) => (flag, true),
+        None => (arg, false),
+    };
+    if GH_KNOWN_BOOLEAN_FLAGS.contains(&flag) {
+        return Some(1);
+    }
+    GH_VALUE_TAKING_OPTIONS
+        .contains(&flag)
+        .then_some(1 + usize::from(!attached))
 }
 
 /// First non-flag positional argument, skipping common `gh` inherited options that take values.
@@ -351,14 +331,34 @@ pub fn gh_requires_branch_check(args: &[String]) -> bool {
     if args.first().map(String::as_str) != Some("pr") {
         return false;
     }
-    let Some(pr_sub) = first_positional_after(&args[1..]) else {
+    let Some(pr_sub) = command_verb(args) else {
         return false;
     };
-    matches!(
-        pr_sub,
-        "checkout" | "create" | "close" | "reopen" | "edit" | "ready" | "merge" | "review"
-    )
+    matches!(pr_sub, "checkout")
+        || (matches!(pr_sub, "merge" | "close") && gh_deletes_local_branch(args))
 }
+fn gh_deletes_local_branch(args: &[String]) -> bool {
+    let mut i = 1;
+    let mut delete_branch = false;
+    while let Some(arg) = args.get(i).map(String::as_str) {
+        if arg == "--" {
+            break;
+        }
+        delete_branch = delete_branch_setting(arg).unwrap_or(delete_branch);
+        i += positional_option_tokens(arg, args.get(i + 1).map(String::as_str)).unwrap_or(1);
+    }
+    delete_branch
+}
+
+fn delete_branch_setting(arg: &str) -> Option<bool> {
+    if arg == "--delete-branch" {
+        return Some(true);
+    }
+    arg.strip_prefix("--delete-branch=")
+        .map(gh_boolean_enabled)
+        .or_else(|| short_options(arg).and_then(|options| options.delete_branch))
+}
+
 const GH_REPO_CLONE_VALUE_OPTIONS: &[&str] = &["-u", "--upstream-remote-name"];
 
 /// Whether the token immediately before `args[idx]` is an option that consumes
@@ -402,7 +402,7 @@ fn gh_repo_clone_token_end(args: &[String]) -> Option<usize> {
             i += if consume_next { 2 } else { 1 };
             continue;
         }
-        if a == "--help" || a == "-h" {
+        if GH_KNOWN_BOOLEAN_FLAGS.contains(&a) || a == "-h" {
             i += 1;
             continue;
         }
@@ -473,13 +473,12 @@ pub fn effective_gh_repo_selector(args: &[String], env_selector: Option<&str>) -
         .map(str::to_owned)
 }
 
-/// Reject a mutating `gh` command whose effective repo selector (explicit
+/// Optional caller-requested binding of a `gh` effective repo selector (explicit
 /// `-R`/`--repo` or implicit `GH_REPO`) does not match the verified local
 /// `origin` slug.
 ///
-/// This is the origin binding the supervisor applies once the branch gate is
-/// satisfied. Extracting it keeps the explicit-`-R` and implicit-`GH_REPO` paths
-/// identical and unit-testable without mutating process environment.
+/// Retained for callers that explicitly need a local-origin relationship. Remote
+/// supervised GitHub commands do not require this binding.
 pub fn bind_gh_repo_selector_to_origin(
     args: &[String],
     env_selector: Option<&str>,
@@ -510,30 +509,121 @@ pub fn gh_repo_selector(args: &[String]) -> Option<&str> {
 }
 
 fn gh_repo_selectors(args: &[String]) -> Vec<&str> {
-    let mut selectors = Vec::new();
+    gh_arguments(args).selectors
+}
+
+#[derive(Default)]
+struct GhArguments<'a> {
+    selectors: Vec<&'a str>,
+    operands: Vec<&'a str>,
+}
+
+fn gh_arguments(args: &[String]) -> GhArguments<'_> {
+    let mut parsed = GhArguments::default();
+    let context = command_options(args);
     let mut i = 0;
     while i < args.len() {
-        match gh_selector_scan_step(args, i) {
-            GhSelectorStep::Done => break,
+        match gh_selector_scan_step(args, i, context) {
+            GhSelectorStep::Done => {
+                parsed
+                    .operands
+                    .extend(args[i + 1..].iter().map(String::as_str));
+                break;
+            }
             GhSelectorStep::Advance(next) => i = next,
             GhSelectorStep::Found { selector, next } => {
-                selectors.push(selector);
+                parsed.selectors.push(selector);
+                i = next;
+            }
+            GhSelectorStep::Operand { value, next } => {
+                parsed.operands.push(value);
                 i = next;
             }
         }
     }
-    selectors
+    parsed
+}
+
+fn command_options(args: &[String]) -> CommandOptions {
+    let family = args.first().map(String::as_str).unwrap_or("");
+    options::for_command(family, command_verb(args))
+}
+
+/// Discover the verb without searching payload text for command names. The
+/// complete argument traversal then uses that verb's exact option metadata.
+fn command_verb(args: &[String]) -> Option<&str> {
+    let family = args.first()?.as_str();
+    let mut i = 1;
+    while let Some(arg) = args.get(i).map(String::as_str) {
+        if arg == "--" {
+            return args
+                .get(i + 1)
+                .map(|verb| options::canonical_verb(family, verb));
+        }
+        if !arg.starts_with('-') {
+            return Some(options::canonical_verb(family, arg));
+        }
+        i += preverb_option_tokens(family, arg);
+    }
+    None
+}
+
+fn preverb_option_tokens(family: &str, arg: &str) -> usize {
+    // Repo create/edit use -h for homepage, including before the verb. Keep
+    // its payload out of command discovery; --help remains unambiguous.
+    if family == "repo"
+        && let Some(value) = arg.strip_prefix("-h")
+    {
+        return 1 + usize::from(value.is_empty());
+    }
+    if matches!(arg, "-h" | "--help") || arg.contains('=') {
+        return 1;
+    }
+    // gh's parent-command discovery consumes separate leaf-option values;
+    // bare leaf booleans before a verb are not equivalent to '=true' forms.
+    if arg.starts_with("--") || arg.len() == 2 {
+        return 2;
+    }
+    let context = CommandOptions {
+        values: options::PREVERB_VALUE_ALIASES,
+        ..CommandOptions::default()
+    };
+    short_options_with_context(arg, context).map_or(1, |options| options.tokens)
+}
+
+fn selector_option_tokens(arg: &str, next: Option<&str>, context: CommandOptions) -> Option<usize> {
+    let flag = arg.split('=').next().unwrap_or(arg);
+    if context.non_values.contains(&flag) {
+        return Some(1);
+    }
+    if context.values.contains(&flag) {
+        return Some(1 + usize::from(!arg.contains('=')));
+    }
+    short_options_with_context(arg, context)
+        .map(|options| options.tokens)
+        .or_else(|| positional_option_tokens(arg, next))
 }
 
 enum GhSelectorStep<'a> {
     Done,
     Advance(usize),
     Found { selector: &'a str, next: usize },
+    Operand { value: &'a str, next: usize },
 }
 
-fn gh_selector_scan_step(args: &[String], i: usize) -> GhSelectorStep<'_> {
+fn gh_selector_scan_step<'a>(
+    args: &'a [String],
+    i: usize,
+    context: CommandOptions,
+) -> GhSelectorStep<'a> {
     let a = args[i].as_str();
     if a == "--" {
+        let previous_tokens = i
+            .checked_sub(1)
+            .and_then(|previous| selector_option_tokens(&args[previous], Some("--"), context));
+        if previous_tokens == Some(1) {
+            return GhSelectorStep::Done;
+        }
         // A `--` that a preceding value-taking option consumes as its value
         // is not the options terminator; gh keeps parsing, so a later
         // `-R other/repo` must still be detected. Fail closed by continuing.
@@ -542,7 +632,14 @@ fn gh_selector_scan_step(args: &[String], i: usize) -> GhSelectorStep<'_> {
         }
         return GhSelectorStep::Done;
     }
-    if let Some((selector, consume_next)) = gh_repo_flag(a, args.get(i + 1).map(String::as_str)) {
+    if !a.starts_with('-') {
+        return GhSelectorStep::Operand {
+            value: a,
+            next: i + 1,
+        };
+    }
+    let next = args.get(i + 1).map(String::as_str);
+    if let Some((selector, consume_next)) = gh_repo_flag_with_context(a, next, context) {
         return GhSelectorStep::Found {
             selector,
             next: if consume_next { i + 2 } else { i + 1 },
@@ -550,10 +647,7 @@ fn gh_selector_scan_step(args: &[String], i: usize) -> GhSelectorStep<'_> {
     }
     // Skip a non-selector value-taking option together with its value so a
     // `--` value cannot terminate scanning prematurely.
-    if a.starts_with('-') && !a.contains('=') && GH_VALUE_TAKING_OPTIONS.contains(&a) {
-        return GhSelectorStep::Advance(i + 2);
-    }
-    GhSelectorStep::Advance(i + 1)
+    GhSelectorStep::Advance(i + selector_option_tokens(a, next, context).unwrap_or(1))
 }
 
 /// Parse one argv token as a `gh` repo selector flag.
@@ -562,6 +656,14 @@ fn gh_selector_scan_step(args: &[String], i: usize) -> GhSelectorStep<'_> {
 /// accepted spelling. A missing required value is an empty selector so callers
 /// can fail closed.
 fn gh_repo_flag<'a>(arg: &'a str, next: Option<&'a str>) -> Option<(&'a str, bool)> {
+    gh_repo_flag_with_context(arg, next, CommandOptions::default())
+}
+
+fn gh_repo_flag_with_context<'a>(
+    arg: &'a str,
+    next: Option<&'a str>,
+    context: CommandOptions,
+) -> Option<(&'a str, bool)> {
     if arg == "--repo" || arg == "-R" {
         return Some((next.unwrap_or(""), true));
     }
@@ -576,10 +678,14 @@ fn gh_repo_flag<'a>(arg: &'a str, next: Option<&'a str>) -> Option<(&'a str, boo
     {
         return Some((value, false));
     }
-    clustered_short_repo_flag(arg, next)
+    clustered_short_repo_flag(arg, next, context)
 }
 
-fn clustered_short_repo_flag<'a>(arg: &'a str, next: Option<&'a str>) -> Option<(&'a str, bool)> {
+fn clustered_short_repo_flag<'a>(
+    arg: &'a str,
+    next: Option<&'a str>,
+    context: CommandOptions,
+) -> Option<(&'a str, bool)> {
     if !arg.starts_with('-') || arg.starts_with("--") {
         return None;
     }
@@ -589,7 +695,10 @@ fn clustered_short_repo_flag<'a>(arg: &'a str, next: Option<&'a str>) -> Option<
         None => (body, None),
     };
     let r_idx = letters.find('R')?;
-    if !letters[..r_idx].chars().all(|c| c.is_ascii_alphabetic()) {
+    if !letters[..r_idx]
+        .chars()
+        .all(|c| c.is_ascii_alphabetic() && !short_value_in_context(c, context))
+    {
         return None;
     }
     let after = &letters[r_idx + 1..];
@@ -648,15 +757,18 @@ pub fn enforce_gh_repo_targets(
     allowlist: &OwnerAllowlist,
     implicit_repo: Option<&str>,
 ) -> Result<()> {
-    let selectors = gh_repo_selectors(args);
-    for selector in &selectors {
+    let parsed = gh_arguments(args);
+    for selector in &parsed.selectors {
         allowlist.enforce_repo_selector(selector)?;
     }
-    let positionals = gh_positional_repo_targets(args);
+    let positionals = gh_positional_repo_targets(args, &parsed.operands)?;
     for selector in &positionals {
         allowlist.enforce_repo_selector(selector)?;
     }
-    if !selectors.is_empty() || !positionals.is_empty() {
+    if let Some(owner) = gh_api_owner_target(args, &parsed.operands)? {
+        return allowlist.enforce_owner(&owner);
+    }
+    if !parsed.selectors.is_empty() || !positionals.is_empty() {
         return Ok(());
     }
     // The implicit GH_REPO selector only applies to commands that actually
@@ -671,20 +783,56 @@ pub fn enforce_gh_repo_targets(
 }
 
 /// Owner-bearing positionals that `-R` / `GH_REPO` do not cover: `gh repo`
-/// operands and GitHub issue/PR URLs or `owner/repo#n` tokens.
-fn gh_positional_repo_targets(args: &[String]) -> Vec<String> {
+/// operands, GitHub issue/PR URLs, and an issue-transfer destination repository.
+fn gh_positional_repo_targets(args: &[String], operands: &[&str]) -> Result<Vec<String>> {
     let Some(subcommand) = args.first().map(String::as_str) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     match subcommand {
-        "repo" => gh_repo_positional_targets(&args[1..]),
-        "pr" | "issue" => gh_issue_or_pr_positional_targets(&args[1..]),
-        _ => Vec::new(),
+        "repo" => Ok(gh_repo_positional_targets(args, operands)),
+        "pr" | "issue" => gh_issue_or_pr_positional_targets(args, operands),
+        _ => Ok(Vec::new()),
     }
 }
 
-fn gh_repo_positional_targets(args: &[String]) -> Vec<String> {
-    let Some(repo_sub) = first_positional_after(args) else {
+/// Scope literal repos/OWNER/REPO and orgs/OWNER/repos or users/OWNER/repos
+/// endpoints without interpreting opaque bodies or GraphQL node IDs. Owner
+/// placeholders use gh's context; a literal owner remains enforceable when
+/// only the repository is a placeholder.
+fn gh_api_owner_target(args: &[String], operands: &[&str]) -> Result<Option<String>> {
+    if args.first().map(String::as_str) != Some("api") {
+        return Ok(None);
+    }
+    let Some(&endpoint) = operands.get(1) else {
+        return Ok(None);
+    };
+    let path = match http_url_parts(endpoint)? {
+        Some((host, path)) if host.eq_ignore_ascii_case("api.github.com") => path,
+        Some(_) => return Ok(None),
+        None => endpoint,
+    };
+    let path = decode_http_path(path)?;
+    Ok(gh_api_path_owner(&path).map(str::to_owned))
+}
+
+fn gh_api_path_owner(path: &str) -> Option<&str> {
+    let mut parts = path.trim_start_matches('/').split('/');
+    let namespace = parts.next()?;
+    let owner = parts.next()?;
+    let resource = parts.next()?;
+    match namespace {
+        "repos" => {}
+        "orgs" | "users" if resource == "repos" => {}
+        _ => return None,
+    }
+    if owner.contains('{') {
+        return None;
+    }
+    Some(owner)
+}
+
+fn gh_repo_positional_targets(args: &[String], operands: &[&str]) -> Vec<String> {
+    let Some(repo_sub) = command_verb(args) else {
         return Vec::new();
     };
     if !matches!(
@@ -701,48 +849,143 @@ fn gh_repo_positional_targets(args: &[String]) -> Vec<String> {
     ) {
         return Vec::new();
     }
-    first_operand_after(args, repo_sub)
-        .map(str::to_owned)
+    operands
+        .get(2)
+        .map(|operand| (*operand).to_owned())
         .into_iter()
         .collect()
 }
 
-fn first_operand_after<'a>(args: &'a [String], token: &str) -> Option<&'a str> {
-    let idx = args.iter().position(|arg| arg == token)?;
-    first_positional_after(&args[idx + 1..])
+fn gh_issue_or_pr_positional_targets(args: &[String], operands: &[&str]) -> Result<Vec<String>> {
+    let mut targets: Vec<String> = operands
+        .iter()
+        .filter_map(|token| positional_github_repo_token(token).transpose())
+        .collect::<Result<_>>()?;
+    if let Some(destination) = issue_transfer_destination(args, operands) {
+        targets.push(destination.to_owned());
+    }
+    Ok(targets)
 }
 
-fn gh_issue_or_pr_positional_targets(args: &[String]) -> Vec<String> {
-    args.iter()
-        .filter_map(|token| positional_github_repo_token(token))
-        .collect()
-}
-
-fn positional_github_repo_token(token: &str) -> Option<String> {
-    if token.starts_with('-') {
+fn issue_transfer_destination<'a>(args: &[String], operands: &[&'a str]) -> Option<&'a str> {
+    if args.first().map(String::as_str) != Some("issue") {
         return None;
     }
-    let bare = token.split('#').next().unwrap_or(token);
-    if normalize_github_repo_identity(bare).is_some() {
-        return Some(bare.to_owned());
+    if command_verb(args) != Some("transfer") {
+        return None;
     }
-    parse_github_issue_or_pr_url(bare)
+    // Family, verb, issue identifier, then the destination repository. An
+    // unqualified destination name has no explicit owner to check here.
+    operands
+        .get(3)
+        .copied()
+        .filter(|destination| normalize_github_repo_identity(destination).is_some())
 }
 
-fn parse_github_issue_or_pr_url(token: &str) -> Option<String> {
-    let rest = token
-        .strip_prefix("https://")
-        .or_else(|| token.strip_prefix("http://"))?;
-    let parts: Vec<&str> = rest.split('/').filter(|p| !p.is_empty()).collect();
+fn positional_github_repo_token(token: &str) -> Result<Option<String>> {
+    if token.starts_with('-') {
+        return Ok(None);
+    }
+    let bare = token.split('#').next().unwrap_or(token);
+    if let Some((host, path)) = http_url_parts(bare)? {
+        let path = decode_http_path(path)?;
+        return Ok(github_http_repo_target(host, &path));
+    }
+    Ok(None)
+}
+
+fn github_http_repo_target(host: &str, path: &str) -> Option<String> {
+    let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
     match parts.as_slice() {
-        [host, owner, repo, kind, ..]
-            if matches!(*kind, "pull" | "issues" | "issue")
-                && (host.contains('.') || *host == "github.com") =>
+        [owner, repo] => Some(format!("{owner}/{repo}")),
+        [owner, repo, kind, ..]
+            if matches!(*kind, "pull" | "issues" | "issue") && host.contains('.') =>
         {
             Some(format!("{owner}/{repo}"))
         }
         _ => None,
     }
+}
+
+/// Decode only the path once. Encoded '?' and '#' remain path bytes, while
+/// literal query/fragment delimiters are removed before percent decoding.
+fn decode_http_path(path: &str) -> Result<Cow<'_, str>> {
+    let path = path.split(['?', '#']).next().unwrap_or(path);
+    if !path.contains('%') {
+        return Ok(Cow::Borrowed(path));
+    }
+    let invalid = || Error::PolicyViolation {
+        code: PolicyCode::OwnerNotAllowed,
+        message: "malformed percent-encoded HTTP target path".to_owned(),
+    };
+    let mut bytes = path.bytes();
+    let mut decoded = Vec::with_capacity(path.len());
+    while let Some(byte) = bytes.next() {
+        if byte == b'%' {
+            let high = bytes.next().and_then(url_hex_byte).ok_or_else(invalid)?;
+            let low = bytes.next().and_then(url_hex_byte).ok_or_else(invalid)?;
+            decoded.push((high << 4) | low);
+        } else {
+            decoded.push(byte);
+        }
+    }
+    String::from_utf8(decoded)
+        .map(Cow::Owned)
+        .map_err(|_| invalid())
+}
+
+fn url_hex_byte(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Parse ordinary HTTP(S) DNS authorities without granting host authorization.
+/// A malformed HTTP target is an error, never an unchecked fallback selector.
+fn http_url_parts(token: &str) -> Result<Option<(&str, &str)>> {
+    let Some((scheme, rest)) = token.split_once("://") else {
+        return Ok(None);
+    };
+    if !scheme.eq_ignore_ascii_case("https") && !scheme.eq_ignore_ascii_case("http") {
+        return Ok(None);
+    }
+    let invalid = || Error::PolicyViolation {
+        code: PolicyCode::OwnerNotAllowed,
+        message: "cannot determine owner from malformed HTTP target authority".to_owned(),
+    };
+    let boundary = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..boundary];
+    let path = rest[boundary..].strip_prefix('/').unwrap_or("");
+    let host_port = authority.rsplit('@').next().ok_or_else(invalid)?;
+    let host = match host_port.split_once(':') {
+        Some((host, port)) => {
+            port.parse::<u16>().map_err(|_| invalid())?;
+            host
+        }
+        None => host_port,
+    };
+    let host = host.strip_suffix('.').unwrap_or(host);
+    if !valid_http_host(host) {
+        return Err(invalid());
+    }
+    Ok(Some((host, path)))
+}
+
+fn valid_http_host(host: &str) -> bool {
+    host.split('.').all(|label| {
+        if label.is_empty() {
+            return false;
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return false;
+        }
+        label
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    })
 }
 
 /// Pin a validated origin slug as an explicit `--repo` so later `gh` spawn

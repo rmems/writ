@@ -289,11 +289,11 @@ enum SupervisorAction {
         #[command(flatten)]
         timeouts: SupervisorTimeouts,
 
-        /// Expected branch for mutating supervised `git` / `gh pr` commands.
+        /// Expected branch for direct mutating Git commands; remote GitHub operations do not require one.
         #[arg(long)]
         expected_branch: Option<String>,
 
-        /// Repository working tree for supervised git branch checks (default: `.`).
+        /// Child working directory; direct Git checks its branch here (default: `.`).
         #[arg(long)]
         repo: Option<PathBuf>,
 
@@ -2155,9 +2155,7 @@ mod tests {
                     cmd: {
                         #[cfg(windows)]
                         {
-                            // `false` may not exist; use powershell is forbidden. Use `cmd` is forbidden.
-                            // Use git with invalid args for non-zero? Prefer `python` - not guaranteed.
-                            // Use `ping` with bad args returns non-zero on Windows.
+                            // `false` may not exist; invalid ping arguments return non-zero on Windows.
                             vec![
                                 "ping".to_owned(),
                                 "/n".to_owned(),
@@ -2207,7 +2205,7 @@ mod tests {
                     expected_branch: None,
                     repo: None,
                     max_parallel: 1,
-                    cmd: vec!["gh".to_owned(), "pr".to_owned(), "merge".to_owned()],
+                    cmd: vec!["gh".to_owned(), "pr".to_owned(), "checkout".to_owned()],
                 },
             }),
         };
@@ -2389,12 +2387,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gh_safe_pr_merge_blocked() {
+    async fn gh_safe_pr_checkout_blocked() {
         let cli = Cli {
             json: false,
             allowed_owners: None,
             command: Some(super::Command::GhSafe {
-                args: vec!["pr".to_owned(), "merge".to_owned()],
+                args: vec!["pr".to_owned(), "checkout".to_owned()],
             }),
         };
         let mut stdout = Vec::new();
@@ -2410,12 +2408,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gh_safe_api_blocked() {
+    async fn gh_safe_api_rejects_disallowed_rest_owner() {
         let cli = Cli {
             json: false,
-            allowed_owners: None,
+            allowed_owners: Some("acme".to_owned()),
             command: Some(super::Command::GhSafe {
-                args: vec!["api".to_owned(), "repos/acme/example-org".to_owned()],
+                args: vec!["api".to_owned(), "repos/other/example-org".to_owned()],
             }),
         };
         let mut stdout = Vec::new();
@@ -2424,7 +2422,7 @@ mod tests {
         assert!(matches!(
             err,
             writ_core::error::Error::PolicyViolation {
-                code: writ_core::error::PolicyCode::GhSubcommandNotAllowed,
+                code: writ_core::error::PolicyCode::OwnerNotAllowed,
                 ..
             }
         ));

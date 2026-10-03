@@ -51,7 +51,7 @@ Heartbeat used by this binary: last stdout/stderr byte timestamp. Hosts may also
 4. **State update** — JSON outcome: `timed_out` / `killed` / `error_code` / `timeout_class` / `recovery_stage` / `elapsed_ms` / `residual` (no `sha` / `commit` / `head`). Watchlist: `process_state: timed_out`, `residual_blockers: ["timeout:hard"|…]`. Do **not** write a SHA unless a push was accepted by the remote. Do **not** delete or reset the harness checkout. Pipe drain is always bounded (30s when no worker deadline).
 5. **Re-dispatch or residual** — harness may run the item again only while `RedispatchBudget::try_acquire` succeeds (default: one extra run). Otherwise mark residual and free the **process slot**. `writ` does not re-dispatch and does not unregister the checkout.
 
-If a host subagent API cannot kill: stop waiting, mark `timeout:lost_child` (or host-equivalent residual), warn the operator. Never merge, never bare `--force` / `-f`, never invent a SHA.
+If a host subagent API cannot kill: stop waiting, mark `timeout:lost_child` (or host-equivalent residual), warn the operator. Recovery itself must not initiate a merge or bare-force-push, or invent a SHA.
 
 ## Progress reporting
 
@@ -67,8 +67,7 @@ supervisor: active=1/2 elapsed=12s idle=3s step=running
 
 Recovery only terminates the supervised child (and Unix process group). It does not
 invoke `git` or `gh`, does not delete worktrees, and does not rewrite leases.
-Mutating commands are still allowlisted **before spawn**; `gh pr merge` and bare
-`git push --force` remain blocked during a timed run.
+Direct git commands are validated before spawn and local branch/WIP checks run after permit acquisition. Bare `git push --force` stays blocked. Remote gh actions rely on GitHub permissions and need no local branch. Host scripts/interpreters can be supervised; nested commands and opaque API payloads are outside recursive argv validation.
 
 Pipe drain is always bounded by the wall-clock deadline, or **30s** when unlimited,
 so inherited pipes cannot hang the supervisor. Progress callbacks run off the wait

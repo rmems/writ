@@ -15,7 +15,7 @@ Neither `PolicyForcePushForbidden` nor `PolicyMergeForbidden` exists in
 
 ## Which commands emit an envelope
 
-All of them, under `--json`:
+Dispatched commands use these envelope names under `--json`; hook protocol and pre-dispatch failures are exceptions:
 
 | Command | Envelope `command` |
 | --- | --- |
@@ -38,8 +38,8 @@ with exit code 2 instead of an envelope:
 $ writ --json git-safe push --force
 writ: policy violation [BARE_FORCE_PUSH]: bare --force/-f is not allowed; use --force-with-lease only
 
-$ writ --json gh-safe pr merge 1
-writ: policy violation [MERGE_BLOCKED]: `gh pr merge` is not allowed
+$ writ --json gh-safe pr checkout 1
+writ: policy violation [MERGE_BLOCKED]: gh command changes the local checkout; use assigned-branch git operations
 ```
 
 So `git-safe` and `gh-safe` *do* emit `git.safe` / `gh.safe` envelopes on success —
