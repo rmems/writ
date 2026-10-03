@@ -59,6 +59,49 @@ fn remote_gh_actions_need_no_checkout_or_expected_branch() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn remote_gh_pins_only_explicit_working_directory() {
+    let root = tempfile::tempdir().unwrap();
+    let original = root.path().join("original");
+    let replacement = root.path().join("replacement");
+    std::fs::create_dir(&original).unwrap();
+    std::fs::create_dir(&replacement).unwrap();
+    let link = root.path().join("selected");
+    std::os::unix::fs::symlink(&original, &link).unwrap();
+    let options = RunOptions {
+        repo: Some(link.clone()),
+        allowlist: Some(OwnerAllowlist::parse("acme")),
+        ..RunOptions::default()
+    };
+    let prepared = prepare_supervised_command(&CommandRequest {
+        program: "gh",
+        args: &["pr", "view", "1", "--repo", "acme/project"],
+        options: &options,
+    })
+    .unwrap();
+    std::fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink(&replacement, &link).unwrap();
+    assert_eq!(
+        prepared.cwd.unwrap().canonicalize().unwrap(),
+        original.canonicalize().unwrap()
+    );
+    assert!(prepared.branch_check.is_none());
+
+    let no_directory = RunOptions {
+        repo: None,
+        ..options
+    };
+    let prepared = prepare_supervised_command(&CommandRequest {
+        program: "gh",
+        args: &["pr", "view", "1", "--repo", "acme/project"],
+        options: &no_directory,
+    })
+    .unwrap();
+    assert!(prepared.cwd.is_none());
+    assert!(prepared.branch_check.is_none());
+}
+
 #[test]
 fn supervisor_admits_host_scripts_and_interpreters() {
     for (program, args) in [

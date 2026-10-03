@@ -314,10 +314,11 @@ Helpers and hooks are opt-in. Supervision accepts host scripts and interpreters;
 
 ## Owner allowlist
 
-Repository access is controlled by a configured owner allowlist, not a built-in org list.
+Writ's GitHub helpers check supported explicit target selectors against a configured owner allowlist. GitHub permissions authorize remote access.
 
 - Set `WRIT_ALLOWED_OWNERS=acme,example-org` (comma-separated), or pass `--allowed-owners` / explicit owners at the API boundary.
 - An empty allowlist denies owner-taking operations (`writ worktree create` and `gh` commands that select a repository via `-R` / `--repo` in any pflag spelling, or via `GH_REPO`) rather than permitting them.
+- `gh api` checks literal owners in `repos/OWNER/REPO/...`, `orgs/OWNER/repos`, and `users/OWNER/repos`, including `api.github.com` URLs. Other API endpoint families and owners hidden in placeholder expansion, GraphQL node IDs or opaque request bodies are outside that inference; configured explicit repository selectors remain checked.
 - Comparison uses the same host/case normalization as `github_repo_slugs_match`, so `Acme/Repo` and `github.com/acme/repo` cannot diverge.
 
 Examples use generic owners such as `acme` and `example-org`.

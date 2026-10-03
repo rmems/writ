@@ -1,150 +1,56 @@
-# ADR 0001: Rust-only v1 runtime and Codex `babysit-pr` boundary
+# ADR 0001: Rust-only v1 runtime and companion PR monitoring
 
-- Status: Historical; runtime and companion-skill boundaries retained, enforcement procedure superseded
-- Date: 2026-09-15
-- Linear: [RM-169](https://linear.app/rpd-34/issue/RM-169/v1-record-rust-only-architecture-and-codex-babysit-pr-boundary) (parent [RM-168](https://linear.app/rpd-34/issue/RM-168/epic-worktree-hive-v1-rust-only-control-plane))
-- Follow-on command/state model: [RM-170](https://linear.app/rpd-34/issue/RM-170/v1-define-unified-wh-command-and-rust-state-model)
-
-## Current interpretation (2026-10-02)
-
-The original text below is preserved as the decision made in September. Its blanket remote-merge/API bans, mandatory mutation routing and managed-checkout procedures are superseded by the collaboration contract in [AGENTS.md](../../AGENTS.md). Rust remains the runtime for shared state and its local integrity helpers. Harnesses own checkouts; tools and trackers are optional; GitHub owns remote authorization. Do not use historical restrictions below as current contribution gates.
+- Status: Accepted architecture; operating policy revised 2026-10-03
+- Original decision: 2026-09-15
+- Linear: [RM-169](https://linear.app/rpd-34/issue/RM-169/v1-record-rust-only-architecture-and-codex-babysit-pr-boundary), with follow-on command/state work in [RM-170](https://linear.app/rpd-34/issue/RM-170/v1-define-unified-wh-command-and-rust-state-model)
+- Contribution and authorization contract: [AGENTS.md](../../AGENTS.md)
 
 ## Context
 
-v1 started as Worktree Hive, with CLI name `wh`. The GitHub repository and binary are now `writ`. This decision applies to that single runtime regardless of the rename; `wh` and Worktree Hive are historical names for the same product.
+The project began as Worktree Hive (`wh`) and is now `writ`. It needs one authoritative implementation of shared coordination state across agent platforms. A second orchestrator or state store would duplicate responsibilities and allow participants to disagree about checkout ownership, handoffs, or recovery.
 
-Two pressures collided:
-
-1. **A second control plane is unsafe.** A Python orchestrator that owned workflow, job state, or direct `git`/`gh` mutation could diverge from Rust policy. Prompt text cannot be the security boundary.
-2. **PR babysitting is already a skill.** OpenAI Codex ships [`babysit-pr`](https://github.com/openai/codex/blob/main/.codex/skills/babysit-pr/SKILL.md) for persistent PR monitoring, CI diagnosis, flaky retries, review handling, and continued polling. Publishing a competing `pr-babysit` repository would duplicate that loop instead of hardening the primitives it should call.
-
-The operational contract lives in [`AGENTS.md`](../../AGENTS.md). This ADR records the v1 architecture *decision*. Current agent procedure still documents local `git` for identity checks and rebase/push; that is not an exemption from the production mutation boundary below.
+Interactive PR monitoring is already supplied by installed host skills such as `babysit-pr`. Maintaining another watcher product inside this repository would duplicate that work.
 
 ## Decision
 
-### 1. `writ` is the only authoritative runtime and mutation boundary
+### Rust owns writ's runtime and shared state
 
-The v1 control plane is one Rust binary: `writ` (CLI) over `writ-core` (policy, worktrees, paths, process supervision).
+The Rust `writ` CLI calls `writ-core` for checkout registration, lease-backed coordination, local integrity helpers, and process supervision. Those implementations remain the source of truth for writ's behavior. Clients consume the CLI and its versioned output rather than adding another coordination database or state machine.
 
-Required production architecture:
+Responsibilities stay with the layer that owns them:
 
-```text
-Agent / SKILL.md
-        |
-        | intent and operator context
-        v
-writ (CLI) -> writ-core (policy)
-        |
-        | allowlisted subprocess operations
-        v
-git / gh / operating system
-```
-
-Claude Code hooks (`PreToolUse`, `WorktreeCreate`, `WorktreeRemove`, `SubagentStart`/`SubagentStop`) are the planned unbypassable admission path (GitHub #124). They dispatch into the same Rust binary. They are not a second policy engine.
-
-`writ` owns:
-
-- exact-base worktree identity and path sandboxing
-- `git`/`gh` mutation allowlists (`git-safe`, `gh-safe`)
-- process supervision and timeouts
-- runtime rejection of GitHub PR merge, auto-merge, merge-queue, default-branch local merge, dirty-WIP merge, and bare force-push
-- local feature-branch `git merge` admission (assigned worktree only)
-- job/watched state, once a writer exists (M1)
-
-This ADR does not add a GitHub PR merge command to `writ`. Local assigned-branch integration is allowlisted. GitHub repository protection owns remote PR merges; `writ` must not grow a merge-permission protocol.
-
-### 2. `SKILL.md` files are thin, platform-facing clients
-
-Installable skills (`SKILL.md`, `CLAUDE.md`, host-specific companions) adapt prompts to a platform. They are not an authoritative runtime, state store, or mutation policy.
-
-A skill may:
-
-- discover work, spawn workers, and report results
-- tell an agent *when* to call `writ`
-- hand a PR to an installed companion `babysit-pr` skill for interactive monitoring
-
-A skill may not:
-
-- relax `AGENTS.md`
-- own a second job-state machine
-- invoke production `git`/`gh` mutations except by routing them through `writ`
-
-If the Rust boundary is unavailable, the mutating flow stops. Re-implementing the allowlist in a wrapper that then calls `git` directly is prompt-level text, not enforcement.
-
-### 3. No separate `pr-babysit` repository in v1
-
-v1 will not publish a standalone `pr-babysit` (or equivalently named) repository, skill pack, or competing babysitting product.
-
-Interactive PR monitoring belongs to the **installed companion** `babysit-pr` skill on the host (Codex's skill, or another platform's equivalent). `writ` already exposes worktree, `git-safe`, `gh-safe`, and supervisor primitives those skills can call. A durable state writer and a `supervise-pr` primitive are planned (M1 / RM-170), not shipping commands. Command names must not claim that `writ` replaces Codex `babysit-pr`. `supervise-pr`, if added, is a runtime primitive, not a duplicate skill.
-
-### 4. Production `git`/`gh` mutation outside Rust policy is prohibited
-
-For production and fleet use, every mutating `git` or `gh` invocation goes through `writ`:
-
-| Allowed production path | Not a production mutation path |
+| Layer | Responsibility |
 | --- | --- |
-| `writ git-safe …` | raw `git` that mutates refs, the index, or the worktree |
-| `writ gh-safe …` | raw `gh` that mutates PRs, checks, comments, or repo state |
-| `writ worktree create` / `remove` / `prune` | raw `git worktree add` / `remove` |
-| `writ supervisor run …` | an unsupervised helper that then mutates |
+| Harness | Create workers and isolated checkouts, assign writable ownership, and manage checkout lifecycle. |
+| `writ` / `writ-core` | Register existing checkouts, maintain shared coordination records, and provide local integrity checks and bounded process execution. |
+| GitHub | Authorize remote source, PR, review, check, and merge operations through repository permissions and rules. |
+| Installed companion skill | Monitor the PR and handle in-scope CI or review feedback according to the operator's requested endpoint. |
 
-Reads are not mutations. GitHub MCP is preferred for PR/issue/check/review reads; shell `gh` reads are a fallback when MCP is unavailable. Identity-adjacent local `git` (`fetch`, `rev-parse`, `status`, `branch --show-current`) is not a second control plane; the production path still prefers `writ git-safe` for those calls (`fetch` is already allowlisted and non-mutating).
+The harness chooses checkout placement. Registration records an existing checkout; it does not seize or reset it. Using writ helpers and hooks is optional. For calls routed through them, direct Git operations retain assigned-branch and WIP checks, and supported GitHub targets retain owner checks. Supervised scripts and opaque API payloads are not recursively inspected. These helpers do not form a universal shell sandbox or a second GitHub permission system.
 
-GitHub MCP may perform GitHub writes that `writ gh-safe` cannot (`gh run` and `gh api` are outside the allowlist). That is still not a raw `gh`/`git` production path, and it remains subject to the GitHub PR merge prohibition. Local feature-branch `git merge` is allowlisted through `writ git-safe`.
+The current command and schema details are maintained in the [CLI contract](../cli-contract.md), [status schema](../status-schema.md), and [timeout policy](../timeout-policy.md).
 
-**Honest current enforcement.** Until M1 hooks land, policy applies only to commands that actually enter `writ`. This ADR states the required production path. It does not claim that raw `git`/`gh` is currently impossible on the operator's machine.
+### Skills are platform-facing clients
 
-### 5. Future Python, if retained, is a thin `writ --json` client only
+`SKILL.md`, `CLAUDE.md`, and host-specific guidance explain how to coordinate work and use the runtime. They link to [AGENTS.md](../../AGENTS.md) for the common contribution contract. They do not introduce a second state store or require contributors to install a particular private tracker.
 
-Python is not part of the required v1 runtime. The previous Python orchestrator was removed (GitHub #144).
+Native Git, GitHub connectors, and other authorized host tools remain valid workflows. A future SDK may wrap the Rust interface and parse its versioned responses; it must not become a competing implementation of writ's coordination state.
 
-If a Python SDK or helper is retained later, it may only:
+### PR monitoring belongs to the installed companion
 
-- spawn `writ --json …`
-- parse the versioned JSON envelope on stdout
-- surface exit codes (`0` success, `1` operational failure, `2` policy violation)
+Writ does not vendor a competing `babysit-pr` skill or watcher loop. The installed companion owns polling, feedback triage, and the requested monitoring endpoint. It may use writ's primitives where useful, alongside the host's authorized native tools.
 
-It must not own workflow, persist a second job-state schema, or call `git`/`gh` itself. The consumption pattern already shown in [`docs/status-schema.md`](../status-schema.md) is the allowed shape.
+A readiness report and a merge are distinct actions. Remote merge authorization comes from the operator's request or established automation policy and GitHub permissions, as defined in [AGENTS.md](../../AGENTS.md#remote-github-merges). Admission through a writ helper is not itself authorization to merge.
 
-## Codex `babysit-pr` integration and compatibility
+## Retired operating policy
 
-Reference skill: [openai/codex `babysit-pr`](https://github.com/openai/codex/blob/main/.codex/skills/babysit-pr/SKILL.md).
+The [original decision at commit `ca446b6`](https://github.com/rmems/writ/blob/ca446b6b794dfde53d9b66e27cd55b89dcc457f6/docs/adr/0001-rust-only-v1-runtime-and-babysit-pr-boundary.md) remains available as immutable history.
 
-That skill owns the **monitoring loop**: poll PR/CI/review state, classify branch vs flake, retry likely flakes within its budget, patch the PR head when the failure or review item is in-scope, and keep watching until the PR is merged/closed or the operator must intervene. A green, mergeable, review-clean PR is a progress milestone, not a license to merge.
-
-`writ` owns the **enforcement primitives** that loop should call when the job is under this runtime.
-
-`writ gh-safe` allowlists top-level `gh` commands such as `pr`, `issue`, and `workflow`. It **rejects** `gh api` (so merge cannot be smuggled through REST/GraphQL) and does **not** allowlist `gh run`. Codex `babysit-pr` today uses `gh run` and `gh api` for job logs, flaky reruns, and some thread resolution. Those calls must not be described as `gh-safe` successes, and they must not fall back to raw `gh api` as a production mutation path.
-
-| `babysit-pr` action | v1 expectation under `writ` |
-| --- | --- |
-| Snapshot PR/CI/review (read) | GitHub MCP first; `gh` read fallback. Not a `writ` mutation. Do not force reads through `gh-safe`. |
-| Patch code on the PR head | Assigned worktree/branch only; identity checklist in `AGENTS.md`. |
-| `git push` / `--force-with-lease` | `writ git-safe` on the assigned branch. Bare `--force`/`-f` remain forbidden. |
-| Allowlisted `gh` writes (for example `gh pr comment`) | `writ gh-safe`. Merge, auto-merge, merge-queue, `gh pr merge` / `ready` / `update-branch` / `checkout` remain blocked. |
-| Check reruns, Actions job logs, review-thread resolve | GitHub MCP, or a future `writ` primitive. Today `gh run` and `gh api` are outside `gh-safe`; do not send them through it, and do not use raw `gh api` in production. |
-| “Until merged or closed” | Observational stop condition. The skill must not merge the pull request. |
-| Ready-to-merge report | Handoff signal only. A human merges on GitHub. |
-
-Compatibility rules:
-
-1. **Do not fork or republish** Codex `babysit-pr` as a `writ` product.
-2. **Do not vendor** its watcher scripts as a second orchestrator.
-3. **When a babysit skill operates inside a `writ`-managed worktree**, production git mutations go through `writ git-safe`. Allowlisted `gh` writes go through `writ gh-safe`. Writes that are outside that allowlist (`gh run`, `gh api`) go through GitHub MCP or wait for a future primitive; they do not use raw `gh api`. The Codex skill's default raw `git`/`gh` examples are host defaults, not an exemption from this runtime.
-4. **This repository's `SKILL.md`** is a portable client that hands monitoring to the installed companion skill; it is not a reimplementation of the Codex watcher.
-5. **Naming:** `supervise-pr` (or successor) describes a primitive. It must not be marketed or documented as “the `writ` babysit-pr skill.”
+Its mandatory mutation routing, managed-checkout procedures, planned universal hook boundary, and blanket remote-merge/API restrictions have been retired. Those procedures are not contribution requirements. The retained decision is one Rust runtime for writ's shared state, thin platform clients, and companion-owned interactive PR monitoring; the current operating contract is [AGENTS.md](../../AGENTS.md).
 
 ## Consequences
 
-- Skills stay portable across Codex, Claude, Cursor, and later hosts because they share one mutation boundary.
-- PR monitoring quality can improve on the host skill without a fork in this repository.
-- RM-170 can define the unified command surface, including a non-skill `supervise-pr` primitive, without reopening the product-boundary question.
-- Operators must route fleet mutations through `writ` until hooks make that path unbypassable.
-- A later Python SDK, if any, is documentation-and-wrapper work, not a control-plane revival.
-
-## Non-goals
-
-- Reimplementing OpenAI Codex `babysit-pr`.
-- Automated merging, auto-merge, or merge queues.
-- A Python-owned workflow, state store, or direct `git`/`gh` mutation path.
-- Changing the live `writ` command surface in this ADR (that is RM-170).
+- Platforms share one coordination implementation without surrendering their native worker or checkout lifecycle.
+- PR monitoring can improve independently in the host's installed skill.
+- Contributors can use authorized native tools and checkpoints without tracker or helper startup requirements.
+- Local ownership/WIP checks, process containment, and GitHub's remote authority remain distinct, with their limits documented at their respective interfaces.

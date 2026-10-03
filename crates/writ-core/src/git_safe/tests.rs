@@ -1400,6 +1400,57 @@ fn gh_api_uses_literal_rest_endpoint_owner_checks() {
 }
 
 #[test]
+fn gh_api_repository_collections_enforce_literal_owners() {
+    let allowlist = crate::owners::OwnerAllowlist::parse("acme");
+    for (endpoint, allowed) in [
+        ("orgs/other/repos", false),
+        ("users/other/repos", false),
+        ("/orgs/other/repos?type=all", false),
+        ("https://api.github.com/orgs/other/repos", false),
+        (
+            "https://api.github.com/users/other/repos?per_page=10",
+            false,
+        ),
+        ("orgs/acme/repos", true),
+        ("users/ACME/repos", true),
+        ("https://api.github.com/users/acme/repos", true),
+    ] {
+        let args: Vec<String> = ["api", "-X", "POST", endpoint, "-f", "name=outside"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        let result = enforce_gh_repo_targets(&args, &allowlist, Some("acme/project"));
+        assert_eq!(result.is_ok(), allowed, "{endpoint}: {result:?}");
+        if !allowed {
+            assert_eq!(result.unwrap_err().code(), "OWNER_NOT_ALLOWED");
+        }
+    }
+}
+
+#[test]
+fn gh_api_collection_flags_keep_explicit_owner_authoritative() {
+    for flags in [
+        vec!["--method=POST"],
+        vec!["-iXPOST"],
+        vec!["-iH", "Accept:application/vnd.github+json"],
+        vec!["--silent=true"],
+    ] {
+        for owner in ["acme", "other"] {
+            let mut args = vec!["api".into()];
+            args.extend(flags.iter().map(|flag| (*flag).to_owned()));
+            args.push(format!("orgs/{owner}/repos"));
+            let allowlist = crate::owners::OwnerAllowlist::parse("acme");
+            // An unrelated local default must neither veto nor authorize this endpoint.
+            let result = enforce_gh_repo_targets(&args, &allowlist, Some("other/default"));
+            assert_eq!(result.is_ok(), owner == "acme", "{args:?}: {result:?}");
+            if owner != "acme" {
+                assert_eq!(result.unwrap_err().code(), "OWNER_NOT_ALLOWED");
+            }
+        }
+    }
+}
+
+#[test]
 fn gh_api_options_do_not_hide_literal_repository_target() {
     let allowlist = crate::owners::OwnerAllowlist::parse("acme");
     for flags in [

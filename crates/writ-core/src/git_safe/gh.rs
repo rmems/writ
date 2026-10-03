@@ -295,11 +295,7 @@ fn short_options(arg: &str) -> Option<ShortOptions> {
     let mut delete_branch = None;
     for (index, flag) in body.char_indices() {
         let suffix = &body[index + flag.len_utf8()..];
-        if flag == 'R'
-            || GH_VALUE_TAKING_OPTIONS
-                .iter()
-                .any(|option| option.len() == 2 && char::from(option.as_bytes()[1]) == flag)
-        {
+        if short_option_takes_value(flag) {
             return Some(ShortOptions {
                 tokens: if suffix.is_empty() { 2 } else { 1 },
                 delete_branch,
@@ -319,6 +315,16 @@ fn short_options(arg: &str) -> Option<ShortOptions> {
         tokens: 1,
         delete_branch,
     })
+}
+
+fn short_option_takes_value(flag: char) -> bool {
+    if flag == 'R' {
+        return true;
+    }
+    GH_VALUE_TAKING_OPTIONS
+        .iter()
+        .filter(|option| option.len() == 2)
+        .any(|option| char::from(option.as_bytes()[1]) == flag)
 }
 
 fn gh_boolean_enabled(value: &str) -> bool {
@@ -341,27 +347,30 @@ fn classify_positional_token(args: &[String], idx: usize) -> PositionalScan {
     if !a.starts_with('-') {
         return PositionalScan::Stop(Some(idx));
     }
-    // Only documented parent flags; anything else fails closed.
-    if GH_KNOWN_BOOLEAN_FLAGS.contains(&a) || matches!(a, "-h" | "-i") {
-        return PositionalScan::Skip(1);
+    match positional_option_tokens(a, args.get(idx + 1).map(String::as_str)) {
+        Some(tokens) => PositionalScan::Skip(tokens),
+        None => PositionalScan::Stop(None),
     }
-    if let Some(options) = short_options(a) {
-        return PositionalScan::Skip(options.tokens);
+}
+
+/// Number of argv tokens consumed by a supported option and its value.
+fn positional_option_tokens(arg: &str, next: Option<&str>) -> Option<usize> {
+    if let Some(options) = short_options(arg) {
+        return Some(options.tokens);
     }
-    if let Some((_, consume_next)) = gh_repo_flag(a, args.get(idx + 1).map(String::as_str)) {
-        return PositionalScan::Skip(if consume_next { 2 } else { 1 });
+    if let Some((_, consume_next)) = gh_repo_flag(arg, next) {
+        return Some(1 + usize::from(consume_next));
     }
-    // Value-taking option in separate-token form: skip it and its value so the
-    // value (which may be `--`) is not mistaken for a terminator.
-    if GH_VALUE_TAKING_OPTIONS.contains(&a) {
-        return PositionalScan::Skip(2);
+    let (flag, attached) = match arg.split_once('=') {
+        Some((flag, _)) => (flag, true),
+        None => (arg, false),
+    };
+    if GH_KNOWN_BOOLEAN_FLAGS.contains(&flag) {
+        return Some(1);
     }
-    if a.split_once('=').is_some_and(|(flag, _)| {
-        GH_VALUE_TAKING_OPTIONS.contains(&flag) || GH_KNOWN_BOOLEAN_FLAGS.contains(&flag)
-    }) {
-        return PositionalScan::Skip(1);
-    }
-    PositionalScan::Stop(None)
+    GH_VALUE_TAKING_OPTIONS
+        .contains(&flag)
+        .then_some(1 + usize::from(!attached))
 }
 
 /// First non-flag positional argument, skipping common `gh` inherited options that take values.
@@ -395,29 +404,19 @@ fn gh_deletes_local_branch(args: &[String]) -> bool {
         if arg == "--" {
             break;
         }
-        if let Some(options) = short_options(arg) {
-            if let Some(enabled) = options.delete_branch {
-                delete_branch = enabled;
-            }
-            i += options.tokens;
-            continue;
-        }
-        if let Some((_, consumes)) = gh_repo_flag(arg, args.get(i + 1).map(String::as_str)) {
-            i += if consumes { 2 } else { 1 };
-            continue;
-        }
-        if GH_VALUE_TAKING_OPTIONS.contains(&arg) {
-            i += 2;
-            continue;
-        }
-        if arg == "--delete-branch" {
-            delete_branch = true;
-        } else if let Some(value) = arg.strip_prefix("--delete-branch=") {
-            delete_branch = gh_boolean_enabled(value);
-        }
-        i += 1;
+        delete_branch = delete_branch_setting(arg).unwrap_or(delete_branch);
+        i += positional_option_tokens(arg, args.get(i + 1).map(String::as_str)).unwrap_or(1);
     }
     delete_branch
+}
+
+fn delete_branch_setting(arg: &str) -> Option<bool> {
+    if arg == "--delete-branch" {
+        return Some(true);
+    }
+    arg.strip_prefix("--delete-branch=")
+        .map(gh_boolean_enabled)
+        .or_else(|| short_options(arg).and_then(|options| options.delete_branch))
 }
 
 const GH_REPO_CLONE_VALUE_OPTIONS: &[&str] = &["-u", "--upstream-remote-name"];
@@ -716,7 +715,11 @@ pub fn enforce_gh_repo_targets(
     for selector in &positionals {
         allowlist.enforce_repo_selector(selector)?;
     }
-    if !selectors.is_empty() || !positionals.is_empty() {
+    let api_owner = gh_api_owner_target(args);
+    if let Some(owner) = api_owner {
+        allowlist.enforce_owner(owner)?;
+    }
+    if !selectors.is_empty() || !positionals.is_empty() || api_owner.is_some() {
         return Ok(());
     }
     // The implicit GH_REPO selector only applies to commands that actually
@@ -737,31 +740,41 @@ fn gh_positional_repo_targets(args: &[String]) -> Vec<String> {
         return Vec::new();
     };
     match subcommand {
-        "api" => gh_api_repo_target(&args[1..]).into_iter().collect(),
         "repo" => gh_repo_positional_targets(&args[1..]),
         "pr" | "issue" => gh_issue_or_pr_positional_targets(&args[1..]),
         _ => Vec::new(),
     }
 }
 
-/// Scope literal REST repository endpoints without interpreting request bodies
-/// or GraphQL node IDs. Owner placeholders use gh's single-repository context;
-/// a literal owner remains enforceable even when the repository is a placeholder.
-fn gh_api_repo_target(args: &[String]) -> Option<String> {
-    let endpoint = first_positional_after(args)?;
+/// Scope literal repos/OWNER/REPO and orgs/OWNER/repos or users/OWNER/repos
+/// endpoints without interpreting opaque bodies or GraphQL node IDs. Owner
+/// placeholders use gh's context; a literal owner remains enforceable when
+/// only the repository is a placeholder.
+fn gh_api_owner_target(args: &[String]) -> Option<&str> {
+    if args.first().map(String::as_str) != Some("api") {
+        return None;
+    }
+    let endpoint = first_positional_after(&args[1..])?;
     let path = endpoint
         .strip_prefix("https://api.github.com/")
         .unwrap_or(endpoint);
     let mut parts = path
+        .split(['?', '#'])
+        .next()?
         .trim_start_matches('/')
-        .strip_prefix("repos/")?
         .split('/');
+    let namespace = parts.next()?;
     let owner = parts.next()?;
-    let repo = parts.next()?;
+    let resource = parts.next()?;
+    match namespace {
+        "repos" => {}
+        "orgs" | "users" if resource == "repos" => {}
+        _ => return None,
+    }
     if owner.contains('{') {
         return None;
     }
-    Some(format!("{owner}/{repo}"))
+    Some(owner)
 }
 
 fn gh_repo_positional_targets(args: &[String]) -> Vec<String> {

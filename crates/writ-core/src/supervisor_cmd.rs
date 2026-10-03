@@ -117,7 +117,12 @@ fn prepare_gh_command(prep: &CommandRequest<'_>) -> Result<PreparedCommand> {
     Ok(PreparedCommand {
         program: "gh".to_owned(),
         args,
-        cwd: prep.options.repo.clone(),
+        cwd: prep
+            .options
+            .repo
+            .as_deref()
+            .map(|repo| resolve_supervised_repo(Some(repo)))
+            .transpose()?,
         branch_check: None,
     })
 }
