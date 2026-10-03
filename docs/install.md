@@ -133,3 +133,4 @@ Linux and macOS are the supported install surfaces. On WSL, use the Linux `$HOME
 | `writ` binary | `cargo install --path crates/writ` (see README Build), or a GitHub Release artifact | Shipping |
 | Agent skill | this document / `scripts/install-skill.sh` | Shipping |
 | Claude Code hooks | `writ install` writing `.claude/settings.json` | Implemented; burn-in outstanding ([#124](https://github.com/rmems/writ/issues/124)) |
+| Optional Beads context | `.claude/hooks/optional-bd-prime.sh` from `SessionStart` and `PreCompact` | Exits 0 when `bd` is missing or `bd prime` fails. Does not delete `.beads/` or other hooks. |

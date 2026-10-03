@@ -5,12 +5,14 @@ This guide defines the review and pull-request lifecycle for `writ`. It applies 
 ## Lifecycle
 
 ```text
-issue -> claimed job -> isolated worktree -> focused commits -> pull request
-      -> companion-skill interactive monitoring -> merge-ready report -> human merge decision
+task -> writable checkout only when writing -> focused commits -> checkpoint or pull request
+      -> merge-ready only after the validation, review, and required GitHub checks the change needs
       -> human merges on GitHub (repository protection owns the merge)
 ```
 
-The orchestrator, unattended runtime, installed companion `babysit-pr` skill, and worker agents may prepare or monitor a pull request and report that it is merge-ready, but they never merge the pull request or claim that an automated merge will occur. The companion skill is guidance, not an enforcement boundary. Local feature-branch integration in an assigned worktree is allowed; GitHub owns remote PR merges. Auto-merge and merge queues remain forbidden. If `main` is unprotected, report that operator gap rather than rebuilding a writ merge-permission protocol.
+A draft or checkpoint is not merge-ready. Say which checks ran, which did not, and any failure. Do not describe an unrun or failing check as passed, and do not weaken GitHub's required checks.
+
+Read-only review uses the current checkout. It does not need its own branch, pull request, or issue. The orchestrator, companion `babysit-pr` skill, and writers may prepare or monitor a pull request, but they never merge it. The companion skill is guidance, not an enforcement boundary. Local feature-branch integration in an assigned worktree is allowed; GitHub owns remote PR merges. Auto-merge and merge queues remain forbidden. If `main` is unprotected, report that operator gap rather than rebuilding a writ merge-permission protocol.
 
 For stacked pull requests, review and fix the bottom PR before its children. Re-evaluate children after their base changes.
 
@@ -18,13 +20,12 @@ For stacked pull requests, review and fix the bottom PR before its children. Re-
 
 ### Scope and traceability
 
-- [ ] The PR links its GitHub issue and, when present, the matching Linear `RM-*` issue.
-- [ ] Changes satisfy the linked acceptance criteria without unrelated refactors.
-- [ ] Session work is reflected accurately in Beads.
-- [ ] Generated replies identify the agent. Review-fix replies include the pushed commit SHA. Coordination messages and no-code-change replies do not invent a SHA.
+- [ ] The pull request identifies the task already in hand: a Linear id for maintainer work, or a GitHub issue when a contributor filed one. No issue twin, child issue, or Beads record is required.
+- [ ] Changes satisfy the stated acceptance criteria without unrelated refactors.
+- [ ] Generated replies identify the agent. Review-fix replies include the pushed commit SHA. Discussion, help, and intent messages do not invent a SHA.
 - [ ] Attribution is audited only on commits reachable from the submitted PR head and not its base, excluding synthetic review-merge/checkout and test-fixture commits. The Git author is the primary author, `Co-authored-by` credits an additional contributor, and `Agent` identifies the coding agent; the presence of one does not prove another.
 - [ ] Every Codex-authored commit in that submitted range contains exact `Agent: Codex` and `Co-authored-by: Codex <noreply@openai.com>` trailers without rewriting Cursor-attributed history.
-- [ ] After the first tested implementation and before final publication, one independent review matched to the change's risk was completed. Extra review was requested only for a named high-risk boundary or a reproduced finding that warranted follow-up.
+- [ ] A checkpoint or draft states its real test status. Merge or release readiness, when claimed, follows the validation and review the change needs, with required GitHub checks actually green.
 
 ### Safety
 
@@ -64,7 +65,7 @@ Rust owns the hard safety boundary. Reviewers should check:
 - Public error codes are stable enough for callers to classify without parsing prose.
 - Unsafe Rust remains forbidden unless a separately reviewed design justifies it.
 
-Run:
+Use these when reviewing behavior or declaring readiness. A draft checkpoint does not need this full suite first; its test status must still be truthful.
 
 ```bash
 cargo fmt --all -- --check

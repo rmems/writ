@@ -222,7 +222,7 @@ Call-outs:
 
 ### Why hooks
 
-Enforcement runs as [Claude Code hooks](https://code.claude.com/docs/en/hooks): `writ install` writes the hook block into `.claude/settings.json`, and `writ hook` dispatches the JSON payloads. This repo's own `.claude/settings.json` still registers only `SessionStart` and `PreCompact` — hooks are opt-in until the [#124](https://github.com/rmems/writ/issues/124) burn-in completes.
+Enforcement runs as [Claude Code hooks](https://code.claude.com/docs/en/hooks): `writ install` writes the hook block into `.claude/settings.json`, and `writ hook` dispatches the JSON payloads. This repo's own `.claude/settings.json` registers only `SessionStart` and `PreCompact`, and those commands run [`.claude/hooks/optional-bd-prime.sh`](.claude/hooks/optional-bd-prime.sh), which exits 0 when `bd` is absent. Writ enforcement hooks stay opt-in until the [#124](https://github.com/rmems/writ/issues/124) burn-in completes.
 
 - **`PreToolUse`** — "Exit 2 means a blocking error… exit 2 blocks whether or not you print JSON: even a JSON `permissionDecision` of `allow` can't override it."
 - **`SubagentStart`/`SubagentStop`** — agent registry.
@@ -299,7 +299,7 @@ The shared store carries intent, dependency-ready, blocker, overlap, help-reques
 | **GitHub** | Source of truth for code, PRs, reviews, checks, and protected-branch merges. |
 | **writ** | Same-host coordination state only. No task-tracker clone, no merge authority. |
 
-GitHub issue twins or Beads mirrors are not a required workflow.
+GitHub issue twins or Beads mirrors are not a required workflow. A checkpoint or draft pull request is not merge or release readiness: state which checks ran, and do not mark an unrun or failing GitHub check as passed.
 
 ## Safety invariants
 
@@ -326,12 +326,12 @@ Examples use generic owners such as `acme` and `example-org`.
 
 | Skill | Role |
 | --- | --- |
-| **`writ`** ([`SKILL.md`](SKILL.md)) | Fleet procedure: register checkouts, coordinate workers, local integration, issue → PR. |
+| **`writ`** ([`SKILL.md`](SKILL.md)) | Fleet procedure: register checkouts, coordinate writers, local integration, checkpoint → pull request. |
 | **`babysit-pr`** (installed companion) | Single-PR interactive monitoring in the current checkout: CI, reviews, threads, merge-ready report. |
 
 ## Build and gates
 
-Contributor quality gates — these are canonical, and external analyzers are advisory until reproduced:
+Readiness gates for a change you call merge-ready or release-ready. A checkpoint uses focused checks and says so. External analyzers are advisory until reproduced:
 
 ```bash
 cargo fmt --all -- --check
@@ -373,7 +373,7 @@ If the new `writ` data root is absent and a pre-rename `worktrees-hives` root st
 | --- | --- |
 | Agent does not see the `writ` skill | `ls "$HOME/.agents/skills/writ/SKILL.md"`; confirm the host's actual skill root; recreate the symlink. |
 | `writ: command not found` | `cargo install --path crates/writ` from the clone, or set `WRIT_BIN`. |
-
+| Session startup fails because `bd` is missing | The checked-in hook must be `.claude/hooks/optional-bd-prime.sh`, which exits 0 without `bd`. Do not replace it with a bare `bd prime`. |
 | `writ status` / `writ jobs` is empty | Expected until a checkout is registered. Register with `writ worktree register`. See [`docs/status-schema.md`](docs/status-schema.md); for the live GitHub overlay use `writ watchlist` ([`docs/watchlist-schema.md`](docs/watchlist-schema.md)). |
 | `policy violation [BARE_FORCE_PUSH]` or `[MERGE_BLOCKED]` | Exit 2 is the safety boundary working. Use `--force-with-lease` only when allowed. `MERGE_BLOCKED` covers `gh pr merge`, `git mergetool`, default-branch local merge, and dirty-WIP merge — not routine feature-branch integration. |
 | Owner allowlist did not block another org | Confirm `WRIT_ALLOWED_OWNERS` / `--allowed-owners` is set. Empty lists deny. The gate covers worktree create and `gh` repo selectors, not host MCP calls. |
@@ -397,13 +397,13 @@ Keep GitHub label descriptions identical to this table (commands in
 Optional GitHub issue forms live in [`.github/ISSUE_TEMPLATE/`](.github/ISSUE_TEMPLATE/):
 **Feature** (new capability), **Bug** (unexpected failure), **Chore** (hygiene,
 packaging, docs-only). Each asks for Summary, Problem / context, Acceptance
-criteria checkboxes, and the Linear footer documented in
-[`CONTRIBUTING.md`](CONTRIBUTING.md).
+criteria checkboxes, and an optional Linear footer documented in
+[`CONTRIBUTING.md`](CONTRIBUTING.md). Contributors can leave the footer blank.
 
 ## Roadmap and tracking
 
-- Product direction and task tracking for this repo: Linear (`writ` / `RM` tickets). Using Linear is a convention of this repository's maintainers, not a product requirement.
-- GitHub issues mirror actionable work items; they are optional, not a required workflow.
+- Product direction and task tracking for this repo's maintainers: Linear (`writ` / `RM` tickets). Contributors do not need Linear access.
+- GitHub holds code, pull requests, reviews, and checks. Existing GitHub issues stay as contributor reports and history. Maintainers do not file a GitHub issue twin for a Linear task.
 - Open coordination work: crash-consistent lease/ownership records and the same-host claim/overlap/message/handoff layer build on the existing SQLite lease store.
 - Lease budgets (fix-loop bound): [#167](https://github.com/rmems/writ/issues/167)
 - Hook burn-in: [#124](https://github.com/rmems/writ/issues/124) · Install narrative: [#18](https://github.com/rmems/writ/issues/18) · Owner allowlist: [#146](https://github.com/rmems/writ/issues/146)
@@ -417,8 +417,8 @@ criteria checkboxes, and the Linear footer documented in
 - [`docs/cli-contract.md`](docs/cli-contract.md) — command, JSON envelope, exit-code, persistence, and lifecycle compatibility matrix
 - [`REVIEW.md`](REVIEW.md) — pull-request lifecycle and review checklist
 - [`docs/adr/0001-rust-only-v1-runtime-and-babysit-pr-boundary.md`](docs/adr/0001-rust-only-v1-runtime-and-babysit-pr-boundary.md) — v1 Rust-only runtime and Codex `babysit-pr` boundary
-- [`docs/workflows/safe-issue-verified-commit.md`](docs/workflows/safe-issue-verified-commit.md) — issue → verified push
-- [`docs/workflows/safe-verified-commit-to-pr.md`](docs/workflows/safe-verified-commit-to-pr.md) — verified push → PR handoff
+- [`docs/workflows/safe-issue-verified-commit.md`](docs/workflows/safe-issue-verified-commit.md) — checkpoint push
+- [`docs/workflows/safe-verified-commit-to-pr.md`](docs/workflows/safe-verified-commit-to-pr.md) — checkpoint → pull request
 - [`docs/status-schema.md`](docs/status-schema.md) — `status` / `jobs` JSON
 - [`docs/timeout-policy.md`](docs/timeout-policy.md) — supervisor hang recovery (hard/idle/lost-child, grace kill, redispatch budget)
 - [`docs/watchlist-schema.md`](docs/watchlist-schema.md) — `watchlist` collaboration view
