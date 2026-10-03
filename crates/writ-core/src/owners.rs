@@ -109,6 +109,12 @@ impl OwnerAllowlist {
         self.owners.is_empty()
     }
 
+    /// Whether `owner` normalizes to an allowlisted owner (empty list denies).
+    #[must_use]
+    pub fn allows(&self, owner: &str) -> bool {
+        github_owner_name(owner).is_some_and(|o| self.owners.contains(&o))
+    }
+
     /// Reject `owner` unless it normalizes to an allowlisted owner.
     pub fn enforce_owner(&self, owner: &str) -> Result<()> {
         self.enforce_spec(OwnerSpecKind::Owner, owner)

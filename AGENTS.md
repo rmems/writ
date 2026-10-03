@@ -1,5 +1,7 @@
 # AGENTS.md
 
+See @CLAUDE.md for additional repository context. The @-mention makes Amp load it; Amp reads `CLAUDE.md` on its own only when no `AGENTS.md` exists. Where the two files overlap, this file takes precedence, as `CLAUDE.md` itself states.
+
 ## Purpose
 
 This file defines how coding agents contribute to `writ` and how the collaboration layer divides responsibility. The project is a Rust workspace designed for multiple agent platforms.
@@ -135,7 +137,7 @@ The v1 decision that `writ` is the only authoritative runtime, that `SKILL.md` f
 
 `writ` is a **Rust workspace**. One binary owns both layers:
 
-- **Coordination state** — `writ worktree register`/`unregister`/`inspect`/`list` and `writ hook` grant and release SQLite lease rows (`leases` + `agents`) for harness-created checkouts. Deprecated managed `create`/`remove` still persist lease identity for verified reclaim ([#141](https://github.com/rmems/writ/issues/141)). Path scopes, declared-path overlap, messages/handoffs, and ownership transfer build on this store — no second database. `state.rs` still only *reads* `watched.json`; that file is superseded by the lease store, not given a writer.
+- **Coordination state** — `writ worktree register`/`unregister`/`inspect`/`list` and `writ hook` grant and release SQLite lease rows (`leases` + `agents`) for harness-created checkouts. `writ status` / `writ jobs` read that same store. Path scopes, declared-path overlap, messages/handoffs, and ownership transfer build on this store — no second database. `state.rs` still only *reads* leftover `watched.json`; that file is superseded by the lease store, not given a writer, and is not the status authority.
 - **Safety boundary** — exact-base identity, path sandboxing, process supervision/timeouts, branch verification, and force-with-lease-only pushes, enforced at the process boundary to protect WIP and coordination integrity.
 - **Agent skill (`SKILL.md`)** — portable prompts describing when and how agents call the CLI on any platform.
 
@@ -184,7 +186,7 @@ The installable `SKILL.md` will own platform-facing prompts and command guidance
 
 ## Data flow
 
-**Supported today.** Checkout registration (`writ worktree register`/`unregister`/`inspect`/`list`), `writ git-safe` / `writ gh-safe` / `writ supervisor`, and `writ hook` (JSON on stdin) are implemented. The managed lifecycle commands (`worktree create`/`remove`/`prune`) are deprecated. Claude Code does not register that hook until the operator runs `writ install` (implemented; held back from shared settings pending the [#124](https://github.com/rmems/writ/issues/124) burn-in).
+**Supported today.** Checkout registration (`writ worktree register`/`unregister`/`inspect`/`list`), `writ status` / `writ jobs` (lease-store snapshot), `writ git-safe` / `writ gh-safe` / `writ supervisor`, and `writ hook` (JSON on stdin) are implemented. The managed lifecycle commands (`worktree create`/`remove`/`prune`) are deprecated. Claude Code does not register that hook until the operator runs `writ install` (implemented; held back from shared settings pending the [#124](https://github.com/rmems/writ/issues/124) burn-in).
 
 1. The operator or agent supplies Linear task or GitHub PR context.
 2. The harness (Claude Code agent teams, `/batch`, Cursor, plain `git worktree add`, or an equivalent) assigns work and creates the isolated checkout wherever it wants.
@@ -193,3 +195,4 @@ The installable `SKILL.md` will own platform-facing prompts and command guidance
 5. On `PreToolUse`, `writ hook` validates each `git`/`gh` mutation and blocks an unsafe one with exit 2, which no other hook can override. Until the hook is registered, validation also happens when `writ git-safe` / `writ gh-safe` is invoked.
 6. `writ worktree unregister` (or a `WorktreeRemove` hook event) releases the lease row. The checkout itself is the harness's to delete — writ never removes it, and expiring a claim never erases WIP.
 7. The installed companion `babysit-pr` skill handles interactive monitoring after a PR handoff.
+8. A timeout or hang on `writ supervisor` is a recovery and handoff event: contain the child, record residual state, and leave the harness-owned checkout in place. Policy: [`docs/timeout-policy.md`](docs/timeout-policy.md). Do not improvise a second timeout path in the CLI.

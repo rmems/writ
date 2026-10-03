@@ -1,26 +1,8 @@
-//! Watched-job state: **read path only**.
+//! Watched-job JSON reader kept for compatibility tests.
 //!
-//! There is no writer. This module exposes `load_jobs` and nothing that
-//! persists, so nothing in this workspace ever creates `watched.json`. With the
-//! file absent -- the normal case -- `writ status` and `writ jobs` return an empty
-//! array.
-//!
-//! That is not the same as "always empty". `load_jobs_from` returns an empty vec
-//! only on `NotFound`; a file that does exist at the resolved path is parsed and
-//! returned as-is. So populated output is reachable when something outside this
-//! workspace writes the file, or when `WRIT_STATE_PATH` (or legacy `WH_STATE_PATH`)
-//! points at one. The gap is
-//! the missing writer, not a guarantee about the value.
-//!
-//! GitHub #26 ("R3: Job/state store") is closed as completed and an earlier
-//! version of this comment claimed it implemented the store. It delivered the
-//! reader and the serde types; the persistence path never landed. The claim is
-//! corrected here rather than left implying a writer exists somewhere.
-//!
-//! This module is superseded rather than completed: the SQLite lease store in
-//! GitHub #124 replaces it, with crash consistency tracked in #136. Do not add a
-//! `watched.json` writer without checking whether the lease store should own the
-//! state instead.
+//! `writ status` / `writ jobs` no longer use this file. Collaboration status is
+//! loaded from the SQLite lease store (`crates/writ-core/src/status.rs`).
+//! There is still no writer for `watched.json`; do not add one.
 
 use std::fs;
 use std::path::Path;
@@ -75,6 +57,7 @@ mod tests {
             process_state: ProcessState::Running,
             last_error: None,
             ci_class: CiClass::Pending,
+            ..JobStatus::default()
         }
     }
 
