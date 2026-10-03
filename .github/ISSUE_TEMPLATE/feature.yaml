@@ -59,8 +59,7 @@ body:
     id: linear
     attributes:
       label: Linear
-      description: Planning twin. Keep this footer even when no twin exists yet; replace the placeholders when it does.
-      value: |
-        Linear: <url> (`RM-N`)
+      description: Optional maintainer task id. Leave blank unless an RM-* task already exists. Do not invent a Linear twin.
+      placeholder: "Linear: <url> (`RM-N`)"
     validations:
-      required: true
+      required: false

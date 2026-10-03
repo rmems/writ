@@ -6,12 +6,12 @@ This file provides instructions and context for AI coding agents working on this
 
 ## Repository policy
 
-[`AGENTS.md`](AGENTS.md) is the authoritative contribution, autonomy, attribution, review, validation, Beads, and session-completion contract. Claude agents must read it before mutating work. Do not duplicate that common contract here.
+[`AGENTS.md`](AGENTS.md) is the authoritative contribution, autonomy, attribution, review, validation, and session-completion contract. Claude agents must read it before mutating work. Do not duplicate that common contract here.
 
 Use these `AGENTS.md` sections as the single source of truth:
 
-- [Beads Issue Tracker](AGENTS.md#beads-issue-tracker)
-- [Session Completion](AGENTS.md#session-completion)
+- [Optional execution aids](AGENTS.md#optional-execution-aids)
+- [Session completion](AGENTS.md#session-completion)
 - [Attribution semantics](AGENTS.md#attribution-semantics)
 - [Local collaboration](AGENTS.md#local-collaboration-allowed)
 - [Remote GitHub merges](AGENTS.md#remote-github-merges)

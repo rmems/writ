@@ -1,6 +1,6 @@
 # Safe Issue → Verified Commit
 
-Portable worker contract for any coding agent (Codex, Claude, Grok, Hermes, Devin, or later). Stops at a verified push and an issue comment. Does not open a PR — that is [Safe Verified Commit → PR](safe-verified-commit-to-pr.md).
+Portable worker contract for any coding agent (Codex, Claude, Grok, Hermes, Devin, or later). Stops at a verified push and, when a tracker was supplied, a comment on that tracker. Does not open a PR — that is [Safe Verified Commit → PR](safe-verified-commit-to-pr.md).
 
 Safety rules live in [`AGENTS.md`](../../AGENTS.md) and [`SKILL.md`](../../SKILL.md). This file does not relax them.
 
@@ -10,7 +10,7 @@ Contracts: isolation [#6](https://github.com/rmems/writ/issues/6), skill/procedu
 
 | Input | Required | Notes |
 | --- | --- | --- |
-| `issue` | yes | GitHub issue URL or number |
+| `task` | no | Linear `RM-*` and/or a GitHub issue when one was supplied. `none` or omitted when neither exists; scope and acceptance then come from the assigned request. Do not invent a tracker. |
 | `owner` / `repo` | no | If omitted, resolve from `git remote` in the current repository |
 | `dry_run` | no | Intake + isolate + plan only. No commit, push, or issue comment |
 
@@ -20,11 +20,11 @@ Do not hard-code an owner. Multi-repo discovery and scheduling still use `WRIT_A
 
 Abort and report if any of these fail:
 
-- Issue is closed, is a pull request, or has no actionable acceptance criteria
+- A supplied task is closed, is a pull request, or has no actionable acceptance criteria. With no tracker, stop when the assigned request has no actionable acceptance criteria
 - Owner is outside the configured allowlist (unless the operator named this repo/job explicitly).
 - Unsafe identity or path mismatch, a genuine ownership collision, or a non-recoverable cleanliness/remote check. Exact remote-base equality applies only to a newly created, unpublished assigned branch. A published branch must have the expected upstream and local/remote relationship instead. Repair a clean bootstrap source or unpublished verified-base alignment before editing; do not abort isolated work because a primary checkout is dirty or stale.
 - `writ` is missing and no enforcing wrapper is available (mutating runs). An "enforcing wrapper" means a wrapper that routes the mutation through `writ-core`'s allowlist and branch verification; a wrapper that merely calls `git` directly is not one, and does not satisfy this check.
-- Any required quality gate fails or times out
+- A **merge-ready** claim when a required quality gate failed or timed out (a checkpoint with honest residuals is not this stop)
 - A deny-listed command would be required (GitHub PR merge, local merge into `main`/`master`, dirty-WIP merge, bare `--force` / `-f`)
 - `git push` exits non-zero or the remote rejects the push
 
@@ -32,14 +32,14 @@ Abort and report if any of these fail:
 
 ### 1. Intake (read-only)
 
-1. Read the GitHub issue with **GitHub MCP first**. Shell `gh` only if MCP is unavailable.
+1. Read the supplied Linear task and/or GitHub issue (GitHub **MCP first** for GitHub). With no tracker, read the assigned request. Shell `gh` only if MCP is unavailable.
 2. Read `AGENTS.md` or `CLAUDE.md`, `README.md`, and [`REVIEW.md`](../../REVIEW.md).
-3. Extract acceptance criteria. Preserve them. Do not invent extra scope.
-4. If a Linear twin is already linked, note its id. Do not create a second twin.
+3. Extract acceptance criteria from the supplied tracker or, when none exists, from the assigned request. Preserve them. Do not invent extra scope.
+4. Do not create a GitHub issue twin for Linear work, or a Linear task for a GitHub-only or tracker-free contribution.
 
 ### 2. Isolate
 
-1. If this repo uses Beads, run `bd prime`, inspect `bd ready`, and claim the relevant bead.
+1. Beads is optional. If `bd` is on `PATH`, you may claim a bead; missing `bd` is not a stop. Native/harness task lists are allowed.
 2. Start from an up-to-date base. Never edit `main` or `master`.
 3. Create or reuse a dedicated branch and isolated checkout:
    - The harness creates the checkout wherever it wants (native worktree support, or plain `git worktree add <path> -b <branch> <remote>/<base>` after fetching). `writ worktree create` is deprecated; do not use it for new work. Never derive the start point from the source checkout's ambient `HEAD`.
@@ -62,8 +62,9 @@ Abort and report if any of these fail:
 ### 4. Focused validation during implementation (fail-closed)
 
 Run focused, task-relevant checks as changes are made. An issue may add
-focused checks. Do not use those extra checks, or an early full native
-suite, as a substitute for the final exact-head run in Stage 6.
+focused checks. Checkpoint commits may proceed with honest residuals; do not
+call an unrun or failing check passed. Do not use an early full native suite
+as a substitute for merge-readiness validation in Stage 6.
 
 The complete native suite for this repository is always:
 
@@ -75,18 +76,22 @@ cargo test --workspace
 
 Run every `cargo` check under an explicit process timeout supplied by the host (orchestrator supervisor, CI job timeout, or equivalent). Do not use a Linux-only timeout command as the contract.
 
-If a focused required gate fails or the process is killed for time, **do not advance to the final publication sequence**. Report the failure or timeout as a residual on the issue. A hang or timeout is not a license to skip the gate and push anyway.
+If a focused required gate fails or the process is killed for time, **do not
+claim merge readiness**. You may still make a checkpoint commit or draft PR
+when the residual is stated honestly. A hang or timeout is not a license to
+report a failed gate as passed.
 
-After the first tested implementation, obtain one independent review matched to
-the change's risk before final publication. Additional review is required only
-for a named high-risk boundary or a reproduced finding that warrants follow-up.
-Address in-scope findings and rerun affected focused checks before continuing.
+A checkpoint push or draft PR does not require independent review. Before a
+merge-ready claim, obtain one independent review matched to the change's risk.
+Additional review is required only for a named high-risk boundary or a
+reproduced finding that warrants follow-up. Address in-scope findings and
+rerun affected focused checks before continuing.
 
 ### 5. Commit
 
 - One or few focused commits. Scoped `git add` (no secrets, no unrelated dirt).
-- Message names the agent and links the GitHub issue (and Linear id if already known).
-- Beads status matches reality.
+- Message names the agent and links Linear `RM-*` and/or the GitHub issue when one exists.
+- If Beads is in use, keep its status aligned; otherwise skip it.
 
 ### 6. Push
 
@@ -95,7 +100,7 @@ Immediately before final alignment or `git push`, fail closed if any of these di
 Then:
 
 1. On a newly created, unpublished branch, fetch and verify the expected remote base again, then perform final alignment or a **successful, conflict-free** rebase on that assigned unpublished branch. Never let an ambient or stale `HEAD` substitute for the verified base. On a published branch, fetch its expected upstream and reconcile the local branch with that upstream; `git pull --rebase` must be successful and conflict-free when a pull is needed. Do not require the published branch to equal the base. If alignment or reconciliation fails or leaves conflicts, **stop**: record the issue as a residual, do **not** run the full native gates, and do **not** `git push`.
-2. Always run the complete native suite named in Stage 4 exactly once (with the same process timeouts) on the exact `HEAD` that would be pushed. An issue may add focused checks but must not replace or reduce this suite. Any later tree change invalidates the run and requires repeating final alignment and this full suite. If any gate fails or times out, **do not push**. Report residuals.
+2. For a **checkpoint** push or draft PR, rerun the focused checks that cover the change and report that status truthfully. For a **merge-ready** claim, run the complete native suite named in Stage 4 exactly once (with the same process timeouts) on the exact `HEAD` that would be pushed. Any later tree change invalidates a readiness run. If a readiness gate fails or times out, **do not claim merge-ready**. A checkpoint may still push when residuals are explicit.
 3. For a first publication, push the already verified remote and assigned branch explicitly: `git push -u <verified-remote> <assigned-branch>`. After upstream is set, use `git push`. If the command exits non-zero or the remote rejects the update, **stop before Stage 7**: record the push failure as a residual. Do **not** report `git rev-parse HEAD` as the pushed SHA.
 
 - Never merge a GitHub pull request. Local `git merge` of peer work into this assigned feature branch is allowed; never merge into `main`/`master`, and refuse a merge that would lose uncommitted WIP.
@@ -106,12 +111,19 @@ Then:
 
 Run this stage **only** after Stage 6 step 3 succeeded (push accepted by the remote).
 
-Comment on the GitHub issue (MCP first) with:
+Report on the tracker that was supplied. Do not create a GitHub issue or a Linear task to hold the comment.
+
+- Linear task: comment on that task.
+- Existing GitHub issue: comment on that issue (MCP first).
+- Linear-only work stops at the Linear comment.
+- No tracker: skip the comment. The pushed branch is the record, and the PR workflow carries handoff.
+
+Include:
 
 - branch
 - pushed SHA (`git rev-parse HEAD` **after** that successful push)
 - what landed
-- residual blockers
+- residual blockers and whether this is a checkpoint or a merge-ready claim
 - agent name, using the [reply attribution](../../SKILL.md#reply-attribution) templates (`writ attribution format`)
 
 Do not claim a merge. Do not open a PR here. A local HEAD SHA after a failed or rejected push is not a completion report.
@@ -122,4 +134,4 @@ Stop after isolate + a written implementation plan. No commits, push, or issue c
 
 ## Done when
 
-Branch is pushed (remote accepted), required gates passed (or residuals are explicit and nothing was committed or reported as pushed over a failed gate, timeout, rebase failure, or rejected push), and the issue has a SHA-bearing comment only after that successful push.
+Branch is pushed (remote accepted) and status is truthful (checkpoint vs merge-ready). When a tracker was supplied, it has a SHA-bearing comment only after that successful push. With no tracker, there is no tracker comment.

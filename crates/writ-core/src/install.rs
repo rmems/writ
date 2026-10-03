@@ -348,12 +348,14 @@ mod tests {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join(".claude/settings.json");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // Pre-existing unrelated hook must survive install. The command
+        // string is a fixture, not something `writ install` injects.
         fs::write(
             &path,
             r#"{
   "hooks": {
     "SessionStart": [
-      { "matcher": "", "hooks": [{ "type": "command", "command": "bd prime" }] }
+      { "matcher": "", "hooks": [{ "type": "command", "command": "user-unrelated-hook" }] }
     ]
   }
 }
@@ -371,7 +373,7 @@ mod tests {
             parsed["hooks"]["SessionStart"][0]["hooks"][0]["command"]
                 .as_str()
                 .unwrap()
-                .contains("bd prime")
+                .contains("user-unrelated-hook")
         );
         assert_eq!(
             parsed["hooks"]["PreToolUse"][0]["hooks"][0]["if"],

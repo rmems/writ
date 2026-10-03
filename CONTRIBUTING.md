@@ -1,8 +1,11 @@
 # Contributing
 
 [`AGENTS.md`](AGENTS.md) is the autonomy and safety contract. This file is the
-short filing guide so humans and agents share one label vocabulary and one
-issue shape.
+short filing guide so humans and agents share one label vocabulary.
+
+Maintainers track work in Linear and land it with a GitHub PR. External
+contributors do not need Linear, Beads, or a GitHub issue twin: a PR is enough.
+GitHub issue templates stay available for GitHub-filed work.
 
 ## Issue templates
 
@@ -16,17 +19,17 @@ forms; blank issues stay enabled):
 | **Chore** | Hygiene, packaging, or docs-only work |
 
 Each template asks for **Summary**, **Problem / context** (or a repro),
-**Acceptance criteria** (checkboxes), a **canonical label**, and a **Linear**
-footer. Keep the write-up short. Do not add extra required fields.
+**Acceptance criteria** (checkboxes), and a **canonical label**. Linear is
+optional (maintainers may add `RM-*` when they already have a task).
 
-Footer pattern (replace the placeholders when a twin exists):
+Footer pattern when a Linear task already exists:
 
 ```text
 Linear: <url> (`RM-N`)
 ```
 
-GitHub is the execution surface. Linear stays the planning twin via that
-footer. Do not invent a second Linear issue when one is already linked.
+Do not invent a GitHub issue twin for Linear work, and do not invent a Linear
+task for a GitHub-only contribution.
 
 ## Canonical labels
 
@@ -67,13 +70,18 @@ gh label edit safety --description "Never-merge, force-with-lease, fix caps, own
 ## Pull requests
 
 Follow [Safe Issue → Verified Commit](docs/workflows/safe-issue-verified-commit.md)
-then [Safe Verified Commit → PR](docs/workflows/safe-verified-commit-to-pr.md).
-Never merge from those workflows. Review checklist: [`REVIEW.md`](REVIEW.md).
+then [Safe Verified Commit → PR](docs/workflows/safe-verified-commit-to-pr.md)
+when using those portable worker contracts. A contributor with neither a Linear
+task nor a GitHub issue still opens the PR; omit `task` or pass `none`.
+Checkpoints and draft PRs are not merge-ready claims. Never merge from those
+workflows. Review checklist: [`REVIEW.md`](REVIEW.md).
 
-Native gates (canonical; see README):
+Integrated native gates for a merge-ready claim (canonical; see README):
 
 ```bash
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
+
+A checkpoint or draft PR reports the focused checks that actually ran. An unrun or failed command stays a residual.

@@ -45,20 +45,23 @@ Before making any code change, the agent MUST verify:
 
 Repair a clean bootstrap source or a newly created unpublished branch's verified-base alignment before editing. Abort and report an unsafe identity or path mismatch, a genuine ownership collision, or any other non-recoverable failure.
 
-### Validation and final publication sequence
+### Validation, checkpoints, and merge readiness
 
-Run focused, task-relevant gates while working. After the first tested
-implementation and before final publication, obtain one independent review
-matched to the change's risk. Additional review is required only for a named
-high-risk boundary or a reproduced finding that warrants follow-up.
+Run focused, task-relevant gates while working. Checkpoint commits, checkpoint
+pushes, and draft PRs may proceed with honest test status and ordinary
+non-destructive publication checks. Do not describe an unrun or failing check
+as passed.
+
+Before claiming merge or release readiness, obtain one independent review
+matched to the change's risk (extra review only for a named high-risk boundary
+or a reproduced finding) and run appropriate integrated validation on the exact
+`HEAD`. That review belongs to the merge-ready claim. Checkpoint commits,
+checkpoint pushes, and draft PRs use the focused-check status above.
 
 Before first publication of an unpublished assigned branch, fetch the verified
 remote base and complete final alignment or rebase. For a published branch,
 fetch and reconcile it with its expected upstream; do not require equality with
-the base. Then run exactly one complete native gate suite on the exact `HEAD`
-that would be pushed. An issue may add focused checks; it must not replace or
-reduce that final suite. Any later tree change invalidates that run and requires
-restoring the applicable alignment and rerunning the suite before push.
+the base. Any later tree change invalidates a readiness run.
 
 ### Final status guidance
 
@@ -168,9 +171,25 @@ SHA policy: include `--commit-sha` only when referring to committed or pushed wo
 - **Recovery:** `live`, `released`, `stale_heartbeat`, `missing_checkout`.
 - **GitHub:** `check` / `check-all` probe PRs live (`gh pr list --head`). That overlay is not a merge gate. `--repo` / `--owner` filters are optional; probes still honour `WRIT_ALLOWED_OWNERS`.
 - **`add` / `remove`:** do not persist. Register or unregister a checkout instead.
-- Same-host SQLite is not cross-host coordination. Linear remains the required task tracker.
+- Same-host SQLite is not cross-host coordination. Linear is the maintainers' optional backlog, not a required contributor service.
 
 See [`docs/watchlist-schema.md`](docs/watchlist-schema.md).
+
+### CI taxonomy (Class A / B / C)
+
+Classifier guidance for PR-check monitoring. It is not a checkpoint gate and not a second store. The taxonomy document and `writ ci classify` belong to [RM-125](https://linear.app/rpd-34/issue/RM-125/ci-taxonomy-actions-vs-codacy-vs-third-party) / [#183](https://github.com/rmems/writ/pull/183); they are not on this branch. Until that command is present, classify each row from `gh pr checks --json name,state,bucket,workflow,link` (and `statusCheckRollup` when `ACTION_REQUIRED` is needed) with the table below. A missing classifier is unavailable; it is neither a failed check nor a pass.
+
+| Class | Meaning | Do | Do not |
+| --- | --- | --- | --- |
+| **A** | GitHub Actions / Azure build-test | Fix source; **one** `gh run rerun` on flake | Empty “kick CI” commits |
+| **B** | Codacy (and similar quality gates) | Fix real file+line findings; residual human gate on `ACTION_REQUIRED` | Empty pushes to wake the dashboard |
+| **C** | Kilo, CodeRabbit, Gitar, unknown bots | Report residual (`class_c:kilo_pending`, …); continue Class A | Empty retrigger commits |
+
+`skipping` is non-blocking and is **not** a performed pass (skip-only is `unknown`, not `pass`). `pending` means continue other work without rerun spam. **Prefer a real fix or `gh run rerun` over noise commits.** Residual codes belong in watchlist notes and the final report.
+
+Do **not** write `watched.json`, a second store, or a lease row for CI. When `writ ci classify` from RM-125 is available, copy its compact `data.collaboration` object (`ci_class`, observation counts, `residual_codes`, `blocks_unrelated_workers: false`) into existing RM-139 / RM-127 status views. An externally blocked service must not freeze unrelated workers.
+
+Requiredness is **not** the Class A/B/C letter and is **not** inferred from a provider name. Pass `isRequired` from GraphQL when available. Count `required_failure` separately from advisory findings, pending results, `ACTION_REQUIRED` external-access/configuration problems, and unknown requiredness. Unknown is a report, not a writ merge gate and not a pass. Do not disable checks, fabricate success, or empty-commit to retrigger a bot.
 
 ### Platform-neutral worker prompt template
 
@@ -186,7 +205,7 @@ SAFETY RULES (non-negotiable):
 - One writable worker per assigned worktree and branch
 - Before editing, verify: worktree path, branch name, clean assigned state, and remote alignment; exact remote-base equality applies only to a newly created unpublished branch, while a published branch must match its expected upstream relationship
 - Repair a clean bootstrap source or unpublished verified-base alignment; abort on unsafe identity or path mismatch
-- After the first tested implementation and before publication, obtain one independent risk-matched review; add review only for a named high-risk boundary or an actual finding
+- After the first tested implementation and before a merge-ready claim, obtain one independent risk-matched review; add review only for a named high-risk boundary or an actual finding. Checkpoints and draft PRs need truthful focused-check status, not a full-suite claim
 - Use `writ attribution format` for automated replies. Intent/dependency/overlap/help/handoff/conflict messages need real agent/task/branch/session identity and must not invent a SHA. After a successful push, review-fix replies include that real SHA.
 ```
 
@@ -201,4 +220,4 @@ Long-running supervised commands use `writ supervisor run` with the named policy
 This skill is portable procedure, not a security boundary. Route orchestrated
 mutations through `writ`, with Rust enforcing the runtime boundary as
 defined in [`AGENTS.md`](AGENTS.md#enforcement-layers). GitHub owns remote PR
-integration; Linear owns task tracking.
+integration; Linear is the maintainers' task record when they use it.

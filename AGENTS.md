@@ -22,7 +22,7 @@ Interactive PR monitoring belongs to the installed companion `babysit-pr` skill.
 - **Never edit outside** a job's assigned worktree or branch. Do not seize another worker's live worktree or discard their uncommitted work.
 - **Repository scope** is a **configured owner allowlist** (env `WRIT_ALLOWED_OWNERS` and/or explicit API args). There is no built-in default org; operators supply the owners they manage. Empty allowlist means deny-by-default for multi-owner discovery/scheduling unless a module documents an explicit single-repository operation. `writ-core` rejects worktree creation and `gh` repository selectors (`-R` / `--repo` in any pflag spelling, plus `GH_REPO`) whose owner is missing from that list.
 - **Process stacked PRs** from the bottom of the stack upward.
-- **Post review replies** only after pushing, and include the pushed SHA plus agent attribution. Coordination messages that do not land code must not invent a SHA.
+- **Post review-fix replies** only after a successful push, and include that SHA plus agent attribution. Discussion, intent, help, overlap, and handoff messages need no SHA and must not invent one.
 - **Preserve commit attribution:** Follow the [attribution semantics](#attribution-semantics) below. Never rewrite a Cursor-authored or Cursor-co-authored commit merely to change attribution; add a new correctly attributed commit instead.
 - **GitHub MCP first (non-negotiable for agents):** For PR status, CI check runs, review threads, issue reads, and PR comments, use the **GitHub MCP** (`github__pull_request_read`, list/comment tools, etc.). Do **not** default to shell `gh` for reads. Shell `gh` is allowed only when MCP is unavailable (e.g. 503) or for operations MCP cannot perform. Local `git` remains for branch/rebase/merge/push. Do **not** hardcode org/owner names in product code or agent docs — owners come only from `WRIT_ALLOWED_OWNERS` / explicit API args.
 
@@ -74,11 +74,11 @@ Audit attribution only on commits actually introduced by the submitted pull-requ
 
 An explicit user request to implement scoped work authorizes the assigned worker to create the scoped branch/worktree, edit code, commit, make the first push, and create the PR without repeated confirmation. That authority never authorizes work outside the assigned scope. Local integration of peer work into the assigned feature branch is allowed. Rust remains the hard enforcement boundary.
 
-- **Beads:** Use Beads as lightweight canonical state: one task per cohesive tranche and claim it before coding. Complete acceptance prose, Linear sync, GitHub child issues, project metadata, and audit reports may follow implementation, but must be complete by PR handoff rather than blocking the first edit.
+- **Trackers:** Maintainers record work in Linear and land it with a GitHub PR. Do not create GitHub issue twins. Child issues, Beads/Dolt setup, and duplicate metadata or audit-report checklists are not contribution gates. External contributors do not need Linear or Beads. Native or harness task lists are allowed.
 - **Isolation and identity:** A dirty or stale primary checkout is not a blocker. Preserve it, bootstrap a clean source/clone, and register the assigned checkout with `writ worktree register`. Registration records the observed state; it never resets a checkout that is ahead of its base. Prefer reclaim and clear identity over aborting a recoverable setup. A newly created, unpublished assigned branch must equal the verified remote-base commit before edits. A published branch contains job history and is not compared for equality with the base; fetch its expected upstream and verify the configured upstream plus the expected local/remote relationship instead. Stop on an unexpected remote commit, behind state, or divergence until it is reconciled safely.
-- **Parallel work:** One writable worker owns one assigned worktree and branch. The manager coordinates separate workers through explicit assignments, status, dependencies, and handoffs. Never allow multiple writers to share one worktree, even for declared disjoint paths. One controller retains commit and push authority for each assignment.
-- **Review and validation:** After the first tested implementation, require one independent review matched to the risk before final publication. Add review only for a named high-risk boundary or an actual finding that warrants follow-up. Run focused gates during work. Immediately before publication, align or rebase an unpublished branch onto the verified base, or reconcile a published branch with its expected upstream, then run exactly one complete native gate suite on the exact would-be-pushed head; any later tree change invalidates that run. An issue may add focused checks; it must not replace or reduce that final suite. Do not require serial policy audits or duplicate full-suite runs from every subagent.
-- **Routine remediation:** Automatically fix safe mechanical findings within scope. Stop for a genuine ownership collision, a destructive or out-of-scope action, an unresolved Critical/Important correctness issue, a material user design decision, or an explicit fail-closed condition in a portable worker contract. A required gate failure or timeout blocks commit/push handoff until it is repaired or the user explicitly changes scope; an in-scope repair does not require another confirmation.
+- **Parallel work:** One writable worker owns one assigned worktree and branch. The manager coordinates separate workers through explicit assignments, status, dependencies, and handoffs. Never allow multiple writers to share one worktree, even for declared disjoint paths. One controller retains commit and push authority for each assignment. Read-only review or investigation helpers need no writable checkout, branch, or PR. Same filenames on separate branches are overlap signals for discussion, not global locks.
+- **Review and validation:** Run focused, task-relevant checks while working. Checkpoint commits, checkpoint pushes, and draft PRs may proceed with truthful test status and ordinary non-destructive publication checks. Do not describe an unrun or failing check as passed. Before claiming merge or release readiness, complete risk-matched review and appropriate integrated validation on the exact head. Do not require a full workspace suite or serial policy audit for every checkpoint. GitHub required checks remain the remote merge authority.
+- **Routine remediation:** Automatically fix safe mechanical findings within scope. Stop for a genuine ownership collision, a destructive or out-of-scope action, an unresolved Critical/Important correctness issue, a material user design decision, or an explicit fail-closed condition in a portable worker contract. A failed required GitHub check or an untruthful readiness claim is a blocker; an in-scope repair of a checkpoint does not require another confirmation.
 - **GitHub access:** GitHub MCP remains preferred; when it is unavailable, use `gh` immediately rather than waiting for connector retries.
 - **Handoff:** Commit, push, and PR handoff are expected outcomes of authorized implementation. Interactive monitoring belongs to the companion `babysit-pr` skill.
 
@@ -105,30 +105,13 @@ These guardrails are enforced at multiple layers:
 Rust must enforce safety-sensitive runtime mutation rules. Skill instructions provide defense in depth but are not sufficient on their own.
 
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:7510c1e2 -->
-## Beads Issue Tracker
+## Optional execution aids
 
-This project uses **bd (beads)** for issue tracking. Run `bd prime` to see full workflow context and commands.
+Beads (`bd`), Dolt, and checked-in `.beads/` data are **optional**. Do not install them solely to contribute. Native or harness task lists are allowed. If `bd` is present, `bd prime` / `bd ready` / `bd remember` may be used; they are not required, and a missing binary must not fail session start.
 
-### Quick Reference
+## Session completion
 
-```bash
-bd ready              # Find available work
-bd show <id>          # View issue details
-bd update <id> --claim  # Claim work
-bd close <id>         # Complete work
-```
-
-### Rules
-
-- Use `bd` as the lightweight canonical task state: one task per cohesive tranche, claimed before code. Do not substitute TodoWrite, TaskCreate, or markdown TODO lists.
-- Run `bd prime` for command reference when needed. Acceptance text, Linear sync, GitHub child issues, project metadata, and audit reports may follow implementation but must be complete by PR handoff.
-- Use `bd remember` for persistent knowledge — do NOT use MEMORY.md files.
-
-**Architecture in one line:** issues live in a local Dolt DB; sync uses `refs/dolt/data` on your git remote; `.beads/issues.jsonl` is a passive export. See https://github.com/gastownhall/beads/blob/main/docs/SYNC_CONCEPTS.md for details and anti-patterns.
-
-## Session Completion
-
-For authorized implementation, complete the cohesive tranche: run focused gates during work and the complete native gate suite once on the exact HEAD before push; commit, push, and create or update the PR for handoff. Record remaining follow-up in Beads and complete required tracking and metadata by PR handoff. Do not add redundant full-suite runs, serial audits, or cleanup that is unrelated to the tranche. A specific user instruction that withholds a push or PR action controls that action. Local feature-branch integration is allowed.
+For authorized implementation, run focused checks during work. Checkpoint commits, pushes, and draft PRs may proceed with honest test status. Before claiming merge or release readiness, run appropriate integrated validation on that exact head. Record remaining follow-up on the Linear task (maintainers) or the GitHub PR. Do not add redundant full-suite runs, serial audits, GitHub issue twins, or metadata gates unrelated to the tranche. A specific user instruction that withholds a push or PR action controls that action. Local feature-branch integration is allowed.
 <!-- END BEADS INTEGRATION -->
 
 ## Architecture
@@ -158,14 +141,14 @@ Rust binary: writ -> writ-core
 git / gh / operating system
        |
        v
-GitHub (source, PRs, reviews, checks) · Linear (task tracking)
+GitHub (source, PRs, reviews, checks) · Linear (maintainers' optional backlog)
 ```
 
 | Layer | Responsibilities |
 | --- | --- |
 | Agent skill | Describe when to discover work, spawn subagents, and report results. The installed companion `babysit-pr` skill handles interactive PR monitoring. Prompt content is portable guidance, not a security boundary. |
 | Rust core and CLI | Hold SQLite lease rows, register checkouts, resolve sandboxed paths, supervise child processes, verify branches, reject unsafe git/GitHub operations, dispatch `writ hook`. Path-scoped coordination and messaging are later work on the same store. |
-| External tools | Runtime `git` and `gh` operations are selected and validated by Rust. GitHub repository rules own protected-branch merges; Linear owns task tracking. The OS supplies filesystem and process primitives. |
+| External tools | Runtime `git` and `gh` operations are selected and validated by Rust. GitHub repository rules own protected-branch merges; Linear is this repository's maintainers' optional backlog, not a contributor requirement. The OS supplies filesystem and process primitives. |
 
 **Why enforce at the hook boundary?** A tool that must be *called* to help is advisory: an agent that does not call it is unconstrained. As a `PreToolUse` hook, enforcement applies to the agent's own commands whether or not the agent cooperates, and a blocking exit cannot be overridden by another hook. Hard stops live in Rust, at the binary boundary, so a malformed prompt cannot bypass them.
 
