@@ -291,37 +291,16 @@ fn blockers_cell(blockers: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use tempfile::tempdir;
     use writ_core::owners::OwnerAllowlist;
     use writ_core::watchlist::{
         CollabStatus, CoordOverlay, RecoveryStatus, WatchEntry, WatchlistData,
     };
 
-    struct TestDir(std::path::PathBuf);
-
-    impl TestDir {
-        fn new() -> Self {
-            static NEXT_ID: AtomicU64 = AtomicU64::new(0);
-            let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "writ-watchlist-ancestors-{}-{id}",
-                std::process::id()
-            ));
-            std::fs::create_dir(&path).unwrap();
-            Self(path)
-        }
-    }
-
-    impl Drop for TestDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
     #[test]
     fn missing_store_ancestor_validation_rejects_regular_files() {
-        let root = TestDir::new();
-        let file = root.0.join("file");
+        let root = tempdir().unwrap();
+        let file = root.path().join("file");
         std::fs::write(&file, b"preserve me").unwrap();
         // Exercise the ancestor contract directly: Unix can reject these paths
         // in the initial stat, while Windows may first report them as absent.
@@ -336,18 +315,18 @@ mod tests {
 
     #[test]
     fn missing_store_ancestor_validation_accepts_absent_paths_without_creating_them() {
-        let root = TestDir::new();
+        let root = tempdir().unwrap();
         let relative = format!("writ-absent-store-{}.db", std::process::id());
         assert!(!Path::new(&relative).exists());
         for path in [
-            root.0.join("leases.db"),
-            root.0.join("missing/nested/leases.db"),
+            root.path().join("leases.db"),
+            root.path().join("missing/nested/leases.db"),
             std::path::PathBuf::from(&relative),
         ] {
             validate_store_ancestors(&path).unwrap();
             assert!(!path.exists());
         }
-        assert_eq!(std::fs::read_dir(&root.0).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
     }
 
     fn sample_entry() -> WatchEntry {

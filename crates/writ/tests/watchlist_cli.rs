@@ -1,32 +1,12 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
 
+use tempfile::{TempDir, tempdir};
 use writ_core::lease::{LeaseGrant, LeaseStore};
 
-static NEXT_ID: AtomicU64 = AtomicU64::new(0);
-
-struct TestDir(PathBuf);
-
-impl TestDir {
-    fn new() -> Self {
-        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        let path =
-            std::env::temp_dir().join(format!("writ-watchlist-cli-{}-{id}", std::process::id()));
-        fs::create_dir_all(&path).unwrap();
-        Self(path)
-    }
-}
-
-impl Drop for TestDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
-fn writ(root: &TestDir, args: &[&str]) -> (i32, String, String) {
-    writ_with_store(&root.0.join("leases.db"), args)
+fn writ(root: &TempDir, args: &[&str]) -> (i32, String, String) {
+    writ_with_store(&root.path().join("leases.db"), args)
 }
 
 fn writ_with_store(path: &Path, args: &[&str]) -> (i32, String, String) {
@@ -51,29 +31,50 @@ const VIEW_COMMANDS: [(&str, &str); 3] = [
 
 fn assert_store_error(path: &Path, error_code: &str) {
     for (verb, command) in VIEW_COMMANDS {
-        let (code, stdout, stderr) = writ_with_store(path, &["--json", "watchlist", verb]);
-        assert_eq!(code, 1, "{verb}: stdout={stdout}; stderr={stderr}");
-        let envelope: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-        assert_eq!(envelope["ok"], false, "{verb}: {envelope}");
-        assert_eq!(envelope["command"], command);
-        assert_eq!(envelope["error"]["code"], error_code);
-        assert!(
-            envelope["error"]["message"]
-                .as_str()
-                .is_some_and(|message| !message.is_empty())
-        );
-
-        let (code, stdout, stderr) = writ_with_store(path, &["watchlist", verb]);
-        assert_eq!(code, 1, "{verb}: stdout={stdout}; stderr={stderr}");
-        assert!(stdout.is_empty(), "{verb}: {stdout}");
-        assert!(!stderr.is_empty(), "{verb}: missing human-readable error");
+        assert_json_store_error(path, verb, command, error_code);
+        assert_human_store_error(path, verb);
     }
+}
+
+fn assert_json_store_error(path: &Path, verb: &str, command: &str, error_code: &str) {
+    let (code, stdout, stderr) = writ_with_store(path, &["--json", "watchlist", verb]);
+    assert_eq!(code, 1, "{verb}: stdout={stdout}; stderr={stderr}");
+    let envelope: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(
+        (
+            envelope["ok"].as_bool(),
+            envelope["command"].as_str(),
+            envelope["error"]["code"].as_str(),
+        ),
+        (Some(false), Some(command), Some(error_code)),
+        "{verb}: {envelope}"
+    );
+    assert!(
+        envelope["error"]["message"]
+            .as_str()
+            .is_some_and(|message| !message.is_empty())
+    );
+}
+
+fn assert_human_store_error(path: &Path, verb: &str) {
+    let (code, stdout, stderr) = writ_with_store(path, &["watchlist", verb]);
+    assert_eq!(code, 1, "{verb}: stdout={stdout}; stderr={stderr}");
+    assert!(stdout.is_empty(), "{verb}: {stdout}");
+    assert!(!stderr.is_empty(), "{verb}: missing human-readable error");
+}
+
+fn successful_json(output: (i32, String, String)) -> serde_json::Value {
+    let (code, stdout, stderr) = output;
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    let envelope: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(envelope["ok"], true, "{envelope}");
+    envelope
 }
 
 #[test]
 fn watchlist_rejects_regular_file_ancestors() {
-    let root = TestDir::new();
-    let parent = root.0.join("not-a-directory");
+    let root = tempdir().unwrap();
+    let parent = root.path().join("not-a-directory");
     fs::write(&parent, b"preserve me").unwrap();
     for path in [parent.join("leases.db"), parent.join("nested/leases.db")] {
         assert_store_error(&path, "IO_ERROR");
@@ -83,8 +84,8 @@ fn watchlist_rejects_regular_file_ancestors() {
 
 #[test]
 fn watchlist_rejects_directory_store() {
-    let root = TestDir::new();
-    let path = root.0.join("leases.db");
+    let root = tempdir().unwrap();
+    let path = root.path().join("leases.db");
     fs::create_dir(&path).unwrap();
     assert_store_error(&path, "LEASE_STORE_FAILED");
     assert_eq!(fs::read_dir(path).unwrap().count(), 0);
@@ -92,8 +93,8 @@ fn watchlist_rejects_directory_store() {
 
 #[test]
 fn watchlist_rejects_corrupt_store_without_modifying_it() {
-    let root = TestDir::new();
-    let path = root.0.join("leases.db");
+    let root = tempdir().unwrap();
+    let path = root.path().join("leases.db");
     fs::write(&path, b"not a SQLite database").unwrap();
     assert_store_error(&path, "LEASE_STORE_FAILED");
     assert_eq!(fs::read(path).unwrap(), b"not a SQLite database");
@@ -101,31 +102,40 @@ fn watchlist_rejects_corrupt_store_without_modifying_it() {
 
 #[test]
 fn watchlist_missing_store_is_empty_without_creating_files() {
-    let root = TestDir::new();
+    let root = tempdir().unwrap();
     for path in [
-        root.0.join("leases.db"),
-        root.0.join("missing/nested/leases.db"),
+        root.path().join("leases.db"),
+        root.path().join("missing/nested/leases.db"),
     ] {
         for (verb, command) in VIEW_COMMANDS {
-            let (code, stdout, stderr) = writ_with_store(&path, &["--json", "watchlist", verb]);
-            assert_eq!(code, 0, "{verb}: stderr={stderr}");
-            let envelope: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-            assert_eq!(envelope["ok"], true);
-            assert_eq!(envelope["command"], command);
-            assert_eq!(envelope["data"]["entries"], serde_json::json!([]));
-            assert_eq!(envelope["data"]["coord_available"], false);
-            assert_eq!(envelope["data"]["github_probed"], verb != "list");
-            assert!(envelope["error"].is_null());
+            let envelope = successful_json(writ_with_store(&path, &["--json", "watchlist", verb]));
+            let snapshot = serde_json::json!({
+                "command": envelope["command"],
+                "entries": envelope["data"]["entries"],
+                "coord_available": envelope["data"]["coord_available"],
+                "github_probed": envelope["data"]["github_probed"],
+                "error": envelope["error"],
+            });
+            assert_eq!(
+                snapshot,
+                serde_json::json!({
+                    "command": command,
+                    "entries": [],
+                    "coord_available": false,
+                    "github_probed": verb != "list",
+                    "error": null,
+                })
+            );
         }
     }
-    assert_eq!(fs::read_dir(&root.0).unwrap().count(), 0);
+    assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
 }
 
 #[cfg(unix)]
 #[test]
 fn watchlist_reports_dangling_symlink_instead_of_empty_store() {
-    let root = TestDir::new();
-    let path = root.0.join("leases.db");
+    let root = tempdir().unwrap();
+    let path = root.path().join("leases.db");
     std::os::unix::fs::symlink("missing.db", &path).unwrap();
     assert_store_error(&path, "IO_ERROR");
     assert_eq!(fs::read_link(path).unwrap(), Path::new("missing.db"));
@@ -134,30 +144,27 @@ fn watchlist_reports_dangling_symlink_instead_of_empty_store() {
 #[cfg(unix)]
 #[test]
 fn watchlist_reports_dangling_ancestor_symlink_instead_of_empty_store() {
-    let root = TestDir::new();
-    let link = root.0.join("store-directory");
+    let root = tempdir().unwrap();
+    let link = root.path().join("store-directory");
     std::os::unix::fs::symlink("missing-directory", &link).unwrap();
     for path in [link.join("leases.db"), link.join("nested/leases.db")] {
         assert_store_error(&path, "IO_ERROR");
     }
     assert_eq!(fs::read_link(link).unwrap(), Path::new("missing-directory"));
-    assert!(!root.0.join("missing-directory").exists());
+    assert!(!root.path().join("missing-directory").exists());
 }
 
 #[cfg(unix)]
 #[test]
 fn watchlist_reads_valid_store_symlink_without_modifying_it() {
-    let root = TestDir::new();
+    let root = tempdir().unwrap();
     seed_lease(&root);
-    let store = root.0.join("leases.db");
+    let store = root.path().join("leases.db");
     let original = fs::read(&store).unwrap();
-    let link = root.0.join("store-link");
+    let link = root.path().join("store-link");
     std::os::unix::fs::symlink("leases.db", &link).unwrap();
 
-    let (code, stdout, stderr) = writ_with_store(&link, &["--json", "watchlist", "list"]);
-    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
-    let envelope: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!(envelope["ok"], true);
+    let envelope = successful_json(writ_with_store(&link, &["--json", "watchlist", "list"]));
     assert_eq!(envelope["data"]["entries"][0]["job_id"], "job-1");
     assert_eq!(fs::read_link(&link).unwrap(), Path::new("leases.db"));
     assert_eq!(fs::read(&store).unwrap(), original);
@@ -166,20 +173,17 @@ fn watchlist_reads_valid_store_symlink_without_modifying_it() {
 #[cfg(unix)]
 #[test]
 fn watchlist_missing_store_under_valid_directory_symlink_is_empty() {
-    let root = TestDir::new();
-    let target = root.0.join("empty-directory");
+    let root = tempdir().unwrap();
+    let target = root.path().join("empty-directory");
     fs::create_dir(&target).unwrap();
-    let link = root.0.join("directory-link");
+    let link = root.path().join("directory-link");
     std::os::unix::fs::symlink("empty-directory", &link).unwrap();
 
     for (verb, _) in VIEW_COMMANDS {
-        let (code, stdout, stderr) = writ_with_store(
+        let envelope = successful_json(writ_with_store(
             &link.join("nested/leases.db"),
             &["--json", "watchlist", verb],
-        );
-        assert_eq!(code, 0, "{verb}: stdout={stdout}; stderr={stderr}");
-        let envelope: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-        assert_eq!(envelope["ok"], true);
+        ));
         assert_eq!(envelope["data"]["entries"], serde_json::json!([]));
     }
     assert_eq!(fs::read_link(link).unwrap(), Path::new("empty-directory"));
@@ -189,20 +193,20 @@ fn watchlist_missing_store_under_valid_directory_symlink_is_empty() {
 #[cfg(unix)]
 #[test]
 fn watchlist_reports_symlink_loop_instead_of_empty_store() {
-    let root = TestDir::new();
-    let path = root.0.join("leases.db");
+    let root = tempdir().unwrap();
+    let path = root.path().join("leases.db");
     std::os::unix::fs::symlink("leases.db", &path).unwrap();
     assert_store_error(&path, "IO_ERROR");
     assert_eq!(fs::read_link(path).unwrap(), Path::new("leases.db"));
 }
 
-fn seed_lease(root: &TestDir) {
-    let store = LeaseStore::open(root.0.join("leases.db")).unwrap();
-    let wt = root.0.join("checkout");
+fn seed_lease(root: &TempDir) {
+    let store = LeaseStore::open(root.path().join("leases.db")).unwrap();
+    let wt = root.path().join("checkout");
     fs::create_dir_all(&wt).unwrap();
     store
         .grant(LeaseGrant {
-            repo: &root.0.join("repo"),
+            repo: &root.path().join("repo"),
             owner: "acme",
             repo_name: "sample",
             job_id: "job-1",
@@ -261,7 +265,7 @@ fn watchlist_cli_cases() {
         },
     ];
     for case in cases {
-        let root = TestDir::new();
+        let root = tempdir().unwrap();
         if case.seed {
             seed_lease(&root);
         }
@@ -275,7 +279,7 @@ fn watchlist_cli_cases() {
             );
         }
         if case.no_json_store {
-            assert!(!root.0.join("watchlist.json").exists());
+            assert!(!root.path().join("watchlist.json").exists());
         }
     }
 }
