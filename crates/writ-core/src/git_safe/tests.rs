@@ -892,6 +892,238 @@ fn gh_pr_comment_body_urls_are_values_not_repository_targets() {
 }
 
 #[test]
+fn gh_percent_encoded_paths_retain_literal_owner_checks() {
+    let allowlist = crate::owners::OwnerAllowlist::parse("acme");
+    for (family, target, expected) in [
+        (
+            "pr",
+            "https://github.com/other%2Fproject/pull/1",
+            Err("OWNER_NOT_ALLOWED"),
+        ),
+        ("pr", "https://github.com/acme%2fproject/pull/1", Ok(())),
+        ("pr", "https://github.com/acme/caf%C3%A9/pull/1", Ok(())),
+        (
+            "pr",
+            "https://github.com/acme%252Fother/project/pull/1",
+            Err("OWNER_NOT_ALLOWED"),
+        ),
+        (
+            "api",
+            "https://api.github.com/%72epos/other/project/issues",
+            Err("OWNER_NOT_ALLOWED"),
+        ),
+        (
+            "api",
+            "https://api.github.com/repos/acme%2Fproject/issues",
+            Ok(()),
+        ),
+        (
+            "api",
+            "%72epos/other%2fproject/issues",
+            Err("OWNER_NOT_ALLOWED"),
+        ),
+        (
+            "api",
+            "repos/acme%3Fother/project",
+            Err("OWNER_NOT_ALLOWED"),
+        ),
+        ("api", "repos/acme/project%GG", Err("OWNER_NOT_ALLOWED")),
+        (
+            "api",
+            "https://api.github.com/repos/acme/project?next=%GG#%",
+            Ok(()),
+        ),
+    ] {
+        let mut args = vec![family.to_owned()];
+        if family == "pr" {
+            args.push("merge".into());
+        }
+        args.push(target.into());
+        assert_eq!(
+            enforce_gh_repo_targets(&args, &allowlist, None).map_err(|error| error.code()),
+            expected,
+            "{args:?}"
+        );
+    }
+}
+
+#[test]
+fn gh_url_path_decoding_rejects_malformed_bytes_without_decoding_query() {
+    let allowlist = crate::owners::OwnerAllowlist::parse("acme");
+    for (target, expected) in [
+        (
+            "https://github.com/acme/project%/pull/1",
+            Err("OWNER_NOT_ALLOWED"),
+        ),
+        (
+            "https://github.com/acme/project%2/pull/1",
+            Err("OWNER_NOT_ALLOWED"),
+        ),
+        (
+            "https://github.com/acme/project%GG/pull/1",
+            Err("OWNER_NOT_ALLOWED"),
+        ),
+        (
+            "https://github.com/acme/project%FF/pull/1",
+            Err("OWNER_NOT_ALLOWED"),
+        ),
+        ("https://github.com/acme/project/pull/1?next=%GG#%", Ok(())),
+    ] {
+        let args = vec!["pr".into(), "view".into(), target.into()];
+        assert_eq!(
+            enforce_gh_repo_targets(&args, &allowlist, None).map_err(|error| error.code()),
+            expected,
+            "{args:?}"
+        );
+    }
+}
+
+#[test]
+fn gh_repo_sync_checks_destination_instead_of_source_payload() {
+    let allowlist = crate::owners::OwnerAllowlist::parse("acme");
+    for flag in ["-s", "--source"] {
+        for (source, destination, expected) in [
+            ("acme/source", "other/dest", Err("OWNER_NOT_ALLOWED")),
+            ("other/source", "acme/dest", Ok(())),
+            ("sync", "other/dest", Err("OWNER_NOT_ALLOWED")),
+        ] {
+            let args: Vec<String> = ["repo", "sync", flag, source, destination, "--force"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+            assert_eq!(
+                enforce_gh_repo_targets(&args, &allowlist, None).map_err(|error| error.code()),
+                expected,
+                "{args:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn gh_repo_preverb_homepage_keeps_destination_owner_checks() {
+    let allowlist = crate::owners::OwnerAllowlist::parse("acme");
+    for verb in ["create", "new", "edit"] {
+        for (destination, expected) in [
+            ("other/project", Err("OWNER_NOT_ALLOWED")),
+            ("acme/project", Ok(())),
+        ] {
+            let args: Vec<String> = [
+                "repo",
+                "-h",
+                "https://example.com/other/site",
+                verb,
+                destination,
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+            assert_eq!(
+                enforce_gh_repo_targets(&args, &allowlist, None).map_err(|error| error.code()),
+                expected,
+                "{args:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn gh_homepage_arity_preserves_long_forms_and_help_controls() {
+    let allowlist = crate::owners::OwnerAllowlist::parse("acme");
+    for (args, expected) in [
+        (
+            vec!["repo", "-hhttps://example.com/site", "new", "other/project"],
+            Err("OWNER_NOT_ALLOWED"),
+        ),
+        (
+            vec!["repo", "-hR", "create", "other/project"],
+            Err("OWNER_NOT_ALLOWED"),
+        ),
+        (
+            vec![
+                "repo",
+                "--homepage",
+                "https://example.com/site",
+                "create",
+                "other/project",
+            ],
+            Err("OWNER_NOT_ALLOWED"),
+        ),
+        (
+            vec![
+                "repo",
+                "create",
+                "-h",
+                "https://example.com/site",
+                "other/project",
+            ],
+            Err("OWNER_NOT_ALLOWED"),
+        ),
+        (vec!["repo", "--help"], Ok(())),
+        (vec!["repo", "-h"], Ok(())),
+        (vec!["repo", "--help", "create", "acme/project"], Ok(())),
+        (
+            vec!["pr", "-h", "view", "feature/foo", "-Racme/project"],
+            Ok(()),
+        ),
+    ] {
+        let args: Vec<String> = args.into_iter().map(str::to_owned).collect();
+        assert_eq!(
+            enforce_gh_repo_targets(&args, &allowlist, None).map_err(|error| error.code()),
+            expected,
+            "{args:?}"
+        );
+    }
+}
+
+#[test]
+fn gh_repo_destinations_use_shared_operands_and_builtin_aliases() {
+    let allowlist = crate::owners::OwnerAllowlist::parse("acme");
+    for (args, expected) in [
+        (
+            vec!["repo", "new", "other/project"],
+            Err("OWNER_NOT_ALLOWED"),
+        ),
+        (
+            vec!["repo", "--description", "create", "new", "other/project"],
+            Err("OWNER_NOT_ALLOWED"),
+        ),
+        (
+            vec![
+                "repo",
+                "create",
+                "--description",
+                "https://example.com/other/project",
+                "acme/project",
+            ],
+            Ok(()),
+        ),
+        (
+            vec![
+                "repo",
+                "sync",
+                "-b",
+                "other/branch",
+                "-sacme/source",
+                "other/dest",
+            ],
+            Err("OWNER_NOT_ALLOWED"),
+        ),
+        (
+            vec!["repo", "sync", "--source=other/source", "acme/dest"],
+            Ok(()),
+        ),
+    ] {
+        let args: Vec<String> = args.into_iter().map(str::to_owned).collect();
+        assert_eq!(
+            enforce_gh_repo_targets(&args, &allowlist, None).map_err(|error| error.code()),
+            expected,
+            "{args:?}"
+        );
+    }
+}
+
+#[test]
 fn gh_pr_slash_branch_operands_are_not_repository_selectors() {
     let allowlist = crate::owners::OwnerAllowlist::parse("acme");
     for verb in [

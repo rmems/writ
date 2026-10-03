@@ -1,5 +1,6 @@
 //! Allowlisted GitHub CLI (`gh`) policy.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::process::Command;
 
@@ -562,12 +563,19 @@ fn command_verb(args: &[String]) -> Option<&str> {
         if !arg.starts_with('-') {
             return Some(options::canonical_verb(family, arg));
         }
-        i += preverb_option_tokens(arg);
+        i += preverb_option_tokens(family, arg);
     }
     None
 }
 
-fn preverb_option_tokens(arg: &str) -> usize {
+fn preverb_option_tokens(family: &str, arg: &str) -> usize {
+    // Repo create/edit use -h for homepage, including before the verb. Keep
+    // its payload out of command discovery; --help remains unambiguous.
+    if family == "repo"
+        && let Some(value) = arg.strip_prefix("-h")
+    {
+        return 1 + usize::from(value.is_empty());
+    }
     if matches!(arg, "-h" | "--help") || arg.contains('=') {
         return 1;
     }
@@ -758,7 +766,7 @@ pub fn enforce_gh_repo_targets(
         allowlist.enforce_repo_selector(selector)?;
     }
     if let Some(owner) = gh_api_owner_target(args, &parsed.operands)? {
-        return allowlist.enforce_owner(owner);
+        return allowlist.enforce_owner(&owner);
     }
     if !parsed.selectors.is_empty() || !positionals.is_empty() {
         return Ok(());
@@ -781,7 +789,7 @@ fn gh_positional_repo_targets(args: &[String], operands: &[&str]) -> Result<Vec<
         return Ok(Vec::new());
     };
     match subcommand {
-        "repo" => Ok(gh_repo_positional_targets(&args[1..])),
+        "repo" => Ok(gh_repo_positional_targets(args, operands)),
         "pr" | "issue" => gh_issue_or_pr_positional_targets(args, operands),
         _ => Ok(Vec::new()),
     }
@@ -791,7 +799,7 @@ fn gh_positional_repo_targets(args: &[String], operands: &[&str]) -> Result<Vec<
 /// endpoints without interpreting opaque bodies or GraphQL node IDs. Owner
 /// placeholders use gh's context; a literal owner remains enforceable when
 /// only the repository is a placeholder.
-fn gh_api_owner_target<'a>(args: &[String], operands: &[&'a str]) -> Result<Option<&'a str>> {
+fn gh_api_owner_target(args: &[String], operands: &[&str]) -> Result<Option<String>> {
     if args.first().map(String::as_str) != Some("api") {
         return Ok(None);
     }
@@ -803,15 +811,12 @@ fn gh_api_owner_target<'a>(args: &[String], operands: &[&'a str]) -> Result<Opti
         Some(_) => return Ok(None),
         None => endpoint,
     };
-    Ok(gh_api_path_owner(path))
+    let path = decode_http_path(path)?;
+    Ok(gh_api_path_owner(&path).map(str::to_owned))
 }
 
 fn gh_api_path_owner(path: &str) -> Option<&str> {
-    let mut parts = path
-        .split(['?', '#'])
-        .next()?
-        .trim_start_matches('/')
-        .split('/');
+    let mut parts = path.trim_start_matches('/').split('/');
     let namespace = parts.next()?;
     let owner = parts.next()?;
     let resource = parts.next()?;
@@ -826,8 +831,8 @@ fn gh_api_path_owner(path: &str) -> Option<&str> {
     Some(owner)
 }
 
-fn gh_repo_positional_targets(args: &[String]) -> Vec<String> {
-    let Some(repo_sub) = first_positional_after(args) else {
+fn gh_repo_positional_targets(args: &[String], operands: &[&str]) -> Vec<String> {
+    let Some(repo_sub) = command_verb(args) else {
         return Vec::new();
     };
     if !matches!(
@@ -844,15 +849,11 @@ fn gh_repo_positional_targets(args: &[String]) -> Vec<String> {
     ) {
         return Vec::new();
     }
-    first_operand_after(args, repo_sub)
-        .map(str::to_owned)
+    operands
+        .get(2)
+        .map(|operand| (*operand).to_owned())
         .into_iter()
         .collect()
-}
-
-fn first_operand_after<'a>(args: &'a [String], token: &str) -> Option<&'a str> {
-    let idx = args.iter().position(|arg| arg == token)?;
-    first_positional_after(&args[idx + 1..])
 }
 
 fn gh_issue_or_pr_positional_targets(args: &[String], operands: &[&str]) -> Result<Vec<String>> {
@@ -887,7 +888,8 @@ fn positional_github_repo_token(token: &str) -> Result<Option<String>> {
     }
     let bare = token.split('#').next().unwrap_or(token);
     if let Some((host, path)) = http_url_parts(bare)? {
-        return Ok(github_http_repo_target(host, path));
+        let path = decode_http_path(path)?;
+        return Ok(github_http_repo_target(host, &path));
     }
     Ok(None)
 }
@@ -901,6 +903,42 @@ fn github_http_repo_target(host: &str, path: &str) -> Option<String> {
         {
             Some(format!("{owner}/{repo}"))
         }
+        _ => None,
+    }
+}
+
+/// Decode only the path once. Encoded '?' and '#' remain path bytes, while
+/// literal query/fragment delimiters are removed before percent decoding.
+fn decode_http_path(path: &str) -> Result<Cow<'_, str>> {
+    let path = path.split(['?', '#']).next().unwrap_or(path);
+    if !path.contains('%') {
+        return Ok(Cow::Borrowed(path));
+    }
+    let invalid = || Error::PolicyViolation {
+        code: PolicyCode::OwnerNotAllowed,
+        message: "malformed percent-encoded HTTP target path".to_owned(),
+    };
+    let mut bytes = path.bytes();
+    let mut decoded = Vec::with_capacity(path.len());
+    while let Some(byte) = bytes.next() {
+        if byte == b'%' {
+            let high = bytes.next().and_then(url_hex_byte).ok_or_else(invalid)?;
+            let low = bytes.next().and_then(url_hex_byte).ok_or_else(invalid)?;
+            decoded.push((high << 4) | low);
+        } else {
+            decoded.push(byte);
+        }
+    }
+    String::from_utf8(decoded)
+        .map(Cow::Owned)
+        .map_err(|_| invalid())
+}
+
+fn url_hex_byte(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
         _ => None,
     }
 }
