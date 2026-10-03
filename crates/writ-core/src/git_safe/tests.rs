@@ -1488,17 +1488,14 @@ fn gh_pr_urls_preserve_public_and_enterprise_owner_checks() {
         "https://GITHUB.COM.",
     ] {
         for (command, kind) in [("pr", "pull"), ("issue", "issues")] {
-            for owner in ["acme", "other"] {
+            for (owner, expected) in [("acme", Ok(())), ("other", Err("OWNER_NOT_ALLOWED"))] {
                 let args = vec![
                     command.into(),
                     "view".into(),
                     format!("{origin}/{owner}/project/{kind}/1"),
                 ];
                 let result = enforce_gh_repo_targets(&args, &allowlist, None);
-                assert_eq!(result.is_ok(), owner == "acme", "{args:?}: {result:?}");
-                if owner == "other" {
-                    assert_eq!(result.unwrap_err().code(), "OWNER_NOT_ALLOWED");
-                }
+                assert_eq!(result.map_err(|error| error.code()), expected, "{args:?}");
             }
         }
     }
