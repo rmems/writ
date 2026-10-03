@@ -1,0 +1,21 @@
+crates/writ/tests/watchlist_cli.rs
+  s_02bb136776671b::t_5f939c1df33ab7 136-177,179-188
+crates/writ/src/watchlist.rs
+  s_02bb136776671b::t_e9a425bd82e544 191-195,197-198,200-209,222,294,300-351
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "1521862b5166dd2cec7c58223ed254d954328d4e",
+  "prompts": {},
+  "sessions": {
+    "s_02bb136776671b": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0fd7f-2100-78c1-8241-e6a180e5c895",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "Raul Cardenas Montoya <montoyaraul34@gmail.com>"
+    }
+  }
+}
