@@ -1,6 +1,8 @@
 //! Lease SQLite schema, migrations, and allocation-op journal.
 
-use rusqlite::{Connection, OptionalExtension, params};
+use std::{thread, time::Duration};
+
+use rusqlite::{Connection, OptionalExtension, ffi::ErrorCode, params};
 
 use super::{Error, Result, lease_err};
 
@@ -55,11 +57,9 @@ pub(super) const INITIAL_SCHEMA: &str = r"
             );
             ";
 
-const STORE_PRAGMAS: &str = r"
-            PRAGMA busy_timeout = 5000;
-            PRAGMA foreign_keys = ON;
-            PRAGMA journal_mode = WAL;
-            ";
+const STORE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const JOURNAL_MODE_RETRY_DELAY: Duration = Duration::from_millis(10);
+const JOURNAL_MODE_RETRIES: usize = 100;
 
 pub(super) const GRANT_UPSERT: &str = r"
             INSERT INTO leases (
@@ -123,8 +123,7 @@ pub(super) const PREPARE_INSERT: &str = r"
             ";
 
 pub(super) fn apply(conn: &Connection) -> Result<()> {
-    conn.execute_batch(STORE_PRAGMAS)
-        .map_err(|e| lease_err("configure lease store", e))?;
+    configure_store(conn)?;
     conn.execute_batch("BEGIN IMMEDIATE")
         .map_err(|e| lease_err("begin lease schema migration", e))?;
     let result = (|| {
@@ -143,6 +142,29 @@ pub(super) fn apply(conn: &Connection) -> Result<()> {
             Err(error)
         }
     }
+}
+
+fn configure_store(conn: &Connection) -> Result<()> {
+    conn.busy_timeout(STORE_BUSY_TIMEOUT)
+        .map_err(|e| lease_err("configure lease store", e))?;
+    conn.pragma_update(None, "foreign_keys", "ON")
+        .map_err(|e| lease_err("configure lease store", e))?;
+    for attempt in 0..=JOURNAL_MODE_RETRIES {
+        match conn.pragma_update(None, "journal_mode", "WAL") {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if attempt < JOURNAL_MODE_RETRIES
+                    && matches!(
+                        error.sqlite_error_code(),
+                        Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+                    ) =>
+            {
+                thread::sleep(JOURNAL_MODE_RETRY_DELAY);
+            }
+            Err(error) => return Err(lease_err("configure lease store", error)),
+        }
+    }
+    unreachable!("journal-mode retry loop returns on its final attempt")
 }
 
 pub(super) fn table_column_names(conn: &Connection) -> Result<Vec<String>> {
