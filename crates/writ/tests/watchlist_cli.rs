@@ -133,6 +133,61 @@ fn watchlist_reports_dangling_symlink_instead_of_empty_store() {
 
 #[cfg(unix)]
 #[test]
+fn watchlist_reports_dangling_ancestor_symlink_instead_of_empty_store() {
+    let root = TestDir::new();
+    let link = root.0.join("store-directory");
+    std::os::unix::fs::symlink("missing-directory", &link).unwrap();
+    for path in [link.join("leases.db"), link.join("nested/leases.db")] {
+        assert_store_error(&path, "IO_ERROR");
+    }
+    assert_eq!(fs::read_link(link).unwrap(), Path::new("missing-directory"));
+    assert!(!root.0.join("missing-directory").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn watchlist_reads_valid_store_symlink_without_modifying_it() {
+    let root = TestDir::new();
+    seed_lease(&root);
+    let store = root.0.join("leases.db");
+    let original = fs::read(&store).unwrap();
+    let link = root.0.join("store-link");
+    std::os::unix::fs::symlink("leases.db", &link).unwrap();
+
+    let (code, stdout, stderr) = writ_with_store(&link, &["--json", "watchlist", "list"]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    let envelope: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(envelope["ok"], true);
+    assert_eq!(envelope["data"]["entries"][0]["job_id"], "job-1");
+    assert_eq!(fs::read_link(&link).unwrap(), Path::new("leases.db"));
+    assert_eq!(fs::read(&store).unwrap(), original);
+}
+
+#[cfg(unix)]
+#[test]
+fn watchlist_missing_store_under_valid_directory_symlink_is_empty() {
+    let root = TestDir::new();
+    let target = root.0.join("empty-directory");
+    fs::create_dir(&target).unwrap();
+    let link = root.0.join("directory-link");
+    std::os::unix::fs::symlink("empty-directory", &link).unwrap();
+
+    for (verb, _) in VIEW_COMMANDS {
+        let (code, stdout, stderr) = writ_with_store(
+            &link.join("nested/leases.db"),
+            &["--json", "watchlist", verb],
+        );
+        assert_eq!(code, 0, "{verb}: stdout={stdout}; stderr={stderr}");
+        let envelope: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(envelope["ok"], true);
+        assert_eq!(envelope["data"]["entries"], serde_json::json!([]));
+    }
+    assert_eq!(fs::read_link(link).unwrap(), Path::new("empty-directory"));
+    assert_eq!(fs::read_dir(target).unwrap().count(), 0);
+}
+
+#[cfg(unix)]
+#[test]
 fn watchlist_reports_symlink_loop_instead_of_empty_store() {
     let root = TestDir::new();
     let path = root.0.join("leases.db");
