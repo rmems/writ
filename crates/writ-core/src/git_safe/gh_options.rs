@@ -73,9 +73,18 @@ fn non_value_flags(family: &str, verb: Option<&str>) -> &'static [&'static str] 
 }
 
 fn value_flags(family: &str, verb: Option<&str>) -> &'static [&'static str] {
-    match (family, verb) {
-        ("pr", Some("create")) => &["-a", "-B", "-l", "-m", "-r", "--reviewer", "--recover"],
-        ("pr", Some("edit")) => &[
+    match family {
+        "pr" => pr_value_flags(verb),
+        "issue" => issue_value_flags(verb),
+        "repo" => repo_value_flags(verb),
+        _ => &[],
+    }
+}
+
+fn pr_value_flags(verb: Option<&str>) -> &'static [&'static str] {
+    match verb {
+        Some("create") => &["-a", "-B", "-l", "-m", "-r", "--reviewer", "--recover"],
+        Some("edit") => &[
             "--add-assignee",
             "--add-label",
             "--add-project",
@@ -87,7 +96,18 @@ fn value_flags(family: &str, verb: Option<&str>) -> &'static [&'static str] {
             "--remove-project",
             "--remove-reviewer",
         ],
-        ("issue", Some("create")) => &[
+        Some("list") => &["--app", "-a", "-B", "-l", "-s"],
+        Some("lock") => &["-r", "--reason"],
+        Some("checkout") => &["--branch"],
+        Some("checks") => &["-i", "--interval"],
+        Some("diff") => &["--color", "-e", "--exclude"],
+        _ => &[],
+    }
+}
+
+fn issue_value_flags(verb: Option<&str>) -> &'static [&'static str] {
+    match verb {
+        Some("create") => &[
             "-a",
             "--blocked-by",
             "--blocking",
@@ -97,7 +117,7 @@ fn value_flags(family: &str, verb: Option<&str>) -> &'static [&'static str] {
             "--recover",
             "--type",
         ],
-        ("issue", Some("edit")) => &[
+        Some("edit") => &[
             "--add-assignee",
             "--add-blocked-by",
             "--add-blocking",
@@ -114,17 +134,19 @@ fn value_flags(family: &str, verb: Option<&str>) -> &'static [&'static str] {
             "--remove-sub-issue",
             "--type",
         ],
-        ("pr", Some("list")) => &["--app", "-a", "-B", "-l", "-s"],
-        ("issue", Some("list")) => &["--app", "-a", "-l", "--mention", "-m", "-s", "--type"],
-        ("issue", Some("develop")) => &["--branch-repo", "-n", "--name"],
-        ("issue", Some("close")) => &["--duplicate-of", "-r", "--reason"],
-        ("pr" | "issue", Some("lock")) => &["-r", "--reason"],
-        ("pr", Some("checkout")) => &["--branch"],
-        ("pr", Some("checks")) => &["-i", "--interval"],
-        ("pr", Some("diff")) => &["--color", "-e", "--exclude"],
-        ("repo", Some("sync")) => &["-s", "--source", "--branch"],
-        ("repo", Some("view")) => &["--branch"],
-        ("repo", Some("create")) => &[
+        Some("list") => &["--app", "-a", "-l", "--mention", "-m", "-s", "--type"],
+        Some("develop") => &["--branch-repo", "-n", "--name"],
+        Some("close") => &["--duplicate-of", "-r", "--reason"],
+        Some("lock") => &["-r", "--reason"],
+        _ => &[],
+    }
+}
+
+fn repo_value_flags(verb: Option<&str>) -> &'static [&'static str] {
+    match verb {
+        Some("sync") => &["-s", "--source", "--branch"],
+        Some("view") => &["--branch"],
+        Some("create") => &[
             "-d",
             "--description",
             "-g",
@@ -139,7 +161,7 @@ fn value_flags(family: &str, verb: Option<&str>) -> &'static [&'static str] {
             "--source",
             "--team",
         ],
-        ("repo", Some("edit")) => &[
+        Some("edit") => &[
             "--add-topic",
             "--default-branch",
             "-d",
@@ -150,7 +172,7 @@ fn value_flags(family: &str, verb: Option<&str>) -> &'static [&'static str] {
             "--squash-merge-commit-message",
             "--visibility",
         ],
-        ("repo", Some("fork")) => &["--fork-name", "--org", "--remote-name"],
+        Some("fork") => &["--fork-name", "--org", "--remote-name"],
         _ => &[],
     }
 }
