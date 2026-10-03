@@ -1,157 +1,219 @@
-use std::path::PathBuf;
-
+use super::*;
 use crate::error::{Error, PolicyCode};
 
-use super::*;
-
-fn platform_pair(windows: &'static str, unix: &'static str) -> &'static str {
-    let pair = (windows, unix);
-    if cfg!(windows) { pair.0 } else { pair.1 }
-}
-
 fn assert_policy_code(err: Error, expected: PolicyCode) {
-    assert!(matches!(
-        err,
-        Error::PolicyViolation { code, .. } if code == expected
-    ));
-}
-
-fn assert_default_policy(program: &str, args: &[&str], expected: PolicyCode) {
-    assert_policy_code(
-        check_command_policy(program, args, &RunOptions::default()).unwrap_err(),
-        expected,
-    );
-}
-
-fn normalize_cases() -> &'static [(&'static str, &'static str)] {
-    &[
-        ("/usr/bin/git", "git"),
-        (r"C:\Program Files\git.exe", "git"),
-        ("./gh", "gh"),
-        ("GH.EXE", "gh"),
-    ]
+    assert!(matches!(err, Error::PolicyViolation { code, .. } if code == expected));
 }
 
 #[test]
 fn normalize_strips_path_and_exe() {
-    for (input, want) in normalize_cases() {
-        assert_eq!(normalize_program_name(input), *want);
+    for (input, want) in [
+        ("/usr/bin/git", "git"),
+        (r"C:\Program Files\git.exe", "git"),
+        ("./gh", "gh"),
+        ("GH.EXE", "gh"),
+    ] {
+        assert_eq!(normalize_program_name(input), want);
     }
 }
 
-fn git_gh_unsafe_policy_cases() -> &'static [(&'static str, &'static [&'static str], PolicyCode)] {
-    &[
+#[test]
+fn policy_retains_direct_git_and_checkout_guards() {
+    for (program, args, expected) in [
         (
             "/usr/bin/git",
-            &["push", "--force"],
+            vec!["push", "--force"],
             PolicyCode::BareForcePush,
         ),
-        ("gh", &["pr", "merge"], PolicyCode::MergeBlocked),
-        ("git", &["commit", "-m", "x"], PolicyCode::BranchMismatch),
-        ("./tools/run", &[], PolicyCode::SubcommandNotAllowed),
-    ]
-}
-
-fn wrapper_unsafe_policy_cases() -> &'static [(&'static str, &'static [&'static str], PolicyCode)] {
-    &[
-        (
-            "sh",
-            &["-c", "gh pr merge 1"],
-            PolicyCode::SubcommandNotAllowed,
-        ),
-        (
-            "setsid",
-            &["gh", "pr", "merge"],
-            PolicyCode::SubcommandNotAllowed,
-        ),
-        (
-            "env",
-            &["gh", "pr", "merge"],
-            PolicyCode::SubcommandNotAllowed,
-        ),
-        (
-            "python3.11",
-            &["-c", "print(1)"],
-            PolicyCode::SubcommandNotAllowed,
-        ),
-        (
-            "python3",
-            &[
-                "-c",
-                "import subprocess; subprocess.run(['gh','pr','merge','1'])",
-            ],
-            PolicyCode::SubcommandNotAllowed,
-        ),
-        (
-            "curl",
-            &[
-                "-X",
-                "PUT",
-                "https://api.github.com/repos/o/r/pulls/1/merge",
-            ],
-            PolicyCode::SubcommandNotAllowed,
-        ),
-    ]
-}
-
-#[test]
-fn policy_blocks_known_unsafe_invocations() {
-    for cases in [git_gh_unsafe_policy_cases(), wrapper_unsafe_policy_cases()] {
-        for (program, args, expected) in cases {
-            assert_default_policy(program, args, *expected);
-        }
+        ("gh", vec!["pr", "checkout", "1"], PolicyCode::MergeBlocked),
+        ("git", vec!["commit", "-m", "x"], PolicyCode::BranchMismatch),
+    ] {
+        assert_policy_code(
+            check_command_policy(program, &args, &RunOptions::default()).unwrap_err(),
+            expected,
+        );
     }
 }
 
-/// Fixed path outside the default worktree sandbox (not `temp_dir`, which Codacy
-/// flags for security-sensitive policy tests).
-fn repo_outside_worktree_base_fixture() -> PathBuf {
-    platform_pair(r"C:\Windows\Temp", "/tmp").into()
+#[test]
+fn remote_gh_actions_need_no_checkout_or_expected_branch() {
+    let options = RunOptions {
+        allowlist: Some(OwnerAllowlist::parse("acme")),
+        ..RunOptions::default()
+    };
+    for verb in [
+        "create",
+        "edit",
+        "close",
+        "reopen",
+        "review",
+        "merge",
+        "ready",
+        "update-branch",
+    ] {
+        check_command_policy("gh", &["pr", verb, "1", "--repo", "acme/project"], &options).unwrap();
+    }
+    assert_policy_code(
+        check_command_policy("gh", &["pr", "merge", "1", "-Rother/project"], &options).unwrap_err(),
+        PolicyCode::OwnerNotAllowed,
+    );
 }
 
 #[test]
-fn mutating_git_rejects_repo_outside_default_worktree_base() {
-    let repo = repo_outside_worktree_base_fixture();
-    assert_policy_code(
-        check_command_policy(
+fn supervisor_admits_host_scripts_and_interpreters() {
+    for (program, args) in [
+        ("sh", vec!["-c", "echo host-script"]),
+        ("python3.11", vec!["-c", "print(1)"]),
+        ("env", vec!["git", "status"]),
+        ("./tools/run", vec![]),
+        ("/opt/tools/run", vec![]),
+    ] {
+        check_command_policy(program, &args, &RunOptions::default()).unwrap();
+    }
+}
+
+fn test_repo() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    for args in [
+        vec!["init", "-b", "main"],
+        vec!["config", "user.name", "Test"],
+        vec!["config", "user.email", "test@example.com"],
+        vec!["commit", "--allow-empty", "-m", "base"],
+        vec!["branch", "peer"],
+    ] {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    dir
+}
+
+#[tokio::test]
+async fn supervised_git_uses_harness_selected_checkout_and_assigned_branch() {
+    let repo = test_repo();
+    let options = RunOptions {
+        repo: Some(repo.path().to_path_buf()),
+        expected_branch: Some("main".into()),
+        ..RunOptions::default()
+    };
+    let output = Supervisor::new(1)
+        .run(
             "git",
-            &["commit", "-m", "x"],
-            &RunOptions {
-                expected_branch: Some("feature".to_owned()),
-                repo: Some(repo),
-                ..RunOptions::default()
-            },
+            &["commit", "--allow-empty", "-m", "assigned"],
+            None,
+            &options,
         )
-        .unwrap_err(),
-        PolicyCode::PathNotAllowed,
+        .await
+        .unwrap();
+    assert!(output.succeeded(), "{output:?}");
+    let wrong_branch = RunOptions {
+        expected_branch: Some("other".into()),
+        ..options
+    };
+    let err = Supervisor::new(1)
+        .run(
+            "git",
+            &["commit", "--allow-empty", "-m", "must not commit"],
+            None,
+            &wrong_branch,
+        )
+        .await
+        .unwrap_err();
+    assert_policy_code(err, PolicyCode::BranchMismatch);
+}
+
+#[tokio::test]
+async fn supervised_local_merge_preserves_dirty_wip() {
+    let repo = test_repo();
+    std::fs::write(repo.path().join("wip.txt"), "keep me").unwrap();
+    let options = RunOptions {
+        repo: Some(repo.path().to_path_buf()),
+        expected_branch: Some("main".into()),
+        ..RunOptions::default()
+    };
+    let err = Supervisor::new(1)
+        .run("git", &["merge", "peer"], None, &options)
+        .await
+        .unwrap_err();
+    assert_policy_code(err, PolicyCode::MergeBlocked);
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join("wip.txt")).unwrap(),
+        "keep me"
     );
 }
 
 #[tokio::test]
-async fn recovery_still_rejects_merge_and_bare_force_push() {
-    let supervisor = Supervisor::new(1);
-    let policy = TimeoutPolicy {
-        idle: Some(Duration::from_millis(50)),
-        grace: Duration::from_millis(20),
-        ..TimeoutPolicy::default()
+async fn supervised_git_accepts_canonical_parent_components() {
+    let repo = test_repo();
+    let options = RunOptions {
+        repo: Some(repo.path().join(".git").join("..")),
+        ..RunOptions::default()
     };
-    let merge = supervisor
-        .run_with_policy("gh", &["pr", "merge"], &policy, &RunOptions::default())
+    let output = Supervisor::new(1)
+        .run("git", &["status", "--porcelain"], None, &options)
         .await
-        .unwrap_err();
-    assert_policy_code(merge, PolicyCode::MergeBlocked);
-    let force = supervisor
-        .run_with_policy("git", &["push", "--force"], &policy, &RunOptions::default())
-        .await
-        .unwrap_err();
-    assert_policy_code(force, PolicyCode::BareForcePush);
+        .unwrap();
+    assert!(output.succeeded(), "{output:?}");
+    assert!(output.stdout.is_empty());
 }
 
 #[tokio::test]
-async fn run_rejects_merge_before_spawn() {
-    let err = Supervisor::new(1)
-        .run("gh", &["pr", "merge"], None, &RunOptions::default())
+async fn supervised_host_shell_captures_output() {
+    let (program, flag) = if cfg!(windows) {
+        ("cmd", "/C")
+    } else {
+        ("sh", "-c")
+    };
+    let output = Supervisor::new(1)
+        .run(
+            program,
+            &[flag, "echo host-script"],
+            None,
+            &RunOptions::default(),
+        )
         .await
-        .unwrap_err();
-    assert_policy_code(err, PolicyCode::MergeBlocked);
+        .unwrap();
+    assert!(output.succeeded(), "{output:?}");
+    assert_eq!(output.stdout.trim(), "host-script");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn supervised_host_shell_remains_timeout_contained() {
+    let output = Supervisor::new(1)
+        .run(
+            "sh",
+            &["-c", "sleep 30"],
+            Some(Duration::from_millis(100)),
+            &RunOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert!(output.timed_out && output.killed, "{output:?}");
+}
+
+#[tokio::test]
+async fn recovery_still_rejects_checkout_and_bare_force_push() {
+    let supervisor = Supervisor::new(1);
+    let policy = TimeoutPolicy::default();
+    for (program, args, code) in [
+        ("gh", vec!["pr", "checkout", "1"], PolicyCode::MergeBlocked),
+        ("git", vec!["push", "--force"], PolicyCode::BareForcePush),
+    ] {
+        assert_policy_code(
+            supervisor
+                .run_with_policy(program, &args, &policy, &RunOptions::default())
+                .await
+                .unwrap_err(),
+            code,
+        );
+    }
 }

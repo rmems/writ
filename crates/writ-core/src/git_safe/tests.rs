@@ -286,16 +286,14 @@ fn switch_create_equals_form_target() {
 }
 
 #[test]
-fn gh_pr_update_branch_rejected() {
-    let err = SafeGhCommand::new(&["pr".to_owned(), "update-branch".to_owned(), "1".to_owned()])
-        .unwrap_err();
-    assert!(matches!(
-        err,
-        Error::PolicyViolation {
-            code: PolicyCode::MergeBlocked,
-            ..
-        }
-    ));
+fn gh_pr_update_branch_is_remote_policy() {
+    SafeGhCommand::new(&[
+        "pr".into(),
+        "update-branch".into(),
+        "1".into(),
+        "--rebase".into(),
+    ])
+    .unwrap();
 }
 
 #[test]
@@ -1207,106 +1205,223 @@ fn gh_pr_create_allowed() {
 }
 
 #[test]
-fn gh_pr_merge_after_repo_flag_rejected() {
-    let err = SafeGhCommand::new(&[
-        "pr".to_owned(),
-        "-R".to_owned(),
-        "acme/widgets".to_owned(),
-        "merge".to_owned(),
-        "1".to_owned(),
-        "-m".to_owned(),
-    ])
-    .unwrap_err();
-    assert!(matches!(
-        err,
-        Error::PolicyViolation {
-            code: PolicyCode::MergeBlocked,
-            ..
-        }
-    ));
-}
-
-#[test]
-fn gh_pr_merge_after_equals_repo_flag_rejected() {
-    let err = SafeGhCommand::new(&[
-        "pr".to_owned(),
-        "-R=acme/widgets".to_owned(),
-        "merge".to_owned(),
-        "1".to_owned(),
-    ])
-    .unwrap_err();
-    assert!(matches!(
-        err,
-        Error::PolicyViolation {
-            code: PolicyCode::MergeBlocked,
-            ..
-        }
-    ));
-}
-
-#[test]
-fn gh_pr_merge_rejected() {
-    let err = SafeGhCommand::new(&["pr".to_owned(), "merge".to_owned()]).unwrap_err();
-    assert!(matches!(
-        err,
-        Error::PolicyViolation {
-            code: PolicyCode::MergeBlocked,
-            ..
-        }
-    ));
-}
-
-#[test]
-fn gh_pr_ready_rejected() {
-    let err = SafeGhCommand::new(&["pr".to_owned(), "ready".to_owned()]).unwrap_err();
-    assert!(matches!(
-        err,
-        Error::PolicyViolation {
-            code: PolicyCode::MergeBlocked,
-            ..
-        }
-    ));
-}
-
-#[test]
-fn gh_merge_flag_rejected() {
+fn gh_remote_pr_actions_are_allowed_with_owner_checks() {
+    let allowlist = crate::owners::OwnerAllowlist::parse("acme");
     for args in [
-        vec!["pr".to_owned(), "create".to_owned(), "--merge".to_owned()],
+        vec!["pr", "-R", "acme/widgets", "merge", "1", "-m"],
+        vec!["pr", "-R=acme/widgets", "merge", "1"],
+        vec!["pr", "ready", "1", "--repo", "acme/widgets"],
         vec![
-            "pr".to_owned(),
-            "view".to_owned(),
-            "1".to_owned(),
-            "--merge-queue".to_owned(),
+            "pr",
+            "update-branch",
+            "1",
+            "--repo",
+            "acme/widgets",
+            "--rebase",
         ],
     ] {
-        let err = SafeGhCommand::new(&args).unwrap_err();
-        assert!(matches!(
-            err,
-            Error::PolicyViolation {
-                code: PolicyCode::GhFlagNotAllowed,
-                ..
-            }
-        ));
+        let args: Vec<String> = args.into_iter().map(str::to_owned).collect();
+        SafeGhCommand::with_allowlist(&args, &allowlist).unwrap();
+        assert!(!gh_requires_branch_check(&args));
+    }
+    for flag in [
+        "--merge",
+        "--squash",
+        "--rebase",
+        "--auto",
+        "--admin",
+        "--merge-queue",
+    ] {
+        let args = vec![
+            "pr".into(),
+            "merge".into(),
+            "1".into(),
+            "-Racme/widgets".into(),
+            flag.into(),
+        ];
+        SafeGhCommand::with_allowlist(&args, &allowlist).unwrap();
+    }
+    let args = vec![
+        "pr".into(),
+        "merge".into(),
+        "1".into(),
+        "--repo=other/widgets".into(),
+    ];
+    assert_eq!(
+        SafeGhCommand::with_allowlist(&args, &allowlist)
+            .unwrap_err()
+            .code(),
+        "OWNER_NOT_ALLOWED"
+    );
+}
+
+#[test]
+fn gh_checkout_changing_actions_remain_protected() {
+    for args in [
+        vec!["pr", "checkout", "1"],
+        vec!["pr", "merge", "1", "--delete-branch"],
+        vec!["pr", "close", "1", "-d"],
+        vec!["pr", "merge", "1", "--delete-branch=true"],
+    ] {
+        let args: Vec<String> = args.into_iter().map(str::to_owned).collect();
+        assert!(gh_requires_branch_check(&args));
+        assert!(SafeGhCommand::new(&args).is_err());
+    }
+    for verb in [
+        "create",
+        "close",
+        "reopen",
+        "edit",
+        "review",
+        "ready",
+        "merge",
+        "update-branch",
+    ] {
+        assert!(!gh_requires_branch_check(&[
+            "pr".into(),
+            verb.into(),
+            "1".into()
+        ]));
     }
 }
 
 #[test]
-fn gh_api_rejected() {
-    // api removed from allowlist to block merge via REST/GraphQL.
-    let err = SafeGhCommand::new(&[
-        "api".to_owned(),
-        "graphql".to_owned(),
-        "-f".to_owned(),
-        "query=mutation { mergePullRequest }".to_owned(),
-    ])
-    .unwrap_err();
-    assert!(matches!(
-        err,
-        Error::PolicyViolation {
-            code: PolicyCode::GhSubcommandNotAllowed,
-            ..
+fn gh_merge_rejects_enabled_deletion_in_short_option_clusters() {
+    for flags in [
+        vec!["-md=true"],
+        vec!["-sd=1"],
+        vec!["-dm=false"],
+        vec!["-dtupdated"],
+        vec!["-tupdated", "-d"],
+    ] {
+        let mut args = vec!["pr".into(), "merge".into(), "1".into()];
+        args.extend(flags.into_iter().map(str::to_owned));
+        assert!(gh_requires_branch_check(&args), "{args:?}");
+        assert_eq!(
+            SafeGhCommand::new(&args).unwrap_err().code(),
+            "MERGE_BLOCKED"
+        );
+    }
+}
+
+#[test]
+fn gh_merge_does_not_treat_attached_values_as_deletion_flags() {
+    for (verb, flags) in [
+        ("merge", vec!["-tupdated"]),
+        ("merge", vec!["-bupdated"]),
+        ("merge", vec!["-mtupdated"]),
+        ("close", vec!["-cupdated"]),
+        ("merge", vec!["-md=false"]),
+        ("merge", vec!["-md=0"]),
+        ("merge", vec!["-d", "--delete-branch=false"]),
+    ] {
+        let mut args = vec!["pr".into(), verb.into(), "1".into()];
+        args.extend(flags.into_iter().map(str::to_owned));
+        assert!(!gh_requires_branch_check(&args), "{args:?}");
+        SafeGhCommand::new(&args).unwrap();
+    }
+}
+
+#[test]
+fn gh_api_short_clusters_preserve_literal_repository_owner_checks() {
+    let allowlist = crate::owners::OwnerAllowlist::parse("acme");
+    for flags in [
+        vec!["-iHAccept:application/vnd.github+json"],
+        vec!["-ii"],
+        vec!["-iXPUT"],
+        vec!["-iiH", "Accept:application/vnd.github+json"],
+    ] {
+        for owner in ["acme", "other"] {
+            let mut args = vec!["api".into()];
+            args.extend(flags.iter().map(|flag| (*flag).to_owned()));
+            args.push(format!("repos/{owner}/project"));
+            let result = SafeGhCommand::with_allowlist(&args, &allowlist);
+            if owner == "acme" {
+                result.unwrap();
+            } else {
+                assert_eq!(result.unwrap_err().code(), "OWNER_NOT_ALLOWED", "{args:?}");
+            }
         }
-    ));
+    }
+}
+
+#[test]
+fn gh_api_repo_placeholder_preserves_literal_owner_check() {
+    let allowlist = crate::owners::OwnerAllowlist::parse("acme");
+    for (endpoint, allowed) in [
+        ("repos/acme/{repo}/pulls", true),
+        ("repos/other/{repo}/pulls", false),
+        ("https://api.github.com/repos/other/{repo}/pulls", false),
+    ] {
+        let args = vec!["api".into(), endpoint.into()];
+        let result = enforce_gh_repo_targets(&args, &allowlist, Some("acme/project"));
+        if allowed {
+            result.unwrap();
+        } else {
+            assert_eq!(result.unwrap_err().code(), "OWNER_NOT_ALLOWED");
+        }
+    }
+}
+
+#[test]
+fn gh_api_uses_literal_rest_endpoint_owner_checks() {
+    let allowlist = crate::owners::OwnerAllowlist::parse("acme");
+    for endpoint in [
+        "repos/acme/widgets/pulls/1/merge",
+        "https://api.github.com/repos/acme/widgets/pulls/1/merge",
+        "graphql",
+    ] {
+        let args = vec![
+            "api".into(),
+            endpoint.into(),
+            "--method".into(),
+            "PUT".into(),
+        ];
+        SafeGhCommand::with_allowlist(&args, &allowlist).unwrap();
+    }
+    for endpoint in [
+        "repos/other/widgets/pulls/1/merge",
+        "/repos/other/widgets/issues",
+        "https://api.github.com/repos/other/widgets",
+    ] {
+        let args = vec![
+            "api".into(),
+            "--method".into(),
+            "PUT".into(),
+            endpoint.into(),
+        ];
+        assert_eq!(
+            SafeGhCommand::with_allowlist(&args, &allowlist)
+                .unwrap_err()
+                .code(),
+            "OWNER_NOT_ALLOWED"
+        );
+    }
+}
+
+#[test]
+fn gh_api_options_do_not_hide_literal_repository_target() {
+    let allowlist = crate::owners::OwnerAllowlist::parse("acme");
+    for flags in [
+        vec!["--silent"],
+        vec!["--silent=true"],
+        vec!["--paginate", "--slurp"],
+        vec!["-i"],
+        vec!["-XPOST"],
+        vec!["--method=PUT"],
+        vec!["--preview", "example"],
+        vec!["-HAccept:application/json"],
+    ] {
+        let mut args: Vec<String> = vec!["api".into()];
+        args.extend(flags.into_iter().map(str::to_owned));
+        args.push("repos/other/widgets/pulls/1/merge".into());
+        assert_eq!(
+            SafeGhCommand::with_allowlist(&args, &allowlist)
+                .unwrap_err()
+                .code(),
+            "OWNER_NOT_ALLOWED"
+        );
+    }
 }
 
 #[test]
@@ -1579,10 +1694,11 @@ fn two_worktree_local_merge_integrates_peer_branch() {
 }
 
 #[test]
-fn merge_on_default_branch_is_blocked() {
+fn merge_on_explicitly_assigned_main_is_allowed() {
     let (repo, worker_a, worker_b) = two_assigned_worktrees();
     let cmd = SafeGitCommand::new(&["merge".to_owned(), "worker-a".to_owned()]).unwrap();
-    expect_merge_blocked(&cmd, &repo, None, "default branch");
+    let out = cmd.run(&repo, Some("main")).unwrap();
+    assert_eq!(out.exit_code, 0, "{}", out.stderr);
     remove_all(&repo, &worker_a, &worker_b);
 }
 
@@ -1625,7 +1741,7 @@ fn merge_abort_is_allowed_with_dirty_tree() {
 }
 
 #[test]
-fn pull_on_default_branch_is_blocked() {
+fn pull_on_explicitly_assigned_main_passes_local_admission() {
     let (repo, worker_a, worker_b) = two_assigned_worktrees();
     let cmd = SafeGitCommand::new(&[
         "pull".to_owned(),
@@ -1634,6 +1750,7 @@ fn pull_on_default_branch_is_blocked() {
         "main".to_owned(),
     ])
     .unwrap();
-    expect_merge_blocked(&cmd, &repo, None, "default branch");
+    cmd.admit_local_merge(&repo).unwrap();
+    cmd.verify_branch(&repo, "main").unwrap();
     remove_all(&repo, &worker_a, &worker_b);
 }

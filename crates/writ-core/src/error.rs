@@ -170,7 +170,7 @@ pub enum PolicyCode {
     SubcommandNotAllowed,
     /// Bare `--force` or `-f` was used without `--force-with-lease`.
     BareForcePush,
-    /// A merge subcommand or `gh pr merge` was attempted.
+    /// A local integration or checkout-changing operation would violate WIP policy.
     MergeBlocked,
     /// The current branch does not match the expected job branch.
     BranchMismatch,
@@ -180,7 +180,7 @@ pub enum PolicyCode {
     GhSubcommandNotAllowed,
     /// A gh subcommand flag is not permitted.
     GhFlagNotAllowed,
-    /// A path is outside the allowed sandbox (e.g. supervised --repo).
+    /// A path violates a local operation boundary or is not a valid working directory.
     PathNotAllowed,
     /// An existing worktree branch lacks a durable identity proving safe resume ownership.
     WorktreeResumeUnproven,

@@ -1,9 +1,13 @@
 # ADR 0001: Rust-only v1 runtime and Codex `babysit-pr` boundary
 
-- Status: Accepted
+- Status: Historical; runtime and companion-skill boundaries retained, enforcement procedure superseded
 - Date: 2026-09-15
 - Linear: [RM-169](https://linear.app/rpd-34/issue/RM-169/v1-record-rust-only-architecture-and-codex-babysit-pr-boundary) (parent [RM-168](https://linear.app/rpd-34/issue/RM-168/epic-worktree-hive-v1-rust-only-control-plane))
 - Follow-on command/state model: [RM-170](https://linear.app/rpd-34/issue/RM-170/v1-define-unified-wh-command-and-rust-state-model)
+
+## Current interpretation (2026-10-02)
+
+The original text below is preserved as the decision made in September. Its blanket remote-merge/API bans, mandatory mutation routing and managed-checkout procedures are superseded by the collaboration contract in [AGENTS.md](../../AGENTS.md). Rust remains the runtime for shared state and its local integrity helpers. Harnesses own checkouts; tools and trackers are optional; GitHub owns remote authorization. Do not use historical restrictions below as current contribution gates.
 
 ## Context
 

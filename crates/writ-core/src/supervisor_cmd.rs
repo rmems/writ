@@ -1,4 +1,4 @@
-//! Supervised command policy: argv allowlist, wrapper refusal, and repo bind.
+//! Direct git/gh checks and harness-selected working directories for supervision.
 //!
 //! Split from [`super`] so hang-recovery stays under CodeScene's file-size gate.
 //! Recovery still never merges, never bare-force-pushes, and never deletes a checkout.
@@ -48,40 +48,20 @@ pub(super) fn prepare_supervised_command(req: &CommandRequest<'_>) -> Result<Pre
     let name = normalize_program_name(req.program);
     let owned_args: Vec<String> = req.args.iter().map(|s| (*s).to_owned()).collect();
 
-    // Shells, interpreters, launchers, and direct network clients are never policy-safe
-    // under substring checks; require direct allowlisted binaries for sensitive actions.
-    if super::is_forbidden_wrapper(&name) {
-        return Err(Error::PolicyViolation {
-            code: PolicyCode::SubcommandNotAllowed,
-            message: format!(
-                "supervised program `{name}` can launch or tunnel unreviewed commands and is not allowed; invoke git, gh, or another binary directly"
-            ),
-        });
-    }
-
     match name.as_str() {
         "git" => prepare_git_command(req),
         "gh" => prepare_gh_command(req),
-        _ => {
-            // Fail closed on path-qualified / relative scripts (./tools/run, tools/run).
-            // Basename-only PATH lookups remain for non-sensitive tooling; git/gh above are
-            // always PATH-forced. Shebang wrappers in the worktree cannot be invoked by path.
-            if super::program_is_path_qualified(req.program) {
-                return Err(Error::PolicyViolation {
-                    code: PolicyCode::SubcommandNotAllowed,
-                    message: format!(
-                        "supervised program `{}` is path-qualified; invoke a PATH binary by basename only (git, gh, …)",
-                        req.program
-                    ),
-                });
-            }
-            Ok(PreparedCommand {
-                program: req.program.to_owned(),
-                args: owned_args,
-                cwd: None,
-                branch_check: None,
-            })
-        }
+        _ => Ok(PreparedCommand {
+            program: req.program.to_owned(),
+            args: owned_args,
+            cwd: req
+                .options
+                .repo
+                .as_deref()
+                .map(|repo| resolve_supervised_repo(Some(repo)))
+                .transpose()?,
+            branch_check: None,
+        }),
     }
 }
 
@@ -124,91 +104,40 @@ fn prepare_git_command(prep: &CommandRequest<'_>) -> Result<PreparedCommand> {
     })
 }
 
-/// Prepare a supervised `gh` command: enforce argv/allowlist policy and, for
-/// mutating `gh pr` commands, require an expected branch and bind the effective
-/// repo selector (explicit `-R` or implicit `GH_REPO`) to the verified local
-/// origin before PATH-forcing the `gh` binary.
+/// Validate direct GitHub CLI operations without requiring local branch state.
+/// An optional working directory remains useful for gh's implicit repo lookup.
 fn prepare_gh_command(prep: &CommandRequest<'_>) -> Result<PreparedCommand> {
-    let owned_args: Vec<String> = prep.args.iter().map(|s| (*s).to_owned()).collect();
-    let options = prep.options;
-    let allowlist = options
+    let args: Vec<String> = prep.args.iter().map(|s| (*s).to_owned()).collect();
+    let allowlist = prep
+        .options
         .allowlist
         .clone()
         .unwrap_or_else(OwnerAllowlist::from_env);
-    let _safe = SafeGhCommand::with_allowlist(&owned_args, &allowlist)?;
-    // Always spawn PATH `gh`, never a user-supplied path-qualified binary.
-    let (cwd, branch_check, owned_args) = if crate::git_safe::gh_requires_branch_check(&owned_args)
-    {
-        let expected = options
-            .expected_branch
-            .clone()
-            .ok_or_else(|| Error::PolicyViolation {
-                code: PolicyCode::BranchMismatch,
-                message: "mutating gh pr commands require --expected-branch under supervisor"
-                    .to_owned(),
-            })?;
-        let repo = resolve_supervised_repo(options.repo.as_deref())?;
-        // Bind the effective repo selector to the verified local checkout so jobs
-        // cannot mutate a different GitHub repository after the branch gate. An
-        // explicit `-R/--repo` wins; otherwise gh reads the implicit `GH_REPO`
-        // environment selector, so bind that too.
-        let env_selector = crate::git_safe::gh_repo_env_target();
-        let local = crate::git_safe::origin_github_slug(&repo)?;
-        crate::git_safe::bind_gh_repo_selector_to_origin(
-            &owned_args,
-            env_selector.as_deref(),
-            &local,
-        )?;
-        // Pin the validated slug before any later permit wait so a TOCTOU
-        // origin rewrite cannot retarget `gh`.
-        let owned_args = if env_selector.is_some() {
-            owned_args
-        } else {
-            crate::git_safe::pin_gh_repo_selector(owned_args, &local)
-        };
-        (
-            Some(repo.clone()),
-            Some(BranchCheck {
-                expected_branch: expected,
-                repo,
-            }),
-            owned_args,
-        )
-    } else {
-        (None, None, owned_args)
-    };
+    SafeGhCommand::with_allowlist(&args, &allowlist)?;
     Ok(PreparedCommand {
         program: "gh".to_owned(),
-        args: owned_args,
-        cwd,
-        branch_check,
+        args,
+        cwd: prep.options.repo.clone(),
+        branch_check: None,
     })
 }
 
-/// Resolve and validate `--repo` for supervised git (cwd + branch checks).
-///
-/// - Rejects `..` path components in the input.
-/// - Canonicalizes to an existing directory.
-/// - Requires the path to stay under `WRIT_WORKTREE_BASE` when set, otherwise under
-///   the documented default `{user_data_dir}/writ/worktrees` root.
-pub(super) fn verify_repo_branch(repo: &std::path::Path, expected_branch: &str) -> Result<()> {
-    let cmd = SafeGitCommand::new(&["rev-parse".to_owned(), "HEAD".to_owned()])?;
-    cmd.verify_branch(repo, expected_branch)
+/// Check assigned branch identity and preserve uncommitted WIP immediately
+/// before a supervised Git command is spawned.
+pub(super) fn verify_repo_branch(
+    repo: &std::path::Path,
+    expected_branch: &str,
+    args: &[String],
+) -> Result<()> {
+    let cmd = SafeGitCommand::new(args)?;
+    cmd.verify_branch(repo, expected_branch)?;
+    cmd.admit_local_merge(repo)
 }
 
 fn resolve_supervised_repo(repo: Option<&std::path::Path>) -> Result<PathBuf> {
-    use std::path::{Component, Path};
-
-    let worktree_base = crate::paths::worktree_base_path()?;
+    use std::path::Path;
 
     let raw = repo.unwrap_or_else(|| Path::new("."));
-    if raw.components().any(|c| matches!(c, Component::ParentDir)) {
-        return Err(Error::PolicyViolation {
-            code: PolicyCode::PathNotAllowed,
-            message: "parent-directory components are not allowed in --repo".to_owned(),
-        });
-    }
-
     let canon = crate::paths::canonicalize_for_tools(raw).map_err(|e| Error::Io {
         context: "canonicalize supervised --repo",
         source: e,
@@ -223,36 +152,5 @@ fn resolve_supervised_repo(repo: Option<&std::path::Path>) -> Result<PathBuf> {
         });
     }
 
-    let base = normalize_existing_or_future_dir(&worktree_base)?;
-    if !canon.starts_with(&base) {
-        return Err(Error::PolicyViolation {
-            code: PolicyCode::PathNotAllowed,
-            message: format!(
-                "supervised --repo `{}` escapes worktree base `{}`",
-                canon.display(),
-                base.display()
-            ),
-        });
-    }
-
     Ok(canon)
-}
-
-fn normalize_existing_or_future_dir(path: &std::path::Path) -> Result<PathBuf> {
-    if path.exists() {
-        return crate::paths::canonicalize_for_tools(path).map_err(|e| Error::Io {
-            context: "canonicalize worktree base",
-            source: e,
-        });
-    }
-    if path.is_absolute() {
-        Ok(path.to_path_buf())
-    } else {
-        std::env::current_dir()
-            .map(|cwd| cwd.join(path))
-            .map_err(|e| Error::Io {
-                context: "resolve worktree base",
-                source: e,
-            })
-    }
 }
