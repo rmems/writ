@@ -86,7 +86,7 @@ For production and fleet use, every mutating `git` or `gh` invocation goes throu
 
 Reads are not mutations. GitHub MCP is preferred for PR/issue/check/review reads; shell `gh` reads are a fallback when MCP is unavailable. Identity-adjacent local `git` (`fetch`, `rev-parse`, `status`, `branch --show-current`) is not a second control plane; the production path still prefers `writ git-safe` for those calls (`fetch` is already allowlisted and non-mutating).
 
-GitHub MCP may perform GitHub writes that `writ gh-safe` cannot (`gh run` and `gh api` are outside the allowlist). That is still not a raw `gh`/`git` production path, and it remains subject to the GitHub PR merge prohibition. Local feature-branch `git merge` is allowlisted through `writ git-safe`.
+`writ gh-safe` now allowlists `gh run` for its read and official-rerun verbs (`view`, `list`, `watch`, `rerun`, `download`), so Actions log views, official flake reruns, and artifact downloads can route through the boundary. The mutating `run` verbs (`rerun`, `download`) are bound to the assigned checkout and branch gate, and `run download --dir` / `-D` must stay inside the worktree (symlinked escapes are rejected); `run delete` / `run cancel` remain blocked. `gh api` stays outside the allowlist so merge-related REST/GraphQL cannot be smuggled through it. GitHub MCP may still perform GitHub writes that `writ gh-safe` cannot (anything behind `gh api`). None of this is a raw `gh`/`git` production path, and it all remains subject to the GitHub PR merge prohibition. Local feature-branch `git merge` is allowlisted through `writ git-safe`.
 
 **Honest current enforcement.** Until M1 hooks land, policy applies only to commands that actually enter `writ`. This ADR states the required production path. It does not claim that raw `git`/`gh` is currently impossible on the operator's machine.
 
@@ -110,7 +110,7 @@ That skill owns the **monitoring loop**: poll PR/CI/review state, classify branc
 
 `writ` owns the **enforcement primitives** that loop should call when the job is under this runtime.
 
-`writ gh-safe` allowlists top-level `gh` commands such as `pr`, `issue`, and `workflow`. It **rejects** `gh api` (so merge cannot be smuggled through REST/GraphQL) and does **not** allowlist `gh run`. Codex `babysit-pr` today uses `gh run` and `gh api` for job logs, flaky reruns, and some thread resolution. Those calls must not be described as `gh-safe` successes, and they must not fall back to raw `gh api` as a production mutation path.
+`writ gh-safe` allowlists top-level `gh` commands such as `pr`, `issue`, `workflow`, and `run`. It **rejects** `gh api` (so merge cannot be smuggled through REST/GraphQL). `gh run` is allowlisted only for its read and official-rerun verbs (`view`, `list`, `watch`, `rerun`, `download`); `run delete` / `run cancel` stay blocked, the mutating verbs (`rerun`, `download`) are bound to the assigned checkout + branch gate, and `run download --dir` / `-D` must stay inside the worktree (symlinked escapes rejected). Codex `babysit-pr` today uses `gh run` for job logs and flaky reruns (now served by `writ gh-safe run …`) and `gh api` for some thread resolution. The remaining `gh api` calls must not be described as `gh-safe` successes, and they must not fall back to raw `gh api` as a production mutation path.
 
 | `babysit-pr` action | v1 expectation under `writ` |
 | --- | --- |
@@ -118,7 +118,7 @@ That skill owns the **monitoring loop**: poll PR/CI/review state, classify branc
 | Patch code on the PR head | Assigned worktree/branch only; identity checklist in `AGENTS.md`. |
 | `git push` / `--force-with-lease` | `writ git-safe` on the assigned branch. Bare `--force`/`-f` remain forbidden. |
 | Allowlisted `gh` writes (for example `gh pr comment`) | `writ gh-safe`. Merge, auto-merge, merge-queue, `gh pr merge` / `ready` / `update-branch` / `checkout` remain blocked. |
-| Check reruns, Actions job logs, review-thread resolve | GitHub MCP, or a future `writ` primitive. Today `gh run` and `gh api` are outside `gh-safe`; do not send them through it, and do not use raw `gh api` in production. |
+| Check reruns, Actions job logs, review-thread resolve | Actions log views and official flake reruns/artifact downloads go through `writ gh-safe run …` (`view`/`list`/`watch`/`rerun`/`download`), bound to the assigned checkout with worktree-confined downloads. `gh api` and review-thread resolve stay outside `gh-safe`: use GitHub MCP or a future `writ` primitive, never raw `gh api` in production. |
 | “Until merged or closed” | Observational stop condition. The skill must not merge the pull request. |
 | Ready-to-merge report | Handoff signal only. A human merges on GitHub. |
 
@@ -126,7 +126,7 @@ Compatibility rules:
 
 1. **Do not fork or republish** Codex `babysit-pr` as a `writ` product.
 2. **Do not vendor** its watcher scripts as a second orchestrator.
-3. **When a babysit skill operates inside a `writ`-managed worktree**, production git mutations go through `writ git-safe`. Allowlisted `gh` writes go through `writ gh-safe`. Writes that are outside that allowlist (`gh run`, `gh api`) go through GitHub MCP or wait for a future primitive; they do not use raw `gh api`. The Codex skill's default raw `git`/`gh` examples are host defaults, not an exemption from this runtime.
+3. **When a babysit skill operates inside a `writ`-managed worktree**, production git mutations go through `writ git-safe`. Allowlisted `gh` writes go through `writ gh-safe`, including `gh run` log views, official flake reruns, and artifact downloads (`view`/`list`/`watch`/`rerun`/`download`), with mutating run verbs bound to the assigned checkout and downloads confined to the worktree. Calls still outside that allowlist (`gh api`, review-thread resolve) go through GitHub MCP or wait for a future primitive; they do not use raw `gh api`. The Codex skill's default raw `git`/`gh` examples are host defaults, not an exemption from this runtime.
 4. **This repository's `SKILL.md`** is a portable client that hands monitoring to the installed companion skill; it is not a reimplementation of the Codex watcher.
 5. **Naming:** `supervise-pr` (or successor) describes a primitive. It must not be marketed or documented as “the `writ` babysit-pr skill.”
 

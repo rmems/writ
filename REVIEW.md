@@ -45,6 +45,7 @@ For stacked pull requests, review and fix the bottom PR before its children. Re-
 - [ ] New behavior has focused tests, including negative policy tests where relevant.
 - [ ] Documentation and examples match the implemented command surface.
 - [ ] Documentation command blocks preserve their caller's working directory when steps run sequentially.
+- [ ] CI check handling follows [`docs/ci-taxonomy.md`](docs/ci-taxonomy.md): Class A/B/C actions, no empty retrigger commits, `skipping` non-blocking, `pending` without rerun spam. Keep required-check failures distinct from advisory findings, pending, external-access/`ACTION_REQUIRED`, and unknown requiredness; a provider name is not a merge gate.
 
 ## Language-specific review notes
 
