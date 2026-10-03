@@ -123,6 +123,16 @@ fn watchlist_missing_store_is_empty_without_creating_files() {
 
 #[cfg(unix)]
 #[test]
+fn watchlist_reports_dangling_symlink_instead_of_empty_store() {
+    let root = TestDir::new();
+    let path = root.0.join("leases.db");
+    std::os::unix::fs::symlink("missing.db", &path).unwrap();
+    assert_store_error(&path, "IO_ERROR");
+    assert_eq!(fs::read_link(path).unwrap(), Path::new("missing.db"));
+}
+
+#[cfg(unix)]
+#[test]
 fn watchlist_reports_symlink_loop_instead_of_empty_store() {
     let root = TestDir::new();
     let path = root.0.join("leases.db");

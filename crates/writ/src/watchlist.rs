@@ -179,8 +179,14 @@ fn render_view(
 }
 
 fn store_exists(path: &Path) -> io::Result<bool> {
-    if path.try_exists()? {
-        return Ok(true);
+    match path.symlink_metadata() {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            path.metadata()?;
+            return Ok(true);
+        }
+        Ok(_) => return Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
     }
     // Windows can report NotFound when an ancestor is a regular file. Only
     // treat the store as absent after reaching an existing directory.
