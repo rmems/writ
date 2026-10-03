@@ -892,9 +892,71 @@ fn gh_pr_comment_body_urls_are_values_not_repository_targets() {
 }
 
 #[test]
+fn gh_pr_slash_branch_operands_are_not_repository_selectors() {
+    let allowlist = crate::owners::OwnerAllowlist::parse("acme");
+    for verb in [
+        "merge",
+        "ready",
+        "update-branch",
+        "view",
+        "checks",
+        "diff",
+        "comment",
+        "review",
+        "close",
+        "reopen",
+    ] {
+        for branch in ["feature/foo", "feature/foo#123"] {
+            let args: Vec<String> = ["pr", verb, branch, "-Racme/project"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+            enforce_gh_repo_targets(&args, &allowlist, None).unwrap();
+        }
+    }
+}
+
+#[test]
+fn gh_pr_branch_admission_keeps_explicit_owner_checks() {
+    let allowlist = crate::owners::OwnerAllowlist::parse("acme");
+    for args in [
+        vec!["pr", "merge", "feature/foo", "-Rother/project"],
+        vec![
+            "pr",
+            "view",
+            "https://github.com/other/project/pull/1",
+            "-Racme/project",
+        ],
+        vec![
+            "pr",
+            "merge",
+            "feature/foo",
+            "-Rother/project",
+            "-Racme/project",
+        ],
+        vec!["issue", "transfer", "1", "other/project", "-Racme/source"],
+        vec![
+            "issue",
+            "transfer",
+            "https://github.com/other/source/issues/1",
+            "acme/target",
+            "-Racme/source",
+        ],
+    ] {
+        let args: Vec<String> = args.into_iter().map(str::to_owned).collect();
+        assert_eq!(
+            enforce_gh_repo_targets(&args, &allowlist, None).map_err(|error| error.code()),
+            Err("OWNER_NOT_ALLOWED"),
+            "{args:?}"
+        );
+    }
+}
+
+#[test]
 fn gh_issue_transfer_checks_every_real_repository_operand() {
     let allowlist = crate::owners::OwnerAllowlist::parse("acme");
     for (destination, expected) in [
+        ("target", Ok(())),
         ("acme/target", Ok(())),
         ("other/target", Err("OWNER_NOT_ALLOWED")),
     ] {

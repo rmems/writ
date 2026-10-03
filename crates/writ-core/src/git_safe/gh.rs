@@ -775,14 +775,14 @@ pub fn enforce_gh_repo_targets(
 }
 
 /// Owner-bearing positionals that `-R` / `GH_REPO` do not cover: `gh repo`
-/// operands and GitHub issue/PR URLs or `owner/repo#n` tokens.
+/// operands, GitHub issue/PR URLs, and an issue-transfer destination repository.
 fn gh_positional_repo_targets(args: &[String], operands: &[&str]) -> Result<Vec<String>> {
     let Some(subcommand) = args.first().map(String::as_str) else {
         return Ok(Vec::new());
     };
     match subcommand {
         "repo" => Ok(gh_repo_positional_targets(&args[1..])),
-        "pr" | "issue" => gh_issue_or_pr_positional_targets(operands),
+        "pr" | "issue" => gh_issue_or_pr_positional_targets(args, operands),
         _ => Ok(Vec::new()),
     }
 }
@@ -855,11 +855,30 @@ fn first_operand_after<'a>(args: &'a [String], token: &str) -> Option<&'a str> {
     first_positional_after(&args[idx + 1..])
 }
 
-fn gh_issue_or_pr_positional_targets(operands: &[&str]) -> Result<Vec<String>> {
-    operands
+fn gh_issue_or_pr_positional_targets(args: &[String], operands: &[&str]) -> Result<Vec<String>> {
+    let mut targets: Vec<String> = operands
         .iter()
         .filter_map(|token| positional_github_repo_token(token).transpose())
-        .collect()
+        .collect::<Result<_>>()?;
+    if let Some(destination) = issue_transfer_destination(args, operands) {
+        targets.push(destination.to_owned());
+    }
+    Ok(targets)
+}
+
+fn issue_transfer_destination<'a>(args: &[String], operands: &[&'a str]) -> Option<&'a str> {
+    if args.first().map(String::as_str) != Some("issue") {
+        return None;
+    }
+    if command_verb(args) != Some("transfer") {
+        return None;
+    }
+    // Family, verb, issue identifier, then the destination repository. An
+    // unqualified destination name has no explicit owner to check here.
+    operands
+        .get(3)
+        .copied()
+        .filter(|destination| normalize_github_repo_identity(destination).is_some())
 }
 
 fn positional_github_repo_token(token: &str) -> Result<Option<String>> {
@@ -869,9 +888,6 @@ fn positional_github_repo_token(token: &str) -> Result<Option<String>> {
     let bare = token.split('#').next().unwrap_or(token);
     if let Some((host, path)) = http_url_parts(bare)? {
         return Ok(github_http_repo_target(host, path));
-    }
-    if normalize_github_repo_identity(bare).is_some() {
-        return Ok(Some(bare.to_owned()));
     }
     Ok(None)
 }
