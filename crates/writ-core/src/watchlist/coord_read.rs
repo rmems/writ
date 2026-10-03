@@ -49,12 +49,8 @@ struct ClaimRow {
 struct MessageRow {
     kind: String,
     from_agent_id: String,
-    from_owner: String,
-    from_repo_name: String,
-    from_job_id: String,
-    to_owner: Option<String>,
-    to_repo_name: Option<String>,
-    to_job_id: Option<String>,
+    from: JobId,
+    to: Option<JobId>,
     owner_generation: i64,
     body: String,
     acked_at: Option<i64>,
@@ -171,15 +167,25 @@ fn load_messages(conn: &Connection) -> rusqlite::Result<Vec<MessageRow>> {
 }
 
 fn message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageRow> {
+    let to_owner: Option<String> = row.get(5)?;
+    let to_repo_name: Option<String> = row.get(6)?;
+    let to_job_id: Option<String> = row.get(7)?;
     Ok(MessageRow {
         kind: row.get(0)?,
         from_agent_id: row.get(1)?,
-        from_owner: row.get(2)?,
-        from_repo_name: row.get(3)?,
-        from_job_id: row.get(4)?,
-        to_owner: row.get(5)?,
-        to_repo_name: row.get(6)?,
-        to_job_id: row.get(7)?,
+        from: JobId {
+            owner: row.get(2)?,
+            repo_name: row.get(3)?,
+            job_id: row.get(4)?,
+        },
+        to: match (to_owner, to_repo_name, to_job_id) {
+            (Some(owner), Some(repo_name), Some(job_id)) => Some(JobId {
+                owner,
+                repo_name,
+                job_id,
+            }),
+            _ => None,
+        },
         body: row.get(8)?,
         acked_at: row.get(9)?,
         owner_generation: row.get(10)?,
@@ -212,35 +218,27 @@ fn waiting_label(msg: &MessageRow, claims: &BTreeMap<JobId, ClaimRow>) -> Option
         "handoff" if source_generation(claims, msg) != Some(msg.owner_generation) => None,
         "help" | "handoff" | "dependency" | "blocker" => Some(format!(
             "{}:{}:{}",
-            msg.kind, msg.from_agent_id, msg.from_job_id
+            msg.kind, msg.from_agent_id, msg.from.job_id
         )),
         _ => None,
     }
 }
 
 fn source_generation(claims: &BTreeMap<JobId, ClaimRow>, msg: &MessageRow) -> Option<i64> {
-    claims
-        .get(&JobId::new(
-            &msg.from_owner,
-            &msg.from_repo_name,
-            &msg.from_job_id,
-        ))
-        .map(|claim| claim.owner_generation)
+    claims.get(&msg.from).map(|claim| claim.owner_generation)
 }
 
 fn overlaps_for(messages: &[MessageRow], key: &JobId) -> Vec<String> {
     messages
         .iter()
         .filter(|msg| msg.acked_at.is_none() && msg.kind == "overlap" && msg.targets(key))
-        .map(|msg| format!("overlap:{}:{}", msg.from_job_id, msg.body))
+        .map(|msg| format!("overlap:{}:{}", msg.from.job_id, msg.body))
         .collect()
 }
 
 impl MessageRow {
     fn targets(&self, key: &JobId) -> bool {
-        self.to_owner.as_deref() == Some(key.owner.as_str())
-            && self.to_repo_name.as_deref() == Some(key.repo_name.as_str())
-            && self.to_job_id.as_deref() == Some(key.job_id.as_str())
+        self.to.as_ref() == Some(key)
     }
 }
 
@@ -288,17 +286,13 @@ mod tests {
         let source = JobId::new("acme", "sample", "job-2");
         let claims = BTreeMap::from([
             (recipient.clone(), claim(7)),
-            (source, claim(source_generation)),
+            (source.clone(), claim(source_generation)),
         ]);
         let message = MessageRow {
             kind: "handoff".to_owned(),
             from_agent_id: "agent-b".to_owned(),
-            from_owner: "acme".to_owned(),
-            from_repo_name: "sample".to_owned(),
-            from_job_id: "job-2".to_owned(),
-            to_owner: Some("acme".to_owned()),
-            to_repo_name: Some("sample".to_owned()),
-            to_job_id: Some("job-1".to_owned()),
+            from: source,
+            to: Some(recipient.clone()),
             owner_generation: message_generation,
             body: "take over".to_owned(),
             acked_at: None,
