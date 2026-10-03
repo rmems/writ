@@ -776,15 +776,166 @@ fn gh_repo_delete_positional_is_enforced_against_allowlist() {
 }
 
 #[test]
+fn gh_preverb_values_cannot_hide_command_specific_repository_checks() {
+    let allowlist = crate::owners::OwnerAllowlist::parse("acme");
+    for args in [
+        vec!["pr", "-r", "acme/team", "create", "-f", "-Rother/project"],
+        vec!["pr", "-a", "alice", "create", "-f", "-Rother/project"],
+        vec!["pr", "--body", "review", "create", "-f", "-Rother/project"],
+        vec!["pr", "-r", "review", "create", "-f", "-Rother/project"],
+        vec!["pr", "-t", "create", "new", "-f", "-Rother/project"],
+        vec!["pr", "--comment=true", "review", "-Rother/project"],
+    ] {
+        let args: Vec<String> = args.into_iter().map(str::to_owned).collect();
+        assert_eq!(
+            enforce_gh_repo_targets(&args, &allowlist, None).map_err(|error| error.code()),
+            Err("OWNER_NOT_ALLOWED"),
+            "{args:?}"
+        );
+    }
+}
+
+#[test]
+fn gh_preverb_payloads_and_builtin_aliases_preserve_allowed_targets() {
+    let allowlist = crate::owners::OwnerAllowlist::parse("acme");
+    for args in [
+        vec!["pr", "-r", "other/team", "create", "-Racme/project"],
+        vec![
+            "pr",
+            "-a",
+            "https://example.com/a/b",
+            "new",
+            "-Racme/project",
+        ],
+        vec!["pr", "--body", "review", "create", "-Racme/project"],
+        vec!["pr", "-r", "review", "new", "-Racme/project"],
+        vec!["pr", "-t", "create", "new", "-Racme/project"],
+        vec!["pr", "--comment=true", "review", "-Racme/project"],
+        vec!["pr", "-tRelease", "new", "-Racme/project"],
+    ] {
+        let args: Vec<String> = args.into_iter().map(str::to_owned).collect();
+        enforce_gh_repo_targets(&args, &allowlist, None).unwrap();
+    }
+}
+
+#[test]
+fn gh_builtin_aliases_use_canonical_option_arity() {
+    let allowlist = crate::owners::OwnerAllowlist::parse("acme");
+    for prefix in [
+        vec!["pr", "new", "-f"],
+        vec!["issue", "new", "-a", "alice"],
+        vec!["gist", "new", "-p"],
+        vec!["release", "new", "-p"],
+        vec!["repo", "new", "-c"],
+        vec!["pr", "ls", "-a", "other/team"],
+        vec!["issue", "ls", "-m", "other/project"],
+    ] {
+        for (target, expected) in [("acme", Ok(())), ("other", Err("OWNER_NOT_ALLOWED"))] {
+            let mut args: Vec<String> = prefix.iter().map(|arg| (*arg).to_owned()).collect();
+            args.push(format!("-R{target}/project"));
+            assert_eq!(
+                enforce_gh_repo_targets(&args, &allowlist, None).map_err(|error| error.code()),
+                expected,
+                "{args:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn gh_checkout_alias_and_preverb_options_preserve_local_guard() {
+    for args in [
+        vec!["pr", "co", "1"],
+        vec!["pr", "-b", "job", "co", "1"],
+        vec!["pr", "-b", "job", "checkout", "1"],
+        vec!["pr", "--body", "text", "merge", "1", "--delete-branch"],
+    ] {
+        let args: Vec<String> = args.into_iter().map(str::to_owned).collect();
+        assert!(gh_requires_branch_check(&args), "{args:?}");
+        assert_eq!(
+            SafeGhCommand::new(&args).unwrap_err().code(),
+            "MERGE_BLOCKED"
+        );
+    }
+}
+
+#[test]
+fn gh_label_boolean_force_keeps_real_repository_selector() {
+    let allowlist = crate::owners::OwnerAllowlist::parse("acme");
+    for verb in ["create", "clone"] {
+        let args: Vec<String> = ["label", verb, "name", "-f", "-Rother/project"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(
+            enforce_gh_repo_targets(&args, &allowlist, None).map_err(|error| error.code()),
+            Err("OWNER_NOT_ALLOWED"),
+            "{args:?}"
+        );
+    }
+}
+
+#[test]
+fn gh_pr_comment_body_urls_are_values_not_repository_targets() {
+    let allowlist = crate::owners::OwnerAllowlist::parse("acme");
+    for body in [
+        "https://example.com/a/b",
+        "https://bad host.example/a/b",
+        "other/project",
+    ] {
+        let args: Vec<String> = ["pr", "comment", "1", "--body", body, "-Racme/project"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        enforce_gh_repo_targets(&args, &allowlist, None).unwrap();
+    }
+}
+
+#[test]
+fn gh_issue_transfer_checks_every_real_repository_operand() {
+    let allowlist = crate::owners::OwnerAllowlist::parse("acme");
+    for (destination, expected) in [
+        ("acme/target", Ok(())),
+        ("other/target", Err("OWNER_NOT_ALLOWED")),
+    ] {
+        let args: Vec<String> = ["issue", "transfer", "1", destination, "-Racme/source"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(
+            enforce_gh_repo_targets(&args, &allowlist, None).map_err(|error| error.code()),
+            expected,
+            "{args:?}"
+        );
+    }
+}
+
+#[test]
 fn gh_repo_selector_respects_command_specific_boolean_flags() {
     let allowlist = crate::owners::OwnerAllowlist::parse("acme");
     for prefix in [
+        vec!["auth", "login", "-c"],
+        vec!["auth", "refresh", "-c"],
+        vec!["auth", "setup-git", "-f"],
+        vec!["auth", "status", "-t"],
+        vec!["browse", "-p"],
+        vec!["browse", "-c"],
+        vec!["gist", "create", "-p"],
+        vec!["issue", "develop", "-c"],
+        vec!["label", "clone", "-f"],
+        vec!["label", "create", "-f"],
+        vec!["pr", "checkout", "-f"],
+        vec!["pr", "create", "-f"],
         vec!["pr", "review", "-c"],
         vec!["pr", "review", "--comment"],
+        vec!["pr", "status", "-c"],
         vec!["pr", "view", "-c"],
         vec!["issue", "view", "-c"],
         vec!["release", "create", "v1", "-p"],
         vec!["release", "create", "v1", "--prerelease"],
+        vec!["repo", "create", "-c"],
+        vec!["repo", "edit", "--template"],
+        vec!["workflow", "run", "--json"],
     ] {
         for (owner, expected) in [("acme", Ok(())), ("other", Err("OWNER_NOT_ALLOWED"))] {
             let mut args: Vec<String> = prefix.iter().map(|arg| (*arg).to_owned()).collect();
@@ -792,6 +943,116 @@ fn gh_repo_selector_respects_command_specific_boolean_flags() {
             let result = enforce_gh_repo_targets(&args, &allowlist, None);
             assert_eq!(result.map_err(|error| error.code()), expected, "{args:?}");
         }
+    }
+}
+
+#[test]
+fn gh_audited_required_values_are_never_repository_operands() {
+    let allowlist = crate::owners::OwnerAllowlist::parse("acme");
+    for prefix in [
+        vec!["pr", "create", "-a"],
+        vec!["pr", "create", "-m"],
+        vec!["pr", "create", "-r"],
+        vec!["pr", "edit", "--add-reviewer"],
+        vec!["issue", "create", "--blocked-by"],
+        vec!["issue", "create", "-l"],
+        vec!["issue", "edit", "--remove-sub-issue"],
+        vec!["issue", "edit", "-m"],
+        vec!["pr", "list", "-s"],
+        vec!["pr", "list", "-B"],
+        vec!["issue", "list", "--mention"],
+        vec!["issue", "develop", "-n"],
+        vec!["pr", "checks", "-i"],
+        vec!["pr", "diff", "-e"],
+        vec!["pr", "lock", "-r"],
+        vec!["issue", "close", "--duplicate-of"],
+        vec!["api", "-f"],
+        vec!["api", "-p"],
+    ] {
+        for (value, target, expected) in [
+            ("https://example.com/a/b", "-Racme/project", Ok(())),
+            ("-Rother/value", "-Racme/project", Ok(())),
+            ("--", "-Rother/project", Err("OWNER_NOT_ALLOWED")),
+        ] {
+            let mut args: Vec<String> = prefix.iter().map(|arg| (*arg).to_owned()).collect();
+            args.extend([value.to_owned(), target.to_owned()]);
+            assert_eq!(
+                enforce_gh_repo_targets(&args, &allowlist, None).map_err(|error| error.code()),
+                expected,
+                "{args:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn gh_real_operands_after_end_marker_retain_owner_checks() {
+    let allowlist = crate::owners::OwnerAllowlist::parse("acme");
+    for args in [
+        vec![
+            "pr",
+            "view",
+            "--",
+            "HTTPS://GITHUB.COM/other/project/pull/1",
+        ],
+        vec!["issue", "transfer", "--", "1", "other/project"],
+    ] {
+        let args: Vec<String> = args.into_iter().map(str::to_owned).collect();
+        assert_eq!(
+            enforce_gh_repo_targets(&args, &allowlist, None).map_err(|error| error.code()),
+            Err("OWNER_NOT_ALLOWED"),
+            "{args:?}"
+        );
+    }
+}
+
+#[test]
+fn gh_command_arity_preserves_clustered_selectors_and_attached_values() {
+    for (family, verb, flag, expected) in [
+        ("label", "create", "-fRother/project", Some("other/project")),
+        ("pr", "create", "-fRother/project", Some("other/project")),
+        ("api", "", "-fRother/project", None),
+        ("pr", "create", "-rRother/project", None),
+        ("pr", "review", "-rRother/project", Some("other/project")),
+        ("pr", "create", "-mRother/project", None),
+        ("pr", "merge", "-mRother/project", Some("other/project")),
+        ("pr", "list", "-sRother/project", None),
+        ("pr", "merge", "-sRother/project", Some("other/project")),
+        ("pr", "checks", "-iRother/project", None),
+        ("issue", "create", "-lRother/project", None),
+        (
+            "issue",
+            "develop",
+            "-lRother/project",
+            Some("other/project"),
+        ),
+        ("pr", "diff", "-eRother/project", None),
+        ("pr", "create", "-eRother/project", Some("other/project")),
+        ("browse", "", "-cRother/project", Some("other/project")),
+        ("browse", "", "-c=Rother/project", None),
+    ] {
+        let args: Vec<String> = [family, verb, flag]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(gh_repo_selector(&args), expected, "{args:?}");
+    }
+}
+
+#[test]
+fn gh_audited_booleans_leave_real_end_markers_intact() {
+    for prefix in [
+        vec!["label", "create", "name", "-f"],
+        vec!["pr", "create", "-f"],
+        vec!["repo", "edit", "--template"],
+        vec!["workflow", "run", "--json"],
+        vec!["browse", "-c"],
+        vec!["browse", "--commit=Rother/project"],
+    ] {
+        let mut args: Vec<String> = prefix.into_iter().map(str::to_owned).collect();
+        args.extend(["--".into(), "-Rother/project".into()]);
+        assert_eq!(gh_repo_selector(&args), None, "{args:?}");
     }
 }
 

@@ -9,6 +9,10 @@ use crate::owners::OwnerAllowlist;
 use super::identity::{github_repo_slugs_match, normalize_github_repo_identity};
 use super::{GitOutput, reject_external_path};
 
+#[path = "gh_options.rs"]
+mod options;
+use options::{CommandOptions, GH_KNOWN_BOOLEAN_FLAGS, GH_VALUE_TAKING_OPTIONS};
+
 /// GitHub CLI command families supported by the helper. GitHub owns remote
 /// authorization; the helper checks explicit repository owners and local effects.
 const ALLOWED_GH_SUBCOMMANDS: &[&str] = &[
@@ -145,91 +149,6 @@ fn gh_enforce_clone_target_owner(
     allowlist.enforce_repo_selector(positionals.first().copied().unwrap_or(""))
 }
 
-/// Known value-taking options used to distinguish operands from option values.
-const GH_VALUE_TAKING_OPTIONS: &[&str] = &[
-    "--template",
-    "-t",
-    "--json",
-    "-q",
-    "--jq",
-    "--limit",
-    "-L",
-    "--search",
-    "-S",
-    "--state",
-    "--label",
-    "--assignee",
-    "--author",
-    "--base",
-    "--head",
-    "--milestone",
-    "--project",
-    "--body",
-    "-b",
-    "--body-file",
-    "-F",
-    "--title",
-    "-T",
-    "--comment",
-    "-c",
-    "--subject",
-    "--author-email",
-    "-A",
-    "--match-head-commit",
-    "--method",
-    "-X",
-    "--header",
-    "-H",
-    "--field",
-    "--raw-field",
-    "-f",
-    "--hostname",
-    "--cache",
-    "--input",
-    "--preview",
-    "-p",
-];
-
-/// `gh` boolean (non-value-taking) flags whose separate-token form does NOT
-/// consume the following argv token. When one of these immediately precedes a
-/// literal `--`, that `--` is genuinely the end-of-options terminator.
-///
-/// This list underpins the fail-closed arity decision in
-/// [`separate_token_option_may_consume_dashdash`]: only when the preceding option
-/// is *known* to be boolean can we be certain the `--` terminates options. Any
-/// other separate-token option (recognized value-taking, a repo selector, or an
-/// unrecognized one) is treated conservatively as possibly consuming the `--`, so
-/// a later `-R other/repo` is never skipped. Keeping this list to well-known
-/// flags is safe: an omission here only makes the scanner *more* conservative
-/// (it keeps scanning), never less.
-///
-/// Only unambiguous long-form booleans are listed. Short forms are deliberately
-/// excluded because a single letter is frequently overloaded across subcommands
-/// (e.g. `-c` is `--comment` for `gh pr close` but `--comments` for `gh pr view`,
-/// and `-d` is `--draft` for create but `--delete-branch`/other elsewhere).
-/// Treating any short form as boolean here would risk failing open, so short
-/// forms fall through to the conservative "may consume `--`" branch.
-const GH_KNOWN_BOOLEAN_FLAGS: &[&str] = &[
-    "--help",
-    "--web",
-    "--comments",
-    "--draft",
-    "--fill",
-    "--fill-first",
-    "--fill-verbose",
-    "--no-maintainer-edit",
-    "--delete-branch",
-    "--dry-run",
-    "--merged",
-    "--closed",
-    "--allow-escape-sequences",
-    "--include",
-    "--paginate",
-    "--silent",
-    "--slurp",
-    "--verbose",
-];
-
 /// Whether a separate-token option `flag` may consume the following argv token as
 /// its value (fail-closed). Repo selectors that expect a value (`-R`, `--repo`,
 /// clustered `-wR`) and the known value-taking options consume it; a *known*
@@ -289,23 +208,23 @@ struct ShortOptions {
 }
 
 fn short_options(arg: &str) -> Option<ShortOptions> {
-    short_options_with_booleans(arg, &[])
+    short_options_with_context(arg, CommandOptions::default())
 }
 
-fn short_options_with_booleans(arg: &str, boolean_flags: &[&str]) -> Option<ShortOptions> {
+fn short_options_with_context(arg: &str, context: CommandOptions) -> Option<ShortOptions> {
     let body = arg
         .strip_prefix('-')
         .filter(|body| !body.starts_with('-') && !body.is_empty())?;
     let mut delete_branch = None;
     for (index, flag) in body.char_indices() {
         let suffix = &body[index + flag.len_utf8()..];
-        if short_value_in_context(flag, boolean_flags) {
+        if short_value_in_context(flag, context) {
             return Some(ShortOptions {
                 tokens: if suffix.is_empty() { 2 } else { 1 },
                 delete_branch,
             });
         }
-        if !short_boolean_in_context(flag, boolean_flags) {
+        if !short_boolean_in_context(flag, context) {
             return None;
         }
         if flag == 'd' {
@@ -321,12 +240,14 @@ fn short_options_with_booleans(arg: &str, boolean_flags: &[&str]) -> Option<Shor
     })
 }
 
-fn short_boolean_in_context(flag: char, boolean_flags: &[&str]) -> bool {
-    matches!(flag, 'h' | 'i' | 'w' | 'd' | 'm' | 'r' | 's') || has_short_flag(boolean_flags, flag)
+fn short_boolean_in_context(flag: char, context: CommandOptions) -> bool {
+    matches!(flag, 'h' | 'i' | 'w' | 'd' | 'm' | 'r' | 's')
+        || has_short_flag(context.non_values, flag)
 }
 
-fn short_value_in_context(flag: char, boolean_flags: &[&str]) -> bool {
-    short_option_takes_value(flag) && !has_short_flag(boolean_flags, flag)
+fn short_value_in_context(flag: char, context: CommandOptions) -> bool {
+    (short_option_takes_value(flag) || has_short_flag(context.values, flag))
+        && !has_short_flag(context.non_values, flag)
 }
 
 fn has_short_flag(flags: &[&str], flag: char) -> bool {
@@ -409,7 +330,7 @@ pub fn gh_requires_branch_check(args: &[String]) -> bool {
     if args.first().map(String::as_str) != Some("pr") {
         return false;
     }
-    let Some(pr_sub) = first_positional_after(&args[1..]) else {
+    let Some(pr_sub) = command_verb(args) else {
         return false;
     };
     matches!(pr_sub, "checkout")
@@ -587,39 +508,90 @@ pub fn gh_repo_selector(args: &[String]) -> Option<&str> {
 }
 
 fn gh_repo_selectors(args: &[String]) -> Vec<&str> {
-    let mut selectors = Vec::new();
-    let boolean_flags = command_boolean_flags(args);
+    gh_arguments(args).selectors
+}
+
+#[derive(Default)]
+struct GhArguments<'a> {
+    selectors: Vec<&'a str>,
+    operands: Vec<&'a str>,
+}
+
+fn gh_arguments(args: &[String]) -> GhArguments<'_> {
+    let mut parsed = GhArguments::default();
+    let context = command_options(args);
     let mut i = 0;
     while i < args.len() {
-        match gh_selector_scan_step(args, i, boolean_flags) {
-            GhSelectorStep::Done => break,
+        match gh_selector_scan_step(args, i, context) {
+            GhSelectorStep::Done => {
+                parsed
+                    .operands
+                    .extend(args[i + 1..].iter().map(String::as_str));
+                break;
+            }
             GhSelectorStep::Advance(next) => i = next,
             GhSelectorStep::Found { selector, next } => {
-                selectors.push(selector);
+                parsed.selectors.push(selector);
+                i = next;
+            }
+            GhSelectorStep::Operand { value, next } => {
+                parsed.operands.push(value);
                 i = next;
             }
         }
     }
-    selectors
+    parsed
 }
 
-/// Only known overloaded flags need command context; other option rules stay shared.
-fn command_boolean_flags(args: &[String]) -> &'static [&'static str] {
-    let verb = args.get(1..).and_then(first_positional_after);
-    match (args.first().map(String::as_str), verb) {
-        (Some("pr"), Some("review")) => &["-c", "--comment"],
-        (Some("pr" | "issue"), Some("view")) => &["-c", "--comments"],
-        (Some("release"), Some("create")) => &["-p", "--prerelease"],
-        _ => &[],
+fn command_options(args: &[String]) -> CommandOptions {
+    let family = args.first().map(String::as_str).unwrap_or("");
+    options::for_command(family, command_verb(args))
+}
+
+/// Discover the verb without searching payload text for command names. The
+/// complete argument traversal then uses that verb's exact option metadata.
+fn command_verb(args: &[String]) -> Option<&str> {
+    let family = args.first()?.as_str();
+    let mut i = 1;
+    while let Some(arg) = args.get(i).map(String::as_str) {
+        if arg == "--" {
+            return args
+                .get(i + 1)
+                .map(|verb| options::canonical_verb(family, verb));
+        }
+        if !arg.starts_with('-') {
+            return Some(options::canonical_verb(family, arg));
+        }
+        i += preverb_option_tokens(arg);
     }
+    None
 }
 
-fn selector_option_tokens(arg: &str, next: Option<&str>, boolean_flags: &[&str]) -> Option<usize> {
+fn preverb_option_tokens(arg: &str) -> usize {
+    if matches!(arg, "-h" | "--help") || arg.contains('=') {
+        return 1;
+    }
+    // gh's parent-command discovery consumes separate leaf-option values;
+    // bare leaf booleans before a verb are not equivalent to '=true' forms.
+    if arg.starts_with("--") || arg.len() == 2 {
+        return 2;
+    }
+    let context = CommandOptions {
+        values: options::PREVERB_VALUE_ALIASES,
+        ..CommandOptions::default()
+    };
+    short_options_with_context(arg, context).map_or(1, |options| options.tokens)
+}
+
+fn selector_option_tokens(arg: &str, next: Option<&str>, context: CommandOptions) -> Option<usize> {
     let flag = arg.split('=').next().unwrap_or(arg);
-    if boolean_flags.contains(&flag) {
+    if context.non_values.contains(&flag) {
         return Some(1);
     }
-    short_options_with_booleans(arg, boolean_flags)
+    if context.values.contains(&flag) {
+        return Some(1 + usize::from(!arg.contains('=')));
+    }
+    short_options_with_context(arg, context)
         .map(|options| options.tokens)
         .or_else(|| positional_option_tokens(arg, next))
 }
@@ -628,18 +600,19 @@ enum GhSelectorStep<'a> {
     Done,
     Advance(usize),
     Found { selector: &'a str, next: usize },
+    Operand { value: &'a str, next: usize },
 }
 
 fn gh_selector_scan_step<'a>(
     args: &'a [String],
     i: usize,
-    boolean_flags: &[&str],
+    context: CommandOptions,
 ) -> GhSelectorStep<'a> {
     let a = args[i].as_str();
     if a == "--" {
-        let previous_tokens = i.checked_sub(1).and_then(|previous| {
-            selector_option_tokens(&args[previous], Some("--"), boolean_flags)
-        });
+        let previous_tokens = i
+            .checked_sub(1)
+            .and_then(|previous| selector_option_tokens(&args[previous], Some("--"), context));
         if previous_tokens == Some(1) {
             return GhSelectorStep::Done;
         }
@@ -651,8 +624,14 @@ fn gh_selector_scan_step<'a>(
         }
         return GhSelectorStep::Done;
     }
+    if !a.starts_with('-') {
+        return GhSelectorStep::Operand {
+            value: a,
+            next: i + 1,
+        };
+    }
     let next = args.get(i + 1).map(String::as_str);
-    if let Some((selector, consume_next)) = gh_repo_flag_with_booleans(a, next, boolean_flags) {
+    if let Some((selector, consume_next)) = gh_repo_flag_with_context(a, next, context) {
         return GhSelectorStep::Found {
             selector,
             next: if consume_next { i + 2 } else { i + 1 },
@@ -660,7 +639,7 @@ fn gh_selector_scan_step<'a>(
     }
     // Skip a non-selector value-taking option together with its value so a
     // `--` value cannot terminate scanning prematurely.
-    GhSelectorStep::Advance(i + selector_option_tokens(a, next, boolean_flags).unwrap_or(1))
+    GhSelectorStep::Advance(i + selector_option_tokens(a, next, context).unwrap_or(1))
 }
 
 /// Parse one argv token as a `gh` repo selector flag.
@@ -669,13 +648,13 @@ fn gh_selector_scan_step<'a>(
 /// accepted spelling. A missing required value is an empty selector so callers
 /// can fail closed.
 fn gh_repo_flag<'a>(arg: &'a str, next: Option<&'a str>) -> Option<(&'a str, bool)> {
-    gh_repo_flag_with_booleans(arg, next, &[])
+    gh_repo_flag_with_context(arg, next, CommandOptions::default())
 }
 
-fn gh_repo_flag_with_booleans<'a>(
+fn gh_repo_flag_with_context<'a>(
     arg: &'a str,
     next: Option<&'a str>,
-    boolean_flags: &[&str],
+    context: CommandOptions,
 ) -> Option<(&'a str, bool)> {
     if arg == "--repo" || arg == "-R" {
         return Some((next.unwrap_or(""), true));
@@ -691,13 +670,13 @@ fn gh_repo_flag_with_booleans<'a>(
     {
         return Some((value, false));
     }
-    clustered_short_repo_flag(arg, next, boolean_flags)
+    clustered_short_repo_flag(arg, next, context)
 }
 
 fn clustered_short_repo_flag<'a>(
     arg: &'a str,
     next: Option<&'a str>,
-    boolean_flags: &[&str],
+    context: CommandOptions,
 ) -> Option<(&'a str, bool)> {
     if !arg.starts_with('-') || arg.starts_with("--") {
         return None;
@@ -710,7 +689,7 @@ fn clustered_short_repo_flag<'a>(
     let r_idx = letters.find('R')?;
     if !letters[..r_idx]
         .chars()
-        .all(|c| c.is_ascii_alphabetic() && !short_value_in_context(c, boolean_flags))
+        .all(|c| c.is_ascii_alphabetic() && !short_value_in_context(c, context))
     {
         return None;
     }
@@ -770,18 +749,18 @@ pub fn enforce_gh_repo_targets(
     allowlist: &OwnerAllowlist,
     implicit_repo: Option<&str>,
 ) -> Result<()> {
-    let selectors = gh_repo_selectors(args);
-    for selector in &selectors {
+    let parsed = gh_arguments(args);
+    for selector in &parsed.selectors {
         allowlist.enforce_repo_selector(selector)?;
     }
-    let positionals = gh_positional_repo_targets(args)?;
+    let positionals = gh_positional_repo_targets(args, &parsed.operands)?;
     for selector in &positionals {
         allowlist.enforce_repo_selector(selector)?;
     }
-    if let Some(owner) = gh_api_owner_target(args)? {
+    if let Some(owner) = gh_api_owner_target(args, &parsed.operands)? {
         return allowlist.enforce_owner(owner);
     }
-    if !selectors.is_empty() || !positionals.is_empty() {
+    if !parsed.selectors.is_empty() || !positionals.is_empty() {
         return Ok(());
     }
     // The implicit GH_REPO selector only applies to commands that actually
@@ -797,13 +776,13 @@ pub fn enforce_gh_repo_targets(
 
 /// Owner-bearing positionals that `-R` / `GH_REPO` do not cover: `gh repo`
 /// operands and GitHub issue/PR URLs or `owner/repo#n` tokens.
-fn gh_positional_repo_targets(args: &[String]) -> Result<Vec<String>> {
+fn gh_positional_repo_targets(args: &[String], operands: &[&str]) -> Result<Vec<String>> {
     let Some(subcommand) = args.first().map(String::as_str) else {
         return Ok(Vec::new());
     };
     match subcommand {
         "repo" => Ok(gh_repo_positional_targets(&args[1..])),
-        "pr" | "issue" => gh_issue_or_pr_positional_targets(&args[1..]),
+        "pr" | "issue" => gh_issue_or_pr_positional_targets(operands),
         _ => Ok(Vec::new()),
     }
 }
@@ -812,11 +791,11 @@ fn gh_positional_repo_targets(args: &[String]) -> Result<Vec<String>> {
 /// endpoints without interpreting opaque bodies or GraphQL node IDs. Owner
 /// placeholders use gh's context; a literal owner remains enforceable when
 /// only the repository is a placeholder.
-fn gh_api_owner_target(args: &[String]) -> Result<Option<&str>> {
+fn gh_api_owner_target<'a>(args: &[String], operands: &[&'a str]) -> Result<Option<&'a str>> {
     if args.first().map(String::as_str) != Some("api") {
         return Ok(None);
     }
-    let Some(endpoint) = first_positional_after(&args[1..]) else {
+    let Some(&endpoint) = operands.get(1) else {
         return Ok(None);
     };
     let path = match http_url_parts(endpoint)? {
@@ -876,8 +855,9 @@ fn first_operand_after<'a>(args: &'a [String], token: &str) -> Option<&'a str> {
     first_positional_after(&args[idx + 1..])
 }
 
-fn gh_issue_or_pr_positional_targets(args: &[String]) -> Result<Vec<String>> {
-    args.iter()
+fn gh_issue_or_pr_positional_targets(operands: &[&str]) -> Result<Vec<String>> {
+    operands
+        .iter()
         .filter_map(|token| positional_github_repo_token(token).transpose())
         .collect()
 }
