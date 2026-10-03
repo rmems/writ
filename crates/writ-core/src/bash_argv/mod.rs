@@ -328,6 +328,13 @@ pub(crate) enum GitGhTool {
 pub(crate) struct GitGhInvocation {
     pub tool: GitGhTool,
     pub args: Vec<String>,
+    /// Effective `-C` directory a git invocation will run in, joined when
+    /// multiple `-C` operands are chained. May be relative to the process cwd.
+    pub git_dir: Option<std::path::PathBuf>,
+    /// A location global other than `-C` (`--git-dir`, `--work-tree`,
+    /// `--namespace`, `--super-prefix`) was stripped, so the real target
+    /// repository is not fully known from argv alone.
+    pub other_location_global: bool,
 }
 
 pub(crate) struct UnparsedCommand<'a>(pub ShellText<'a>);
@@ -372,11 +379,18 @@ fn invocation_from_tokens(tokens: &[String]) -> Option<GitGhInvocation> {
         "gh" => GitGhTool::Gh,
         _ => return None,
     };
+    let mut git_dir = None;
+    let mut other_location_global = false;
     let args = match tool {
-        GitGhTool::Git => skip_git_globals(Argv(rest)),
+        GitGhTool::Git => skip_git_globals(Argv(rest), &mut git_dir, &mut other_location_global),
         GitGhTool::Gh => rest.to_vec(),
     };
-    Some(GitGhInvocation { tool, args })
+    Some(GitGhInvocation {
+        tool,
+        args,
+        git_dir,
+        other_location_global,
+    })
 }
 
 fn strip_env_assignments(tokens: Argv<'_>) -> &[String] {
@@ -399,7 +413,11 @@ fn is_env_assignment(token: ArgToken<'_>) -> bool {
         && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-fn skip_git_globals(args: Argv<'_>) -> Vec<String> {
+fn skip_git_globals(
+    args: Argv<'_>,
+    git_dir: &mut Option<std::path::PathBuf>,
+    other_location_global: &mut bool,
+) -> Vec<String> {
     let mut rest = args.0;
     loop {
         let Some(first) = rest.first() else {
@@ -408,10 +426,37 @@ fn skip_git_globals(args: Argv<'_>) -> Vec<String> {
         match GitPrefix::classify(ArgToken(first)) {
             GitPrefix::Operand => return rest.to_vec(),
             GitPrefix::EndOfOptions => return rest.get(1..).unwrap_or(&[]).to_vec(),
-            GitPrefix::TakesValue => rest = rest.get(2..).unwrap_or(&[]),
-            GitPrefix::EqualsForm => rest = rest.get(1..).unwrap_or(&[]),
+            GitPrefix::TakesValue => {
+                record_location_global(first, rest.get(1), git_dir, other_location_global);
+                rest = rest.get(2..).unwrap_or(&[])
+            }
+            GitPrefix::EqualsForm => {
+                *other_location_global = true;
+                rest = rest.get(1..).unwrap_or(&[])
+            }
         }
     }
+}
+
+/// Track the repository a location global points at. `-C` operands fold into
+/// the effective directory (git resolves each relative to the previous);
+/// other location globals mark the target as not fully known.
+fn record_location_global(
+    flag: &str,
+    value: Option<&String>,
+    git_dir: &mut Option<std::path::PathBuf>,
+    other_location_global: &mut bool,
+) {
+    if flag != "-C" {
+        *other_location_global = true;
+        return;
+    }
+    let Some(dir) = value else { return };
+    let next = std::path::PathBuf::from(dir);
+    *git_dir = Some(match git_dir.take() {
+        Some(base) if !next.is_absolute() => base.join(next),
+        _ => next,
+    });
 }
 
 #[derive(Clone, Copy)]

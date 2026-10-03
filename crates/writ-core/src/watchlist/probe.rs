@@ -5,7 +5,8 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use super::WatchlistError;
-use crate::git_safe::{GhRun, SafeGhCommand};
+use crate::owners::OwnerAllowlist;
+use crate::supervisor::{RunOptions, SupervisedOutput, Supervisor};
 
 /// Default wall-clock deadline for a single `gh pr view` probe. A hung `gh`
 /// (network stall, credential prompt) is killed after this and mapped to
@@ -70,43 +71,76 @@ impl PrProbe for GhPrProbe {
             "number,title,url,state,headRefName,baseRefName,mergeable,reviewDecision,isDraft,statusCheckRollup"
                 .to_owned(),
         ];
-        let cmd = SafeGhCommand::new(&args)?;
-        // Use a bounded wall-clock deadline: a truly hung `gh` never returns
-        // from blocking `output()`, so the stderr-based `looks_like_timeout`
-        // heuristic below can never fire. The deadline turns a stall into an
-        // explicit WatchlistError::Timeout; the stderr mapping stays as a
-        // fallback for a `gh` that exits non-zero with a timeout message.
-        let output = match cmd.run_with_timeout(GH_PROBE_TIMEOUT)? {
-            GhRun::Completed(output) => output,
-            GhRun::TimedOut { timeout } => {
-                return Err(WatchlistError::Timeout {
-                    repo: repo.to_owned(),
-                    number,
-                    message: format!("gh pr view exceeded {}s deadline", timeout.as_secs()),
-                });
-            }
+        let output = run_gh_supervised(args)?;
+        let stdout = parse_probe_output(repo, number, output)?;
+        parse_pr_view(repo, &stdout)
+    }
+}
+
+fn run_gh_supervised(args: [String; 7]) -> Result<SupervisedOutput, WatchlistError> {
+    let worker = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|source| WatchlistError::Io {
+                context: "create gh probe runtime",
+                path: std::path::PathBuf::from("gh"),
+                source,
+            })?;
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let options = RunOptions {
+            allowlist: Some(OwnerAllowlist::from_env()),
+            ..RunOptions::default()
         };
-        if output.exit_code != 0 {
-            let stderr = output.stderr.trim();
-            if looks_like_timeout(stderr) {
-                return Err(WatchlistError::Timeout {
-                    repo: repo.to_owned(),
-                    number,
-                    message: stderr.to_owned(),
-                });
-            }
-            return Err(WatchlistError::Gh {
+        runtime
+            .block_on(Supervisor::new(1).run("gh", &refs, Some(GH_PROBE_TIMEOUT), &options))
+            .map_err(WatchlistError::from)
+    });
+    worker.join().map_err(|_| WatchlistError::Gh {
+        repo: String::new(),
+        number: 0,
+        message: "gh probe supervisor thread panicked".to_owned(),
+    })?
+}
+
+fn parse_probe_output(
+    repo: &str,
+    number: u64,
+    output: SupervisedOutput,
+) -> Result<String, WatchlistError> {
+    if output.timed_out {
+        return Err(WatchlistError::Timeout {
+            repo: repo.to_owned(),
+            number,
+            message: format!(
+                "gh pr view exceeded {}s deadline",
+                GH_PROBE_TIMEOUT.as_secs()
+            ),
+        });
+    }
+    if output.exit_code != Some(0) {
+        let stderr = output.stderr.trim();
+        if looks_like_timeout(stderr) {
+            return Err(WatchlistError::Timeout {
                 repo: repo.to_owned(),
                 number,
-                message: if stderr.is_empty() {
-                    format!("gh pr view exited {}", output.exit_code)
-                } else {
-                    stderr.to_owned()
-                },
+                message: stderr.to_owned(),
             });
         }
-        parse_pr_view(repo, &output.stdout)
+        return Err(WatchlistError::Gh {
+            repo: repo.to_owned(),
+            number,
+            message: if stderr.is_empty() {
+                match output.exit_code {
+                    Some(code) => format!("gh pr view exited {code}"),
+                    None => "gh pr view was killed".to_owned(),
+                }
+            } else {
+                stderr.to_owned()
+            },
+        });
     }
+    Ok(output.stdout)
 }
 
 fn looks_like_timeout(message: &str) -> bool {
@@ -216,5 +250,24 @@ mod tests {
     fn parse_invalid_json_is_gh_error() {
         let err = parse_pr_view("acme/widgets", "{").unwrap_err();
         assert!(matches!(err, WatchlistError::Gh { .. }));
+    }
+
+    #[test]
+    fn supervised_timeout_maps_to_watchlist_timeout() {
+        let output = crate::supervisor::SupervisedOutput {
+            timed_out: true,
+            ..crate::supervisor::SupervisedOutput::default()
+        };
+
+        let err = parse_probe_output("acme/widgets", 7, output).unwrap_err();
+
+        assert!(matches!(
+            err,
+            WatchlistError::Timeout {
+                repo,
+                number: 7,
+                ..
+            } if repo == "acme/widgets"
+        ));
     }
 }

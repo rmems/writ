@@ -9,9 +9,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
-use crate::error::{Error, Result};
+use crate::error::{Error, PolicyCode, Result};
 
 /// Lease admission modes reserved by #124. Phase 1 only uses
 /// `WriterLocked` (held) and `Unassigned` (released, identity kept).
@@ -23,6 +23,8 @@ pub enum LeaseMode {
     NeedsHuman,
     Blocked,
     MergeReady,
+    /// Stored value is not one of the known modes. Not treated as released.
+    Unknown,
 }
 
 impl LeaseMode {
@@ -35,6 +37,7 @@ impl LeaseMode {
             Self::NeedsHuman => "NEEDS_HUMAN",
             Self::Blocked => "BLOCKED",
             Self::MergeReady => "MERGE_READY",
+            Self::Unknown => "UNKNOWN",
         }
     }
 
@@ -45,7 +48,8 @@ impl LeaseMode {
             "NEEDS_HUMAN" => Self::NeedsHuman,
             "BLOCKED" => Self::Blocked,
             "MERGE_READY" => Self::MergeReady,
-            _ => Self::Unassigned,
+            "UNASSIGNED" => Self::Unassigned,
+            _ => Self::Unknown,
         }
     }
 }
@@ -62,6 +66,8 @@ pub struct Lease {
     pub worktree_path: String,
     pub start_commit: String,
     pub mode: LeaseMode,
+    /// Stored mode text before mapping; unrecognized values survive verbatim.
+    pub mode_raw: String,
     pub ttl: Option<i64>,
     pub heartbeat: Option<i64>,
     pub max_files: Option<i64>,
@@ -69,6 +75,20 @@ pub struct Lease {
     pub max_fix_cycles: Option<i64>,
     pub fix_cycles: Option<i64>,
     pub released_at: Option<i64>,
+    /// SQLite row id. Identity for the lease record, not an ownership generation.
+    pub row_id: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// One `agents` registry row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentRecord {
+    pub agent_id: String,
+    pub agent_type: String,
+    pub session_id: Option<String>,
+    pub started_at: i64,
+    pub stopped_at: Option<i64>,
 }
 
 /// Inputs required to grant or refresh a writer lock.
@@ -113,7 +133,7 @@ struct LeaseSql {
     context: &'static str,
 }
 
-const LEASE_SELECT: &str = "SELECT repo, owner, repo_name, job_id, branch, branch_ref, worktree_path, start_commit, mode, ttl, heartbeat, max_files, max_churn, max_fix_cycles, fix_cycles, released_at FROM leases";
+const LEASE_SELECT: &str = "SELECT repo, owner, repo_name, job_id, branch, branch_ref, worktree_path, start_commit, mode, ttl, heartbeat, max_files, max_churn, max_fix_cycles, fix_cycles, released_at, id, created_at, updated_at FROM leases";
 
 /// SQLite-backed lease and agent registry.
 #[derive(Debug)]
@@ -174,6 +194,17 @@ impl LeaseStore {
         })
     }
 
+    /// Open an existing store without creating files or applying schema.
+    pub fn open_read_only(path: impl Into<PathBuf>) -> Result<Self> {
+        let path = path.into();
+        let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|e| lease_err("open lease store read-only", e))?;
+        Ok(Self {
+            path,
+            conn: Mutex::new(conn),
+        })
+    }
+
     /// Filesystem path of this store.
     #[must_use]
     pub fn path(&self) -> &Path {
@@ -181,13 +212,18 @@ impl LeaseStore {
     }
 
     /// Grant or refresh a writer lock, keeping reserved budget columns null.
+    ///
+    /// The conflict target `(owner, repo_name, job_id)` refreshes in place only
+    /// when the existing row is released or names the same `worktree_path`; an
+    /// active lease held by a different checkout path is never seized — the
+    /// grant fails with [`PolicyCode::LeaseConflict`].
     pub fn grant(&self, grant: LeaseGrant<'_>) -> Result<Lease> {
         let now = now_secs();
         let repo = path_text(grant.repo);
         let worktree_path = path_text(grant.worktree_path);
         let branch_ref = format!("refs/heads/{}", grant.branch);
         let conn = self.lock()?;
-        conn.execute(
+        let changed = conn.execute(
             "
             INSERT INTO leases (
                 repo, owner, repo_name, job_id, branch, branch_ref, worktree_path,
@@ -204,6 +240,8 @@ impl LeaseStore {
                 heartbeat = excluded.heartbeat,
                 updated_at = excluded.updated_at,
                 released_at = NULL
+            WHERE leases.released_at IS NOT NULL
+                OR leases.worktree_path = excluded.worktree_path
             ",
             params![
                 repo,
@@ -220,6 +258,15 @@ impl LeaseStore {
         )
         .map_err(|e| lease_err("grant lease", e))?;
         drop(conn);
+        if changed == 0 {
+            return Err(Error::PolicyViolation {
+                code: PolicyCode::LeaseConflict,
+                message: format!(
+                    "job `{}` already holds an active lease for a different worktree path",
+                    grant.job_id
+                ),
+            });
+        }
         self.find_job(JobKey {
             owner: grant.owner,
             repo_name: grant.repo_name,
@@ -269,6 +316,43 @@ impl LeaseStore {
             },
             params![key.owner, key.repo_name, key.job_id],
         )
+    }
+
+    /// All currently held (unreleased) leases, in insertion order.
+    pub fn list_active(&self) -> Result<Vec<Lease>> {
+        let conn = self.lock()?;
+        list_leases_on(
+            &conn,
+            "WHERE released_at IS NULL ORDER BY id",
+            "list active leases",
+        )
+    }
+
+    /// All lease identity rows, including released ones, in insertion order.
+    pub fn list_all(&self) -> Result<Vec<Lease>> {
+        let conn = self.lock()?;
+        list_leases_on(&conn, "ORDER BY id", "list leases")
+    }
+
+    /// Agent registry rows, live first, then by start time.
+    pub fn list_agents(&self) -> Result<Vec<AgentRecord>> {
+        let conn = self.lock()?;
+        list_agents_on(&conn)
+    }
+
+    /// Leases and agents from one read transaction.
+    ///
+    /// The mutex serializes this connection only; the transaction keeps other
+    /// processes' writes from splitting the two reads.
+    pub fn snapshot(&self) -> Result<(Vec<Lease>, Vec<AgentRecord>)> {
+        let conn = self.lock()?;
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| lease_err("snapshot transaction", e))?;
+        let leases = list_leases_on(&tx, "ORDER BY id", "list leases")?;
+        let agents = list_agents_on(&tx)?;
+        tx.commit().map_err(|e| lease_err("snapshot commit", e))?;
+        Ok((leases, agents))
     }
 
     /// Look up a lease by worktree path.
@@ -351,9 +435,35 @@ impl LeaseStore {
     }
 }
 
+fn list_leases_on(conn: &Connection, suffix: &str, context: &'static str) -> Result<Vec<Lease>> {
+    let query = format!("{LEASE_SELECT} {suffix}");
+    let mut stmt = conn.prepare(&query).map_err(|e| lease_err(context, e))?;
+    let rows = stmt
+        .query_map([], lease_from_row)
+        .map_err(|e| lease_err(context, e))?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| lease_err(context, e))
+}
+
+fn list_agents_on(conn: &Connection) -> Result<Vec<AgentRecord>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT agent_id, agent_type, session_id, started_at, stopped_at
+             FROM agents
+             ORDER BY (stopped_at IS NOT NULL), started_at, agent_id",
+        )
+        .map_err(|e| lease_err("list agents", e))?;
+    let rows = stmt
+        .query_map([], agent_from_row)
+        .map_err(|e| lease_err("list agents", e))?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| lease_err("list agents", e))
+}
+
 fn lease_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Lease> {
     let identity = lease_identity(row)?;
     let limits = lease_limits(row)?;
+    let meta = lease_meta(row)?;
     Ok(Lease {
         repo: identity.repo,
         owner: identity.owner,
@@ -364,6 +474,7 @@ fn lease_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Lease> {
         worktree_path: identity.worktree_path,
         start_commit: identity.start_commit,
         mode: identity.mode,
+        mode_raw: identity.mode_raw,
         ttl: limits.ttl,
         heartbeat: limits.heartbeat,
         max_files: limits.max_files,
@@ -371,6 +482,33 @@ fn lease_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Lease> {
         max_fix_cycles: limits.max_fix_cycles,
         fix_cycles: limits.fix_cycles,
         released_at: limits.released_at,
+        row_id: meta.row_id,
+        created_at: meta.created_at,
+        updated_at: meta.updated_at,
+    })
+}
+
+fn agent_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRecord> {
+    Ok(AgentRecord {
+        agent_id: row.get(0)?,
+        agent_type: row.get(1)?,
+        session_id: row.get(2)?,
+        started_at: row.get(3)?,
+        stopped_at: row.get(4)?,
+    })
+}
+
+struct LeaseMeta {
+    row_id: i64,
+    created_at: i64,
+    updated_at: i64,
+}
+
+fn lease_meta(row: &rusqlite::Row<'_>) -> rusqlite::Result<LeaseMeta> {
+    Ok(LeaseMeta {
+        row_id: row.get(16)?,
+        created_at: row.get(17)?,
+        updated_at: row.get(18)?,
     })
 }
 
@@ -384,6 +522,7 @@ struct LeaseIdentity {
     worktree_path: String,
     start_commit: String,
     mode: LeaseMode,
+    mode_raw: String,
 }
 
 struct LeaseLimits {
@@ -408,7 +547,8 @@ fn lease_identity(row: &rusqlite::Row<'_>) -> rusqlite::Result<LeaseIdentity> {
         branch_ref: refs.0,
         worktree_path: refs.1,
         start_commit: refs.2,
-        mode: refs.3,
+        mode: LeaseMode::parse(&refs.3),
+        mode_raw: refs.3,
     })
 }
 
@@ -424,13 +564,8 @@ fn lease_names(
     ))
 }
 
-fn lease_refs(row: &rusqlite::Row<'_>) -> rusqlite::Result<(String, String, String, LeaseMode)> {
-    Ok((
-        row.get(5)?,
-        row.get(6)?,
-        row.get(7)?,
-        LeaseMode::parse(&row.get::<_, String>(8)?),
-    ))
+fn lease_refs(row: &rusqlite::Row<'_>) -> rusqlite::Result<(String, String, String, String)> {
+    Ok((row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?))
 }
 
 fn lease_limits(row: &rusqlite::Row<'_>) -> rusqlite::Result<LeaseLimits> {
@@ -507,10 +642,21 @@ mod tests {
         assert_eq!(held.max_files, None);
         assert_eq!(held.fix_cycles, None);
         assert!(held.released_at.is_none());
+        assert!(held.row_id > 0);
+        assert!(held.created_at > 0);
 
         let released = store.release_by_path(&wt).unwrap().unwrap();
         assert_eq!(released.mode, LeaseMode::Unassigned);
         assert!(released.released_at.is_some());
+
+        let active = store.list_active().unwrap();
+        assert!(active.is_empty(), "released lease must not list as active");
+        let all = store.list_all().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].mode, LeaseMode::Unassigned);
+        let all = store.list_all().unwrap();
+        assert_eq!(all.len(), 1);
+        assert!(all[0].released_at.is_some());
 
         let resume = store
             .find_resume(ResumeKey {
@@ -526,6 +672,48 @@ mod tests {
     }
 
     #[test]
+    fn grant_refuses_active_lease_held_by_different_path() {
+        let tmp = tempdir().unwrap();
+        let store = LeaseStore::open(tmp.path().join("leases.db")).unwrap();
+        let repo = tmp.path().join("repo");
+        let wt_a = tmp.path().join("checkouts/a");
+        let wt_b = tmp.path().join("checkouts/b");
+        fn grant_for<'a>(repo: &'a Path, wt: &'a Path) -> LeaseGrant<'a> {
+            LeaseGrant {
+                repo,
+                owner: "local",
+                repo_name: "repo",
+                job_id: "job-1",
+                branch: "hive/job-1",
+                worktree_path: wt,
+                start_commit: "abc123",
+            }
+        }
+
+        store.grant(grant_for(&repo, &wt_a)).unwrap();
+
+        // A different path for the same job id is a conflict, not a seize.
+        let err = store.grant(grant_for(&repo, &wt_b)).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::LeaseConflict,
+                ..
+            }
+        ));
+
+        // Re-granting the same path refreshes in place.
+        let refreshed = store.grant(grant_for(&repo, &wt_a)).unwrap();
+        assert!(refreshed.released_at.is_none());
+        assert_eq!(refreshed.worktree_path, wt_a);
+
+        // After release, the other path can take the identity.
+        store.release_by_path(&wt_a).unwrap();
+        let moved = store.grant(grant_for(&repo, &wt_b)).unwrap();
+        assert_eq!(moved.worktree_path, wt_b);
+    }
+
+    #[test]
     fn agent_upsert_and_retire() {
         let tmp = tempdir().unwrap();
         let store = LeaseStore::open(tmp.path().join("leases.db")).unwrap();
@@ -536,7 +724,20 @@ mod tests {
                 session_id: Some("session-1"),
             })
             .unwrap();
+        store
+            .upsert_agent(AgentIdentity {
+                agent_id: "agent-2",
+                agent_type: "Worker",
+                session_id: None,
+            })
+            .unwrap();
         store.retire_agent("agent-1").unwrap();
+        let agents = store.list_agents().unwrap();
+        assert_eq!(agents.len(), 2);
+        assert_eq!(agents[0].agent_id, "agent-2");
+        assert!(agents[0].stopped_at.is_none());
+        assert_eq!(agents[1].agent_id, "agent-1");
+        assert!(agents[1].stopped_at.is_some());
         let conn = store.conn.lock().unwrap();
         let stopped: Option<i64> = conn
             .query_row(
@@ -546,5 +747,40 @@ mod tests {
             )
             .unwrap();
         assert!(stopped.is_some());
+    }
+
+    #[test]
+    fn unrecognized_mode_is_unknown_not_unassigned() {
+        let tmp = tempdir().unwrap();
+        let store = LeaseStore::open(tmp.path().join("leases.db")).unwrap();
+        let repo = tmp.path().join("repo");
+        let wt = tmp.path().join("checkouts/a");
+        store
+            .grant(LeaseGrant {
+                repo: &repo,
+                owner: "acme",
+                repo_name: "sample",
+                job_id: "job-a",
+                branch: "hive/a",
+                worktree_path: &wt,
+                start_commit: "abc123",
+            })
+            .unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute("UPDATE leases SET mode = 'NOT_A_MODE'", [])
+                .unwrap();
+        }
+        let lease = store
+            .find_job(JobKey {
+                owner: "acme",
+                repo_name: "sample",
+                job_id: "job-a",
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(lease.mode, LeaseMode::Unknown);
+        assert_eq!(lease.mode_raw, "NOT_A_MODE");
+        assert_ne!(lease.mode, LeaseMode::Unassigned);
     }
 }

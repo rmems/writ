@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::time::Duration;
 
 use super::*;
 use crate::watchlist::import::import_pr_babysit;
@@ -425,42 +424,6 @@ fn check_maps_probe_timeout_to_entry_status() {
     assert_eq!(
         report.checked[0].residual_blockers,
         vec!["timeout:gh".to_owned()]
-    );
-}
-
-#[test]
-fn probe_timeout_maps_to_watchlist_timeout() {
-    // A stalled child must surface as WatchlistError::Timeout. `sleep 5`
-    // is not gh, so we exercise the mapping via a tiny probe that reuses
-    // the same GhRun::TimedOut -> Timeout logic shape.
-    struct SlowProbe;
-    impl PrProbe for SlowProbe {
-        fn view(&self, repo: &str, number: u64) -> Result<PrSnapshot, WatchlistError> {
-            use crate::git_safe::{GhRun, SafeGhCommand};
-            // `version` is allowlisted and returns fast; force the timeout
-            // path with a zero deadline to assert the mapping.
-            let cmd = SafeGhCommand::new(&[
-                "pr".to_owned(),
-                "view".to_owned(),
-                number.to_string(),
-                "--repo".to_owned(),
-                repo.to_owned(),
-            ])?;
-            match cmd.run_with_timeout(Duration::from_millis(0)) {
-                Ok(GhRun::TimedOut { timeout }) => Err(WatchlistError::Timeout {
-                    repo: repo.to_owned(),
-                    number,
-                    message: format!("gh exceeded {}s deadline", timeout.as_secs()),
-                }),
-                Ok(GhRun::Completed(_)) => Ok(open_snap(repo, number, "feat/a", "main")),
-                Err(err) => Err(err.into()),
-            }
-        }
-    }
-    let err = SlowProbe.view("acme/widgets", 1).unwrap_err();
-    assert!(
-        matches!(err, WatchlistError::Timeout { number: 1, .. }),
-        "expected timeout, got {err:?}"
     );
 }
 

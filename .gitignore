@@ -296,6 +296,12 @@ SKILL-grok-linear.md
 # OpenCode agent skills / local tooling (not product)
 .opencode/
 
+# Qodana scan output (local runs; Qodana CI removed in #155)
+qodana/
+.qodana-venv
+*.sarif
+*.sarif.json
+
 # Local agent / IDE MCP scratch (never commit)
 .chroma_recall_status.json
 .chroma_recall_tmp.py

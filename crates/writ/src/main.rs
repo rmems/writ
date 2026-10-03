@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 mod watchlist;
 
@@ -15,15 +15,22 @@ struct Cli {
     #[arg(long, global = true)]
     json: bool,
 
+    /// Comma-separated GitHub owners allowed for worktree create and `gh -R`.
+    ///
+    /// Overrides `WRIT_ALLOWED_OWNERS` / `WH_ALLOWED_OWNERS` when present. An
+    /// empty value is still deny-by-default.
+    #[arg(long, global = true, value_name = "OWNERS")]
+    allowed_owners: Option<String>,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Show status of all watched jobs.
+    /// Show collaboration status from the shared lease store.
     Status,
-    /// List all watched jobs (alias for status).
+    /// List collaboration participants (alias for status).
     Jobs,
     /// Validate and run a git command under safety policy.
     GitSafe {
@@ -53,16 +60,17 @@ enum Command {
         action: SupervisorAction,
     },
 
-    /// Isolated git worktree lifecycle (create/list/remove/prune).
+    /// Checkout coordination (register/unregister/inspect/list) plus the
+    /// deprecated managed lifecycle (create/remove/prune).
     Worktree {
         #[command(subcommand)]
         action: WorktreeAction,
     },
 
-    /// Multi-owner PR watchlist persisted in `watchlist.json`.
-    Watchlist {
+    /// Format an attributed PR thread reply or summary comment.
+    Attribution {
         #[command(subcommand)]
-        action: WatchlistAction,
+        action: AttributionAction,
     },
 
     /// Dispatch a Claude Code hook event from JSON on stdin.
@@ -76,6 +84,12 @@ enum Command {
         /// Executable the hook should invoke (default: `WRIT_BIN`, then `writ` on `PATH`).
         #[arg(long)]
         writ_bin: Option<PathBuf>,
+    },
+
+    /// Persistent external PR visibility (not shared coordination authority).
+    Watchlist {
+        #[command(subcommand)]
+        action: WatchlistAction,
     },
 }
 
@@ -170,7 +184,32 @@ enum WatchlistAction {
 
 #[derive(Debug, Subcommand)]
 enum WorktreeAction {
-    /// Create a worktree for a hive job under the sandboxed base path.
+    /// Register an existing, harness-created checkout for coordination.
+    ///
+    /// Writ does not create, move, or modify the checkout; this only writes a
+    /// coordination record in the shared lease store. Works for any path:
+    /// a linked worktree, the primary checkout, or a standalone clone.
+    Register {
+        /// Path to an existing git checkout (any location).
+        path: PathBuf,
+        /// Job id for the coordination record (default: checkout dir name).
+        #[arg(long)]
+        job: Option<String>,
+    },
+    /// Release the coordination record for a checkout. Never deletes files,
+    /// branches, or uncommitted changes.
+    Unregister {
+        /// Path of the registered checkout.
+        path: PathBuf,
+    },
+    /// Read-only inspection of a checkout: branch, HEAD, dirty/detached state,
+    /// repo identity. Writes nothing.
+    Inspect {
+        /// Path to an existing git checkout.
+        path: PathBuf,
+    },
+    /// Deprecated: create a worktree under the sandboxed base path.
+    /// The harness should create checkouts itself; use `register` instead.
     Create {
         /// Repository root (git dir / working tree).
         #[arg(long)]
@@ -203,9 +242,10 @@ enum WorktreeAction {
         )]
         schema_version: u8,
     },
-    /// List hive worktrees under the configured base.
+    /// List registered checkouts in the shared coordination store.
     List,
-    /// Remove a worktree path (must stay under the sandbox base).
+    /// Deprecated: remove a worktree path (must stay under the sandbox base).
+    /// The harness owns physical cleanup; use `unregister` for coordination.
     Remove {
         /// Absolute or relative worktree path.
         path: PathBuf,
@@ -213,10 +253,121 @@ enum WorktreeAction {
         #[arg(long)]
         force: bool,
     },
-    /// Prune stale git worktree metadata for a repo.
+    /// Deprecated: prune stale git worktree metadata for a repo.
+    /// Equivalent to `git worktree prune`; physical cleanup is harness-owned.
     Prune {
         #[arg(long)]
         repo: PathBuf,
+    },
+}
+
+/// Timeout-policy knobs for `writ supervisor run`, grouped so the many
+/// second-valued budgets travel together instead of as loose primitives.
+#[derive(Debug, Args)]
+struct SupervisorTimeouts {
+    /// Wall-clock timeout in seconds. 0 means no timeout.
+    #[arg(
+        long,
+        env = writ_core::timeout_policy::ENV_TIMEOUT_SECS,
+        default_value_t = writ_core::timeout_policy::DEFAULT_WORKER_SECS
+    )]
+    timeout: u64,
+
+    /// Idle hang detector: no captured output for this many seconds. 0 disables.
+    /// `--stall` is an alias from the RM-129 comparison lane (same detector).
+    #[arg(
+        long,
+        visible_alias = "stall",
+        env = writ_core::timeout_policy::ENV_IDLE_SECS,
+        default_value_t = writ_core::timeout_policy::DEFAULT_IDLE_SECS
+    )]
+    idle: u64,
+
+    /// Optional per-step cap in seconds. 0 disables.
+    #[arg(
+        long,
+        env = writ_core::timeout_policy::ENV_STEP_SECS,
+        default_value_t = writ_core::timeout_policy::DEFAULT_STEP_SECS
+    )]
+    step: u64,
+
+    /// Overall wait budget in seconds. 0 falls back to `--timeout`.
+    #[arg(
+        long,
+        env = writ_core::timeout_policy::ENV_ORCHESTRATOR_SECS,
+        default_value_t = writ_core::timeout_policy::DEFAULT_ORCHESTRATOR_SECS
+    )]
+    orchestrator: u64,
+
+    /// Seconds between SIGTERM and SIGKILL (Unix). 0 = kill immediately.
+    #[arg(
+        long,
+        env = writ_core::timeout_policy::ENV_GRACE_SECS,
+        default_value_t = writ_core::timeout_policy::DEFAULT_GRACE_SECS
+    )]
+    grace: u64,
+
+    /// Progress tick interval on stderr while waiting. 0 disables.
+    #[arg(
+        long,
+        env = writ_core::timeout_policy::ENV_PROGRESS_SECS,
+        default_value_t = writ_core::timeout_policy::DEFAULT_PROGRESS_SECS
+    )]
+    progress_secs: u64,
+
+    /// Harness redispatch budget recorded on the policy. Supervisor never retries.
+    #[arg(
+        long,
+        env = writ_core::timeout_policy::ENV_MAX_REDISPATCH,
+        default_value_t = writ_core::timeout_policy::DEFAULT_MAX_REDISPATCH_PER_ITEM
+    )]
+    max_redispatch: u32,
+}
+
+impl SupervisorTimeouts {
+    /// Build the core timeout policy from the parsed second-valued budgets.
+    fn to_policy(&self) -> writ_core::timeout_policy::TimeoutPolicy {
+        writ_core::timeout_policy::TimeoutPolicy {
+            worker: secs_opt(self.timeout),
+            step: secs_opt(self.step),
+            idle: secs_opt(self.idle),
+            orchestrator: secs_opt(self.orchestrator),
+            grace: Duration::from_secs(self.grace),
+            max_redispatch_per_item: self.max_redispatch,
+            progress_every: secs_opt(self.progress_secs),
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum AttributionAction {
+    /// Render a reply body with attribution and optional commit SHA.
+    Format {
+        /// Main reply content.
+        #[arg(long, allow_hyphen_values = true)]
+        body: String,
+        /// Identity line. Overrides `WRIT_AGENT_ID` / `WRIT_ATTRIBUTION`.
+        #[arg(long)]
+        agent_id: Option<String>,
+        /// Actual commit SHA when discussing committed work. Omit for
+        /// coordination messages and when no code changed. Never invent a SHA.
+        #[arg(long)]
+        commit_sha: Option<String>,
+        /// `footer` (default) or `header`.
+        #[arg(long)]
+        placement: Option<String>,
+        /// Linear or issue id when one exists. Omit rather than inventing.
+        #[arg(long)]
+        task: Option<String>,
+        /// Assigned branch when one exists. Omit rather than inventing.
+        #[arg(long)]
+        branch: Option<String>,
+        /// Agent session id when one exists. Omit rather than inventing.
+        #[arg(long)]
+        session: Option<String>,
+        /// Format as a PR-level comment instead of a review thread reply.
+        #[arg(long)]
+        pr_comment: bool,
     },
 }
 
@@ -224,9 +375,8 @@ enum WorktreeAction {
 enum SupervisorAction {
     /// Run a command under supervision.
     Run {
-        /// Wall-clock timeout in seconds. 0 means no timeout.
-        #[arg(long, default_value = "0")]
-        timeout: u64,
+        #[command(flatten)]
+        timeouts: SupervisorTimeouts,
 
         /// Expected branch for mutating supervised `git` / `gh pr` commands.
         #[arg(long)]
@@ -251,27 +401,20 @@ enum SupervisorAction {
 async fn main() -> ExitCode {
     let cli = Cli::parse();
     let json = cli.json;
-    let worktree_command = worktree_command_name(&cli);
+    let envelope_command = json_error_command(&cli);
     let worktree_schema_version = worktree_schema_version(&cli);
 
     match run(cli, &mut io::stdout()).await {
         Ok(code) => code,
         Err(error) => {
-            if json && let Some(command) = worktree_command {
-                let response = writ_core::contract::Response {
-                    ok: false,
-                    schema_version: worktree_schema_version,
-                    command,
-                    data: worktree_error_data(&error),
-                    error: Some(writ_core::contract::ErrorData {
-                        code: error.code().to_owned(),
-                        message: error.to_string(),
-                    }),
-                };
+            if json && let Some(command) = envelope_command {
                 let mut stdout = io::stdout();
-                if serde_json::to_writer(&mut stdout, &response).is_ok() {
-                    let _ = stdout.write_all(b"\n");
-                }
+                let _ = write_json_error_envelope(
+                    command,
+                    worktree_schema_version,
+                    &error,
+                    &mut stdout,
+                );
             }
             let _ = writeln!(io::stderr(), "writ: {error}");
             ExitCode::from(error.exit_code())
@@ -406,6 +549,9 @@ fn worktree_schema_version(cli: &Cli) -> u8 {
 fn worktree_command_name(cli: &Cli) -> Option<&'static str> {
     match &cli.command {
         Some(Command::Worktree { action }) => Some(match action {
+            WorktreeAction::Register { .. } => "worktree.register",
+            WorktreeAction::Unregister { .. } => "worktree.unregister",
+            WorktreeAction::Inspect { .. } => "worktree.inspect",
             WorktreeAction::Create { .. } => "worktree.create",
             WorktreeAction::List => "worktree.list",
             WorktreeAction::Remove { .. } => "worktree.remove",
@@ -415,50 +561,65 @@ fn worktree_command_name(cli: &Cli) -> Option<&'static str> {
     }
 }
 
-fn worktree_response(
-    action: WorktreeAction,
-) -> writ_core::error::Result<writ_core::contract::Response<serde_json::Value>> {
-    use writ_core::contract::Response;
-    use writ_core::worktree::WorktreeManager;
-
-    match action {
-        create @ WorktreeAction::Create { .. } => worktree_create_response(create),
-        WorktreeAction::List => {
-            let manager = WorktreeManager::new()?;
-            let worktrees = manager.list()?;
-            Ok(Response::success(
-                "worktree.list",
-                serde_json::json!({
-                    "worktrees": worktrees.iter().map(|wt| serde_json::json!({
-                        "path": wt.path,
-                        "branch": wt.branch,
-                    })).collect::<Vec<_>>(),
-                }),
-            ))
-        }
-        WorktreeAction::Remove { path, force } => {
-            let manager = WorktreeManager::new()?;
-            manager.remove(&path, force)?;
-            Ok(Response::success(
-                "worktree.remove",
-                serde_json::json!({ "removed": path }),
-            ))
-        }
-        WorktreeAction::Prune { repo } => {
-            let manager = WorktreeManager::new()?;
-            manager.prune(&repo)?;
-            Ok(Response::success("worktree.prune", serde_json::json!({})))
-        }
-    }
+fn json_error_command(cli: &Cli) -> Option<&'static str> {
+    worktree_command_name(cli).or(match &cli.command {
+        Some(Command::Attribution { .. }) => Some("attribution.format"),
+        Some(Command::Watchlist { action }) => Some(match action {
+            WatchlistAction::Add { .. } => "watchlist.add",
+            WatchlistAction::Remove { .. } => "watchlist.remove",
+            WatchlistAction::List { .. } => "watchlist.list",
+            WatchlistAction::Check { .. } => "watchlist.check",
+            WatchlistAction::CheckAll { .. } => "watchlist.check_all",
+            WatchlistAction::ImportPrBabysit { .. } => "watchlist.import_pr_babysit",
+        }),
+        _ => None,
+    })
 }
 
+fn write_json_error_envelope(
+    command: &'static str,
+    schema_version: u8,
+    error: &writ_core::error::Error,
+    stdout: &mut impl Write,
+) -> io::Result<()> {
+    let response = writ_core::contract::Response {
+        ok: false,
+        schema_version,
+        command,
+        data: worktree_error_data(error),
+        error: Some(writ_core::contract::ErrorData {
+            code: error.code().to_owned(),
+            message: error.to_string(),
+        }),
+    };
+    serde_json::to_writer(&mut *stdout, &response).map_err(io::Error::other)?;
+    stdout.write_all(b"\n")
+}
+
+/// Owned fields of a `worktree create` request, threaded from the CLI action to
+/// [`worktree_create_response`] so the dispatch arm stays small.
+struct WorktreeCreateArgs {
+    repo: PathBuf,
+    owner: String,
+    repo_name: String,
+    job_id: String,
+    branch: String,
+    start_point: Option<String>,
+    pr_number: Option<u64>,
+    source_remote: Option<String>,
+    head_repo: Option<String>,
+    schema_version: u8,
+}
+
+/// Build the `worktree.create` response, preserving the exact JSON envelope.
 fn worktree_create_response(
-    action: WorktreeAction,
+    allowlist: &writ_core::owners::OwnerAllowlist,
+    args: WorktreeCreateArgs,
 ) -> writ_core::error::Result<writ_core::contract::Response<serde_json::Value>> {
     use writ_core::contract::Response;
     use writ_core::worktree::{WorktreeCreateRequest, WorktreeManager};
 
-    let WorktreeAction::Create {
+    let WorktreeCreateArgs {
         repo,
         owner,
         repo_name,
@@ -469,17 +630,15 @@ fn worktree_create_response(
         source_remote,
         head_repo,
         schema_version,
-    } = action
-    else {
-        unreachable!("worktree_create_response requires Create");
-    };
+    } = args;
+
     if schema_version == writ_core::contract::SCHEMA_VERSION {
         return Err(writ_core::error::Error::ContractUpgradeRequired {
             required_schema_version: writ_core::contract::EXACT_BASE_SCHEMA_VERSION,
         });
     }
     let start_point = start_point.ok_or(writ_core::error::Error::StartPointRequired)?;
-    let manager = WorktreeManager::new()?;
+    let manager = WorktreeManager::new()?.with_allowlist(allowlist.clone());
     let wt = manager.create_with_request(WorktreeCreateRequest {
         repo_root: &repo,
         owner: &owner,
@@ -506,12 +665,135 @@ fn worktree_create_response(
     ))
 }
 
+fn checkout_json(info: &writ_core::checkout::CheckoutInfo) -> serde_json::Value {
+    serde_json::json!({
+        "path": info.path,
+        "branch": info.branch,
+        "head_commit": info.head_commit,
+        "common_dir": info.common_dir,
+        "linked_worktree": info.linked_worktree,
+        "origin_slug": info.origin_slug,
+        "dirty": info.dirty,
+    })
+}
+
+fn worktree_register_response(
+    path: PathBuf,
+    job: Option<String>,
+) -> writ_core::error::Result<writ_core::contract::Response<serde_json::Value>> {
+    use writ_core::checkout::CheckoutRegistry;
+    use writ_core::contract::Response;
+
+    let registry = CheckoutRegistry::new()?;
+    let job_id = job.unwrap_or_else(|| writ_core::checkout::default_job_id(&path));
+    let info = registry.register(&path, &job_id)?;
+    let mut data = checkout_json(&info);
+    data["job_id"] = serde_json::Value::String(job_id);
+    Ok(Response::success("worktree.register", data))
+}
+
+fn worktree_unregister_response(
+    path: PathBuf,
+) -> writ_core::error::Result<writ_core::contract::Response<serde_json::Value>> {
+    use writ_core::checkout::CheckoutRegistry;
+    use writ_core::contract::Response;
+
+    let released = CheckoutRegistry::new()?.unregister(&path)?;
+    Ok(Response::success(
+        "worktree.unregister",
+        serde_json::json!({ "released": released.is_some() }),
+    ))
+}
+
+fn worktree_inspect_response(
+    path: PathBuf,
+) -> writ_core::error::Result<writ_core::contract::Response<serde_json::Value>> {
+    use writ_core::contract::Response;
+
+    let info = writ_core::checkout::inspect_checkout(&path)?;
+    Ok(Response::success("worktree.inspect", checkout_json(&info)))
+}
+
+fn worktree_list_response()
+-> writ_core::error::Result<writ_core::contract::Response<serde_json::Value>> {
+    use writ_core::checkout::CheckoutRegistry;
+    use writ_core::contract::Response;
+
+    let worktrees = CheckoutRegistry::new()?.registered()?;
+    Ok(Response::success(
+        "worktree.list",
+        serde_json::json!({
+            "worktrees": worktrees.iter().map(|lease| serde_json::json!({
+                "path": lease.worktree_path,
+                "branch": lease.branch,
+                "job_id": lease.job_id,
+                "mode": lease.mode.as_str(),
+            })).collect::<Vec<_>>(),
+        }),
+    ))
+}
+
+fn worktree_response(
+    action: WorktreeAction,
+    allowlist: &writ_core::owners::OwnerAllowlist,
+) -> writ_core::error::Result<writ_core::contract::Response<serde_json::Value>> {
+    use writ_core::contract::Response;
+    use writ_core::worktree::WorktreeManager;
+
+    match action {
+        WorktreeAction::Register { path, job } => worktree_register_response(path, job),
+        WorktreeAction::Unregister { path } => worktree_unregister_response(path),
+        WorktreeAction::Inspect { path } => worktree_inspect_response(path),
+        WorktreeAction::List => worktree_list_response(),
+        WorktreeAction::Create {
+            repo,
+            owner,
+            repo_name,
+            job_id,
+            branch,
+            start_point,
+            pr_number,
+            source_remote,
+            head_repo,
+            schema_version,
+        } => worktree_create_response(
+            allowlist,
+            WorktreeCreateArgs {
+                repo,
+                owner,
+                repo_name,
+                job_id,
+                branch,
+                start_point,
+                pr_number,
+                source_remote,
+                head_repo,
+                schema_version,
+            },
+        ),
+        WorktreeAction::Remove { path, force } => {
+            let manager = WorktreeManager::new()?;
+            manager.remove(&path, force)?;
+            Ok(Response::success(
+                "worktree.remove",
+                serde_json::json!({ "removed": path }),
+            ))
+        }
+        WorktreeAction::Prune { repo } => {
+            let manager = WorktreeManager::new()?;
+            manager.prune(&repo)?;
+            Ok(Response::success("worktree.prune", serde_json::json!({})))
+        }
+    }
+}
+
 fn run_worktree(
     action: WorktreeAction,
+    allowlist: &writ_core::owners::OwnerAllowlist,
     json: bool,
     stdout: &mut impl Write,
 ) -> writ_core::error::Result<ExitCode> {
-    let response = worktree_response(action)?;
+    let response = worktree_response(action, allowlist)?;
 
     if json {
         write_json_line(stdout, &response)?;
@@ -521,6 +803,121 @@ fn run_worktree(
     Ok(ExitCode::SUCCESS)
 }
 
+fn attribution_config_from_format(
+    agent_id: Option<&str>,
+    placement: Option<&str>,
+    task: Option<&str>,
+    branch: Option<&str>,
+    session: Option<&str>,
+) -> writ_core::attribution::AttributionConfig {
+    let mut config = writ_core::attribution::AttributionConfig::from_env();
+    if let Some(id) = agent_id {
+        config.agent_id = writ_core::attribution::canonicalize_agent_id(id);
+    }
+    if let Some(placement) = placement {
+        config.placement = writ_core::attribution::AttributionPlacement::coerce(placement);
+    }
+    if let Some(task) = task {
+        config.task_id = writ_core::attribution::canonicalize_label(task);
+    }
+    if let Some(branch) = branch {
+        config.branch = writ_core::attribution::canonicalize_label(branch);
+    }
+    if let Some(session) = session {
+        config.session_id = writ_core::attribution::canonicalize_label(session);
+    }
+    config
+}
+
+fn parse_format_commit_sha(raw: Option<&str>) -> writ_core::error::Result<Option<&str>> {
+    let Some(sha) = raw.map(str::trim).filter(|sha| !sha.is_empty()) else {
+        return Ok(None);
+    };
+    writ_core::attribution::sanitize_commit_sha(Some(sha))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid --commit-sha '{sha}'"),
+            )
+            .into()
+        })
+        .map(Some)
+}
+
+fn write_attribution_format(
+    json: bool,
+    config: &writ_core::attribution::AttributionConfig,
+    text: &str,
+    commit_sha: Option<&str>,
+    is_thread_reply: bool,
+    stdout: &mut impl Write,
+) -> io::Result<()> {
+    if !json {
+        return writeln!(stdout, "{text}");
+    }
+    let response = writ_core::contract::Response::success(
+        "attribution.format",
+        serde_json::json!({
+            "text": text,
+            "agent_id": config.agent_id,
+            "task_id": config.task_id,
+            "branch": config.branch,
+            "session_id": config.session_id,
+            "include_sha_on_fix": config.include_sha_on_fix,
+            "placement": config.placement,
+            "commit_sha": commit_sha,
+            "is_thread_reply": is_thread_reply,
+        }),
+    );
+    serde_json::to_writer(&mut *stdout, &response).map_err(io::Error::other)?;
+    stdout.write_all(b"\n")
+}
+
+fn run_attribution(
+    action: AttributionAction,
+    json: bool,
+    stdout: &mut impl Write,
+) -> writ_core::error::Result<ExitCode> {
+    match action {
+        AttributionAction::Format {
+            body,
+            agent_id,
+            commit_sha,
+            placement,
+            task,
+            branch,
+            session,
+            pr_comment,
+        } => {
+            if body.trim().is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "attribution body must not be empty",
+                )
+                .into());
+            }
+            let config = attribution_config_from_format(
+                agent_id.as_deref(),
+                placement.as_deref(),
+                task.as_deref(),
+                branch.as_deref(),
+                session.as_deref(),
+            );
+            let commit_sha = parse_format_commit_sha(commit_sha.as_deref())?;
+            let is_thread_reply = !pr_comment;
+            let text = writ_core::attribution::format_reply(
+                body,
+                Some(&config),
+                commit_sha,
+                is_thread_reply,
+            );
+            write_attribution_format(json, &config, &text, commit_sha, is_thread_reply, stdout)?;
+            Ok(ExitCode::SUCCESS)
+        }
+    }
+}
+
+/// Entry point for CLI commands (status/jobs, git/gh-safe, supervisor, worktree, attribution).
 fn run_hook(stdout: &mut impl Write) -> writ_core::error::Result<ExitCode> {
     let mut input = String::new();
     io::stdin().read_to_string(&mut input)?;
@@ -593,20 +990,16 @@ fn writ_command(writ_bin: Option<PathBuf>) -> String {
     "writ".to_owned()
 }
 
-/// Entry point for CLI commands (status/jobs, git/gh-safe, supervisor, worktree).
 async fn run(cli: Cli, stdout: &mut impl Write) -> writ_core::error::Result<ExitCode> {
+    let allowlist =
+        writ_core::owners::OwnerAllowlist::from_cli_or_env(cli.allowed_owners.as_deref());
     match cli.command {
         Some(Command::Status) => {
-            run_status(
-                cli.json,
-                "cli.status",
-                writ_core::state::load_jobs(),
-                stdout,
-            )?;
+            run_status(cli.json, "cli.status", writ_core::status::load(), stdout)?;
             Ok(ExitCode::SUCCESS)
         }
         Some(Command::Jobs) => {
-            run_status(cli.json, "cli.jobs", writ_core::state::load_jobs(), stdout)?;
+            run_status(cli.json, "cli.jobs", writ_core::status::load(), stdout)?;
             Ok(ExitCode::SUCCESS)
         }
         Some(Command::GitSafe {
@@ -614,10 +1007,10 @@ async fn run(cli: Cli, stdout: &mut impl Write) -> writ_core::error::Result<Exit
             repo,
             args,
         }) => run_git_safe(&args, expected_branch.as_deref(), repo, cli.json, stdout),
-        Some(Command::GhSafe { args }) => run_gh_safe(&args, cli.json, stdout),
+        Some(Command::GhSafe { args }) => run_gh_safe(&args, &allowlist, cli.json, stdout),
         Some(Command::Supervisor { action }) => match action {
             SupervisorAction::Run {
-                timeout,
+                timeouts,
                 expected_branch,
                 repo,
                 max_parallel,
@@ -625,23 +1018,28 @@ async fn run(cli: Cli, stdout: &mut impl Write) -> writ_core::error::Result<Exit
             } => {
                 run_supervisor(
                     cli.json,
-                    timeout,
-                    expected_branch,
-                    repo,
+                    &timeouts,
                     max_parallel,
                     cmd,
+                    writ_core::supervisor::RunOptions {
+                        expected_branch,
+                        repo,
+                        allowlist: Some(allowlist),
+                        ..Default::default()
+                    },
                     stdout,
                 )
                 .await
             }
         },
-        Some(Command::Worktree { action }) => run_worktree(action, cli.json, stdout),
-        Some(Command::Watchlist { action }) => {
-            watchlist::run(action, cli.json, stdout).map_err(Into::into)
-        }
+        Some(Command::Worktree { action }) => run_worktree(action, &allowlist, cli.json, stdout),
+        Some(Command::Attribution { action }) => run_attribution(action, cli.json, stdout),
         Some(Command::Hook) => run_hook(stdout),
         Some(Command::Install { settings, writ_bin }) => {
             run_install(settings, writ_bin, cli.json, stdout)
+        }
+        Some(Command::Watchlist { action }) => {
+            watchlist::run(action, cli.json, stdout).map_err(Into::into)
         }
         None => {
             if cli.json {
@@ -657,14 +1055,17 @@ async fn run(cli: Cli, stdout: &mut impl Write) -> writ_core::error::Result<Exit
     }
 }
 
+fn secs_opt(secs: u64) -> Option<Duration> {
+    (secs > 0).then(|| Duration::from_secs(secs))
+}
+
 /// Run `writ supervisor run` with policy-checked core supervisor and consistent JSON envelopes.
 async fn run_supervisor(
     json: bool,
-    timeout_secs: u64,
-    expected_branch: Option<String>,
-    repo: Option<PathBuf>,
+    timeouts: &SupervisorTimeouts,
     max_parallel: usize,
     cmd: Vec<String>,
+    mut options: writ_core::supervisor::RunOptions,
     stdout: &mut impl Write,
 ) -> writ_core::error::Result<ExitCode> {
     let program = match cmd.first() {
@@ -678,20 +1079,20 @@ async fn run_supervisor(
         }
     };
     let args: Vec<&str> = cmd[1..].iter().map(|s| s.as_str()).collect();
-    let options = writ_core::supervisor::RunOptions {
-        expected_branch,
-        repo,
-    };
-    let timeout = if timeout_secs == 0 {
-        None
-    } else {
-        Some(Duration::from_secs(timeout_secs))
-    };
+    let policy = timeouts.to_policy();
+    options.on_progress = policy.progress_every.map(|_| {
+        std::sync::Arc::new(|snap: &writ_core::timeout_policy::ProgressSnapshot| {
+            eprintln!("{}", snap.format_line());
+        }) as writ_core::timeout_policy::ProgressCallback
+    });
 
     // One-shot CLI: a single awaited child cannot contend with itself.
     // Library callers may still use Supervisor::new(n) for in-process fan-out.
     let supervisor = writ_core::supervisor::Supervisor::new(max_parallel.max(1));
-    match supervisor.run(program, &args, timeout, &options).await {
+    match supervisor
+        .run_with_policy(program, &args, &policy, &options)
+        .await
+    {
         Ok(output) => {
             write_supervisor_result(json, Ok(&output), stdout)?;
             if json {
@@ -778,15 +1179,15 @@ fn supervised_exit_code(output: &writ_core::supervisor::SupervisedOutput) -> Exi
     }
 }
 
-/// Render status/jobs from a preloaded `load_jobs` result (testable without env mutation).
+/// Render status/jobs from a preloaded snapshot (testable without env mutation).
 fn run_status(
     json: bool,
     command_name: &'static str,
-    jobs_result: Result<Vec<writ_core::status::JobStatus>, String>,
+    jobs_result: Result<writ_core::status::JobsData, String>,
     stdout: &mut impl Write,
 ) -> io::Result<()> {
     match jobs_result {
-        Ok(jobs) => run_with_jobs(json, command_name, jobs, stdout),
+        Ok(data) => run_with_jobs(json, command_name, data, stdout),
         Err(e) => {
             if json {
                 // JSON path: write ok:false envelope, then exit non-zero.
@@ -805,23 +1206,15 @@ fn run_status(
 fn run_with_jobs(
     json: bool,
     command_name: &'static str,
-    jobs: Vec<writ_core::status::JobStatus>,
+    data: writ_core::status::JobsData,
     stdout: &mut impl Write,
 ) -> io::Result<()> {
     if json {
-        let response = writ_core::status::status_response(command_name, jobs);
+        let response = writ_core::status::status_response(command_name, data);
         serde_json::to_writer(&mut *stdout, &response).map_err(io::Error::other)?;
         stdout.write_all(b"\n")?;
-    } else if jobs.is_empty() {
-        stdout.write_all(b"No watched jobs.\n")?;
     } else {
-        for job in &jobs {
-            writeln!(
-                stdout,
-                "{} [{}] {}/{} branch={} ci={}",
-                job.job_id, job.process_state, job.owner, job.repo, job.branch, job.ci_class
-            )?;
-        }
+        stdout.write_all(writ_core::status::format_human(&data).as_bytes())?;
     }
     Ok(())
 }
@@ -843,10 +1236,11 @@ fn run_git_safe(
 
 fn run_gh_safe(
     args: &[String],
+    allowlist: &writ_core::owners::OwnerAllowlist,
     json: bool,
     stdout: &mut impl Write,
 ) -> writ_core::error::Result<ExitCode> {
-    let cmd = writ_core::git_safe::SafeGhCommand::new(args)?;
+    let cmd = writ_core::git_safe::SafeGhCommand::with_allowlist(args, allowlist)?;
     let output = cmd.run()?;
 
     write_safe_result("gh.safe", cmd.args(), &output, json, stdout)?;
@@ -909,9 +1303,12 @@ mod tests {
     use std::str;
 
     use clap::{CommandFactory, Parser};
-    use writ_core::status::{CiClass, JobStatus, ProcessState};
+    use writ_core::status::{CiClass, CollaborationState, JobStatus, JobsData, ProcessState};
 
-    use super::{Cli, run, run_status, run_with_jobs, supervised_exit_code};
+    use super::{
+        Cli, json_error_command, run, run_status, run_with_jobs, supervised_exit_code,
+        write_json_error_envelope,
+    };
 
     fn sample_job() -> JobStatus {
         JobStatus {
@@ -922,10 +1319,54 @@ mod tests {
             pr_number: None,
             worktree_path: "/tmp/wt/writ-1".to_owned(),
             branch: "feature/foo".to_owned(),
-            process_state: ProcessState::Running,
+            process_state: ProcessState::Unknown,
             last_error: None,
-            ci_class: CiClass::Pending,
+            ci_class: CiClass::Unknown,
+            collaboration_state: CollaborationState::Running,
+            lease_mode: Some("WRITER_LOCKED".to_owned()),
+            head: Some("abc123".to_owned()),
+            head_source: Some("lease".to_owned()),
+            lease_row_id: Some(1),
+            updated_at: Some(1),
+            ..JobStatus::default()
         }
+    }
+
+    /// Timeout knobs with every second-valued budget disabled, matching the
+    /// hand-built `Run` variants these tests previously constructed inline.
+    fn disabled_timeouts() -> super::SupervisorTimeouts {
+        super::SupervisorTimeouts {
+            timeout: 0,
+            idle: 0,
+            step: 0,
+            orchestrator: 0,
+            grace: 0,
+            progress_secs: 0,
+            max_redispatch: 1,
+        }
+    }
+
+    fn sample_data() -> JobsData {
+        JobsData {
+            source: "lease_store".to_owned(),
+            jobs: vec![sample_job()],
+            agents: Vec::new(),
+        }
+    }
+
+    /// Assert the shared success envelope shape and return `data` for further
+    /// per-command checks.
+    fn ok_envelope<'v>(v: &'v serde_json::Value, command: &str) -> &'v serde_json::Value {
+        assert_eq!(v.get("ok").and_then(serde_json::Value::as_bool), Some(true));
+        assert_eq!(
+            v.get("command").and_then(serde_json::Value::as_str),
+            Some(command)
+        );
+        assert!(
+            v.get("error").expect("missing error").is_null(),
+            "error must be explicitly null, not absent"
+        );
+        v.get("data").expect("missing data")
     }
 
     #[test]
@@ -933,32 +1374,468 @@ mod tests {
         Cli::command().debug_assert();
     }
 
+    fn parse_format(args: &[&str]) -> super::AttributionAction {
+        let parsed = Cli::try_parse_from(args).unwrap();
+        let Some(super::Command::Attribution { action }) = parsed.command else {
+            panic!("expected attribution command")
+        };
+        action
+    }
+
+    fn parsed_identity_format() -> super::AttributionAction {
+        parse_format(&[
+            "writ",
+            "attribution",
+            "format",
+            "--body",
+            "Looks good!",
+            "--agent-id",
+            "Claude Code: writ agent",
+            "--commit-sha",
+            "abc1234",
+            "--task",
+            "RM-128",
+            "--branch",
+            "cursor/reply-attribution-config-6e46",
+            "--session",
+            "bc-fa8ed877",
+        ])
+    }
+
     #[test]
-    fn watchlist_parser_accepts_add_repo_and_numbers() {
+    fn attribution_format_parser_accepts_agent_and_sha() {
+        let super::AttributionAction::Format {
+            body,
+            agent_id,
+            commit_sha,
+            pr_comment: false,
+            ..
+        } = parsed_identity_format()
+        else {
+            panic!("expected attribution format command")
+        };
+        assert_eq!(body, "Looks good!");
+        assert_eq!(
+            (agent_id.as_deref(), commit_sha.as_deref()),
+            (Some("Claude Code: writ agent"), Some("abc1234"))
+        );
+    }
+
+    #[test]
+    fn attribution_format_parser_accepts_task_and_branch() {
+        let super::AttributionAction::Format {
+            task,
+            branch,
+            pr_comment: false,
+            ..
+        } = parsed_identity_format()
+        else {
+            panic!("expected attribution format command")
+        };
+        assert_eq!(task.as_deref(), Some("RM-128"));
+        assert_eq!(
+            branch.as_deref(),
+            Some("cursor/reply-attribution-config-6e46")
+        );
+    }
+
+    #[test]
+    fn attribution_format_parser_accepts_session() {
+        let super::AttributionAction::Format {
+            session,
+            pr_comment: false,
+            ..
+        } = parsed_identity_format()
+        else {
+            panic!("expected attribution format command")
+        };
+        assert_eq!(session.as_deref(), Some("bc-fa8ed877"));
+    }
+
+    #[test]
+    fn attribution_format_parser_accepts_hyphen_body() {
+        let super::AttributionAction::Format {
+            body: hyphen_body, ..
+        } = parse_format(&[
+            "writ",
+            "attribution",
+            "format",
+            "--body",
+            "- Fixed the branch check.",
+        ]);
+        assert_eq!(hyphen_body, "- Fixed the branch check.");
+    }
+
+    #[test]
+    fn attribution_format_parser_accepts_pr_comment() {
+        let super::AttributionAction::Format {
+            pr_comment: true, ..
+        } = parse_format(&[
+            "writ",
+            "attribution",
+            "format",
+            "--body",
+            "All checks passed.",
+            "--pr-comment",
+        ])
+        else {
+            panic!("expected PR comment attribution format")
+        };
+    }
+
+    struct FormatCase {
+        json: bool,
+        body: &'static str,
+        agent_id: Option<&'static str>,
+        commit_sha: Option<&'static str>,
+        placement: Option<&'static str>,
+        task: Option<&'static str>,
+        branch: Option<&'static str>,
+        session: Option<&'static str>,
+        pr_comment: bool,
+    }
+
+    fn format_cli(case: FormatCase) -> Cli {
+        Cli {
+            json: case.json,
+            allowed_owners: None,
+            command: Some(super::Command::Attribution {
+                action: super::AttributionAction::Format {
+                    body: case.body.to_owned(),
+                    agent_id: case.agent_id.map(str::to_owned),
+                    commit_sha: case.commit_sha.map(str::to_owned),
+                    placement: case.placement.map(str::to_owned),
+                    task: case.task.map(str::to_owned),
+                    branch: case.branch.map(str::to_owned),
+                    session: case.session.map(str::to_owned),
+                    pr_comment: case.pr_comment,
+                },
+            }),
+        }
+    }
+
+    async fn run_format(case: FormatCase) -> (writ_core::error::Result<ExitCode>, Vec<u8>) {
+        let mut stdout = Vec::new();
+        let result = run(format_cli(case), &mut stdout).await;
+        (result, stdout)
+    }
+
+    fn parse_stdout_json(stdout: &[u8]) -> serde_json::Value {
+        serde_json::from_str(str::from_utf8(stdout).unwrap().trim()).unwrap()
+    }
+
+    fn format_envelope_ok(value: &serde_json::Value) -> bool {
+        value["ok"] == true
+            && value["schema_version"] == 1
+            && value["command"] == "attribution.format"
+            && value["error"].is_null()
+    }
+
+    async fn format_ok(case: FormatCase) -> Vec<u8> {
+        let (result, stdout) = run_format(case).await;
+        match result {
+            Ok(code) if code == ExitCode::SUCCESS => stdout,
+            other => panic!("expected successful attribution format, got {other:?}"),
+        }
+    }
+
+    async fn format_json(case: FormatCase) -> serde_json::Value {
+        parse_stdout_json(&format_ok(case).await)
+    }
+
+    impl FormatCase {
+        fn json_body(body: &'static str) -> Self {
+            Self {
+                json: true,
+                body,
+                agent_id: Some("writ agent"),
+                commit_sha: None,
+                placement: None,
+                task: None,
+                branch: None,
+                session: None,
+                pr_comment: false,
+            }
+        }
+    }
+
+    fn collab_overlap_case() -> FormatCase {
+        FormatCase {
+            task: Some("RM-128"),
+            branch: Some("cursor/reply-attribution-config-6e46"),
+            session: Some("bc-fa8ed877"),
+            ..FormatCase::json_body(
+                "Overlap: I own SKILL.md Reply attribution; RM-145 owns the rest.",
+            )
+        }
+    }
+
+    fn pushed_fix_case() -> FormatCase {
+        FormatCase {
+            commit_sha: Some("abc1234"),
+            placement: Some("footer"),
+            ..FormatCase::json_body("Fixed the issue.")
+        }
+    }
+
+    fn pr_comment_no_code_case() -> FormatCase {
+        FormatCase {
+            agent_id: Some("Codex: writ agent"),
+            commit_sha: Some("  "),
+            pr_comment: true,
+            ..FormatCase::json_body("No code change.")
+        }
+    }
+
+    #[tokio::test]
+    async fn attribution_format_human_omits_sha() {
+        let human = format_ok(FormatCase {
+            json: false,
+            ..FormatCase::json_body("Looks good!")
+        })
+        .await;
+        assert_eq!(
+            str::from_utf8(&human).unwrap(),
+            "Looks good!\n\n---\nwrit agent\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn attribution_format_collaboration_message_omits_sha() {
+        let collab = format_json(collab_overlap_case()).await;
+        assert!(format_envelope_ok(&collab), "{collab}");
+        assert_eq!(
+            collab["data"]["text"].as_str(),
+            Some(
+                "Overlap: I own SKILL.md Reply attribution; RM-145 owns the rest.\n\n---\nwrit agent | task RM-128 | branch cursor/reply-attribution-config-6e46 | session bc-fa8ed877"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn attribution_format_collaboration_message_has_no_sha() {
+        let collab = format_json(collab_overlap_case()).await;
+        assert!(collab["data"]["commit_sha"].is_null());
+    }
+
+    #[tokio::test]
+    async fn attribution_format_json_exposes_collab_identity_fields() {
+        let collab = format_json(collab_overlap_case()).await;
+        assert_eq!(
+            (
+                collab["data"]["task_id"].as_str(),
+                collab["data"]["branch"].as_str(),
+                collab["data"]["session_id"].as_str()
+            ),
+            (
+                Some("RM-128"),
+                Some("cursor/reply-attribution-config-6e46"),
+                Some("bc-fa8ed877")
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn attribution_format_json_includes_pushed_sha() {
+        let with_sha = format_json(pushed_fix_case()).await;
+        assert!(format_envelope_ok(&with_sha), "{with_sha}");
+        assert_eq!(
+            with_sha["data"]["text"].as_str(),
+            Some("Fixed the issue.\n\n---\nwrit agent: fixed in abc1234")
+        );
+    }
+
+    #[tokio::test]
+    async fn attribution_format_json_commit_sha_field() {
+        let with_sha = format_json(pushed_fix_case()).await;
+        assert_eq!(with_sha["data"]["commit_sha"].as_str(), Some("abc1234"));
+    }
+
+    #[tokio::test]
+    async fn attribution_format_pr_comment_omits_blank_sha() {
+        let omit_sha = format_json(pr_comment_no_code_case()).await;
+        assert_eq!(
+            omit_sha["data"]["text"].as_str(),
+            Some("No code change.\n\nCodex: writ agent")
+        );
+        assert!(omit_sha["data"]["commit_sha"].is_null());
+    }
+
+    #[tokio::test]
+    async fn attribution_format_pr_comment_is_not_thread_reply() {
+        let omit_sha = format_json(pr_comment_no_code_case()).await;
+        assert_eq!(omit_sha["data"]["is_thread_reply"].as_bool(), Some(false));
+    }
+
+    #[tokio::test]
+    async fn attribution_format_rejects_invalid_inputs() {
+        for case in [
+            FormatCase {
+                json: false,
+                body: "   ",
+                agent_id: None,
+                commit_sha: None,
+                placement: None,
+                task: None,
+                branch: None,
+                session: None,
+                pr_comment: false,
+            },
+            FormatCase {
+                json: false,
+                body: "Looks good!",
+                agent_id: None,
+                commit_sha: Some("not-a-sha"),
+                placement: None,
+                task: None,
+                branch: None,
+                session: None,
+                pr_comment: false,
+            },
+        ] {
+            let (result, stdout) = run_format(case).await;
+            assert!(result.is_err() && stdout.is_empty());
+        }
+    }
+
+    fn empty_body_case() -> FormatCase {
+        FormatCase {
+            json: true,
+            body: "",
+            agent_id: None,
+            commit_sha: None,
+            placement: None,
+            task: None,
+            branch: None,
+            session: None,
+            pr_comment: false,
+        }
+    }
+
+    #[test]
+    fn attribution_format_empty_body_maps_to_json_command() {
+        assert_eq!(
+            json_error_command(&format_cli(empty_body_case())),
+            Some("attribution.format")
+        );
+    }
+
+    #[tokio::test]
+    async fn attribution_format_json_rejects_empty_body() {
+        let (result, stdout) = run_format(empty_body_case()).await;
+        assert!(result.is_err());
+        assert!(stdout.is_empty());
+    }
+
+    #[tokio::test]
+    async fn attribution_format_json_empty_body_envelope_message() {
+        let (result, mut stdout) = run_format(empty_body_case()).await;
+        let error = result.expect_err("empty body must be rejected");
+        write_json_error_envelope(
+            "attribution.format",
+            writ_core::contract::SCHEMA_VERSION,
+            &error,
+            &mut stdout,
+        )
+        .unwrap();
+        let value = parse_stdout_json(&stdout);
+        assert_eq!(value["ok"].as_bool(), Some(false));
+        assert_eq!(
+            value["error"]["message"].as_str(),
+            Some("io operation: attribution body must not be empty")
+        );
+    }
+
+    #[tokio::test]
+    async fn attribution_format_empty_agent_id_falls_back_to_default() {
+        let empty_agent = parse_stdout_json(
+            &format_ok(FormatCase {
+                json: true,
+                body: "Looks good!",
+                agent_id: Some("   "),
+                commit_sha: None,
+                placement: None,
+                task: None,
+                branch: None,
+                session: None,
+                pr_comment: false,
+            })
+            .await,
+        );
+        assert_eq!(
+            empty_agent["data"]["agent_id"],
+            writ_core::attribution::DEFAULT_AGENT_ID
+        );
+    }
+
+    #[test]
+    fn supervisor_run_parses_named_timeout_policy_flags() {
         let cli = Cli::try_parse_from([
             "writ",
-            "watchlist",
-            "add",
-            "--repo",
-            "acme/widgets",
-            "41",
-            "36",
+            "supervisor",
+            "run",
+            "--timeout",
+            "10",
+            "--idle",
+            "3",
+            "--step",
+            "2",
+            "--orchestrator",
+            "15",
+            "--grace",
+            "5",
+            "--progress-secs",
+            "1",
+            "--max-redispatch",
+            "1",
+            "true",
         ])
         .unwrap();
-        let Some(super::Command::Watchlist {
+        let Some(super::Command::Supervisor {
             action:
-                super::WatchlistAction::Add {
-                    repo: Some(repo),
-                    targets,
-                    reset: false,
+                super::SupervisorAction::Run {
+                    timeouts:
+                        super::SupervisorTimeouts {
+                            timeout,
+                            idle,
+                            step,
+                            orchestrator,
+                            grace,
+                            progress_secs,
+                            max_redispatch,
+                        },
+                    cmd,
                     ..
                 },
         }) = cli.command
         else {
-            panic!("expected watchlist add");
+            panic!("expected supervisor run");
         };
-        assert_eq!(repo, "acme/widgets");
-        assert_eq!(targets, ["41", "36"]);
+        assert_eq!(timeout, 10);
+        assert_eq!(idle, 3);
+        assert_eq!(step, 2);
+        assert_eq!(orchestrator, 15);
+        assert_eq!(grace, 5);
+        assert_eq!(progress_secs, 1);
+        assert_eq!(max_redispatch, 1);
+        assert_eq!(cmd, vec!["true"]);
+    }
+
+    #[test]
+    fn supervisor_run_parses_stall_as_idle_alias() {
+        let cli =
+            Cli::try_parse_from(["writ", "supervisor", "run", "--stall", "9", "true"]).unwrap();
+        let Some(super::Command::Supervisor {
+            action:
+                super::SupervisorAction::Run {
+                    timeouts: super::SupervisorTimeouts { idle, .. },
+                    ..
+                },
+        }) = cli.command
+        else {
+            panic!("expected supervisor run");
+        };
+        assert_eq!(idle, 9);
     }
 
     #[test]
@@ -1053,6 +1930,7 @@ mod tests {
     async fn json_mode_writes_v1_envelope_to_stdout() {
         let cli = Cli {
             json: true,
+            allowed_owners: None,
             command: None,
         };
         let mut stdout = Vec::new();
@@ -1070,6 +1948,7 @@ mod tests {
     async fn default_mode_keeps_stdout_empty() {
         let cli = Cli {
             json: false,
+            allowed_owners: None,
             command: None,
         };
         let mut stdout = Vec::new();
@@ -1083,25 +1962,25 @@ mod tests {
     fn status_json_emits_v1_envelope_with_jobs_in_data() {
         let mut stdout = Vec::new();
 
-        run_with_jobs(true, "cli.status", vec![], &mut stdout).unwrap();
+        run_with_jobs(true, "cli.status", JobsData::empty(), &mut stdout).unwrap();
 
         let output = str::from_utf8(&stdout).unwrap();
         let v: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
 
-        assert_eq!(v.get("schema_version").expect("missing schema_version"), 1);
-        assert_eq!(v.get("command").expect("missing command"), "cli.status");
-        assert!(v.get("ok").expect("missing ok").as_bool().unwrap());
-        assert!(
-            v.get("error").expect("missing error").is_null(),
-            "error must be explicitly null, not absent"
+        let data = ok_envelope(&v, "cli.status");
+        assert_eq!(
+            (
+                v.get("schema_version").expect("missing schema_version"),
+                data.get("source").expect("missing source")
+            ),
+            (&serde_json::json!(2), &serde_json::json!("lease_store"))
         );
-        let data = v.get("data").expect("missing data");
-        let jobs = data
-            .get("jobs")
-            .expect("missing data.jobs")
-            .as_array()
-            .expect("data.jobs must be an array");
-        assert!(jobs.is_empty());
+        assert_eq!(
+            data.get("jobs")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(0)
+        );
         assert!(v.get("jobs").is_none(), "jobs must be nested under data");
     }
 
@@ -1109,22 +1988,30 @@ mod tests {
     fn status_json_includes_injected_jobs() {
         let mut stdout = Vec::new();
 
-        run_with_jobs(true, "cli.status", vec![sample_job()], &mut stdout).unwrap();
+        run_with_jobs(true, "cli.status", sample_data(), &mut stdout).unwrap();
 
         let output = str::from_utf8(&stdout).unwrap();
         let v: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
 
-        let data = v.get("data").expect("missing data");
+        let data = ok_envelope(&v, "cli.status");
         let jobs = data
             .get("jobs")
-            .expect("missing data.jobs")
-            .as_array()
+            .and_then(serde_json::Value::as_array)
             .expect("data.jobs must be an array");
         assert_eq!(jobs.len(), 1);
-        assert_eq!(jobs[0].get("job_id").expect("missing job_id"), "writ-1");
         assert_eq!(
-            jobs[0].get("process_state").expect("missing process_state"),
-            "running"
+            (
+                jobs[0].get("job_id").expect("missing job_id"),
+                jobs[0]
+                    .get("collaboration_state")
+                    .expect("missing collaboration_state"),
+                jobs[0].get("process_state").expect("missing process_state")
+            ),
+            (
+                &serde_json::json!("writ-1"),
+                &serde_json::json!("running"),
+                &serde_json::json!("unknown")
+            )
         );
     }
 
@@ -1132,25 +2019,19 @@ mod tests {
     fn jobs_json_emits_v1_envelope_with_jobs_in_data() {
         let mut stdout = Vec::new();
 
-        run_with_jobs(true, "cli.jobs", vec![], &mut stdout).unwrap();
+        run_with_jobs(true, "cli.jobs", JobsData::empty(), &mut stdout).unwrap();
 
         let output = str::from_utf8(&stdout).unwrap();
         let v: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
 
-        assert_eq!(v.get("schema_version").expect("missing schema_version"), 1);
-        assert_eq!(v.get("command").expect("missing command"), "cli.jobs");
-        assert!(v.get("ok").expect("missing ok").as_bool().unwrap());
-        assert!(
-            v.get("error").expect("missing error").is_null(),
-            "error must be explicitly null, not absent"
+        let data = ok_envelope(&v, "cli.jobs");
+        assert_eq!(v.get("schema_version").expect("missing schema_version"), 2);
+        assert_eq!(
+            data.get("jobs")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(0)
         );
-        let data = v.get("data").expect("missing data");
-        let jobs = data
-            .get("jobs")
-            .expect("missing data.jobs")
-            .as_array()
-            .expect("data.jobs must be an array");
-        assert!(jobs.is_empty());
         assert!(v.get("jobs").is_none(), "jobs must be nested under data");
     }
 
@@ -1158,25 +2039,31 @@ mod tests {
     fn status_without_json_prints_human_readable() {
         let mut stdout = Vec::new();
 
-        run_with_jobs(false, "cli.status", vec![], &mut stdout).unwrap();
+        run_with_jobs(false, "cli.status", JobsData::empty(), &mut stdout).unwrap();
 
-        assert_eq!(str::from_utf8(&stdout).unwrap(), "No watched jobs.\n");
+        assert_eq!(
+            str::from_utf8(&stdout).unwrap(),
+            "No collaboration participants.\n"
+        );
     }
 
     #[test]
     fn jobs_without_json_prints_human_readable() {
         let mut stdout = Vec::new();
 
-        run_with_jobs(false, "cli.jobs", vec![], &mut stdout).unwrap();
+        run_with_jobs(false, "cli.jobs", JobsData::empty(), &mut stdout).unwrap();
 
-        assert_eq!(str::from_utf8(&stdout).unwrap(), "No watched jobs.\n");
+        assert_eq!(
+            str::from_utf8(&stdout).unwrap(),
+            "No collaboration participants.\n"
+        );
     }
 
     #[test]
     fn status_without_json_lists_jobs_when_present() {
         let mut stdout = Vec::new();
 
-        run_with_jobs(false, "cli.status", vec![sample_job()], &mut stdout).unwrap();
+        run_with_jobs(false, "cli.status", sample_data(), &mut stdout).unwrap();
 
         let output = str::from_utf8(&stdout).unwrap();
         assert!(output.contains("writ-1"));
@@ -1190,30 +2077,29 @@ mod tests {
         let err = run_status(
             true,
             "cli.status",
-            Err("failed to parse watched.json: expected value".to_owned()),
+            Err("failed to open lease store".to_owned()),
             &mut stdout,
         )
         .unwrap_err();
-        assert!(err.to_string().contains("failed to parse"));
+        assert!(err.to_string().contains("failed to open lease store"));
 
         let output = str::from_utf8(&stdout).unwrap();
         let v: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
-        assert_eq!(v.get("ok").expect("missing ok"), false);
         assert_eq!(
-            v.get("error")
-                .expect("missing error")
-                .get("code")
-                .expect("missing code"),
-            "STATE_LOAD_FAILED"
+            (
+                v.get("ok").expect("missing ok"),
+                v.pointer("/error/code").expect("missing error.code")
+            ),
+            (
+                &serde_json::json!(false),
+                &serde_json::json!("STATE_LOAD_FAILED")
+            )
         );
-        assert!(
-            v.get("data")
-                .expect("missing data")
-                .get("jobs")
-                .expect("missing jobs")
-                .as_array()
-                .expect("jobs array")
-                .is_empty()
+        assert_eq!(
+            v.pointer("/data/jobs")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(0)
         );
     }
 
@@ -1223,14 +2109,16 @@ mod tests {
         let err = run_status(
             false,
             "cli.status",
-            Err("failed to read watched.json: permission denied".to_owned()),
+            Err("failed to query leases: permission denied".to_owned()),
             &mut stdout,
         )
         .unwrap_err();
         assert!(err.to_string().contains("permission denied"));
         // Must not look like a healthy empty watch list.
         assert!(
-            !str::from_utf8(&stdout).unwrap().contains("No watched jobs"),
+            !str::from_utf8(&stdout)
+                .unwrap()
+                .contains("No collaboration participants"),
             "human load error must not print healthy empty summary"
         );
         assert!(
@@ -1243,9 +2131,10 @@ mod tests {
     async fn supervisor_run_non_json_emits_raw_supervised_output() {
         let cli = Cli {
             json: false,
+            allowed_owners: None,
             command: Some(super::Command::Supervisor {
                 action: super::SupervisorAction::Run {
-                    timeout: 0,
+                    timeouts: disabled_timeouts(),
                     expected_branch: None,
                     repo: None,
                     max_parallel: 1,
@@ -1277,9 +2166,10 @@ mod tests {
     async fn supervisor_run_blocks_unsafe_git_command() {
         let cli = Cli {
             json: false,
+            allowed_owners: None,
             command: Some(super::Command::Supervisor {
                 action: super::SupervisorAction::Run {
-                    timeout: 0,
+                    timeouts: disabled_timeouts(),
                     expected_branch: None,
                     repo: None,
                     max_parallel: 1,
@@ -1304,9 +2194,10 @@ mod tests {
     async fn supervisor_run_blocks_path_qualified_git_force() {
         let cli = Cli {
             json: true,
+            allowed_owners: None,
             command: Some(super::Command::Supervisor {
                 action: super::SupervisorAction::Run {
-                    timeout: 0,
+                    timeouts: disabled_timeouts(),
                     expected_branch: None,
                     repo: None,
                     max_parallel: 1,
@@ -1346,9 +2237,10 @@ mod tests {
     async fn supervisor_run_json_nonzero_sets_ok_false() {
         let cli = Cli {
             json: true,
+            allowed_owners: None,
             command: Some(super::Command::Supervisor {
                 action: super::SupervisorAction::Run {
-                    timeout: 0,
+                    timeouts: disabled_timeouts(),
                     expected_branch: None,
                     repo: None,
                     max_parallel: 1,
@@ -1400,9 +2292,10 @@ mod tests {
     async fn supervisor_run_blocks_unsafe_gh_command() {
         let cli = Cli {
             json: false,
+            allowed_owners: None,
             command: Some(super::Command::Supervisor {
                 action: super::SupervisorAction::Run {
-                    timeout: 0,
+                    timeouts: disabled_timeouts(),
                     expected_branch: None,
                     repo: None,
                     max_parallel: 1,
@@ -1427,9 +2320,10 @@ mod tests {
     async fn supervisor_run_json_wraps_v1_envelope() {
         let cli = Cli {
             json: true,
+            allowed_owners: None,
             command: Some(super::Command::Supervisor {
                 action: super::SupervisorAction::Run {
-                    timeout: 0,
+                    timeouts: disabled_timeouts(),
                     expected_branch: None,
                     repo: None,
                     max_parallel: 1,
@@ -1466,26 +2360,15 @@ mod tests {
     #[test]
     fn supervised_exit_code_maps_timeout_and_kill() {
         let timed_out = writ_core::supervisor::SupervisedOutput {
-            exit_code: None,
             timed_out: true,
             killed: true,
-            stdout: String::new(),
-            stderr: String::new(),
-            stdout_truncated: false,
-            stderr_truncated: false,
-            error_code: None,
+            ..writ_core::supervisor::SupervisedOutput::default()
         };
         assert_eq!(supervised_exit_code(&timed_out), ExitCode::from(124));
 
         let child_fail = writ_core::supervisor::SupervisedOutput {
             exit_code: Some(7),
-            timed_out: false,
-            killed: false,
-            stdout: String::new(),
-            stderr: String::new(),
-            stdout_truncated: false,
-            stderr_truncated: false,
-            error_code: None,
+            ..writ_core::supervisor::SupervisedOutput::default()
         };
         assert_eq!(supervised_exit_code(&child_fail), ExitCode::from(7));
     }
@@ -1494,6 +2377,7 @@ mod tests {
     async fn git_safe_valid_command_executes() {
         let cli = Cli {
             json: false,
+            allowed_owners: None,
             command: Some(super::Command::GitSafe {
                 expected_branch: None,
                 repo: None,
@@ -1514,6 +2398,7 @@ mod tests {
     async fn git_safe_json_mode_includes_exit_code() {
         let cli = Cli {
             json: true,
+            allowed_owners: None,
             command: Some(super::Command::GitSafe {
                 expected_branch: None,
                 repo: None,
@@ -1539,13 +2424,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn git_safe_blocks_merge() {
+    async fn git_safe_blocks_mergetool() {
         let cli = Cli {
             json: false,
+            allowed_owners: None,
             command: Some(super::Command::GitSafe {
                 expected_branch: None,
                 repo: None,
-                args: vec!["merge".to_owned(), "feature".to_owned()],
+                args: vec!["mergetool".to_owned()],
             }),
         };
         let mut stdout = Vec::new();
@@ -1564,6 +2450,7 @@ mod tests {
     async fn git_safe_blocks_bare_force() {
         let cli = Cli {
             json: false,
+            allowed_owners: None,
             command: Some(super::Command::GitSafe {
                 expected_branch: None,
                 repo: None,
@@ -1597,6 +2484,7 @@ mod tests {
     async fn gh_safe_pr_merge_blocked() {
         let cli = Cli {
             json: false,
+            allowed_owners: None,
             command: Some(super::Command::GhSafe {
                 args: vec!["pr".to_owned(), "merge".to_owned()],
             }),
@@ -1617,6 +2505,7 @@ mod tests {
     async fn gh_safe_api_blocked() {
         let cli = Cli {
             json: false,
+            allowed_owners: None,
             command: Some(super::Command::GhSafe {
                 args: vec!["api".to_owned(), "repos/acme/example-org".to_owned()],
             }),
@@ -1638,6 +2527,7 @@ mod tests {
         // May fail if gh is not auth'd; policy must accept `pr view`.
         let cli = Cli {
             json: true,
+            allowed_owners: None,
             command: Some(super::Command::GhSafe {
                 args: vec!["pr".to_owned(), "view".to_owned(), "1".to_owned()],
             }),
@@ -1656,5 +2546,49 @@ mod tests {
             }
             Err(e) => panic!("unexpected error: {e}"),
         }
+    }
+
+    #[tokio::test]
+    async fn gh_safe_repo_selector_outside_allowlist_is_blocked() {
+        let cli = Cli {
+            json: false,
+            allowed_owners: Some("acme".to_owned()),
+            command: Some(super::Command::GhSafe {
+                args: vec![
+                    "pr".to_owned(),
+                    "view".to_owned(),
+                    "-R".to_owned(),
+                    "other/repo".to_owned(),
+                    "1".to_owned(),
+                ],
+            }),
+        };
+        let mut stdout = Vec::new();
+        let err = run(cli, &mut stdout).await.unwrap_err();
+        assert!(matches!(
+            err,
+            writ_core::error::Error::PolicyViolation {
+                code: writ_core::error::PolicyCode::OwnerNotAllowed,
+                ..
+            }
+        ));
+        assert!(stdout.is_empty());
+    }
+
+    #[test]
+    fn allowed_owners_flag_is_global() {
+        let parsed = Cli::try_parse_from([
+            "writ",
+            "--allowed-owners",
+            "acme,example-org",
+            "gh-safe",
+            "pr",
+            "view",
+            "-R",
+            "acme/repo",
+            "1",
+        ])
+        .unwrap();
+        assert_eq!(parsed.allowed_owners.as_deref(), Some("acme,example-org"));
     }
 }

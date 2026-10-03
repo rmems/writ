@@ -45,39 +45,64 @@ fn extracts_dollar_and_backtick_substitutions() {
     );
 }
 
+#[track_caller]
+fn stripped_git_args(tokens: &[&str]) -> Vec<String> {
+    let argv: Vec<String> = tokens.iter().map(|t| (*t).to_owned()).collect();
+    skip_git_globals(Argv(&argv), &mut None, &mut false)
+}
+
 #[test]
 fn skip_git_globals_uses_checked_slices_after_end_of_options() {
+    assert_eq!(stripped_git_args(&["--"]), [] as [String; 0]);
+    assert_eq!(stripped_git_args(&["--", "status"]), ["status"]);
     assert_eq!(
-        skip_git_globals(Argv(&["--".to_owned()])),
-        [] as [String; 0]
-    );
-    assert_eq!(
-        skip_git_globals(Argv(&["--".to_owned(), "status".to_owned()])),
+        stripped_git_args(&["-C", "/tmp/repo", "status"]),
         ["status"]
     );
     assert_eq!(
-        skip_git_globals(Argv(&[
-            "-C".to_owned(),
-            "/tmp/repo".to_owned(),
-            "status".to_owned()
-        ])),
-        ["status"]
-    );
-    assert_eq!(
-        skip_git_globals(Argv(&[
-            "-c".to_owned(),
-            "alias.status=!git push --force".to_owned(),
-            "status".to_owned()
-        ])),
+        stripped_git_args(&["-c", "alias.status=!git push --force", "status"]),
         ["-c", "alias.status=!git push --force", "status"]
     );
     assert_eq!(
-        skip_git_globals(Argv(&[
-            "--config-env=alias.status=FOO".to_owned(),
-            "status".to_owned()
-        ])),
+        stripped_git_args(&["--config-env=alias.status=FOO", "status"]),
         ["--config-env=alias.status=FOO", "status"]
     );
+}
+
+#[test]
+fn skip_git_globals_tracks_dash_c_target() {
+    let argv: Vec<String> = ["-C", "/tmp/repo", "merge", "feature"]
+        .iter()
+        .map(|t| (*t).to_owned())
+        .collect();
+    let mut git_dir = None;
+    let mut other = false;
+    assert_eq!(
+        skip_git_globals(Argv(&argv), &mut git_dir, &mut other),
+        ["merge", "feature"]
+    );
+    assert_eq!(git_dir.as_deref(), Some(std::path::Path::new("/tmp/repo")));
+    assert!(!other);
+
+    // Chained relative -C operands fold into the first absolute base.
+    let argv: Vec<String> = ["-C", "/tmp", "-C", "repo", "status"]
+        .iter()
+        .map(|t| (*t).to_owned())
+        .collect();
+    let mut git_dir = None;
+    let mut other = false;
+    skip_git_globals(Argv(&argv), &mut git_dir, &mut other);
+    assert_eq!(git_dir.as_deref(), Some(std::path::Path::new("/tmp/repo")));
+
+    let argv: Vec<String> = ["--git-dir=/x/.git", "status"]
+        .iter()
+        .map(|t| (*t).to_owned())
+        .collect();
+    let mut git_dir = None;
+    let mut other = false;
+    skip_git_globals(Argv(&argv), &mut git_dir, &mut other);
+    assert!(git_dir.is_none());
+    assert!(other);
 }
 
 #[test]

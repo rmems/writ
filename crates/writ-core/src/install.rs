@@ -30,8 +30,6 @@ struct HookEventName(&'static str);
 
 impl HookEventName {
     const PRE_TOOL_USE: Self = Self("PreToolUse");
-    const WORKTREE_CREATE: Self = Self("WorktreeCreate");
-    const WORKTREE_REMOVE: Self = Self("WorktreeRemove");
     const SUBAGENT_START: Self = Self("SubagentStart");
     const SUBAGENT_STOP: Self = Self("SubagentStop");
 
@@ -180,14 +178,14 @@ fn write_settings(settings_path: &Path, merged: &Value) -> Result<()> {
 }
 
 fn merge_hook_block(mut root: Value, writ_command: WritCommand<'_>) -> (Value, bool) {
+    // Harnesses own worktree creation/removal; writ must not install
+    // WorktreeCreate/WorktreeRemove handlers that would replace that path.
+    // Existing writ handlers for those events in an older settings file are
+    // left in place here rather than silently stripped — `writ hook` treats
+    // them as coordination-only.
     let hooks = hooks_object(&mut root);
     let mut changed = ensure_pre_tool_use(hooks, writ_command);
-    for event in [
-        HookEventName::WORKTREE_CREATE,
-        HookEventName::WORKTREE_REMOVE,
-        HookEventName::SUBAGENT_START,
-        HookEventName::SUBAGENT_STOP,
-    ] {
+    for event in [HookEventName::SUBAGENT_START, HookEventName::SUBAGENT_STOP] {
         changed |= ensure_unmatched_event(hooks, event, writ_command);
     }
     (root, changed)
@@ -383,8 +381,16 @@ mod tests {
             parsed["hooks"]["PreToolUse"][0]["hooks"][1]["if"],
             "Bash(gh *)"
         );
+        assert!(
+            parsed["hooks"].get("WorktreeCreate").is_none(),
+            "install must not claim harness-owned worktree creation"
+        );
+        assert!(
+            parsed["hooks"].get("WorktreeRemove").is_none(),
+            "install must not claim harness-owned worktree removal"
+        );
         assert_eq!(
-            parsed["hooks"]["WorktreeCreate"][0]["hooks"][0]["args"],
+            parsed["hooks"]["SubagentStart"][0]["hooks"][0]["args"],
             json!(["hook"])
         );
     }
