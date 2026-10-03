@@ -272,6 +272,40 @@ mod tests {
         load_coord_snapshot(&path)
     }
 
+    fn claim(generation: i64) -> ClaimRow {
+        ClaimRow {
+            agent_id: "agent".to_owned(),
+            session_id: None,
+            intent: None,
+            owner_generation: generation,
+            paused_at: None,
+            declared_paths: Vec::new(),
+        }
+    }
+
+    fn cross_job_handoff(source_generation: i64, message_generation: i64) -> Option<String> {
+        let recipient = JobId::new("acme", "sample", "job-1");
+        let source = JobId::new("acme", "sample", "job-2");
+        let claims = BTreeMap::from([
+            (recipient.clone(), claim(7)),
+            (source, claim(source_generation)),
+        ]);
+        let message = MessageRow {
+            kind: "handoff".to_owned(),
+            from_agent_id: "agent-b".to_owned(),
+            from_owner: "acme".to_owned(),
+            from_repo_name: "sample".to_owned(),
+            from_job_id: "job-2".to_owned(),
+            to_owner: Some("acme".to_owned()),
+            to_repo_name: Some("sample".to_owned()),
+            to_job_id: Some("job-1".to_owned()),
+            owner_generation: message_generation,
+            body: "take over".to_owned(),
+            acked_at: None,
+        };
+        waiting_on_for(&[message], &recipient, &claims)
+    }
+
     #[test]
     fn missing_tables_are_unavailable_not_an_error() {
         let tmp = tempdir().unwrap();
@@ -346,44 +380,17 @@ mod tests {
 
     #[test]
     fn cross_job_handoff_uses_source_generation() {
-        let snap = snapshot_with(
-            "
-            INSERT INTO coord_claims VALUES (
-                'acme','sample','job-1','agent-a',NULL,NULL,'[]', 7, NULL
-            );
-            INSERT INTO coord_claims VALUES (
-                'acme','sample','job-2','agent-b',NULL,NULL,'[]', 3, NULL
-            );
-            INSERT INTO coord_messages VALUES (
-                'handoff','agent-b','acme','sample','job-2','acme','sample','job-1',
-                'take over', NULL, 3
-            );
-            ",
-        );
         // Recipient generation (7) differs from the message (3), but the source
         // claim generation matches, so the handoff stays visible.
-        let overlay = snap.overlay_for(&JobId::new("acme", "sample", "job-1"));
-        assert_eq!(overlay.waiting_on.as_deref(), Some("handoff:agent-b:job-2"));
+        assert_eq!(
+            cross_job_handoff(3, 3).as_deref(),
+            Some("handoff:agent-b:job-2")
+        );
     }
 
     #[test]
     fn stale_source_generation_hides_cross_job_handoff() {
-        let snap = snapshot_with(
-            "
-            INSERT INTO coord_claims VALUES (
-                'acme','sample','job-1','agent-a',NULL,NULL,'[]', 7, NULL
-            );
-            INSERT INTO coord_claims VALUES (
-                'acme','sample','job-2','agent-b',NULL,NULL,'[]', 4, NULL
-            );
-            INSERT INTO coord_messages VALUES (
-                'handoff','agent-b','acme','sample','job-2','acme','sample','job-1',
-                'take over', NULL, 3
-            );
-            ",
-        );
-        let overlay = snap.overlay_for(&JobId::new("acme", "sample", "job-1"));
-        assert!(overlay.waiting_on.is_none());
+        assert!(cross_job_handoff(4, 3).is_none());
     }
 
     #[test]

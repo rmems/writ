@@ -818,7 +818,33 @@ mod tests {
             stored.worktree_path
         );
         assert_eq!(stored.allocation_state, AllocationState::Prepared);
+    }
 
+    #[test]
+    fn replacement_operation_does_not_authorize_reconcile_success() {
+        let (tmp, repo) = init_repo();
+        let wt = tmp.path().join("wts/one");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "job/one",
+                wt.to_str().unwrap(),
+            ],
+        );
+        let store_path = tmp.path().join("leases.db");
+        let registry =
+            CheckoutRegistry::with_store(LeaseStore::open(&store_path).unwrap()).unwrap();
+        registry.register(&wt, "shared-job").unwrap();
+        let info = inspect_checkout(&wt).unwrap();
+        let stored = registry
+            .leases
+            .find_job(registration_job_key(&info, "shared-job"))
+            .unwrap()
+            .unwrap();
         let replacement = rusqlite::Connection::open(&store_path).unwrap();
         replacement
             .execute(
@@ -829,11 +855,7 @@ mod tests {
         drop(replacement);
         let replacement = registry
             .leases
-            .find_job(JobKey {
-                owner: &info.owner,
-                repo_name: &info.repo_name,
-                job_id: "shared-job",
-            })
+            .find_job(registration_job_key(&info, "shared-job"))
             .unwrap()
             .unwrap();
         let err = registry
