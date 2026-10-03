@@ -1,14 +1,16 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
+use crate::checkout::checkout_path_key;
 use crate::error::{
     Error, PolicyCode, Result, WorktreeCreationFailure, WorktreePostconditionFailure,
 };
 use crate::identity::{
     BranchName, BranchRef, CommitId, JobId, Owner, Repo, StartPoint, resolve_start_commit,
 };
-use crate::lease::{LeaseGrant, LeaseStore, ResumeKey};
+use crate::lease::{Lease, LeaseGrant, LeaseMode, LeaseStore, ResumeKey};
 use crate::owners::OwnerAllowlist;
 use crate::paths::{canonicalize_for_tools, derive_worktree_path, worktree_base_path};
 use crate::porcelain;
@@ -66,14 +68,21 @@ pub struct WorktreeCreateRequest<'a> {
 pub struct WorktreeManager {
     base_path: Option<PathBuf>,
     allowlist: OwnerAllowlist,
-    leases: LeaseStore,
+    lease_path: Option<PathBuf>,
+    leases: OnceLock<LeaseStore>,
 }
 
 impl WorktreeManager {
     /// Create a new manager using the default base path and the durable lease store.
     pub fn new() -> Result<Self> {
-        let base = worktree_base_path()?;
-        Self::with_base_and_leases(base, LeaseStore::open(crate::paths::lease_store_path())?)
+        let base = checkout_path_key(&worktree_base_path()?)?;
+        let lease_path = checkout_path_key(&crate::paths::lease_store_path())?;
+        Ok(Self {
+            base_path: Some(base),
+            allowlist: OwnerAllowlist::from_env(),
+            lease_path: Some(lease_path),
+            leases: OnceLock::new(),
+        })
     }
 
     /// Create a new manager with an explicit base path (for testing or overrides).
@@ -87,8 +96,16 @@ impl WorktreeManager {
             context: "create worktree base directory",
             source: e,
         })?;
-        let lease_path = base.join("leases.db");
-        Self::with_base_and_leases(base, LeaseStore::open(lease_path)?)
+        let base = canonicalize_for_tools(&base).map_err(|e| Error::Io {
+            context: "canonicalize worktree base directory",
+            source: e,
+        })?;
+        Ok(Self {
+            lease_path: Some(base.join("leases.db")),
+            base_path: Some(base),
+            allowlist: OwnerAllowlist::from_env(),
+            leases: OnceLock::new(),
+        })
     }
 
     /// Create a manager with an explicit base path and lease store.
@@ -103,10 +120,13 @@ impl WorktreeManager {
             context: "canonicalize worktree base directory",
             source: e,
         })?;
+        let cell = OnceLock::new();
+        let _ = cell.set(leases);
         Ok(Self {
             base_path: Some(base),
             allowlist: OwnerAllowlist::from_env(),
-            leases,
+            lease_path: None,
+            leases: cell,
         })
     }
 
@@ -128,10 +148,30 @@ impl WorktreeManager {
         })
     }
 
-    /// Borrow the lease store used by this manager.
+    fn leases(&self) -> Result<&LeaseStore> {
+        if let Some(store) = self.leases.get() {
+            return Ok(store);
+        }
+        let path = self.lease_path.as_ref().ok_or_else(|| Error::LeaseStore {
+            context: "open lease store",
+            message: "lease store path not initialized".to_owned(),
+        })?;
+        let _ = self.leases.set(LeaseStore::open(path)?);
+        self.leases.get().ok_or_else(|| Error::LeaseStore {
+            context: "open lease store",
+            message: "lease store missing after initialization".to_owned(),
+        })
+    }
+
+    /// Borrow the lease store used by deprecated managed lifecycle operations.
+    ///
+    /// This retains the original infallible accessor for API compatibility.
+    /// Mutating operations use the fallible internal accessor and return any
+    /// initialization error normally.
     #[must_use]
     pub fn lease_store(&self) -> &LeaseStore {
-        &self.leases
+        self.leases()
+            .expect("deprecated worktree lease store could not be opened")
     }
 
     /// Create a new worktree for the given job.
@@ -193,30 +233,32 @@ impl WorktreeManager {
             Repo(request.repo),
             JobId(request.job_id),
         )?;
-        let mode = decide_create_mode(
-            &request,
-            CommitId(&start_commit),
-            &worktree_path,
-            &self.leases,
-        )?;
-        // Persist identity before Git mutates so a later add/verify error
-        // still has a reclaimable lease. Residual git state is not deleted.
-        self.leases.grant(LeaseGrant {
-            repo: request.repo_root,
+        let leases = self.leases()?;
+        let mode = decide_create_mode(&request, CommitId(&start_commit), &worktree_path, leases)?;
+        let canonical_repo = canonicalize_for_tools(request.repo_root).map_err(|e| Error::Io {
+            context: "canonicalize source repository",
+            source: e,
+        })?;
+        let grant = LeaseGrant {
+            repo: &canonical_repo,
             owner: request.owner,
             repo_name: request.repo,
             job_id: request.job_id,
             branch: request.branch,
             worktree_path: &worktree_path,
             start_commit: &start_commit,
-        })?;
+        };
         match mode {
-            CreateMode::AlreadyPresent => {}
+            CreateMode::AlreadyPresent => {
+                leases.grant(grant)?;
+            }
             CreateMode::Reclaim => {
                 add_worktree(&request, &worktree_path, CommitId(&start_commit), true)?;
+                leases.grant(grant)?;
             }
             CreateMode::Fresh => {
                 add_worktree(&request, &worktree_path, CommitId(&start_commit), false)?;
+                leases.grant(grant)?;
             }
         }
 
@@ -242,7 +284,7 @@ impl WorktreeManager {
         if !base.exists() {
             return Ok(Vec::new());
         }
-        collect_job_worktrees(base, &self.leases)
+        collect_job_worktrees(base)
     }
 
     /// Remove a worktree by its path.
@@ -250,30 +292,35 @@ impl WorktreeManager {
     /// If `force` is true, the worktree is removed even if it has uncommitted changes.
     /// The associated branch is NOT deleted by default.
     pub fn remove(&self, worktree_path: &Path, force: bool) -> Result<()> {
-        if !worktree_path.exists() {
-            self.leases.release_by_path(worktree_path)?;
-            return Ok(());
-        }
-
-        // Verify the path is within our sandbox
         let base = self.base_path()?;
-        if !is_within_base(worktree_path, base)? {
+        let canonical_path = checkout_path_key(worktree_path)?;
+        if !canonical_path.starts_with(base) {
             return Err(Error::SandboxViolation {
                 base: base.to_path_buf(),
                 candidate: worktree_path.to_path_buf(),
                 reason: "worktree path is outside configured base",
             });
         }
+        let leases = self.leases()?;
+        let observed = leases.find_by_path(&canonical_path)?;
+
+        if !canonical_path.exists() {
+            if let Some(lease) = observed.as_ref() {
+                prune_stale_registration(Path::new(&lease.repo))?;
+                leases.release_if_current(lease)?;
+            }
+            return Ok(());
+        }
 
         // Find the repo root for this worktree
-        let repo_root = find_repo_root_for_worktree(worktree_path)?;
+        let repo_root = find_repo_root_for_worktree(&canonical_path)?;
 
         let mut args = vec!["worktree".into(), "remove".into()];
         if force {
             args.push("--force".into());
         }
         args.push("--".into());
-        args.push(worktree_path.to_string_lossy().to_string());
+        args.push(canonical_path.to_string_lossy().to_string());
 
         let output = Command::new("git")
             .arg("-C")
@@ -294,8 +341,10 @@ impl WorktreeManager {
         }
 
         // Also clean up empty parent directories
-        cleanup_empty_parents(worktree_path, base);
-        self.leases.release_by_path(worktree_path)?;
+        cleanup_empty_parents(&canonical_path, base);
+        if let Some(lease) = observed.as_ref() {
+            leases.release_if_current(lease)?;
+        }
 
         Ok(())
     }
@@ -454,13 +503,42 @@ fn decide_create_mode(
     leases: &LeaseStore,
 ) -> Result<CreateMode> {
     if let Some(mode) = existing_worktree_mode(request, start_commit, worktree_path)? {
+        prove_resume(request, start_commit, worktree_path, leases)?;
         return Ok(mode);
     }
     if !branch_exists_in_repo(request.repo_root, BranchName(request.branch))? {
+        reject_foreign_branch_identity(request, start_commit, worktree_path, leases)?;
         return Ok(CreateMode::Fresh);
     }
     prove_resume(request, start_commit, worktree_path, leases)?;
     Ok(CreateMode::Reclaim)
+}
+
+fn reject_foreign_branch_identity(
+    request: &WorktreeCreateRequest<'_>,
+    start_commit: CommitId<'_>,
+    worktree_path: &Path,
+    leases: &LeaseStore,
+) -> Result<()> {
+    for lease in leases.list_all()? {
+        if lease.owner != request.owner
+            || lease.repo_name != request.repo
+            || lease.branch != request.branch
+            || !lease_repo_matches(&lease, request.repo_root)
+        {
+            continue;
+        }
+        if lease.job_id != request.job_id {
+            return Err(resume_unproven(
+                request,
+                start_commit,
+                worktree_path,
+                Some(&lease_evidence(&lease)),
+                "durable ownership for this repository and branch belongs to another job",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn existing_worktree_mode(
@@ -521,12 +599,50 @@ fn prove_resume(
             "no durable lease identity for this owner/repo/job/branch",
         ));
     };
+    let ownership = lease_evidence(&lease);
+    let expected_ref = format!("refs/heads/{}", request.branch);
+    if !lease_repo_matches(&lease, request.repo_root) {
+        return Err(resume_unproven(
+            request,
+            start_commit,
+            worktree_path,
+            Some(&ownership),
+            "lease belongs to a different source repository",
+        ));
+    }
+    if lease.branch_ref != expected_ref {
+        return Err(resume_unproven(
+            request,
+            start_commit,
+            worktree_path,
+            Some(&ownership),
+            "lease branch ref does not match the requested branch",
+        ));
+    }
+    if !matches!(lease.mode, LeaseMode::WriterLocked | LeaseMode::Unassigned) {
+        return Err(resume_unproven(
+            request,
+            start_commit,
+            worktree_path,
+            Some(&ownership),
+            "lease mode is not reclaimable",
+        ));
+    }
+    if Path::new(&lease.worktree_path) != worktree_path {
+        return Err(resume_unproven(
+            request,
+            start_commit,
+            worktree_path,
+            Some(&ownership),
+            "lease worktree path does not match the derived job path",
+        ));
+    }
     if lease.start_commit != start_commit.as_str() {
         return Err(resume_unproven(
             request,
             start_commit,
             worktree_path,
-            None,
+            Some(&ownership),
             &format!(
                 "lease start_commit {} does not match requested commit {}",
                 lease.start_commit,
@@ -549,7 +665,7 @@ fn prove_resume(
             request,
             start_commit,
             worktree_path,
-            None,
+            Some(&ownership),
             &format!("branch moved: current commit {branch_commit}"),
         ));
     }
@@ -558,43 +674,140 @@ fn prove_resume(
             request,
             start_commit,
             worktree_path,
-            None,
+            Some(&ownership),
             "branch is checked out in another worktree",
         ));
     }
-    verify_resume_upstream(request.repo_root, request.branch)?;
+    if let Some(reason) = resume_upstream_mismatch(request.repo_root, request.branch)? {
+        return Err(resume_unproven(
+            request,
+            start_commit,
+            worktree_path,
+            Some(&ownership),
+            &reason,
+        ));
+    }
     Ok(())
 }
 
-fn verify_resume_upstream(repo_root: &Path, branch: &str) -> Result<()> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
-        .args([
+fn lease_repo_matches(lease: &Lease, repo_root: &Path) -> bool {
+    canonicalize_for_tools(Path::new(&lease.repo))
+        .ok()
+        .zip(canonicalize_for_tools(repo_root).ok())
+        .is_some_and(|(stored, requested)| stored == requested)
+}
+
+fn lease_evidence(lease: &Lease) -> String {
+    format!(
+        "lease_mode={} lease_repo={} lease_branch_ref={} lease_path={}",
+        lease.mode_raw, lease.repo, lease.branch_ref, lease.worktree_path
+    )
+}
+
+fn resume_upstream_mismatch(repo_root: &Path, branch: &str) -> Result<Option<String>> {
+    let remote = optional_git_stdout(
+        repo_root,
+        GitArgList(&["config", "--get", &format!("branch.{branch}.remote")]),
+    );
+    let merge = optional_git_stdout(
+        repo_root,
+        GitArgList(&["config", "--get", &format!("branch.{branch}.merge")]),
+    );
+    let (remote, merge) = match (remote, merge) {
+        (None, None) => return Ok(None),
+        (Some(remote), Some(merge)) => (remote, merge),
+        _ => return Ok(Some("upstream configuration is incomplete".to_owned())),
+    };
+    let expected_merge = format!("refs/heads/{branch}");
+    if merge != expected_merge {
+        return Ok(Some(format!(
+            "configured merge ref {merge:?} does not match {expected_merge:?}"
+        )));
+    }
+    let upstream = optional_git_stdout(
+        repo_root,
+        GitArgList(&[
             "rev-parse",
             "--abbrev-ref",
             "--symbolic-full-name",
             &format!("{branch}@{{upstream}}"),
-        ])
-        .output()
-        .map_err(|e| Error::Io {
-            context: "verify resume upstream",
-            source: e,
-        })?;
-    if !output.status.success() {
-        return Ok(());
+        ]),
+    );
+    let Some(upstream) = upstream else {
+        return Ok(Some(
+            "configured upstream ref cannot be resolved".to_owned(),
+        ));
+    };
+    let expected_upstream = if remote == "." {
+        branch.to_owned()
+    } else {
+        format!("{remote}/{branch}")
+    };
+    if upstream != expected_upstream {
+        return Ok(Some(format!(
+            "upstream {upstream:?} does not match configured ref {expected_upstream:?}"
+        )));
     }
-    let upstream = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    let expected_suffix = format!("/{branch}");
-    if upstream == branch || upstream.ends_with(&expected_suffix) {
-        return Ok(());
+
+    let local = git_stdout(
+        repo_root,
+        GitArgList(&[
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            &format!("refs/heads/{branch}^{{commit}}"),
+        ]),
+        IoContext("verify local resume commit"),
+    )?;
+    let upstream_commit = git_stdout(
+        repo_root,
+        GitArgList(&[
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            &format!("{upstream}^{{commit}}"),
+        ]),
+        IoContext("verify upstream resume commit"),
+    )?;
+    if git_is_ancestor(repo_root, &upstream_commit, &local)? {
+        return Ok(None);
     }
-    Err(Error::PolicyViolation {
-        code: PolicyCode::WorktreeResumeUnproven,
-        message: format!(
-            "refusing to reuse branch {branch:?}: upstream {upstream:?} is not the expected tracking ref"
-        ),
-    })
+    if git_is_ancestor(repo_root, &local, &upstream_commit)? {
+        return Ok(Some(format!("branch is behind upstream {upstream:?}")));
+    }
+    Ok(Some(format!(
+        "branch has diverged from upstream {upstream:?}"
+    )))
+}
+
+fn git_is_ancestor(repo_root: &Path, ancestor: &str, descendant: &str) -> Result<bool> {
+    let output = spawn_git(
+        repo_root,
+        GitArgList(&[
+            "merge-base",
+            "--is-ancestor",
+            "--end-of-options",
+            ancestor,
+            descendant,
+        ]),
+    )
+    .map_err(|e| Error::Io {
+        context: "verify resume ancestry",
+        source: e,
+    })?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(Error::GitCommand {
+            args: vec![
+                "merge-base".to_owned(),
+                "--is-ancestor".to_owned(),
+                ancestor.to_owned(),
+                descendant.to_owned(),
+            ],
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        }),
+    }
 }
 
 fn branch_checked_out_elsewhere(
@@ -888,12 +1101,12 @@ fn verify_creation_postconditions(postconditions: CreationPostconditions<'_>) ->
     Ok(head_commit)
 }
 
-fn collect_job_worktrees(base: &Path, leases: &LeaseStore) -> Result<Vec<Worktree>> {
+fn collect_job_worktrees(base: &Path) -> Result<Vec<Worktree>> {
     let mut worktrees = Vec::new();
     for owner in dir_dirs(base, "read worktree base directory", "read owner entry")? {
         for repo in dir_dirs(&owner, "read repo directory", "read repo entry")? {
             for job in dir_dirs(&repo, "read job directory", "read job entry")? {
-                worktrees.push(describe_job_worktree(job, leases));
+                worktrees.push(describe_job_worktree(job));
             }
         }
     }
@@ -917,24 +1130,18 @@ fn dir_dirs(path: &Path, dir_ctx: &'static str, entry_ctx: &'static str) -> Resu
     Ok(dirs)
 }
 
-fn describe_job_worktree(path: PathBuf, leases: &LeaseStore) -> Worktree {
+fn describe_job_worktree(path: PathBuf) -> Worktree {
     let branch = get_worktree_branch(&path).unwrap_or_else(|_| "unknown".to_string());
     let repo_root = find_repo_root_for_worktree(&path).unwrap_or_else(|_| PathBuf::new());
     let head_commit = optional_git_stdout(
         &path,
         GitArgList(&["rev-parse", "--verify", "HEAD^{commit}"]),
     );
-    let start_commit = leases
-        .find_by_path(&path)
-        .ok()
-        .flatten()
-        .map(|lease| lease.start_commit)
-        .or_else(|| head_commit.clone());
     Worktree {
         path,
         branch,
         repo_root,
-        start_commit,
+        start_commit: None,
         head_commit,
     }
 }
@@ -1116,18 +1323,19 @@ fn reject_symlink_components_under(base: &Path, path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Check if a path is within the base directory (sandbox check).
-fn is_within_base(path: &Path, base: &Path) -> Result<bool> {
-    let canonical_path = canonicalize_for_tools(path).map_err(|e| Error::Io {
-        context: "canonicalize candidate path",
-        source: e,
-    })?;
-    let canonical_base = canonicalize_for_tools(base).map_err(|e| Error::Io {
-        context: "canonicalize base path",
-        source: e,
-    })?;
-
-    Ok(canonical_path.starts_with(&canonical_base))
+fn prune_stale_registration(repo_root: &Path) -> Result<()> {
+    let output =
+        spawn_git(repo_root, GitArgList(&["worktree", "prune"])).map_err(|e| Error::Io {
+            context: "prune stale worktree registration",
+            source: e,
+        })?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(Error::GitCommand {
+        args: vec!["worktree".to_owned(), "prune".to_owned()],
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    })
 }
 
 /// Clean up empty parent directories up to the base.
@@ -1590,6 +1798,25 @@ mod tests {
     }
 
     #[test]
+    fn create_rejects_matching_registration_without_resume_identity() {
+        let harness = Harness::sha1();
+        let start_commit = harness.head();
+        let branch = "feature/unowned-registration";
+        let path = harness.job_path("job-unowned-registration");
+        harness.git(&[
+            "worktree",
+            "add",
+            "-b",
+            branch,
+            "--",
+            path.to_str().unwrap(),
+            &start_commit,
+        ]);
+
+        assert_unproven_resume(harness.create("job-unowned-registration", branch, &start_commit));
+    }
+
+    #[test]
     fn create_rejects_branch_checked_out_in_another_worktree() {
         let harness = Harness::sha1();
         let start_commit = harness.head();
@@ -1981,6 +2208,20 @@ mod tests {
             fs::read_to_string(target.join("occupied")).unwrap(),
             "force worktree add failure\n"
         );
+        assert!(
+            harness
+                .manager
+                .lease_store()
+                .find_resume(ResumeKey {
+                    owner: "acme",
+                    repo_name: "test-repo",
+                    job_id: "job-collision",
+                    branch: "feature/rollback",
+                })
+                .unwrap()
+                .is_none(),
+            "a failed fresh create must not leave ownership evidence"
+        );
     }
 
     #[test]
@@ -1993,6 +2234,61 @@ mod tests {
         assert!(wt.path.exists());
         harness.manager.remove(&wt.path, false).unwrap();
         assert!(!wt.path.exists());
+    }
+
+    #[test]
+    fn remove_via_noncanonical_path_releases_the_lease() {
+        let harness = Harness::sha1();
+        let start_commit = harness.head();
+        let wt = harness
+            .create("job-noncanonical", "feature/noncanonical", &start_commit)
+            .unwrap();
+
+        harness.manager.remove(&wt.path.join("."), false).unwrap();
+
+        let lease = harness
+            .manager
+            .lease_store()
+            .find_resume(ResumeKey {
+                owner: "acme",
+                repo_name: "test-repo",
+                job_id: "job-noncanonical",
+                branch: "feature/noncanonical",
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(lease.mode, crate::lease::LeaseMode::Unassigned);
+    }
+
+    #[test]
+    fn remove_prunes_registration_for_an_already_deleted_worktree() {
+        let harness = Harness::sha1();
+        let start_commit = harness.head();
+        let wt = harness
+            .create("job-stale", "feature/stale", &start_commit)
+            .unwrap();
+        fs::remove_dir_all(&wt.path).unwrap();
+
+        harness.manager.remove(&wt.path, false).unwrap();
+
+        let listing = harness.git(&["worktree", "list", "--porcelain"]);
+        assert!(!listing.contains(wt.path.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn list_and_prune_do_not_create_a_writable_lease_store() {
+        let temp = tempdir().unwrap();
+        let base = temp.path().join("worktrees");
+        let repo = temp.path().join("repo");
+        fs::create_dir(&repo).unwrap();
+        let repo = init_test_repo_with_object_format(&repo, None).unwrap();
+        let manager = WorktreeManager::with_base(base).unwrap();
+        let lease_path = manager.base_path().unwrap().join("leases.db");
+
+        assert!(!lease_path.exists());
+        assert!(manager.list().unwrap().is_empty());
+        manager.prune(&repo).unwrap();
+        assert!(!lease_path.exists());
     }
 
     #[test]
@@ -2221,6 +2517,190 @@ mod tests {
             .unwrap();
         assert_eq!(lease.mode, crate::lease::LeaseMode::WriterLocked);
         assert!(lease.released_at.is_none());
+    }
+
+    #[test]
+    fn failed_reclaim_does_not_refresh_the_released_lease() {
+        let harness = Harness::sha1();
+        let start_commit = harness.head();
+        let branch = "feature/failed-reclaim";
+        let wt = harness
+            .create("job-failed-reclaim", branch, &start_commit)
+            .unwrap();
+        harness.manager.remove(&wt.path, false).unwrap();
+        let before = harness
+            .manager
+            .lease_store()
+            .find_resume(ResumeKey {
+                owner: "acme",
+                repo_name: "test-repo",
+                job_id: "job-failed-reclaim",
+                branch,
+            })
+            .unwrap()
+            .unwrap();
+        fs::create_dir_all(&wt.path).unwrap();
+        fs::write(wt.path.join("occupied"), "block reclaim\n").unwrap();
+
+        let result = harness.create("job-failed-reclaim", branch, &start_commit);
+
+        assert!(matches!(result, Err(Error::WorktreeCreationFailed(_))));
+        let after = harness
+            .manager
+            .lease_store()
+            .find_resume(ResumeKey {
+                owner: "acme",
+                repo_name: "test-repo",
+                job_id: "job-failed-reclaim",
+                branch,
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.mode, crate::lease::LeaseMode::Unassigned);
+        assert_eq!(after.updated_at, before.updated_at);
+    }
+
+    #[test]
+    fn absent_branch_owned_by_another_job_is_not_fresh() {
+        let harness = Harness::sha1();
+        let start_commit = harness.head();
+        let branch = "feature/owned";
+        let wt = harness.create("job-owner", branch, &start_commit).unwrap();
+        harness.manager.remove(&wt.path, false).unwrap();
+        harness.git(&["branch", "-D", branch]);
+
+        let result = harness.create("job-foreign", branch, &start_commit);
+
+        assert_unproven_resume(result);
+        assert!(harness.git(&["branch", "--list", branch]).trim().is_empty());
+    }
+
+    #[test]
+    fn reclaim_rejects_unknown_lease_mode() {
+        let harness = Harness::sha1();
+        let start_commit = harness.head();
+        let branch = "feature/unknown-mode";
+        let wt = harness
+            .create("job-unknown-mode", branch, &start_commit)
+            .unwrap();
+        harness.manager.remove(&wt.path, false).unwrap();
+        let conn = rusqlite::Connection::open(harness.manager.lease_store().path()).unwrap();
+        conn.execute(
+            "UPDATE leases SET mode = 'FUTURE_MODE' WHERE job_id = 'job-unknown-mode'",
+            [],
+        )
+        .unwrap();
+
+        assert_unproven_resume(harness.create("job-unknown-mode", branch, &start_commit));
+    }
+
+    #[test]
+    fn reclaim_is_bound_to_the_source_repository() {
+        let harness = Harness::sha1();
+        let start_commit = harness.head();
+        let branch = "feature/repo-bound";
+        let wt = harness
+            .create("job-repo-bound", branch, &start_commit)
+            .unwrap();
+        harness.manager.remove(&wt.path, false).unwrap();
+
+        let clone = harness.temp_path().join("other-clone");
+        git_cwd(
+            harness.temp_path(),
+            &[
+                "clone",
+                harness.repo_root.to_str().unwrap(),
+                clone.to_str().unwrap(),
+            ],
+        );
+        git_output(
+            &clone,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://github.com/acme/test-repo.git",
+            ],
+        );
+        git_output(&clone, &["branch", branch, &start_commit]);
+        let mut request = harness.request("job-repo-bound", branch, &start_commit);
+        request.repo_root = &clone;
+
+        assert_unproven_resume(harness.manager.create_with_request(request));
+    }
+
+    fn configure_upstream(
+        harness: &Harness,
+        branch: &str,
+        remote: &str,
+        remote_commit: Option<&str>,
+    ) {
+        harness.git(&["config", &format!("remote.{remote}.url"), "."]);
+        harness.git(&[
+            "config",
+            &format!("remote.{remote}.fetch"),
+            &format!("+refs/heads/*:refs/remotes/{remote}/*"),
+        ]);
+        harness.git(&["config", &format!("branch.{branch}.remote"), remote]);
+        harness.git(&[
+            "config",
+            &format!("branch.{branch}.merge"),
+            &format!("refs/heads/{branch}"),
+        ]);
+        if let Some(commit) = remote_commit {
+            harness.git(&[
+                "update-ref",
+                &format!("refs/remotes/{remote}/{branch}"),
+                commit,
+            ]);
+        }
+    }
+
+    #[test]
+    fn reclaim_rejects_branch_behind_its_upstream() {
+        let harness = Harness::sha1();
+        let start_commit = harness.head();
+        let branch = "feature/behind";
+        let wt = harness.create("job-behind", branch, &start_commit).unwrap();
+        harness.manager.remove(&wt.path, false).unwrap();
+        let remote_commit = harness.commit_file("remote.txt", "remote\n", "remote advance");
+        configure_upstream(&harness, branch, "upstream", Some(&remote_commit));
+
+        assert_unproven_resume(harness.create("job-behind", branch, &start_commit));
+    }
+
+    #[test]
+    fn reclaim_rejects_a_configured_but_unresolved_upstream() {
+        let harness = Harness::sha1();
+        let start_commit = harness.head();
+        let branch = "feature/missing-upstream";
+        let wt = harness
+            .create("job-missing-upstream", branch, &start_commit)
+            .unwrap();
+        harness.manager.remove(&wt.path, false).unwrap();
+        configure_upstream(&harness, branch, "upstream", None);
+
+        assert_unproven_resume(harness.create("job-missing-upstream", branch, &start_commit));
+    }
+
+    #[test]
+    fn reclaim_accepts_a_valid_upstream_remote_containing_slashes() {
+        let harness = Harness::sha1();
+        let start_commit = harness.head();
+        let branch = "feature/slashed-remote";
+        let wt = harness
+            .create("job-slashed-remote", branch, &start_commit)
+            .unwrap();
+        harness.manager.remove(&wt.path, false).unwrap();
+        configure_upstream(&harness, branch, "team/origin", Some(&start_commit));
+
+        let reclaimed = harness
+            .create("job-slashed-remote", branch, &start_commit)
+            .unwrap();
+        assert_eq!(
+            reclaimed.head_commit.as_deref(),
+            Some(start_commit.as_str())
+        );
     }
 
     #[test]
