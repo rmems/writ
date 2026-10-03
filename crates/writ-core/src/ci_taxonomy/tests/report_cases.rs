@@ -492,22 +492,6 @@ fn required_pass_with_unknown_requiredness_fail_is_unknown_not_pass() {
 }
 
 #[test]
-fn observation_code_does_not_end_in_separator_after_slug_truncation() {
-    let report = classify_checks_json(&json!([{
-        "name": format!("{} suffix", "a".repeat(39)),
-        "workflow": "CI",
-        "bucket": "fail",
-        "link": ACTIONS_URL,
-    }]))
-    .unwrap();
-
-    assert_eq!(
-        report.observation_codes(ObservationKind::UnknownRequiredness),
-        vec!["unknown_requiredness:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
-    );
-}
-
-#[test]
 fn all_required_pass_still_reports_pass() {
     let report = classify_checks_json(&json!([
         {

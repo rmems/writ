@@ -1,3 +1,5 @@
+use serde_json::json;
+
 use super::super::*;
 use super::{
     ACTIONS_URL, CODACY_URL, CODERABBIT_URL, GITAR_URL, KILO_URL, assert_outcome, assert_policies,
@@ -235,5 +237,21 @@ fn genuine_vendor_checks_still_classify_b_and_c() {
             codacy_url.check_class,
         ),
         (CheckClass::C, CheckClass::C, CheckClass::B, CheckClass::B)
+    );
+}
+
+#[test]
+fn observation_code_does_not_end_in_separator_after_slug_truncation() {
+    let report = classify_checks_json(&json!([{
+        "name": format!("{} suffix", "a".repeat(39)),
+        "workflow": "CI",
+        "bucket": "fail",
+        "link": ACTIONS_URL,
+    }]))
+    .unwrap();
+
+    assert_eq!(
+        report.observation_codes(ObservationKind::UnknownRequiredness),
+        vec!["unknown_requiredness:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
     );
 }
