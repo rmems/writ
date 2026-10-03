@@ -27,6 +27,7 @@ fn policy_retains_direct_git_and_checkout_guards() {
         ),
         ("gh", vec!["pr", "checkout", "1"], PolicyCode::MergeBlocked),
         ("git", vec!["commit", "-m", "x"], PolicyCode::BranchMismatch),
+        ("git", vec!["merge", "peer"], PolicyCode::BranchMismatch),
     ] {
         assert_policy_code(
             check_command_policy(program, &args, &RunOptions::default()).unwrap_err(),
@@ -174,23 +175,38 @@ async fn supervised_git_uses_harness_selected_checkout_and_assigned_branch() {
 }
 
 #[tokio::test]
-async fn supervised_local_merge_preserves_dirty_wip() {
+async fn supervised_local_merge_checks_wip_before_final_branch_pin() {
     let repo = test_repo();
     std::fs::write(repo.path().join("wip.txt"), "keep me").unwrap();
     let options = RunOptions {
         repo: Some(repo.path().to_path_buf()),
-        expected_branch: Some("main".into()),
         ..RunOptions::default()
+    };
+    for expected_branch in ["main", "peer"] {
+        let options = RunOptions {
+            expected_branch: Some(expected_branch.into()),
+            ..options.clone()
+        };
+        let err = Supervisor::new(1)
+            .run("git", &["merge", "peer"], None, &options)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), "MERGE_BLOCKED", "{expected_branch}: {err}");
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("wip.txt")).unwrap(),
+            "keep me"
+        );
+    }
+    std::fs::remove_file(repo.path().join("wip.txt")).unwrap();
+    let options = RunOptions {
+        expected_branch: Some("peer".into()),
+        ..options
     };
     let err = Supervisor::new(1)
         .run("git", &["merge", "peer"], None, &options)
         .await
         .unwrap_err();
-    assert_policy_code(err, PolicyCode::MergeBlocked);
-    assert_eq!(
-        std::fs::read_to_string(repo.path().join("wip.txt")).unwrap(),
-        "keep me"
-    );
+    assert_policy_code(err, PolicyCode::BranchMismatch);
 }
 
 #[tokio::test]

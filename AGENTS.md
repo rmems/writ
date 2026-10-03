@@ -22,6 +22,8 @@ This is the repository contribution contract. `CLAUDE.md`, `SKILL.md`, `REVIEW.m
 
 Merge, rebase and cherry-pick compatible peer work into the assigned branch. Branch names are not a permission system. Resolve ordinary conflicts in the assigned checkout, use `--continue`, `--abort` or `--quit` as appropriate, and preserve uncommitted work. Writ's direct local merge helpers conservatively refuse dirty-tree integration; commit or stash your own WIP first.
 
+Direct `git-safe` branch pinning with `--expected-branch` is optional; omitting it does not prove runtime assignment or consult registration. Supervision requires that pin for direct mutating Git commands. See the [CLI contract](docs/cli-contract.md#state-and-authority-boundaries) for the checks each path provides.
+
 Each independent writer owns its checkout and branch. Read-only helpers may inspect the current checkout without creating a worktree, branch, issue or PR. Reuse a suitable existing checkout; create a separate checkout when independent writes need isolation. Harnesses choose its location. Registration and supervision do not require placement beneath a writ-managed root.
 
 Overlapping filenames across separate branches are a coordination signal. Identify the owner, agree on a split or handoff, and select one integration owner. Keep useful ownership, conflict and recovery state in the existing lease store. Do not invent another coordination database. Process stacked PRs from the bottom upward.

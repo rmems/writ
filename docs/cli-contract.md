@@ -62,6 +62,18 @@ commands remain only for compatibility. GitHub remains authoritative for remote
 source, pull requests, reviews, checks, repository rules, and protected-branch
 merges.
 
+Direct `git-safe` branch pinning is opt-in through `--expected-branch` (or
+`SafeGitCommand::run(..., Some(branch))`). Mutating commands reject a mismatch
+when that pin is supplied. Omitting it (`None` in the library) provides no
+runtime proof of assignment; no registration or special `main`/`master` rule
+is implied. Local merge/pull WIP checks still apply without a branch pin.
+
+For a direct mutating Git command under `supervisor run`, `--expected-branch`
+is required. After acquiring the concurrency permit, supervision checks local
+merge/pull WIP first and the expected branch last, immediately before spawning
+Git. Direct nonmutating Git commands do not require that pin. These checks do
+not recursively inspect Git calls inside host scripts.
+
 There is **no `writ coord` command in this snapshot**. Planned claim, overlap,
 message, handoff, and lease-reconciliation capabilities belong to RM-825 and must
 extend the existing lease store rather than introduce a second database. Until

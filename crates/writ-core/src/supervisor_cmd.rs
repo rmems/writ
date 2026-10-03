@@ -135,8 +135,8 @@ pub(super) fn verify_repo_branch(
     args: &[String],
 ) -> Result<()> {
     let cmd = SafeGitCommand::new(args)?;
-    cmd.verify_branch(repo, expected_branch)?;
-    cmd.admit_local_merge(repo)
+    cmd.admit_local_merge(repo)?;
+    cmd.verify_branch(repo, expected_branch)
 }
 
 fn resolve_supervised_repo(repo: Option<&std::path::Path>) -> Result<PathBuf> {

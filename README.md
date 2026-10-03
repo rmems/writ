@@ -319,6 +319,7 @@ Writ's GitHub helpers check supported explicit target selectors against a config
 - Set `WRIT_ALLOWED_OWNERS=acme,example-org` (comma-separated), or pass `--allowed-owners` / explicit owners at the API boundary.
 - An empty allowlist denies owner-taking operations (`writ worktree create` and `gh` commands that select a repository via `-R` / `--repo` in any pflag spelling, or via `GH_REPO`) rather than permitting them.
 - `gh api` checks literal owners in `repos/OWNER/REPO/...`, `orgs/OWNER/repos`, and `users/OWNER/repos`, including `api.github.com` URLs. Other API endpoint families and owners hidden in placeholder expansion, GraphQL node IDs or opaque request bodies are outside that inference; configured explicit repository selectors remain checked.
+- HTTP(S) URL scheme and DNS hostname matching are case-insensitive. Numeric ports, userinfo and a trailing DNS dot do not hide the target host. REST URL inference matches `api.github.com` exactly; PR/issue URLs retain owner checks on valid public and enterprise DNS hosts. Extracting an owner does not authorize the host. Malformed HTTP authorities are rejected.
 - Comparison uses the same host/case normalization as `github_repo_slugs_match`, so `Acme/Repo` and `github.com/acme/repo` cannot diverge.
 
 Examples use generic owners such as `acme` and `example-org`.

@@ -711,11 +711,11 @@ pub fn enforce_gh_repo_targets(
     for selector in &selectors {
         allowlist.enforce_repo_selector(selector)?;
     }
-    let positionals = gh_positional_repo_targets(args);
+    let positionals = gh_positional_repo_targets(args)?;
     for selector in &positionals {
         allowlist.enforce_repo_selector(selector)?;
     }
-    if let Some(owner) = gh_api_owner_target(args) {
+    if let Some(owner) = gh_api_owner_target(args)? {
         return allowlist.enforce_owner(owner);
     }
     if !selectors.is_empty() || !positionals.is_empty() {
@@ -734,14 +734,14 @@ pub fn enforce_gh_repo_targets(
 
 /// Owner-bearing positionals that `-R` / `GH_REPO` do not cover: `gh repo`
 /// operands and GitHub issue/PR URLs or `owner/repo#n` tokens.
-fn gh_positional_repo_targets(args: &[String]) -> Vec<String> {
+fn gh_positional_repo_targets(args: &[String]) -> Result<Vec<String>> {
     let Some(subcommand) = args.first().map(String::as_str) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     match subcommand {
-        "repo" => gh_repo_positional_targets(&args[1..]),
+        "repo" => Ok(gh_repo_positional_targets(&args[1..])),
         "pr" | "issue" => gh_issue_or_pr_positional_targets(&args[1..]),
-        _ => Vec::new(),
+        _ => Ok(Vec::new()),
     }
 }
 
@@ -749,14 +749,22 @@ fn gh_positional_repo_targets(args: &[String]) -> Vec<String> {
 /// endpoints without interpreting opaque bodies or GraphQL node IDs. Owner
 /// placeholders use gh's context; a literal owner remains enforceable when
 /// only the repository is a placeholder.
-fn gh_api_owner_target(args: &[String]) -> Option<&str> {
+fn gh_api_owner_target(args: &[String]) -> Result<Option<&str>> {
     if args.first().map(String::as_str) != Some("api") {
-        return None;
+        return Ok(None);
     }
-    let endpoint = first_positional_after(&args[1..])?;
-    let path = endpoint
-        .strip_prefix("https://api.github.com/")
-        .unwrap_or(endpoint);
+    let Some(endpoint) = first_positional_after(&args[1..]) else {
+        return Ok(None);
+    };
+    let path = match http_url_parts(endpoint)? {
+        Some((host, path)) if host.eq_ignore_ascii_case("api.github.com") => path,
+        Some(_) => return Ok(None),
+        None => endpoint,
+    };
+    Ok(gh_api_path_owner(path))
+}
+
+fn gh_api_path_owner(path: &str) -> Option<&str> {
     let mut parts = path
         .split(['?', '#'])
         .next()?
@@ -805,37 +813,82 @@ fn first_operand_after<'a>(args: &'a [String], token: &str) -> Option<&'a str> {
     first_positional_after(&args[idx + 1..])
 }
 
-fn gh_issue_or_pr_positional_targets(args: &[String]) -> Vec<String> {
+fn gh_issue_or_pr_positional_targets(args: &[String]) -> Result<Vec<String>> {
     args.iter()
-        .filter_map(|token| positional_github_repo_token(token))
+        .filter_map(|token| positional_github_repo_token(token).transpose())
         .collect()
 }
 
-fn positional_github_repo_token(token: &str) -> Option<String> {
+fn positional_github_repo_token(token: &str) -> Result<Option<String>> {
     if token.starts_with('-') {
-        return None;
+        return Ok(None);
     }
     let bare = token.split('#').next().unwrap_or(token);
-    if normalize_github_repo_identity(bare).is_some() {
-        return Some(bare.to_owned());
+    if let Some((host, path)) = http_url_parts(bare)? {
+        return Ok(github_http_repo_target(host, path));
     }
-    parse_github_issue_or_pr_url(bare)
+    if normalize_github_repo_identity(bare).is_some() {
+        return Ok(Some(bare.to_owned()));
+    }
+    Ok(None)
 }
 
-fn parse_github_issue_or_pr_url(token: &str) -> Option<String> {
-    let rest = token
-        .strip_prefix("https://")
-        .or_else(|| token.strip_prefix("http://"))?;
-    let parts: Vec<&str> = rest.split('/').filter(|p| !p.is_empty()).collect();
+fn github_http_repo_target(host: &str, path: &str) -> Option<String> {
+    let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
     match parts.as_slice() {
-        [host, owner, repo, kind, ..]
-            if matches!(*kind, "pull" | "issues" | "issue")
-                && (host.contains('.') || *host == "github.com") =>
+        [owner, repo] => Some(format!("{owner}/{repo}")),
+        [owner, repo, kind, ..]
+            if matches!(*kind, "pull" | "issues" | "issue") && host.contains('.') =>
         {
             Some(format!("{owner}/{repo}"))
         }
         _ => None,
     }
+}
+
+/// Parse ordinary HTTP(S) DNS authorities without granting host authorization.
+/// A malformed HTTP target is an error, never an unchecked fallback selector.
+fn http_url_parts(token: &str) -> Result<Option<(&str, &str)>> {
+    let Some((scheme, rest)) = token.split_once("://") else {
+        return Ok(None);
+    };
+    if !scheme.eq_ignore_ascii_case("https") && !scheme.eq_ignore_ascii_case("http") {
+        return Ok(None);
+    }
+    let invalid = || Error::PolicyViolation {
+        code: PolicyCode::OwnerNotAllowed,
+        message: "cannot determine owner from malformed HTTP target authority".to_owned(),
+    };
+    let boundary = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..boundary];
+    let path = rest[boundary..].strip_prefix('/').unwrap_or("");
+    let host_port = authority.rsplit('@').next().ok_or_else(invalid)?;
+    let host = match host_port.split_once(':') {
+        Some((host, port)) => {
+            port.parse::<u16>().map_err(|_| invalid())?;
+            host
+        }
+        None => host_port,
+    };
+    let host = host.strip_suffix('.').unwrap_or(host);
+    if !valid_http_host(host) {
+        return Err(invalid());
+    }
+    Ok(Some((host, path)))
+}
+
+fn valid_http_host(host: &str) -> bool {
+    host.split('.').all(|label| {
+        if label.is_empty() {
+            return false;
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return false;
+        }
+        label
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    })
 }
 
 /// Pin a validated origin slug as an explicit `--repo` so later `gh` spawn

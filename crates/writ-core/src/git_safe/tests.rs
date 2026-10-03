@@ -1451,6 +1451,96 @@ fn gh_api_collection_flags_keep_explicit_owner_authoritative() {
 }
 
 #[test]
+fn gh_api_absolute_urls_preserve_owner_checks_across_scheme_and_host_case() {
+    let allowlist = crate::owners::OwnerAllowlist::parse("acme");
+    for origin in [
+        "https://api.github.com",
+        "http://api.github.com",
+        "HTTPS://API.GITHUB.COM",
+        "hTtP://Api.GitHub.Com",
+        "https://api.github.com:443",
+        "https://API.GITHUB.COM.",
+        "http://api.github.com:80",
+        "https://user@api.github.com",
+    ] {
+        for owner in ["acme", "other"] {
+            let args = vec!["api".into(), format!("{origin}/repos/{owner}/project")];
+            let result = enforce_gh_repo_targets(&args, &allowlist, None);
+            assert_eq!(result.is_ok(), owner == "acme", "{args:?}: {result:?}");
+            if owner == "other" {
+                assert_eq!(result.unwrap_err().code(), "OWNER_NOT_ALLOWED");
+            }
+        }
+    }
+}
+
+#[test]
+fn gh_pr_urls_preserve_public_and_enterprise_owner_checks() {
+    let allowlist = crate::owners::OwnerAllowlist::parse("acme");
+    for origin in [
+        "https://github.com",
+        "http://github.com",
+        "HTTPS://GITHUB.COM",
+        "hTtP://GitHub.Com",
+        "https://git.example.com",
+        "HTTPS://GIT.EXAMPLE.COM:443",
+        "https://user@git.example.com",
+        "https://GITHUB.COM.",
+    ] {
+        for (command, kind) in [("pr", "pull"), ("issue", "issues")] {
+            for owner in ["acme", "other"] {
+                let args = vec![
+                    command.into(),
+                    "view".into(),
+                    format!("{origin}/{owner}/project/{kind}/1"),
+                ];
+                let result = enforce_gh_repo_targets(&args, &allowlist, None);
+                assert_eq!(result.is_ok(), owner == "acme", "{args:?}: {result:?}");
+                if owner == "other" {
+                    assert_eq!(result.unwrap_err().code(), "OWNER_NOT_ALLOWED");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn gh_api_url_host_confusion_does_not_infer_a_github_owner() {
+    let allowlist = crate::owners::OwnerAllowlist::default();
+    for endpoint in [
+        "https://api.github.com.evil.example/repos/other/project",
+        "https://evil-api.github.com/repos/other/project",
+        "https://api.github.com@evil.example/repos/other/project",
+        "https://api.github.com?next=/repos/other/project",
+        "https://api.github.com",
+        "ftp://api.github.com/repos/other/project",
+    ] {
+        let args = vec!["api".into(), endpoint.into()];
+        // Unsupported URLs are outside literal inference, not a new transport ban.
+        enforce_gh_repo_targets(&args, &allowlist, None).unwrap();
+    }
+}
+
+#[test]
+fn gh_pr_malformed_http_authorities_are_rejected() {
+    let allowlist = crate::owners::OwnerAllowlist::parse("acme");
+    for url in [
+        "https://git hub.example/acme/project/pull/1",
+        "https://github.com:invalid/acme/project/pull/1",
+        "https://.github.com/acme/project/pull/1",
+        "https://github..com/acme/project/pull/1",
+    ] {
+        let args = vec!["pr".into(), "view".into(), url.into()];
+        assert_eq!(
+            enforce_gh_repo_targets(&args, &allowlist, None)
+                .unwrap_err()
+                .code(),
+            "OWNER_NOT_ALLOWED"
+        );
+    }
+}
+
+#[test]
 fn gh_api_options_do_not_hide_literal_repository_target() {
     let allowlist = crate::owners::OwnerAllowlist::parse("acme");
     for flags in [
@@ -1751,6 +1841,38 @@ fn merge_on_explicitly_assigned_main_is_allowed() {
     let out = cmd.run(&repo, Some("main")).unwrap();
     assert_eq!(out.exit_code, 0, "{}", out.stderr);
     remove_all(&repo, &worker_a, &worker_b);
+}
+
+#[test]
+fn local_merge_without_branch_pin_accepts_clean_branch_names() {
+    for branch in ["main", "master", "job-branch"] {
+        let repo = temp_repo_with_branch(branch);
+        git_in(&repo, &["checkout", "-b", "peer"]);
+        std::fs::write(repo.join("peer.txt"), "peer change\n").unwrap();
+        git_in(&repo, &["add", "peer.txt"]);
+        git_in(&repo, &["commit", "-m", "peer change"]);
+        git_in(&repo, &["checkout", branch]);
+        let cmd = SafeGitCommand::new(&["merge".to_owned(), "peer".to_owned()]).unwrap();
+
+        let err = cmd.run(&repo, Some("other-branch")).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::BranchMismatch,
+                ..
+            }
+        ));
+        assert!(!repo.join("peer.txt").exists());
+
+        let output = cmd.run(&repo, None).expect("direct branch pin is optional");
+        assert_eq!(output.exit_code, 0, "{branch}: {}", output.stderr);
+        assert_eq!(
+            std::fs::read_to_string(repo.join("peer.txt")).unwrap(),
+            "peer change\n"
+        );
+        assert_eq!(resolve_current_branch(&repo).unwrap(), branch);
+        let _ = std::fs::remove_dir_all(repo);
+    }
 }
 
 #[test]
