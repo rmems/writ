@@ -320,13 +320,15 @@ fn apply_state(
         "
             UPDATE leases
             SET allocation_state = ?1, mode = ?2, heartbeat = ?3, updated_at = ?3
-            WHERE operation_id = ?4 AND released_at IS NULL AND tombstoned_at IS NULL
+            WHERE operation_id = ?4 AND allocation_state = ?5
+              AND released_at IS NULL AND tombstoned_at IS NULL
             "
     } else {
         "
             UPDATE leases
             SET allocation_state = ?1, mode = ?2, updated_at = ?3
-            WHERE operation_id = ?4 AND released_at IS NULL AND tombstoned_at IS NULL
+            WHERE operation_id = ?4 AND allocation_state = ?5
+              AND released_at IS NULL AND tombstoned_at IS NULL
             "
     };
     tx.execute(
@@ -336,6 +338,7 @@ fn apply_state(
             patch.mode.as_str(),
             now,
             expected.operation_id,
+            expected.allocation_state.as_str(),
         ],
     )
     .map_err(|e| lease_err(patch.context, e))?;
@@ -347,10 +350,10 @@ fn apply_abort(tx: &Transaction<'_>, expected: &Lease) -> Result<bool> {
         "
             DELETE FROM leases
             WHERE operation_id = ?1
-              AND allocation_state IN ('PREPARED', 'MUTATING', 'NEEDS_ATTENTION', 'ABORTED')
+              AND allocation_state = ?2
               AND released_at IS NULL AND tombstoned_at IS NULL
             ",
-        params![expected.operation_id],
+        params![expected.operation_id, expected.allocation_state.as_str()],
     )
     .map_err(|e| lease_err("abort reservation", e))?;
     Ok(tx.changes() == 1)
@@ -369,5 +372,90 @@ fn commit_ctx(label: &'static str) -> &'static str {
         "promote" => "commit promote",
         "abort" => "commit abort",
         _ => "commit attention",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lease::AllocateRequest;
+    use tempfile::tempdir;
+
+    fn prepared_store() -> (tempfile::TempDir, LeaseStore, Lease) {
+        let temp = tempdir().unwrap();
+        let store = LeaseStore::open(temp.path().join("leases.db")).unwrap();
+        let prepared = store
+            .prepare_allocate(AllocateRequest {
+                repo: temp.path(),
+                owner: "acme",
+                repo_name: "sample",
+                job_id: "job-1",
+                branch: "hive/job-1",
+                worktree_path: &temp.path().join("worktree"),
+                requested_start_point: "refs/heads/main",
+                start_commit: "0123456789abcdef",
+                ttl: None,
+            })
+            .unwrap();
+        (temp, store, prepared)
+    }
+
+    #[test]
+    fn stale_recovery_state_does_not_overwrite_newer_transition() {
+        let (_temp, store, expected) = prepared_store();
+        let mut conn = store.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE leases SET allocation_state = 'MUTATING' WHERE operation_id = ?1",
+            [&expected.operation_id],
+        )
+        .unwrap();
+        let tx = conn.transaction().unwrap();
+
+        let changed = apply_state(
+            &tx,
+            &expected,
+            42,
+            StatePatch {
+                next: AllocationState::NeedsAttention,
+                mode: LeaseMode::NeedsHuman,
+                set_heartbeat: false,
+                context: "test stale recovery state",
+            },
+        )
+        .unwrap();
+
+        assert!(!changed);
+        let state: String = tx
+            .query_row(
+                "SELECT allocation_state FROM leases WHERE operation_id = ?1",
+                [&expected.operation_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "MUTATING");
+    }
+
+    #[test]
+    fn stale_recovery_state_does_not_delete_newer_transition() {
+        let (_temp, store, expected) = prepared_store();
+        let mut conn = store.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE leases SET allocation_state = 'MUTATING' WHERE operation_id = ?1",
+            [&expected.operation_id],
+        )
+        .unwrap();
+        let tx = conn.transaction().unwrap();
+
+        let changed = apply_abort(&tx, &expected).unwrap();
+
+        assert!(!changed);
+        let state: String = tx
+            .query_row(
+                "SELECT allocation_state FROM leases WHERE operation_id = ?1",
+                [&expected.operation_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "MUTATING");
     }
 }
