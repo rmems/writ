@@ -214,7 +214,7 @@ pub struct SupervisedOutput {
     pub exit_code: Option<i32>,
     /// Whether the process was killed due to timeout.
     pub timed_out: bool,
-    /// Whether the process was killed (by timeout or signal).
+    /// Whether kill containment was attempted, or the child exited by signal.
     pub killed: bool,
     /// Captured stdout.
     pub stdout: String,
@@ -1060,7 +1060,13 @@ async fn cancel_supervised_child(child: &mut ProcessGroupChild, grace: Duration)
             // Keep the exited Unix leader unreaped until group containment.
             kill_process_group(child.pid);
             let _ = tokio::time::timeout(POST_KILL_JOIN_TIMEOUT, child.wait()).await;
-            RecoveryStage::GracefulCancel
+            // On Unix, report the strongest containment action issued to the
+            // group: descendants may have survived the leader's graceful exit.
+            if cfg!(unix) {
+                RecoveryStage::Kill
+            } else {
+                RecoveryStage::GracefulCancel
+            }
         }
         Ok(Err(_)) | Err(_) => {
             let _ = child.kill().await;
@@ -1404,3 +1410,7 @@ mod tests;
 #[cfg(test)]
 #[path = "supervisor_policy_tests.rs"]
 mod policy_tests;
+
+#[cfg(test)]
+#[path = "supervisor_cancellation_tests.rs"]
+mod cancellation_tests;

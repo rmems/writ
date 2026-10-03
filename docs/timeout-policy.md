@@ -47,7 +47,7 @@ Heartbeat used by this binary: last stdout/stderr byte timestamp. Hosts may also
 
 1. **Detect** hard, idle, or lost-child.
 2. **Soft cancel** — Unix: `SIGTERM` to the process group. Windows: no SIGTERM group; wait `grace` then kill the direct child.
-3. **Kill** — if still alive after `grace`, Unix `SIGKILL` to the group; Windows `child.kill()` (direct child only; no job object yet). After reap, the supervisor **disarms** Drop so a reused PID is not SIGKILL'd.
+3. **Kill** — if still alive after `grace`, Unix `SIGKILL` to the group; Windows `child.kill()` (direct child only; no job object yet). Unix also sends the group `SIGKILL` when its leader exits during grace, before reaping that leader, to contain descendants that may still be running. It reports `recovery_stage: kill` and `killed: true` for that action; a graceful leader exit does not prove every descendant exited. Windows reports `graceful_cancel` and `killed: false` when the direct child exits within grace. After reap, the supervisor **disarms** Drop so a reused PID is not SIGKILL'd.
 4. **State update** — JSON outcome: `timed_out` / `killed` / `error_code` / `timeout_class` / `recovery_stage` / `elapsed_ms` / `residual` (no `sha` / `commit` / `head`). Watchlist: `process_state: timed_out`, `residual_blockers: ["timeout:hard"|…]`. Do **not** write a SHA unless a push was accepted by the remote. Do **not** delete or reset the harness checkout. Pipe drain is always bounded (30s when no worker deadline).
 5. **Re-dispatch or residual** — harness may run the item again only while `RedispatchBudget::try_acquire` succeeds (default: one extra run). Otherwise mark residual and free the **process slot**. `writ` does not re-dispatch and does not unregister the checkout.
 
