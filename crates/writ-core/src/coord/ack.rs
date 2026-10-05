@@ -5,7 +5,9 @@ use rusqlite::params;
 use crate::error::{Error, PolicyCode, Result};
 use crate::lease::JobKey;
 
-use super::access::{load_claim_tx, require_active_lease_tx};
+use super::access::{
+    NewMessage, insert_message, load_claim_tx, load_message_tx, require_active_lease_tx,
+};
 use super::types::{AckRequest, CoordClaim, CoordMessage, SendRequest};
 use super::util::{coord_err, coord_missing, held_error, stale_error, terminal_allocation};
 
@@ -85,6 +87,97 @@ pub(super) fn require_target_agent(
     } else {
         Err(held_error(&claim))
     }
+}
+
+pub(super) fn ack_message_tx(
+    tx: &rusqlite::Transaction<'_>,
+    request: AckRequest<'_>,
+    now: i64,
+) -> Result<(CoordMessage, Option<CoordClaim>)> {
+    let message = load_message_tx(tx, request.message_id)?.ok_or_else(|| Error::LeaseStore {
+        context: "ack coord message",
+        message: format!("unknown message {}", request.message_id),
+    })?;
+    require_active_lease_tx(
+        tx,
+        JobKey {
+            owner: request.owner,
+            repo_name: request.repo_name,
+            job_id: request.job_id,
+        },
+    )?;
+    refuse_acknowledged(&message, request.message_id)?;
+    let transferred = transfer_if_handoff(tx, &message, request, now)?;
+    mark_acknowledged(tx, request.message_id, now)?;
+    let ack = insert_ack(tx, &message, request, transferred.as_ref(), now)?;
+    Ok((ack, transferred))
+}
+
+fn refuse_acknowledged(message: &CoordMessage, message_id: i64) -> Result<()> {
+    if message.acked_at.is_none() {
+        return Ok(());
+    }
+    Err(Error::LeaseStore {
+        context: "ack coord message",
+        message: format!("message {message_id} is already acknowledged"),
+    })
+}
+
+fn transfer_if_handoff(
+    tx: &rusqlite::Transaction<'_>,
+    message: &CoordMessage,
+    request: AckRequest<'_>,
+    now: i64,
+) -> Result<Option<CoordClaim>> {
+    if message.kind == super::types::MessageKind::Handoff {
+        return transfer_on_handoff_ack(tx, message, request, now).map(Some);
+    }
+    require_ack_recipient(tx, message, request)?;
+    Ok(None)
+}
+
+fn mark_acknowledged(tx: &rusqlite::Transaction<'_>, message_id: i64, now: i64) -> Result<()> {
+    tx.execute(
+        "UPDATE coord_messages SET acked_at = ?1 WHERE id = ?2 AND acked_at IS NULL",
+        params![now, message_id],
+    )
+    .map_err(|e| coord_err("mark coord message acked", e))?;
+    if tx.changes() == 1 {
+        return Ok(());
+    }
+    Err(Error::LeaseStore {
+        context: "ack coord message",
+        message: "message was acknowledged concurrently".to_owned(),
+    })
+}
+
+fn insert_ack(
+    tx: &rusqlite::Transaction<'_>,
+    message: &CoordMessage,
+    request: AckRequest<'_>,
+    transferred: Option<&CoordClaim>,
+    now: i64,
+) -> Result<CoordMessage> {
+    insert_message(
+        tx,
+        NewMessage {
+            kind: super::types::MessageKind::Ack,
+            from_agent_id: request.agent_id,
+            from_owner: request.owner,
+            from_repo_name: request.repo_name,
+            from_job_id: request.job_id,
+            to_agent_id: Some(message.from_agent_id.as_str()),
+            to_owner: Some(message.from_owner.as_str()),
+            to_repo_name: Some(message.from_repo_name.as_str()),
+            to_job_id: Some(message.from_job_id.as_str()),
+            owner_generation: transferred
+                .map_or(message.owner_generation, |claim| claim.owner_generation),
+            body: "acknowledged",
+            paths: &[],
+            ack_of: Some(request.message_id),
+            now,
+        },
+    )
 }
 
 fn ack_targets_request(message: &CoordMessage, request: AckRequest<'_>) -> bool {

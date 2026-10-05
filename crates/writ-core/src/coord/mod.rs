@@ -27,12 +27,9 @@ pub use types::{
 
 use access::{
     CLAIM_SELECT, MESSAGE_SELECT, NewMessage, claim_from_row, insert_message, load_claim_locked,
-    load_claim_tx, load_message_tx, message_from_row, require_active_lease_tx,
+    load_claim_tx, message_from_row, require_active_lease_tx,
 };
-use ack::{
-    require_ack_recipient, require_complete_recipient, require_target_agent,
-    transfer_on_handoff_ack,
-};
+use ack::{ack_message_tx, require_complete_recipient, require_target_agent};
 use announce::{AnnounceTx, MailboxDraft, announce_tx, mailbox_from_send, route_generic_ack};
 use declared_paths::normalize_paths;
 use util::{coord_err, coord_missing, held_error, now_secs, stale_error, terminal_allocation};
@@ -308,67 +305,9 @@ impl LeaseStore {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| coord_err("begin coord ack", e))?;
-        let message =
-            load_message_tx(&tx, request.message_id)?.ok_or_else(|| Error::LeaseStore {
-                context: "ack coord message",
-                message: format!("unknown message {}", request.message_id),
-            })?;
-        require_active_lease_tx(
-            &tx,
-            JobKey {
-                owner: request.owner,
-                repo_name: request.repo_name,
-                job_id: request.job_id,
-            },
-        )?;
-        if message.acked_at.is_some() {
-            return Err(Error::LeaseStore {
-                context: "ack coord message",
-                message: format!("message {} is already acknowledged", request.message_id),
-            });
-        }
-        if message.kind != MessageKind::Handoff {
-            require_ack_recipient(&tx, &message, request)?;
-        }
-        let transferred = if message.kind == MessageKind::Handoff {
-            Some(transfer_on_handoff_ack(&tx, &message, request, now)?)
-        } else {
-            None
-        };
-        tx.execute(
-            "UPDATE coord_messages SET acked_at = ?1 WHERE id = ?2 AND acked_at IS NULL",
-            params![now, request.message_id],
-        )
-        .map_err(|e| coord_err("mark coord message acked", e))?;
-        if tx.changes() != 1 {
-            return Err(Error::LeaseStore {
-                context: "ack coord message",
-                message: "message was acknowledged concurrently".to_owned(),
-            });
-        }
-        let ack = insert_message(
-            &tx,
-            NewMessage {
-                kind: MessageKind::Ack,
-                from_agent_id: request.agent_id,
-                from_owner: request.owner,
-                from_repo_name: request.repo_name,
-                from_job_id: request.job_id,
-                to_agent_id: Some(message.from_agent_id.as_str()),
-                to_owner: Some(message.from_owner.as_str()),
-                to_repo_name: Some(message.from_repo_name.as_str()),
-                to_job_id: Some(message.from_job_id.as_str()),
-                owner_generation: transferred
-                    .as_ref()
-                    .map_or(message.owner_generation, |claim| claim.owner_generation),
-                body: "acknowledged",
-                paths: &[],
-                ack_of: Some(request.message_id),
-                now,
-            },
-        )?;
+        let result = ack_message_tx(&tx, request, now)?;
         tx.commit().map_err(|e| coord_err("commit coord ack", e))?;
-        Ok((ack, transferred))
+        Ok(result)
     }
 }
 
