@@ -720,6 +720,36 @@ fn session_change_increments_owner_generation() {
 }
 
 #[test]
+fn reannounce_with_disjoint_paths_clears_obsolete_overlap() {
+    let harness = Harness::new();
+    harness.seed_job("job-a", "hive/job-a");
+    harness.seed_job("job-b", "hive/job-b");
+    announce(
+        &harness.store,
+        "job-a",
+        "agent-a",
+        &[String::from("src/shared")],
+    );
+    announce(
+        &harness.store,
+        "job-b",
+        "agent-b",
+        &[String::from("src/shared")],
+    );
+
+    announce(&harness.store, "job-a", "agent-a", &[String::from("src/a")]);
+
+    assert!(
+        harness
+            .store
+            .inbox(job_key_a())
+            .unwrap()
+            .iter()
+            .all(|message| message.kind != MessageKind::Overlap || message.acked_at.is_some())
+    );
+}
+
+#[test]
 fn regrant_clears_stale_coord_claim() {
     let harness = Harness::new();
     let worktree = harness.seed_job("job-a", "hive/job-a");
@@ -739,6 +769,30 @@ fn regrant_clears_stale_coord_claim() {
         .unwrap();
     let claimed = announce(&harness.store, "job-a", "agent-b", &[]);
     assert_eq!(claimed.claim.agent_id, "agent-b");
+}
+
+#[test]
+fn active_reregister_refreshes_coord_claim_checkout_identity() {
+    let harness = Harness::new();
+    let worktree = harness.seed_job("job-a", "hive/job-a");
+    announce(&harness.store, "job-a", "agent-a", &[]);
+
+    harness
+        .store
+        .grant(crate::lease::LeaseGrant {
+            repo: &harness.repo,
+            owner: "acme",
+            repo_name: "sample",
+            job_id: "job-a",
+            branch: "hive/job-renamed",
+            worktree_path: &worktree,
+            start_commit: &harness.start,
+        })
+        .unwrap();
+
+    let claim = harness.store.find_claim(job_key_a()).unwrap().unwrap();
+    assert_eq!(claim.branch, "hive/job-renamed");
+    assert_eq!(claim.worktree_path, worktree.to_string_lossy());
 }
 
 #[test]
@@ -815,13 +869,101 @@ fn regrant_deletes_stale_handoff_so_it_cannot_transfer_fresh_assignment() {
         .map(|message| message.body)
         .collect::<Vec<_>>();
     assert!(bodies.iter().any(|body| body == "gen-1 offer"));
-    assert!(bodies.iter().any(|body| body == "preserved help"));
+    assert!(!bodies.iter().any(|body| body == "preserved help"));
     assert!(!bodies.iter().any(|body| body == "stale unacked offer"));
     let claim = harness.store.find_claim(job_key_a()).unwrap().unwrap();
     assert_eq!(
         (claim.agent_id.as_str(), claim.owner_generation),
         ("agent-c", 1)
     );
+}
+
+#[test]
+fn released_claim_cannot_ack_messages() {
+    let harness = Harness::new();
+    let worktree = harness.seed_job("job-a", "hive/job-a");
+    announce(&harness.store, "job-a", "agent-a", &[]);
+    let message = harness
+        .store
+        .send_message(SendRequest {
+            owner: "acme",
+            repo_name: "sample",
+            job_id: "job-a",
+            agent_id: "agent-a",
+            kind: MessageKind::Help,
+            body: "help",
+            to_agent_id: None,
+            to_owner: Some("acme"),
+            to_repo_name: Some("sample"),
+            to_job_id: Some("job-a"),
+            paths: &[],
+            ack_of: None,
+        })
+        .unwrap();
+    harness.store.release_by_path(&worktree).unwrap();
+
+    let err = harness
+        .store
+        .ack_message(AckRequest {
+            message_id: message.id,
+            owner: "acme",
+            repo_name: "sample",
+            job_id: "job-a",
+            agent_id: "agent-a",
+            session_id: Some("session-a"),
+        })
+        .unwrap_err();
+    assert!(err.to_string().contains("ACTIVE"), "got {err}");
+}
+
+#[test]
+fn send_rejects_target_agent_that_does_not_own_recipient_job() {
+    let harness = Harness::new();
+    harness.seed_job("job-a", "hive/job-a");
+    harness.seed_job("job-b", "hive/job-b");
+    announce(&harness.store, "job-a", "agent-a", &[]);
+    announce(&harness.store, "job-b", "agent-b", &[]);
+
+    let err = harness
+        .store
+        .send_message(SendRequest {
+            owner: "acme",
+            repo_name: "sample",
+            job_id: "job-a",
+            agent_id: "agent-a",
+            kind: MessageKind::Dependency,
+            body: "blocked",
+            to_agent_id: Some("former-agent"),
+            to_owner: Some("acme"),
+            to_repo_name: Some("sample"),
+            to_job_id: Some("job-b"),
+            paths: &[],
+            ack_of: None,
+        })
+        .unwrap_err();
+    assert!(err.to_string().contains("agent-b"), "got {err}");
+}
+
+#[test]
+fn handoff_requires_expected_owner_generation() {
+    let harness = Harness::new();
+    harness.seed_job("job-a", "hive/job-a");
+    announce(&harness.store, "job-a", "agent-a", &[]);
+
+    let err = harness
+        .store
+        .propose_handoff(HandoffRequest {
+            owner: "acme",
+            repo_name: "sample",
+            job_id: "job-a",
+            from_agent_id: "agent-a",
+            to_agent_id: "agent-b",
+            to_job_id: None,
+            expected_generation: None,
+            body: "stale process",
+        })
+        .unwrap_err();
+    assert!(err.to_string().contains("generation"), "got {err}");
 }
 
 #[test]

@@ -5,7 +5,7 @@ use rusqlite::params;
 use crate::error::{Error, PolicyCode, Result};
 use crate::lease::JobKey;
 
-use super::access::load_claim_tx;
+use super::access::{load_claim_tx, require_active_lease_tx};
 use super::types::{AckRequest, CoordClaim, CoordMessage, SendRequest};
 use super::util::{coord_err, coord_missing, held_error, stale_error, terminal_allocation};
 
@@ -57,6 +57,33 @@ pub(super) fn require_ack_recipient(
         Ok(())
     } else {
         Err(ack_recipient_error(request))
+    }
+}
+
+pub(super) fn require_target_agent(
+    tx: &rusqlite::Transaction<'_>,
+    request: SendRequest<'_>,
+) -> Result<()> {
+    let (Some(owner), Some(repo_name), Some(job_id), Some(agent_id)) = (
+        request.to_owner,
+        request.to_repo_name,
+        request.to_job_id,
+        request.to_agent_id,
+    ) else {
+        return Ok(());
+    };
+    let key = JobKey {
+        owner,
+        repo_name,
+        job_id,
+    };
+    require_active_lease_tx(tx, key)?;
+    let claim = load_claim_tx(tx, key)?
+        .ok_or_else(|| coord_missing("target coordination claim is missing"))?;
+    if claim.agent_id == agent_id {
+        Ok(())
+    } else {
+        Err(held_error(&claim))
     }
 }
 

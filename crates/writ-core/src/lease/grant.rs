@@ -179,7 +179,8 @@ fn write_grant(tx: &rusqlite::Transaction<'_>, grant: LeaseGrant<'_>, now: i64) 
             operation_id: &operation_id,
             now,
         },
-    )
+    )?;
+    refresh_active_claim(tx, &grant, &worktree_path)
 }
 
 fn reject_ungrantable(existing: Option<&Lease>) -> Result<()> {
@@ -216,7 +217,8 @@ fn clear_released_claim(
     tx.execute(
         "
         DELETE FROM coord_messages
-        WHERE kind = 'handoff' AND acked_at IS NULL AND (
+        WHERE kind IN ('handoff', 'help', 'dependency', 'blocker', 'overlap')
+          AND acked_at IS NULL AND (
             (from_owner = ?1 AND from_repo_name = ?2 AND from_job_id = ?3)
             OR (to_owner = ?1 AND to_repo_name = ?2 AND to_job_id = ?3)
         )
@@ -224,6 +226,29 @@ fn clear_released_claim(
         params![grant.owner, grant.repo_name, grant.job_id],
     )
     .map_err(|e| lease_err("clear stale coord messages on regrant", e))?;
+    Ok(())
+}
+
+fn refresh_active_claim(
+    tx: &rusqlite::Transaction<'_>,
+    grant: &LeaseGrant<'_>,
+    worktree_path: &str,
+) -> Result<()> {
+    tx.execute(
+        "
+        UPDATE coord_claims
+        SET branch = ?1, worktree_path = ?2
+        WHERE owner = ?3 AND repo_name = ?4 AND job_id = ?5
+        ",
+        params![
+            grant.branch,
+            worktree_path,
+            grant.owner,
+            grant.repo_name,
+            grant.job_id
+        ],
+    )
+    .map_err(|e| lease_err("refresh coord claim after grant", e))?;
     Ok(())
 }
 

@@ -246,6 +246,45 @@ fn interrupted_allocation_on_a_different_branch_stays_fail_closed() {
 }
 
 #[test]
+fn interrupted_detached_allocation_attached_to_branch_stays_fail_closed() {
+    let harness = RepoHarness::new();
+    let prepared = harness
+        .store
+        .prepare_allocate(AllocateRequest {
+            repo: &harness.repo,
+            owner: "acme",
+            repo_name: "sample",
+            job_id: "job-1",
+            branch: "(detached)",
+            worktree_path: &harness.worktree,
+            requested_start_point: "HEAD",
+            start_commit: &harness.start,
+            ttl: None,
+        })
+        .unwrap();
+    harness.store.mark_mutating(&prepared.operation_id).unwrap();
+    git(
+        &harness.repo,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "hive/attached",
+            "--",
+            harness.worktree.to_str().unwrap(),
+            &harness.start,
+        ],
+    );
+
+    assert_outcome(
+        &harness.store,
+        harness.key(),
+        &harness.repo,
+        "needs_attention",
+    );
+}
+
+#[test]
 fn conflicting_head_stays_fail_closed() {
     let harness = RepoHarness::new();
     harness.prepare_and_add_worktree();

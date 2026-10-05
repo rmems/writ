@@ -29,7 +29,10 @@ use access::{
     CLAIM_SELECT, MESSAGE_SELECT, NewMessage, claim_from_row, insert_message, load_claim_locked,
     load_claim_tx, load_message_tx, message_from_row, require_active_lease_tx,
 };
-use ack::{require_ack_recipient, require_complete_recipient, transfer_on_handoff_ack};
+use ack::{
+    require_ack_recipient, require_complete_recipient, require_target_agent,
+    transfer_on_handoff_ack,
+};
 use announce::{AnnounceTx, MailboxDraft, announce_tx, mailbox_from_send, route_generic_ack};
 use declared_paths::normalize_paths;
 use util::{coord_err, coord_missing, held_error, now_secs, stale_error, terminal_allocation};
@@ -107,12 +110,10 @@ impl LeaseStore {
                 now,
             },
         )?;
+        let claim = load_claim_tx(&tx, key)?
+            .ok_or_else(|| coord_missing("claim missing after announce"))?;
         tx.commit()
             .map_err(|e| coord_err("commit coord announce", e))?;
-        drop(conn);
-        let claim = self
-            .find_claim(key)?
-            .ok_or_else(|| coord_missing("claim missing after announce"))?;
         Ok(AnnounceResult {
             claim,
             intent,
@@ -197,6 +198,7 @@ impl LeaseStore {
         if claim.agent_id != request.agent_id {
             return Err(held_error(&claim));
         }
+        require_target_agent(&tx, request)?;
         let message = insert_message(
             &tx,
             mailbox_from_send(MailboxDraft {
@@ -263,9 +265,13 @@ impl LeaseStore {
                 ),
             });
         }
-        if let Some(expected) = request.expected_generation
-            && expected != claim.owner_generation
-        {
+        let expected = request
+            .expected_generation
+            .ok_or_else(|| Error::PolicyViolation {
+                code: PolicyCode::CoordStaleGeneration,
+                message: "handoff requires the current owner generation".to_owned(),
+            })?;
+        if expected != claim.owner_generation {
             return Err(stale_error(&claim, expected));
         }
         let message = insert_message(
@@ -307,6 +313,14 @@ impl LeaseStore {
                 context: "ack coord message",
                 message: format!("unknown message {}", request.message_id),
             })?;
+        require_active_lease_tx(
+            &tx,
+            JobKey {
+                owner: request.owner,
+                repo_name: request.repo_name,
+                job_id: request.job_id,
+            },
+        )?;
         if message.acked_at.is_some() {
             return Err(Error::LeaseStore {
                 context: "ack coord message",

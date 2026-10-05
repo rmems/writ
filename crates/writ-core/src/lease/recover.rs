@@ -282,6 +282,18 @@ fn load_open_lease(
             },
         )?,
     };
+    let current = match current {
+        Some(current) => Some(current),
+        None if matches!(lookup, RecoverLookup::Operation) => lookup_lease(
+            tx,
+            LeaseLookup {
+                where_sql: "WHERE owner = ?1 AND repo_name = ?2 AND job_id = ?3",
+                sql_params: params![expected.owner, expected.repo_name, expected.job_id],
+                context: "check replacement lease before recover",
+            },
+        )?,
+        None => None,
+    };
     Ok(match current {
         None => ControlFlow::Break(ReconcileOutcome::Retry {
             operation_id: expected.operation_id.clone(),
@@ -290,10 +302,7 @@ fn load_open_lease(
         Some(current) if current.allocation_state.is_terminal() => {
             ControlFlow::Break(terminal_outcome(current, inspection.clone()))
         }
-        Some(current)
-            if matches!(lookup, RecoverLookup::Job)
-                && current.operation_id != expected.operation_id =>
-        {
+        Some(current) if current.operation_id != expected.operation_id => {
             ControlFlow::Break(ReconcileOutcome::NeedsAttention {
                 lease: current,
                 inspection: inspection.clone(),
@@ -457,5 +466,42 @@ mod tests {
             )
             .unwrap();
         assert_eq!(state, "MUTATING");
+    }
+
+    #[test]
+    fn operation_miss_reports_replacement_job_as_needs_attention() {
+        let (_temp, store, expected) = prepared_store();
+        let mut conn = store.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE leases SET operation_id = 'replacement-op', allocation_state = 'ACTIVE' \
+             WHERE operation_id = ?1",
+            [&expected.operation_id],
+        )
+        .unwrap();
+        let tx = conn.transaction().unwrap();
+        let inspection = AllocationInspection {
+            operation_id: Some(expected.operation_id.clone()),
+            allocation_state: Some(expected.allocation_state.as_str().to_owned()),
+            requested_start_point: Some(expected.requested_start_point.clone()),
+            resolved_start_commit: Some(expected.start_commit.clone()),
+            derived_path: expected.worktree_path.clone().into(),
+            path_exists: false,
+            branch_ref: expected.branch_ref.clone(),
+            branch_commit: None,
+            head_commit: None,
+            worktree_registered: false,
+            repo_identity: expected.repo.clone(),
+            lease_present: true,
+            ttl_expired: false,
+            classification: EvidenceClass::Retryable,
+            conflicts: Vec::new(),
+        };
+
+        let outcome =
+            load_open_lease(&tx, &expected, &inspection, RecoverLookup::Operation).unwrap();
+        let ControlFlow::Break(ReconcileOutcome::NeedsAttention { lease, .. }) = outcome else {
+            panic!("expected replacement needs attention, got {outcome:?}");
+        };
+        assert_eq!(lease.operation_id, "replacement-op");
     }
 }

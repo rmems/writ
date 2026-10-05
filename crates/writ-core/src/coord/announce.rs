@@ -121,6 +121,7 @@ pub(super) fn persist_announce_tx(
     tx: &rusqlite::Transaction<'_>,
     row: AnnouncePersist<'_>,
 ) -> Result<(CoordMessage, Vec<PathOverlap>)> {
+    clear_obsolete_overlaps(tx, row.request)?;
     persist_announce_claim(tx, &row)?;
     let intent = insert_announce_intent(
         tx,
@@ -150,6 +151,24 @@ pub(super) fn persist_announce_tx(
         },
     )?;
     Ok((intent, overlaps))
+}
+
+fn clear_obsolete_overlaps(
+    tx: &rusqlite::Transaction<'_>,
+    request: &AnnounceRequest<'_>,
+) -> Result<()> {
+    tx.execute(
+        "
+        DELETE FROM coord_messages
+        WHERE kind = 'overlap' AND acked_at IS NULL AND (
+            (from_owner = ?1 AND from_repo_name = ?2 AND from_job_id = ?3)
+            OR (to_owner = ?1 AND to_repo_name = ?2 AND to_job_id = ?3)
+        )
+        ",
+        params![request.owner, request.repo_name, request.job_id],
+    )
+    .map_err(|e| coord_err("clear obsolete coord overlaps", e))?;
+    Ok(())
 }
 
 pub(super) struct IntentInsert<'a> {

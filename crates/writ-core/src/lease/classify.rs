@@ -203,18 +203,9 @@ fn identity_conflicts(lease: &Lease, evidence: &GitEvidence, repo_root: &Path) -
     {
         conflicts.push(conflict);
     }
-    if named_git_branch(&lease.branch) {
-        match evidence.head_branch.as_deref() {
-            Some(branch) if branch == lease.branch => {}
-            Some(branch) => conflicts.push(format!(
-                "worker branch {branch} != recorded branch {}",
-                lease.branch
-            )),
-            None => conflicts.push(format!(
-                "worker branch is detached; expected recorded branch {}",
-                lease.branch
-            )),
-        }
+    if let Some(conflict) = checkout_branch_conflict(&lease.branch, evidence.head_branch.as_deref())
+    {
+        conflicts.push(conflict);
     }
     if let Some(conflict) = commit_conflict(
         evidence.head_commit.as_deref(),
@@ -225,6 +216,22 @@ fn identity_conflicts(lease: &Lease, evidence: &GitEvidence, repo_root: &Path) -
         conflicts.push(conflict);
     }
     conflicts
+}
+
+fn checkout_branch_conflict(recorded: &str, observed: Option<&str>) -> Option<String> {
+    match (recorded, observed) {
+        ("(detached)", None) | ("", _) => None,
+        ("(detached)", Some(branch)) => Some(format!(
+            "worker branch {branch} is attached; recorded checkout is detached"
+        )),
+        (expected, Some(branch)) if branch == expected => None,
+        (expected, Some(branch)) => Some(format!(
+            "worker branch {branch} != recorded branch {expected}"
+        )),
+        (expected, None) => Some(format!(
+            "worker branch is detached; expected recorded branch {expected}"
+        )),
+    }
 }
 
 fn commit_conflict(
