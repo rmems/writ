@@ -516,35 +516,37 @@ fn short_options_with_context(arg: &str, context: CommandOptions) -> Option<Shor
     let body = arg
         .strip_prefix('-')
         .filter(|body| !body.starts_with('-') && !body.is_empty())?;
-    let mut delete_branch = None;
-    let mut checkout_branch = None;
+    let mut parsed = ShortOptions {
+        tokens: 1,
+        delete_branch: None,
+        checkout_branch: None,
+    };
     for (index, flag) in body.char_indices() {
         let suffix = &body[index + flag.len_utf8()..];
         if short_value_in_context(flag, context) {
-            return Some(ShortOptions {
-                tokens: if suffix.is_empty() { 2 } else { 1 },
-                delete_branch,
-                checkout_branch,
-            });
+            parsed.tokens = if suffix.is_empty() { 2 } else { 1 };
+            return Some(parsed);
         }
         if !short_boolean_in_context(flag, context) {
             return None;
         }
-        if flag == 'd' {
-            delete_branch = Some(suffix.strip_prefix('=').is_none_or(gh_boolean_enabled));
-        }
-        if flag == 'c' {
-            checkout_branch = Some(suffix.strip_prefix('=').is_none_or(gh_boolean_enabled));
-        }
+        record_boolean_flag(flag, suffix, &mut parsed);
         if suffix.starts_with('=') {
             break;
         }
     }
-    Some(ShortOptions {
-        tokens: 1,
-        delete_branch,
-        checkout_branch,
-    })
+    Some(parsed)
+}
+
+/// Record the boolean state of the tracked single-letter flags (`-d` delete
+/// branch, `-c` checkout) a cluster may carry.
+fn record_boolean_flag(flag: char, suffix: &str, parsed: &mut ShortOptions) {
+    let enabled = Some(suffix.strip_prefix('=').is_none_or(gh_boolean_enabled));
+    match flag {
+        'd' => parsed.delete_branch = enabled,
+        'c' => parsed.checkout_branch = enabled,
+        _ => {}
+    }
 }
 
 fn short_boolean_in_context(flag: char, context: CommandOptions) -> bool {
@@ -659,35 +661,41 @@ pub fn gh_requires_branch_check(args: &[String]) -> bool {
 /// `issue develop` creates the branch remotely without a local checkout
 /// change, so it is not flagged.
 fn gh_issue_develop_checks_out(args: &[String]) -> bool {
+    let context = command_options(args);
     let mut checkout = false;
     let mut i = 1;
     while let Some(arg) = args.get(i).map(String::as_str) {
         if arg == "--" {
             break;
         }
-        if let Some(options) = short_options_with_context(arg, command_options(args)) {
+        if let Some(options) = short_options_with_context(arg, context) {
             i += options.tokens;
-            if let Some(enabled) = options.checkout_branch {
-                checkout = enabled;
-            }
+            checkout = options.checkout_branch.unwrap_or(checkout);
             continue;
         }
-        if arg == "--checkout" {
-            checkout = true;
-        } else if let Some(value) = arg.strip_prefix("--checkout=") {
-            checkout = gh_boolean_enabled(value);
-        }
-        if let Some((_, consumes)) = gh_repo_flag(arg, args.get(i + 1).map(String::as_str)) {
-            i += if consumes { 2 } else { 1 };
-            continue;
-        }
-        if ISSUE_DEVELOP_VALUE_OPTIONS.contains(&arg) {
-            i += 2;
-            continue;
-        }
-        i += 1;
+        checkout = checkout_setting(arg).unwrap_or(checkout);
+        i += issue_develop_option_tokens(arg, args.get(i + 1).map(String::as_str));
     }
     checkout
+}
+
+fn checkout_setting(arg: &str) -> Option<bool> {
+    if arg == "--checkout" {
+        return Some(true);
+    }
+    arg.strip_prefix("--checkout=").map(gh_boolean_enabled)
+}
+
+/// Tokens consumed by a non-cluster `gh issue develop` option: repo selectors
+/// and develop's value flags consume their value, everything else one token.
+fn issue_develop_option_tokens(arg: &str, next: Option<&str>) -> usize {
+    if let Some((_, consumes)) = gh_repo_flag(arg, next) {
+        return if consumes { 2 } else { 1 };
+    }
+    if ISSUE_DEVELOP_VALUE_OPTIONS.contains(&arg) {
+        return 2;
+    }
+    1
 }
 
 /// `gh issue develop` separate-token value options (from the command table).
