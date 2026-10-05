@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
@@ -153,8 +153,11 @@ impl LeaseStore {
             })?;
         }
         let conn = Connection::open(&path).map_err(|e| lease_err("open lease store", e))?;
+        conn.busy_timeout(Duration::from_millis(5000))
+            .map_err(|e| lease_err("set lease busy timeout", e))?;
         conn.execute_batch(
             "
+            PRAGMA journal_mode = WAL;
             PRAGMA foreign_keys = ON;
             CREATE TABLE IF NOT EXISTS leases (
                 id INTEGER PRIMARY KEY,
@@ -238,7 +241,10 @@ impl LeaseStore {
                 start_commit = excluded.start_commit,
                 mode = excluded.mode,
                 heartbeat = excluded.heartbeat,
-                updated_at = excluded.updated_at,
+                updated_at = CASE
+                    WHEN leases.updated_at >= excluded.updated_at THEN leases.updated_at + 1
+                    ELSE excluded.updated_at
+                END,
                 released_at = NULL
             WHERE leases.released_at IS NOT NULL
                 OR leases.worktree_path = excluded.worktree_path
@@ -286,7 +292,12 @@ impl LeaseStore {
         conn.execute(
             "
             UPDATE leases
-            SET mode = ?1, released_at = ?2, updated_at = ?2
+            SET mode = ?1,
+                released_at = ?2,
+                updated_at = CASE
+                    WHEN updated_at >= ?2 THEN updated_at + 1
+                    ELSE ?2
+                END
             WHERE worktree_path = ?3 AND released_at IS NULL
             ",
             params![LeaseMode::Unassigned.as_str(), now, path],
@@ -294,6 +305,36 @@ impl LeaseStore {
         .map_err(|e| lease_err("release lease", e))?;
         drop(conn);
         self.find_by_path(worktree_path)
+    }
+
+    /// Release the exact lease generation previously observed by a remover.
+    ///
+    /// Returns `false` when another operation refreshed or replaced the row
+    /// after it was observed, leaving that newer writer lock untouched.
+    pub fn release_if_current(&self, observed: &Lease) -> Result<bool> {
+        let now = now_secs();
+        let conn = self.lock()?;
+        let changed = conn
+            .execute(
+                "
+                UPDATE leases
+                SET mode = ?1,
+                    released_at = ?2,
+                    updated_at = CASE
+                        WHEN updated_at >= ?2 THEN updated_at + 1
+                        ELSE ?2
+                    END
+                WHERE id = ?3 AND updated_at = ?4 AND released_at IS NULL
+                ",
+                params![
+                    LeaseMode::Unassigned.as_str(),
+                    now,
+                    observed.row_id,
+                    observed.updated_at,
+                ],
+            )
+            .map_err(|e| lease_err("release current lease", e))?;
+        Ok(changed == 1)
     }
 
     /// Durable resume identity for an owner/repo/job/branch, including released rows.
@@ -711,6 +752,58 @@ mod tests {
         store.release_by_path(&wt_a).unwrap();
         let moved = store.grant(grant_for(&repo, &wt_b)).unwrap();
         assert_eq!(moved.worktree_path, wt_b);
+    }
+
+    #[test]
+    fn stale_release_cannot_release_a_refreshed_lease() {
+        let tmp = tempdir().unwrap();
+        let store = LeaseStore::open(tmp.path().join("leases.db")).unwrap();
+        let repo = tmp.path().join("repo");
+        let wt = tmp.path().join("checkouts/a");
+        let grant = LeaseGrant {
+            repo: &repo,
+            owner: "local",
+            repo_name: "repo",
+            job_id: "job-1",
+            branch: "hive/job-1",
+            worktree_path: &wt,
+            start_commit: "abc123",
+        };
+        let observed = store.grant(grant).unwrap();
+        let refreshed = store.grant(grant).unwrap();
+
+        assert!(!store.release_if_current(&observed).unwrap());
+        let live = store.find_by_path(&wt).unwrap().unwrap();
+        assert_eq!(live.mode, LeaseMode::WriterLocked);
+        assert_eq!(live.updated_at, refreshed.updated_at);
+    }
+
+    #[test]
+    fn old_generation_cannot_match_after_release_and_regrant() {
+        let tmp = tempdir().unwrap();
+        let store = LeaseStore::open(tmp.path().join("leases.db")).unwrap();
+        let repo = tmp.path().join("repo");
+        let wt = tmp.path().join("checkouts/a");
+        let grant = LeaseGrant {
+            repo: &repo,
+            owner: "local",
+            repo_name: "repo",
+            job_id: "job-1",
+            branch: "hive/job-1",
+            worktree_path: &wt,
+            start_commit: "abc123",
+        };
+        store.grant(grant).unwrap();
+        let old_generation = store.grant(grant).unwrap();
+        store.release_by_path(&wt).unwrap();
+        let current = store.grant(grant).unwrap();
+
+        assert_ne!(old_generation.updated_at, current.updated_at);
+        assert!(!store.release_if_current(&old_generation).unwrap());
+        assert_eq!(
+            store.find_by_path(&wt).unwrap().unwrap().mode,
+            LeaseMode::WriterLocked
+        );
     }
 
     #[test]

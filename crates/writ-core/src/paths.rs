@@ -196,8 +196,9 @@ pub fn state_path() -> PathBuf {
 
 /// Resolve the SQLite lease-store path.
 ///
-/// Honours `WRIT_LEASE_PATH` when set and non-empty; otherwise
-/// `{resolved_state_root}/leases.db`.
+/// Honours `WRIT_LEASE_PATH` when set and non-empty. Otherwise defaults to
+/// `{resolved_state_root}/leases.db`, independently of the configured worktree
+/// base so every coordination command observes the same durable store.
 #[must_use]
 pub fn lease_store_path() -> PathBuf {
     resolve_lease_path_in(
@@ -386,12 +387,26 @@ mod tests {
             root.watched_json(),
             PathBuf::from("/tmp/writ-state/watched.json")
         );
+        assert_eq!(root.leases_db(), PathBuf::from("/tmp/writ-state/leases.db"));
     }
 
     #[test]
     fn resolve_state_path_honours_writ_state_path_override() {
         let path = resolve_state_path(Some(OsStr::new("/tmp/acme/watched.json")));
         assert_eq!(path, PathBuf::from("/tmp/acme/watched.json"));
+    }
+
+    #[test]
+    fn resolve_lease_path_uses_the_canonical_state_root() {
+        let user_data = tempfile::tempdir().unwrap();
+        assert_eq!(
+            super::resolve_lease_path_in(user_data.path(), None),
+            user_data.path().join("writ/leases.db")
+        );
+        assert_eq!(
+            super::resolve_lease_path_in(user_data.path(), os("/tmp/custom/leases.db")),
+            PathBuf::from("/tmp/custom/leases.db")
+        );
     }
 
     #[test]
