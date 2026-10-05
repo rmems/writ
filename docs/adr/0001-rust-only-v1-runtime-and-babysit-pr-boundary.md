@@ -30,6 +30,8 @@ The harness chooses checkout placement. Registration records an existing checkou
 
 The current command and schema details are maintained in the [CLI contract](../cli-contract.md), [status schema](../status-schema.md), and [timeout policy](../timeout-policy.md).
 
+`writ gh-safe` also admits the `gh run` read and official-rerun verbs (`view`, `list`, `watch`, `rerun`) and bounded `run download` destinations under the working directory; `run delete` / `run cancel` stay blocked. `gh api` routes through the same explicit-owner checks as other families. GitHub MCP may still perform GitHub writes outside this boundary; none of it is a raw `gh`/`git` production path, and remote merge authorization remains GitHub's and the operator's.
+
 ### Skills are platform-facing clients
 
 `SKILL.md`, `CLAUDE.md`, and host-specific guidance explain how to coordinate work and use the runtime. They link to [AGENTS.md](../../AGENTS.md) for the common contribution contract. They do not introduce a second state store or require contributors to install a particular private tracker.

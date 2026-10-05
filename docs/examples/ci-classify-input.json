@@ -1,0 +1,23 @@
+[
+  {
+    "name": "Build & Test",
+    "workflow": "CI",
+    "bucket": "fail",
+    "state": "fail",
+    "link": "https://github.com/acme/example-org/actions/runs/12345"
+  },
+  {
+    "name": "Codacy Static Code Analysis",
+    "bucket": "fail",
+    "link": "https://app.codacy.com/gh/acme/example-org/pull-requests/12"
+  },
+  {
+    "name": "Kilo Code Review",
+    "bucket": "pending",
+    "link": "https://app.kilo.ai/review/1"
+  },
+  {
+    "name": "Supabase Preview",
+    "bucket": "skipping"
+  }
+]

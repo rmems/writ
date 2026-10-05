@@ -2214,6 +2214,167 @@ fn gh_issue_list_allowed() {
     assert_eq!(cmd.args(), &["issue", "list"]);
 }
 
+#[test]
+fn gh_run_rerun_and_view_allowed() {
+    let rerun =
+        SafeGhCommand::new(&["run".to_owned(), "rerun".to_owned(), "12345".to_owned()]).unwrap();
+    assert_eq!(rerun.args(), &["run", "rerun", "12345"]);
+
+    let view = SafeGhCommand::new(&[
+        "run".to_owned(),
+        "view".to_owned(),
+        "12345".to_owned(),
+        "--log-failed".to_owned(),
+    ])
+    .unwrap();
+    assert_eq!(view.args(), &["run", "view", "12345", "--log-failed"]);
+
+    let repo_flag = SafeGhCommand::with_allowlist(
+        &[
+            "run".to_owned(),
+            "-R".to_owned(),
+            "acme/example-org".to_owned(),
+            "rerun".to_owned(),
+            "9".to_owned(),
+        ],
+        &crate::owners::OwnerAllowlist::from_owners(["acme"]),
+    )
+    .unwrap();
+    assert_eq!(
+        repo_flag.args(),
+        &["run", "-R", "acme/example-org", "rerun", "9"]
+    );
+}
+
+#[test]
+fn gh_run_download_relative_dir_allowed() {
+    // `SafeGhCommand::new` applies only the cwd-independent string gate to a
+    // download `--dir`; the symlink gate is rooted at the worktree in the
+    // supervisor path, so this test must not mutate the process-global cwd.
+
+    let relative = SafeGhCommand::new(&[
+        "run".to_owned(),
+        "download".to_owned(),
+        "123".to_owned(),
+        "--dir".to_owned(),
+        "artifacts".to_owned(),
+    ])
+    .unwrap();
+    assert_eq!(
+        relative.args(),
+        &["run", "download", "123", "--dir", "artifacts"]
+    );
+
+    SafeGhCommand::new(&[
+        "run".to_owned(),
+        "download".to_owned(),
+        "-D".to_owned(),
+        "artifacts".to_owned(),
+    ])
+    .unwrap();
+    SafeGhCommand::new(&[
+        "run".to_owned(),
+        "download".to_owned(),
+        "--dir=artifacts".to_owned(),
+    ])
+    .unwrap();
+    SafeGhCommand::new(&[
+        "run".to_owned(),
+        "download".to_owned(),
+        "-Dartifacts".to_owned(),
+    ])
+    .unwrap();
+    // `--name` / `--pattern` select artifacts; they are not filesystem destinations.
+    SafeGhCommand::new(&[
+        "run".to_owned(),
+        "download".to_owned(),
+        "--name".to_owned(),
+        "coverage".to_owned(),
+        "--pattern".to_owned(),
+        "cov-*".to_owned(),
+    ])
+    .unwrap();
+    SafeGhCommand::new(&[
+        "run".to_owned(),
+        "download".to_owned(),
+        "-n".to_owned(),
+        "../selector-not-a-path".to_owned(),
+    ])
+    .unwrap();
+    SafeGhCommand::new(&["run".to_owned(), "download".to_owned(), "123".to_owned()]).unwrap();
+}
+
+#[test]
+fn gh_run_download_external_dir_rejected() {
+    let cases = [
+        vec!["run", "download", "--dir", "/tmp/outside"],
+        vec!["run", "download", "--dir=../outside"],
+        vec!["run", "download", "-D", "/tmp/outside"],
+        vec!["run", "download", "-D/tmp/outside"],
+        vec!["run", "download", "-D=../outside"],
+        vec!["run", "download", "--dir"],
+    ];
+    for args in cases {
+        let owned: Vec<String> = args.into_iter().map(str::to_owned).collect();
+        let err = SafeGhCommand::new(&owned).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::PolicyViolation {
+                    code: PolicyCode::PathNotAllowed,
+                    ..
+                }
+            ),
+            "expected PathNotAllowed for {owned:?}, got {err:?}"
+        );
+    }
+}
+
+#[test]
+fn gh_run_download_unknown_flag_rejected() {
+    for args in [
+        vec!["run", "download", "-hD/tmp/outside"],
+        vec!["run", "download", "-xD", "/tmp/outside"],
+        vec!["run", "download", "--output", "/tmp/outside"],
+    ] {
+        let owned: Vec<String> = args.into_iter().map(str::to_owned).collect();
+        let err = SafeGhCommand::new(&owned).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::PolicyViolation {
+                    code: PolicyCode::GhFlagNotAllowed,
+                    ..
+                }
+            ),
+            "expected GhFlagNotAllowed for {owned:?}, got {err:?}"
+        );
+    }
+}
+
+#[test]
+fn gh_run_delete_and_cancel_rejected() {
+    for verb in ["delete", "cancel"] {
+        let err =
+            SafeGhCommand::new(&["run".to_owned(), verb.to_owned(), "1".to_owned()]).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::GhSubcommandNotAllowed,
+                ..
+            }
+        ));
+    }
+    let err = SafeGhCommand::new(&["run".to_owned()]).unwrap_err();
+    assert!(matches!(
+        err,
+        Error::PolicyViolation {
+            code: PolicyCode::GhSubcommandNotAllowed,
+            ..
+        }
+    ));
+}
+
 // ---- error display tests ----
 
 #[test]
@@ -2557,4 +2718,249 @@ fn pull_on_explicitly_assigned_main_passes_local_admission() {
     cmd.admit_local_merge(&repo).unwrap();
     cmd.verify_branch(&repo, "main").unwrap();
     remove_all(&repo, &worker_a, &worker_b);
+}
+
+// ---- FEAT-002 / PR #183 finding #2: gh run verbs are not local-checkout changes ----
+
+#[test]
+fn gh_run_verbs_skip_local_checkout_check() {
+    // `gh run` verbs act on remote Actions runs (GitHub authorizes) or, for
+    // `download`, are bounded by their own destination gates. None switch or
+    // delete the local checkout, so the local-checkout gate does not apply.
+    for args in [
+        vec!["run", "rerun", "123"],
+        vec!["run", "rerun", "--failed", "123"],
+        vec!["run", "download", "123"],
+        vec!["run", "download", "--dir", "sub", "123"],
+        vec!["run", "view", "123"],
+        vec!["run", "view", "--log-failed", "123"],
+        vec!["run", "list"],
+        vec!["run", "watch", "123"],
+    ] {
+        let owned: Vec<String> = args.iter().map(|s| (*s).to_owned()).collect();
+        assert!(
+            !gh_requires_branch_check(&owned),
+            "expected {args:?} to skip the local-checkout check"
+        );
+    }
+}
+
+#[test]
+fn gh_pr_local_checkout_check_behaviour() {
+    // Only pr forms that switch or delete the local checkout are flagged;
+    // remote mutations and reads are GitHub's authorization decision.
+    for args in [
+        vec!["pr", "checkout", "1"],
+        vec!["pr", "merge", "1", "--delete-branch"],
+        vec!["pr", "close", "1", "--delete-branch"],
+    ] {
+        let owned: Vec<String> = args.iter().map(|s| (*s).to_owned()).collect();
+        assert!(
+            gh_requires_branch_check(&owned),
+            "expected {args:?} to be flagged as a local checkout change"
+        );
+    }
+    for args in [
+        vec!["pr", "create"],
+        vec!["pr", "close", "1"],
+        vec!["pr", "merge", "1"],
+        vec!["pr", "view", "1"],
+        vec!["pr", "list"],
+        vec!["pr", "diff", "1"],
+    ] {
+        let owned: Vec<String> = args.iter().map(|s| (*s).to_owned()).collect();
+        assert!(
+            !gh_requires_branch_check(&owned),
+            "expected {args:?} to skip the local-checkout check"
+        );
+    }
+}
+
+#[test]
+fn gh_run_rerun_mismatched_selector_rejected_by_origin_bind() {
+    // A `gh run rerun` targeting a different (still allowed-owner) repo via -R
+    // must be rejected when bound to the verified origin, exactly like pr
+    // mutations. This is the gate that extending gh_requires_branch_check wires
+    // in through supervisor_cmd::prepare_gh_command.
+    let args = vec![
+        "run".to_owned(),
+        "rerun".to_owned(),
+        "-R".to_owned(),
+        "other/repo".to_owned(),
+        "123".to_owned(),
+    ];
+    let err = bind_gh_repo_selector_to_origin(&args, None, "acme/repo").unwrap_err();
+    assert!(
+        matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::PathNotAllowed,
+                ..
+            }
+        ),
+        "expected PathNotAllowed for mismatched run rerun selector, got {err:?}"
+    );
+    // A matching selector is accepted.
+    bind_gh_repo_selector_to_origin(&args, None, "other/repo").unwrap();
+    // No selector falls back to the working directory (accepted); the pin step
+    // in the supervisor then injects the verified origin.
+    let bare = vec!["run".to_owned(), "rerun".to_owned(), "123".to_owned()];
+    bind_gh_repo_selector_to_origin(&bare, None, "acme/repo").unwrap();
+    let pinned = pin_gh_repo_selector(bare, "acme/repo");
+    assert_eq!(gh_repo_selector(&pinned), Some("acme/repo"));
+}
+
+// ---- FEAT-002 / PR #183 finding #7: symlinked download destination escape ----
+
+/// A `gh run download --dir <symlink>` whose destination escapes the worktree
+/// via a symlink is rejected by the worktree-root-aware validator, and crucially
+/// the validator uses the passed `worktree_root` — NOT the process cwd — so the
+/// escape is caught even when the supervisor process runs in a different
+/// directory (the normal supervised case). This is a pure function of
+/// `(args, root)`: no `set_current_dir`, hence no `CWD_GUARD`.
+///
+/// If the validator were reverted to reading `std::env::current_dir()` instead
+/// of `worktree_root`, the `evil` symlink lives only in `worktree_root` (not in
+/// the process cwd, which stays elsewhere), so the walk would step up to an
+/// existing ancestor of the process cwd and WRONGLY accept — this test would
+/// fail. That makes it a meaningful regression guard for finding #1.
+#[cfg(unix)]
+#[test]
+fn gh_run_download_symlink_escape_uses_worktree_root_not_cwd() {
+    use std::os::unix::fs::symlink;
+
+    // External directory the symlink escapes to.
+    let outside = tempfile::tempdir().unwrap();
+    // Worktree root the child `gh` process would run in.
+    let worktree = tempfile::tempdir().unwrap();
+    let worktree_root = worktree.path().canonicalize().unwrap();
+
+    // Keep the PROCESS cwd somewhere else entirely so a cwd-based check could
+    // not see the worktree's `evil` symlink. We do not chdir to it; the
+    // validator takes the root explicitly.
+    let process_cwd = tempfile::tempdir().unwrap();
+    let _process_cwd_root = process_cwd.path().canonicalize().unwrap();
+
+    // `evil` is a relative name that passes the string check but points outside
+    // the worktree.
+    symlink(outside.path(), worktree_root.join("evil")).unwrap();
+
+    // Direct symlink destination is rejected.
+    let err = reject_external_gh_download_destination_in(
+        &[
+            "run".to_owned(),
+            "download".to_owned(),
+            "--dir".to_owned(),
+            "evil".to_owned(),
+            "123".to_owned(),
+        ],
+        &worktree_root,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::PathNotAllowed,
+                ..
+            }
+        ),
+        "expected PathNotAllowed for symlinked download dir, got {err:?}"
+    );
+
+    // A symlink used as a leading component of a deeper destination is also
+    // rejected (the extraction would still land outside).
+    let err = reject_external_gh_download_destination_in(
+        &[
+            "run".to_owned(),
+            "download".to_owned(),
+            "--dir".to_owned(),
+            "evil/artifacts".to_owned(),
+            "123".to_owned(),
+        ],
+        &worktree_root,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::PathNotAllowed,
+                ..
+            }
+        ),
+        "expected PathNotAllowed for symlink-prefixed download dir, got {err:?}"
+    );
+}
+
+/// A plain in-worktree relative destination is accepted by the worktree-root-aware
+/// validator while the process cwd stays elsewhere (proving the root, not the
+/// cwd, is what the gate resolves against). Pure function of `(args, root)`:
+/// no `set_current_dir`, no `CWD_GUARD`.
+#[cfg(unix)]
+#[test]
+fn gh_run_download_plain_relative_dir_accepted_against_worktree_root() {
+    // Process cwd stays wherever the test harness launched; we never chdir.
+    let worktree = tempfile::tempdir().unwrap();
+    let worktree_root = worktree.path().canonicalize().unwrap();
+
+    // A plain in-worktree relative destination (nonexistent nested dir) is fine.
+    reject_external_gh_download_destination_in(
+        &[
+            "run".to_owned(),
+            "download".to_owned(),
+            "--dir".to_owned(),
+            "sub/artifacts".to_owned(),
+            "123".to_owned(),
+        ],
+        &worktree_root,
+    )
+    .unwrap();
+
+    // An existing real (non-symlink) in-worktree directory is also accepted.
+    std::fs::create_dir_all(worktree_root.join("real")).unwrap();
+    reject_external_gh_download_destination_in(
+        &[
+            "run".to_owned(),
+            "download".to_owned(),
+            "--dir".to_owned(),
+            "real".to_owned(),
+            "123".to_owned(),
+        ],
+        &worktree_root,
+    )
+    .unwrap();
+
+    // The pure-string gate still rejects absolute / `..` escapes here too (both
+    // gates run in the worktree-root-aware entry point).
+    for bad in ["/tmp/outside", "../outside"] {
+        let err = reject_external_gh_download_destination_in(
+            &[
+                "run".to_owned(),
+                "download".to_owned(),
+                "--dir".to_owned(),
+                bad.to_owned(),
+                "123".to_owned(),
+            ],
+            &worktree_root,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::PolicyViolation {
+                    code: PolicyCode::PathNotAllowed,
+                    ..
+                }
+            ),
+            "expected PathNotAllowed for {bad}, got {err:?}"
+        );
+    }
+
+    // A non-download command is a no-op even with an odd `--dir` elsewhere.
+    reject_external_gh_download_destination_in(
+        &["run".to_owned(), "view".to_owned(), "123".to_owned()],
+        &worktree_root,
+    )
+    .unwrap();
 }

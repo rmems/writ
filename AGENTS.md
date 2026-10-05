@@ -137,3 +137,8 @@ The installable `SKILL.md` will own platform-facing prompts and command guidance
 6. `writ worktree unregister` (or a `WorktreeRemove` hook event) releases the lease row. The checkout itself is the harness's to delete — writ never removes it, and expiring a claim never erases WIP.
 7. The installed companion `babysit-pr` skill handles interactive monitoring after a PR handoff.
 8. A timeout or hang on `writ supervisor` is a recovery and handoff event: contain the child, record residual state, and leave the harness-owned checkout in place. Policy: [`docs/timeout-policy.md`](docs/timeout-policy.md). Do not improvise a second timeout path in the CLI.
+
+## Related planning
+
+- Stabilization: GitHub [#124](https://github.com/rmems/writ/issues/124)
+- Maintainer workflow contract: GitHub [#129](https://github.com/rmems/writ/issues/129) / [PR #130](https://github.com/rmems/writ/pull/130)

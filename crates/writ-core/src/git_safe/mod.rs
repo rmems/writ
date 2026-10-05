@@ -6,6 +6,9 @@
 //! - Local `git merge` on an assigned feature branch is allowed; `git mergetool` stays blocked.
 //! - Local integration with uncommitted work is refused so WIP is preserved.
 //! - GitHub owns remote merge authorization; local checkout-changing gh forms are refused.
+//! - `gh run` is allowlisted only for `view`, `list`, `watch`, `rerun`, and `download`
+//!   (Class A log fetch and official flake rerun). `run delete` / `run cancel` are rejected.
+//!   `run download --dir` / `-D` must stay under the working directory.
 //! - Mutating commands verify the current branch when `expected_branch` is provided to `run`.
 //! - `gh -R` / `--repo` selectors are checked against the configured owner allowlist.
 //! - All policy violations carry stable structured error codes.
@@ -26,7 +29,7 @@ mod tests;
 pub use gh::{
     SafeGhCommand, bind_gh_repo_selector_to_origin, effective_gh_repo_selector,
     enforce_gh_repo_targets, first_positional_after, gh_repo_env_target, gh_repo_selector,
-    gh_requires_branch_check, pin_gh_repo_selector,
+    gh_requires_branch_check, pin_gh_repo_selector, reject_external_gh_download_destination_in,
 };
 pub use identity::{
     github_owner_name, github_repo_slugs_match, is_supported_github_remote,

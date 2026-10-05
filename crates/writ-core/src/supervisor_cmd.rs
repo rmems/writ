@@ -105,7 +105,8 @@ fn prepare_git_command(prep: &CommandRequest<'_>) -> Result<PreparedCommand> {
 }
 
 /// Validate direct GitHub CLI operations without requiring local branch state.
-/// An optional working directory remains useful for gh's implicit repo lookup.
+/// An optional working directory remains useful for gh's implicit repo lookup
+/// and bounds `gh run download` destinations to that directory.
 fn prepare_gh_command(prep: &CommandRequest<'_>) -> Result<PreparedCommand> {
     let args: Vec<String> = prep.args.iter().map(|s| (*s).to_owned()).collect();
     let allowlist = prep
@@ -114,15 +115,22 @@ fn prepare_gh_command(prep: &CommandRequest<'_>) -> Result<PreparedCommand> {
         .clone()
         .unwrap_or_else(OwnerAllowlist::from_env);
     SafeGhCommand::with_allowlist(&args, &allowlist)?;
+    // Resolve an optional working directory for gh's implicit repo lookup and,
+    // for `gh run download`, apply the symlink-resolution destination gate
+    // against it (the string gate already ran inside `with_allowlist`).
+    let cwd = prep
+        .options
+        .repo
+        .as_deref()
+        .map(|repo| resolve_supervised_repo(Some(repo)))
+        .transpose()?;
+    if let Some(ref repo) = cwd {
+        crate::git_safe::reject_external_gh_download_destination_in(&args, repo)?;
+    }
     Ok(PreparedCommand {
         program: "gh".to_owned(),
         args,
-        cwd: prep
-            .options
-            .repo
-            .as_deref()
-            .map(|repo| resolve_supervised_repo(Some(repo)))
-            .transpose()?,
+        cwd,
         branch_check: None,
     })
 }
