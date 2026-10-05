@@ -2746,6 +2746,40 @@ fn gh_run_verbs_skip_local_checkout_check() {
 }
 
 #[test]
+fn gh_issue_develop_checkout_flagged_as_local_checkout_change() {
+    // `gh issue develop --checkout` creates the development branch AND switches
+    // the worktree onto it; the bare form only creates the branch remotely.
+    for args in [
+        vec!["issue", "develop", "123", "--checkout"],
+        vec!["issue", "develop", "123", "-c"],
+        vec!["issue", "develop", "--checkout", "123"],
+        vec!["issue", "develop", "-cl", "123"],
+        vec!["issue", "develop", "123", "-c=false", "--checkout"],
+    ] {
+        let owned: Vec<String> = args.iter().map(|s| (*s).to_owned()).collect();
+        assert!(
+            gh_requires_branch_check(&owned),
+            "expected {args:?} to be flagged as a local checkout change"
+        );
+    }
+    for args in [
+        vec!["issue", "develop", "123"],
+        vec!["issue", "develop", "123", "-c=false"],
+        vec!["issue", "develop", "123", "--checkout=false"],
+        vec!["issue", "develop", "123", "--name", "feat-x"],
+        vec!["issue", "develop", "123", "-n", "-c-looking-name"],
+        vec!["issue", "view", "123", "-c"],
+        vec!["issue", "create", "-c"],
+    ] {
+        let owned: Vec<String> = args.iter().map(|s| (*s).to_owned()).collect();
+        assert!(
+            !gh_requires_branch_check(&owned),
+            "expected {args:?} to skip the local-checkout check"
+        );
+    }
+}
+
+#[test]
 fn gh_pr_local_checkout_check_behaviour() {
     // Only pr forms that switch or delete the local checkout are flagged;
     // remote mutations and reads are GitHub's authorization decision.

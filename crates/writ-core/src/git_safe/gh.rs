@@ -505,6 +505,7 @@ enum PositionalScan {
 struct ShortOptions {
     tokens: usize,
     delete_branch: Option<bool>,
+    checkout_branch: Option<bool>,
 }
 
 fn short_options(arg: &str) -> Option<ShortOptions> {
@@ -516,12 +517,14 @@ fn short_options_with_context(arg: &str, context: CommandOptions) -> Option<Shor
         .strip_prefix('-')
         .filter(|body| !body.starts_with('-') && !body.is_empty())?;
     let mut delete_branch = None;
+    let mut checkout_branch = None;
     for (index, flag) in body.char_indices() {
         let suffix = &body[index + flag.len_utf8()..];
         if short_value_in_context(flag, context) {
             return Some(ShortOptions {
                 tokens: if suffix.is_empty() { 2 } else { 1 },
                 delete_branch,
+                checkout_branch,
             });
         }
         if !short_boolean_in_context(flag, context) {
@@ -530,6 +533,9 @@ fn short_options_with_context(arg: &str, context: CommandOptions) -> Option<Shor
         if flag == 'd' {
             delete_branch = Some(suffix.strip_prefix('=').is_none_or(gh_boolean_enabled));
         }
+        if flag == 'c' {
+            checkout_branch = Some(suffix.strip_prefix('=').is_none_or(gh_boolean_enabled));
+        }
         if suffix.starts_with('=') {
             break;
         }
@@ -537,6 +543,7 @@ fn short_options_with_context(arg: &str, context: CommandOptions) -> Option<Shor
     Some(ShortOptions {
         tokens: 1,
         delete_branch,
+        checkout_branch,
     })
 }
 
@@ -626,22 +633,65 @@ pub fn first_positional_after(args: &[String]) -> Option<&str> {
 
 /// Whether a validated `gh` command mutates local checkout/worktree state.
 ///
-/// Only `gh pr` forms that switch or delete the local checkout qualify:
-/// `checkout`, and `merge` / `close` with `--delete-branch`. Remote mutations
-/// (`merge`, `ready`, `update-branch`, reviews, `gh run` reruns) are GitHub's
-/// authorization decision; `gh run download` writes worktree files but is
-/// bounded by its own destination gates, so it is not a checkout change.
+/// Only forms that switch or delete the local checkout qualify: `pr checkout`,
+/// `pr merge` / `close` with `--delete-branch`, and `issue develop` with
+/// `--checkout` / `-c`. Remote mutations (`merge`, `ready`, `update-branch`,
+/// reviews, `gh run` reruns) are GitHub's authorization decision; `gh run
+/// download` writes worktree files but is bounded by its own destination
+/// gates, so it is not a checkout change.
 #[must_use]
 pub fn gh_requires_branch_check(args: &[String]) -> bool {
-    if args.first().map(String::as_str) != Some("pr") {
-        return false;
+    match args.first().map(String::as_str) {
+        Some("pr") => {
+            let Some(pr_sub) = command_verb(args) else {
+                return false;
+            };
+            matches!(pr_sub, "checkout")
+                || (matches!(pr_sub, "merge" | "close") && gh_deletes_local_branch(args))
+        }
+        Some("issue") => command_verb(args) == Some("develop") && gh_issue_develop_checks_out(args),
+        _ => false,
     }
-    let Some(pr_sub) = command_verb(args) else {
-        return false;
-    };
-    matches!(pr_sub, "checkout")
-        || (matches!(pr_sub, "merge" | "close") && gh_deletes_local_branch(args))
 }
+
+/// Whether `gh issue develop` carries an enabled `--checkout` / `-c`, which
+/// creates the development branch AND switches the worktree onto it. Bare
+/// `issue develop` creates the branch remotely without a local checkout
+/// change, so it is not flagged.
+fn gh_issue_develop_checks_out(args: &[String]) -> bool {
+    let mut checkout = false;
+    let mut i = 1;
+    while let Some(arg) = args.get(i).map(String::as_str) {
+        if arg == "--" {
+            break;
+        }
+        if let Some(options) = short_options_with_context(arg, command_options(args)) {
+            i += options.tokens;
+            if let Some(enabled) = options.checkout_branch {
+                checkout = enabled;
+            }
+            continue;
+        }
+        if arg == "--checkout" {
+            checkout = true;
+        } else if let Some(value) = arg.strip_prefix("--checkout=") {
+            checkout = gh_boolean_enabled(value);
+        }
+        if let Some((_, consumes)) = gh_repo_flag(arg, args.get(i + 1).map(String::as_str)) {
+            i += if consumes { 2 } else { 1 };
+            continue;
+        }
+        if ISSUE_DEVELOP_VALUE_OPTIONS.contains(&arg) {
+            i += 2;
+            continue;
+        }
+        i += 1;
+    }
+    checkout
+}
+
+/// `gh issue develop` separate-token value options (from the command table).
+const ISSUE_DEVELOP_VALUE_OPTIONS: &[&str] = &["-n", "--name", "--branch-repo"];
 fn gh_deletes_local_branch(args: &[String]) -> bool {
     let mut i = 1;
     let mut delete_branch = false;
