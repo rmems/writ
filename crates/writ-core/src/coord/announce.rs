@@ -266,8 +266,14 @@ pub(super) fn advisory_overlap_with(
     if shared.is_empty() {
         return Ok(None);
     }
-    insert_message(tx, overlap_from_request(scan, other, &shared))?;
-    insert_message(tx, overlap_from_existing_claim(scan, other, &shared))?;
+    insert_message(
+        tx,
+        overlap_message(scan, other, &shared, OverlapDirection::FromRequest),
+    )?;
+    insert_message(
+        tx,
+        overlap_message(scan, other, &shared, OverlapDirection::FromExistingClaim),
+    )?;
     Ok(Some(PathOverlap {
         owner: other.owner.clone(),
         repo_name: other.repo_name.clone(),
@@ -279,47 +285,60 @@ pub(super) fn advisory_overlap_with(
     }))
 }
 
-fn overlap_from_request<'a>(
-    scan: &'a OverlapScan<'a>,
-    other: &'a CoordClaim,
-    shared: &'a [String],
-) -> NewMessage<'a> {
-    let request = scan.request;
-    NewMessage {
-        kind: MessageKind::Overlap,
-        from_agent_id: request.agent_id,
-        from_owner: request.owner,
-        from_repo_name: request.repo_name,
-        from_job_id: request.job_id,
-        to_agent_id: Some(other.agent_id.as_str()),
-        to_owner: Some(other.owner.as_str()),
-        to_repo_name: Some(other.repo_name.as_str()),
-        to_job_id: Some(other.job_id.as_str()),
-        owner_generation: scan.generation,
-        body: "advisory declared-path overlap",
-        paths: shared,
-        ack_of: None,
-        now: scan.now,
-    }
+enum OverlapDirection {
+    FromRequest,
+    FromExistingClaim,
 }
 
-fn overlap_from_existing_claim<'a>(
+fn overlap_message<'a>(
     scan: &'a OverlapScan<'a>,
     other: &'a CoordClaim,
     shared: &'a [String],
+    direction: OverlapDirection,
 ) -> NewMessage<'a> {
     let request = scan.request;
+    let (from_agent_id, from_owner, from_repo_name, from_job_id, owner_generation) = match direction
+    {
+        OverlapDirection::FromRequest => (
+            request.agent_id,
+            request.owner,
+            request.repo_name,
+            request.job_id,
+            scan.generation,
+        ),
+        OverlapDirection::FromExistingClaim => (
+            other.agent_id.as_str(),
+            other.owner.as_str(),
+            other.repo_name.as_str(),
+            other.job_id.as_str(),
+            other.owner_generation,
+        ),
+    };
+    let (to_agent_id, to_owner, to_repo_name, to_job_id) = match direction {
+        OverlapDirection::FromRequest => (
+            other.agent_id.as_str(),
+            other.owner.as_str(),
+            other.repo_name.as_str(),
+            other.job_id.as_str(),
+        ),
+        OverlapDirection::FromExistingClaim => (
+            request.agent_id,
+            request.owner,
+            request.repo_name,
+            request.job_id,
+        ),
+    };
     NewMessage {
         kind: MessageKind::Overlap,
-        from_agent_id: &other.agent_id,
-        from_owner: &other.owner,
-        from_repo_name: &other.repo_name,
-        from_job_id: &other.job_id,
-        to_agent_id: Some(request.agent_id),
-        to_owner: Some(request.owner),
-        to_repo_name: Some(request.repo_name),
-        to_job_id: Some(request.job_id),
-        owner_generation: other.owner_generation,
+        from_agent_id,
+        from_owner,
+        from_repo_name,
+        from_job_id,
+        to_agent_id: Some(to_agent_id),
+        to_owner: Some(to_owner),
+        to_repo_name: Some(to_repo_name),
+        to_job_id: Some(to_job_id),
+        owner_generation,
         body: "advisory declared-path overlap",
         paths: shared,
         ack_of: None,

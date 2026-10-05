@@ -6,6 +6,9 @@ use std::path::Path;
 use std::process::Command;
 use tempfile::tempdir;
 
+mod assignment;
+mod overlap;
+
 struct Harness {
     _temp: tempfile::TempDir,
     store: LeaseStore,
@@ -134,56 +137,6 @@ fn announce_in(store: &LeaseStore, spec: AnnounceCase<'_>) -> AnnounceResult {
             paths: spec.paths,
         })
         .unwrap()
-}
-
-#[test]
-fn two_store_connections_exchange_advisory_overlap() {
-    let harness = Harness::new();
-    harness.seed_job("job-a", "hive/job-a");
-    harness.seed_job("job-b", "hive/job-b");
-    let peer = LeaseStore::open(&harness.path).unwrap();
-
-    let first = announce(
-        &harness.store,
-        "job-a",
-        "agent-a",
-        &[String::from("crates/writ-core/src/coord.rs")],
-    );
-    assert!(first.overlaps.is_empty());
-    let second = announce(
-        &peer,
-        "job-b",
-        "agent-b",
-        &[String::from("crates/writ-core/src")],
-    );
-    assert_eq!(second.overlaps.len(), 1);
-    assert!(second.overlaps[0].advisory);
-    assert_eq!(second.overlaps[0].job_id, "job-a");
-
-    let inbox = peer
-        .inbox(JobKey {
-            owner: "acme",
-            repo_name: "sample",
-            job_id: "job-a",
-        })
-        .unwrap();
-    assert!(
-        inbox
-            .iter()
-            .any(|message| message.kind == MessageKind::Overlap && message.from_job_id == "job-b")
-    );
-    let announcing_inbox = peer
-        .inbox(JobKey {
-            owner: "acme",
-            repo_name: "sample",
-            job_id: "job-b",
-        })
-        .unwrap();
-    assert!(
-        announcing_inbox.iter().any(|message| {
-            message.kind == MessageKind::Overlap && message.from_job_id == "job-a"
-        })
-    );
 }
 
 #[test]
@@ -729,116 +682,6 @@ fn session_change_increments_owner_generation() {
         })
         .unwrap();
     assert_eq!(second.claim.owner_generation, 2);
-}
-
-#[test]
-fn reannounce_with_disjoint_paths_clears_obsolete_overlap() {
-    let harness = Harness::new();
-    harness.seed_job("job-a", "hive/job-a");
-    harness.seed_job("job-b", "hive/job-b");
-    announce(
-        &harness.store,
-        "job-a",
-        "agent-a",
-        &[String::from("src/shared")],
-    );
-    announce(
-        &harness.store,
-        "job-b",
-        "agent-b",
-        &[String::from("src/shared")],
-    );
-
-    announce(&harness.store, "job-a", "agent-a", &[String::from("src/a")]);
-
-    assert!(
-        harness
-            .store
-            .inbox(job_key_a())
-            .unwrap()
-            .iter()
-            .all(|message| message.kind != MessageKind::Overlap || message.acked_at.is_some())
-    );
-}
-
-#[test]
-fn release_clears_overlap_messages_for_live_peers() {
-    let harness = Harness::new();
-    let worktree_a = harness.seed_job("job-a", "hive/job-a");
-    harness.seed_job("job-b", "hive/job-b");
-    announce(
-        &harness.store,
-        "job-a",
-        "agent-a",
-        &[String::from("src/shared")],
-    );
-    announce(
-        &harness.store,
-        "job-b",
-        "agent-b",
-        &[String::from("src/shared")],
-    );
-
-    harness.store.release_by_path(&worktree_a).unwrap();
-
-    assert!(
-        harness
-            .store
-            .inbox(JobKey {
-                owner: "acme",
-                repo_name: "sample",
-                job_id: "job-b",
-            })
-            .unwrap()
-            .iter()
-            .all(|message| message.kind != MessageKind::Overlap || message.acked_at.is_some())
-    );
-}
-
-#[test]
-fn regrant_clears_stale_coord_claim() {
-    let harness = Harness::new();
-    let worktree = harness.seed_job("job-a", "hive/job-a");
-    announce(&harness.store, "job-a", "agent-a", &[]);
-    harness.store.release_by_path(&worktree).unwrap();
-    harness
-        .store
-        .grant(crate::lease::LeaseGrant {
-            repo: &harness.repo,
-            owner: "acme",
-            repo_name: "sample",
-            job_id: "job-a",
-            branch: "hive/job-a",
-            worktree_path: &worktree,
-            start_commit: &harness.start,
-        })
-        .unwrap();
-    let claimed = announce(&harness.store, "job-a", "agent-b", &[]);
-    assert_eq!(claimed.claim.agent_id, "agent-b");
-}
-
-#[test]
-fn active_reregister_refreshes_coord_claim_checkout_identity() {
-    let harness = Harness::new();
-    let worktree = harness.seed_job("job-a", "hive/job-a");
-    announce(&harness.store, "job-a", "agent-a", &[]);
-
-    harness
-        .store
-        .grant(crate::lease::LeaseGrant {
-            repo: &harness.repo,
-            owner: "acme",
-            repo_name: "sample",
-            job_id: "job-a",
-            branch: "hive/job-renamed",
-            worktree_path: &worktree,
-            start_commit: &harness.start,
-        })
-        .unwrap();
-
-    let claim = harness.store.find_claim(job_key_a()).unwrap().unwrap();
-    assert_eq!(claim.branch, "hive/job-renamed");
-    assert_eq!(claim.worktree_path, worktree.to_string_lossy());
 }
 
 #[test]
