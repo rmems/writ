@@ -190,6 +190,11 @@ fn hook_boundary_fail_closed_cases() {
         ("{", 2, "IO_ERROR"),
         (
             r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"gh pr merge 1"}}"#,
+            0,
+            "",
+        ),
+        (
+            r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"gh pr checkout 1"}}"#,
             2,
             "MERGE_BLOCKED",
         ),

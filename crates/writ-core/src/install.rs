@@ -344,6 +344,26 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn repository_settings_do_not_require_startup_helpers() {
+        let settings: Value =
+            serde_json::from_str(include_str!("../../../.claude/settings.json")).unwrap();
+        let commands: Vec<&str> = settings["hooks"]
+            .as_object()
+            .into_iter()
+            .flat_map(|events| events.values())
+            .filter_map(Value::as_array)
+            .flatten()
+            .filter_map(|group| group["hooks"].as_array())
+            .flatten()
+            .filter_map(|handler| handler["command"].as_str())
+            .collect();
+        assert!(
+            commands.is_empty(),
+            "checkout must not start mandatory helpers: {commands:?}"
+        );
+    }
+
+    #[test]
     fn install_is_idempotent_and_preserves_existing_hooks() {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join(".claude/settings.json");
@@ -353,7 +373,7 @@ mod tests {
             r#"{
   "hooks": {
     "SessionStart": [
-      { "matcher": "", "hooks": [{ "type": "command", "command": "bd prime" }] }
+      { "matcher": "", "hooks": [{ "type": "command", "command": "printf session-ready" }] }
     ]
   }
 }
@@ -371,7 +391,7 @@ mod tests {
             parsed["hooks"]["SessionStart"][0]["hooks"][0]["command"]
                 .as_str()
                 .unwrap()
-                .contains("bd prime")
+                .contains("printf session-ready")
         );
         assert_eq!(
             parsed["hooks"]["PreToolUse"][0]["hooks"][0]["if"],

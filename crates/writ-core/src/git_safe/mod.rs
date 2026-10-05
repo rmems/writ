@@ -4,11 +4,11 @@
 //! - Only allowlisted git subcommands may be executed.
 //! - Bare `--force` / `-f` is always rejected; only `--force-with-lease` is permitted.
 //! - Local `git merge` on an assigned feature branch is allowed; `git mergetool` stays blocked.
-//! - Merge into `main`/`master`, or with uncommitted work, is refused so WIP is preserved.
-//! - `gh pr merge` and merge-related flags are blocked; `gh api` is not allowlisted.
+//! - Local integration with uncommitted work is refused so WIP is preserved.
+//! - GitHub owns remote merge authorization; local checkout-changing gh forms are refused.
 //! - `gh run` is allowlisted only for `view`, `list`, `watch`, `rerun`, and `download`
 //!   (Class A log fetch and official flake rerun). `run delete` / `run cancel` are rejected.
-//!   `run download --dir` / `-D` must be a relative path under the worktree.
+//!   `run download --dir` / `-D` must stay under the working directory.
 //! - Mutating commands verify the current branch when `expected_branch` is provided to `run`.
 //! - `gh -R` / `--repo` selectors are checked against the configured owner allowlist.
 //! - All policy violations carry stable structured error codes.
@@ -307,8 +307,8 @@ impl SafeGitCommand {
     /// merge-permission engine.
     ///
     /// Feature-branch integration and `--abort`/`--continue`/`--quit` are allowed.
-    /// Default-branch (`main`/`master`) integration and dirty-tree merges that would
-    /// clobber uncommitted work are refused.
+    /// Branch names do not determine authority. Dirty-tree merges that could
+    /// clobber uncommitted work are refused; callers verify assigned branch identity.
     pub fn admit_local_merge(&self, repo_dir: &Path) -> Result<()> {
         let verb = match self.subcommand() {
             "merge" => "merge",
@@ -317,15 +317,6 @@ impl SafeGitCommand {
         };
         if merge_is_recovery(&self.args) {
             return Ok(());
-        }
-        let current = resolve_current_branch(repo_dir)?;
-        if is_default_integration_branch(&current) {
-            return Err(Error::PolicyViolation {
-                code: PolicyCode::MergeBlocked,
-                message: format!(
-                    "local {verb} on default branch `{current}` is not allowed; GitHub owns protected-branch integration"
-                ),
-            });
         }
         if working_tree_is_dirty(repo_dir)? {
             return Err(Error::PolicyViolation {
@@ -931,10 +922,6 @@ fn push_destination_names(args: &[String]) -> Vec<String> {
 fn merge_is_recovery(args: &[String]) -> bool {
     args.iter()
         .any(|a| a == "--abort" || a == "--continue" || a == "--quit")
-}
-
-fn is_default_integration_branch(branch: &str) -> bool {
-    matches!(branch, "main" | "master")
 }
 
 fn working_tree_is_dirty(repo_dir: &Path) -> Result<bool> {
