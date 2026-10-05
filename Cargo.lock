@@ -684,6 +684,7 @@ dependencies = [
  "clap",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "writ-core",
 ]

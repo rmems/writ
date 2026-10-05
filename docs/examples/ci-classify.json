@@ -1,0 +1,135 @@
+{
+    "command": "ci.classify",
+    "data": {
+        "advisory_finding_codes": [],
+        "all_passed": false,
+        "checks": [
+            {
+                "check_class": "A",
+                "entry": {
+                    "conclusion": "failure",
+                    "description": "",
+                    "details_url": "https://github.com/acme/example-org/actions/runs/12345",
+                    "name": "Build & Test",
+                    "requirement": "unknown",
+                    "run_id": 12345,
+                    "status": "completed",
+                    "workflow_name": "CI"
+                },
+                "observation": "unknown_requiredness",
+                "policies": [
+                    "fix_source",
+                    "reply_with_sha",
+                    "forbid_empty_commit",
+                    "forbid_ignore"
+                ],
+                "reason": "Class A first-party CI 'Build & Test' \u2014 fix source or `gh run rerun`; never empty-commit",
+                "recommended_action": {
+                    "kind": "fix_source"
+                }
+            },
+            {
+                "check_class": "B",
+                "entry": {
+                    "conclusion": "failure",
+                    "description": "",
+                    "details_url": "https://app.codacy.com/gh/acme/example-org/pull-requests/12",
+                    "name": "Codacy Static Code Analysis",
+                    "requirement": "unknown",
+                    "run_id": null,
+                    "status": "completed",
+                    "workflow_name": ""
+                },
+                "observation": "unknown_requiredness",
+                "policies": [
+                    "fix_source",
+                    "reply_with_sha",
+                    "forbid_empty_commit",
+                    "forbid_ignore"
+                ],
+                "reason": "Class B quality gate 'Codacy Static Code Analysis' \u2014 fix real findings; residual human gate if ACTION_REQUIRED",
+                "recommended_action": {
+                    "kind": "fix_source"
+                }
+            },
+            {
+                "check_class": "C",
+                "entry": {
+                    "conclusion": "pending",
+                    "description": "",
+                    "details_url": "https://app.kilo.ai/review/1",
+                    "name": "Kilo Code Review",
+                    "requirement": "unknown",
+                    "run_id": null,
+                    "status": "pending",
+                    "workflow_name": ""
+                },
+                "observation": "pending",
+                "policies": [],
+                "reason": "Class C third-party review 'Kilo Code Review' \u2014 report residual; never empty-commit to retrigger",
+                "recommended_action": {
+                    "kind": "wait"
+                },
+                "residual_code": "class_c:kilo_pending"
+            },
+            {
+                "check_class": "C",
+                "entry": {
+                    "conclusion": "skipped",
+                    "description": "",
+                    "details_url": "",
+                    "name": "Supabase Preview",
+                    "requirement": "unknown",
+                    "run_id": null,
+                    "status": "completed",
+                    "workflow_name": ""
+                },
+                "observation": "skipping",
+                "policies": [],
+                "reason": "Class C third-party review 'Supabase Preview' \u2014 report residual; never empty-commit to retrigger",
+                "recommended_action": {
+                    "kind": "ignore"
+                }
+            }
+        ],
+        "collaboration": {
+            "advisory_finding_count": 0,
+            "blocks_unrelated_workers": false,
+            "ci_class": "pending",
+            "continue_other_work": true,
+            "external_access_count": 0,
+            "fixable_failure_count": 2,
+            "forbid_empty_retrigger_commit": true,
+            "pending_count": 1,
+            "required_failure_count": 0,
+            "residual_codes": [
+                "class_c:kilo_pending"
+            ],
+            "skipped_count": 1,
+            "unknown_requiredness_count": 2
+        },
+        "external_access_codes": [],
+        "fixable_failure_count": 2,
+        "github_is_required_check_authority": true,
+        "operator_note": "GitHub is the required-check authority. A provider name does not decide requiredness. Unknown requiredness, advisory findings, pending results, skipped analyses, and external access/configuration problems are reported and are not writ merge gates. A skipped analysis is not a performed pass.",
+        "pending_codes": [
+            "class_c:kilo_pending"
+        ],
+        "required_failure_codes": [],
+        "required_failure_count": 0,
+        "residual_codes": [
+            "class_c:kilo_pending"
+        ],
+        "skipped_codes": [
+            "skipping:supabase_preview"
+        ],
+        "unknown_requiredness_codes": [
+            "unknown_requiredness:build_test",
+            "unknown_requiredness:codacy_static_code_analysis"
+        ],
+        "unknown_requiredness_is_not_a_writ_merge_gate": true
+    },
+    "error": null,
+    "ok": true,
+    "schema_version": 1
+}

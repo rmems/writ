@@ -60,7 +60,7 @@ Linear: RM-<n>  <!-- omit this line if no twin exists -->
 - [ ] CI on PR
 
 ## Notes for review
-- Known residuals: ...
+- Known residuals: ... (use Class A/B/C residual codes from [`docs/ci-taxonomy.md`](../ci-taxonomy.md) when CI is the blocker)
 ```
 
 ### Partial / blocked

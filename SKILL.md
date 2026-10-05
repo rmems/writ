@@ -172,6 +172,22 @@ SHA policy: include `--commit-sha` only when referring to committed or pushed wo
 
 See [`docs/watchlist-schema.md`](docs/watchlist-schema.md).
 
+### CI taxonomy (Class A / B / C)
+
+When monitoring PR checks, classify each row from `gh pr checks --json name,state,bucket,workflow,link` (and `statusCheckRollup` when `ACTION_REQUIRED` is needed) using [`docs/ci-taxonomy.md`](docs/ci-taxonomy.md) or `writ --json ci classify`. Summary:
+
+| Class | Meaning | Do | Do not |
+| --- | --- | --- | --- |
+| **A** | GitHub Actions / Azure build-test | Fix source; **one** `gh run rerun` on flake | Empty “kick CI” commits |
+| **B** | Codacy (and similar quality gates) | Fix real file+line findings; residual human gate on `ACTION_REQUIRED` | Empty pushes to wake the dashboard |
+| **C** | Kilo, CodeRabbit, Gitar, unknown bots | Report residual (`class_c:kilo_pending`, …); continue Class A | Empty retrigger commits |
+
+`skipping` is non-blocking and is **not** a performed pass (skip-only is `unknown`, not `pass`). `pending` means continue other work without rerun spam. **Prefer a real fix or `gh run rerun` over noise commits.** Residual codes belong in watchlist notes and the final report.
+
+`writ --json ci classify` emits a compact `data.collaboration` object (`ci_class`, observation counts, `residual_codes`, `blocks_unrelated_workers: false`). Copy that into existing RM-139 / RM-127 status views. Do **not** write `watched.json`, a second store, or a lease row for CI. An externally blocked service must not freeze unrelated workers.
+
+Requiredness is **not** the Class A/B/C letter and is **not** inferred from a provider name. Pass `isRequired` from GraphQL when available. Count `required_failure` separately from advisory findings, pending results, `ACTION_REQUIRED` external-access/configuration problems, and unknown requiredness. Unknown is a report, not a writ merge gate and not a pass. Do not disable checks, fabricate success, or empty-commit to retrigger a bot.
+
 ### Platform-neutral worker prompt template
 
 When spawning a worker subagent, include these safety instructions in the prompt:

@@ -13,10 +13,20 @@ use super::{GitOutput, reject_external_path};
 ///
 /// Note: `api` is intentionally excluded so merge-related REST/GraphQL cannot be
 /// invoked through `gh api` (e.g. `mergePullRequest` / REST merge endpoints).
+/// `run` is allowlisted so official Actions log views and flake reruns can go
+/// through this boundary; nested `run` verbs are restricted separately.
 const ALLOWED_GH_SUBCOMMANDS: &[&str] = &[
-    "auth", "browse", "gist", "issue", "label", "pr", "release", "repo", "secret", "ssh-key",
-    "variable", "workflow",
+    "auth", "browse", "gist", "issue", "label", "pr", "release", "repo", "run", "secret",
+    "ssh-key", "variable", "workflow",
 ];
+
+/// `gh run` verbs that fetch logs, download artifacts, or perform an official rerun.
+///
+/// `delete` and `cancel` stay blocked: they are destructive and are not the
+/// Class A flake path (`gh run rerun` / `gh run view --log-failed`).
+/// `download` stays allowlisted, but [`gh_reject_external_download_destination`]
+/// refuses a `--dir` / `-D` that leaves the worktree.
+const ALLOWED_GH_RUN_SUBSUBCOMMANDS: &[&str] = &["download", "list", "rerun", "view", "watch"];
 
 /// `gh pr` sub-subcommands that are blocked (merge / merge-like updates).
 ///
@@ -65,6 +75,8 @@ impl SafeGhCommand {
     pub fn with_allowlist(args: &[String], allowlist: &OwnerAllowlist) -> Result<Self> {
         let subcommand = gh_subcommand(args)?;
         gh_reject_blocked_pr_subsubcommand(subcommand, args)?;
+        gh_reject_disallowed_run_verb(subcommand, args)?;
+        gh_reject_external_download_destination(subcommand, args)?;
         gh_reject_external_clone_destination(subcommand, args)?;
         gh_enforce_clone_target_owner(subcommand, args, allowlist)?;
         gh_reject_blocked_flags(args)?;
@@ -132,6 +144,293 @@ fn gh_reject_blocked_pr_subsubcommand(subcommand: &str, args: &[String]) -> Resu
         }
     }
     Ok(())
+}
+
+/// Restrict `gh run` to log fetch and official rerun verbs.
+fn gh_reject_disallowed_run_verb(subcommand: &str, args: &[String]) -> Result<()> {
+    if subcommand != "run" {
+        return Ok(());
+    }
+    match first_positional_after(&args[1..]) {
+        Some(run_sub) => {
+            let allowed_run: HashSet<&str> =
+                ALLOWED_GH_RUN_SUBSUBCOMMANDS.iter().copied().collect();
+            if !allowed_run.contains(run_sub) {
+                return Err(Error::PolicyViolation {
+                    code: PolicyCode::GhSubcommandNotAllowed,
+                    message: format!("`gh run {run_sub}` is not allowed"),
+                });
+            }
+        }
+        None => {
+            return Err(Error::PolicyViolation {
+                code: PolicyCode::GhSubcommandNotAllowed,
+                message: "`gh run` requires an allowed verb (view, list, watch, rerun, download)"
+                    .to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// `gh run download` extracts artifacts into `--dir` / `-D` (default `.`).
+///
+/// Reject destinations that leave the worktree. `--name` and `--pattern` select
+/// artifacts; they are not output paths. Unknown download flags are rejected so
+/// a clustered short cannot hide an outside destination.
+///
+/// # Validation split (PR #183 review follow-up)
+///
+/// This runs only the cwd-independent **string** gate ([`reject_external_path`]:
+/// absolute / `..` / drive / UNC). It is reached from
+/// [`SafeGhCommand::with_allowlist`], which has no worktree context:
+/// [`SafeGhCommand::new`] is a direct-call path with no supervised worktree, and
+/// the child `gh` is actually spawned with its cwd set to the resolved worktree
+/// (`prepared.cwd`), not the supervisor process cwd. Resolving a symlink here
+/// against `std::env::current_dir()` would therefore inspect the wrong directory
+/// in the normal supervised case. The symlink-resolution gate is applied
+/// separately against the real worktree root in
+/// [`reject_external_gh_download_destination_in`], called from
+/// `supervisor_cmd::prepare_gh_command` where the worktree root is known.
+/// Direct `SafeGhCommand::new` callers still get the string gate here.
+fn gh_reject_external_download_destination(subcommand: &str, args: &[String]) -> Result<()> {
+    if subcommand != "run" || first_positional_after(&args[1..]) != Some("download") {
+        return Ok(());
+    }
+    for dest in gh_run_download_dirs(args)? {
+        // Cwd-independent string gate: rejects absolute / `..` / drive / UNC
+        // spellings. The symlink-resolution gate is rooted at the worktree in
+        // `reject_external_gh_download_destination_in` (supervised path).
+        reject_external_path(Some(dest), "gh run download destination")?;
+    }
+    Ok(())
+}
+
+/// Validate a `gh run download` command's `--dir` / `-D` destinations against an
+/// explicit `worktree_root` (the resolved repo dir that becomes the child `gh`
+/// process cwd), running **both** gates fail-closed:
+///
+/// 1. the pure-string [`reject_external_path`] check (absolute / `..` / drive /
+///    UNC), unchanged; and
+/// 2. the symlink-resolution check, which joins/resolves each destination
+///    against the canonicalized `worktree_root` and confirms the resolved
+///    nearest-existing-ancestor stays within it, rejecting symlink components.
+///
+/// This is the worktree-root-aware entry point used by the supervisor so the
+/// defense inspects the directory the child actually extracts into, regardless
+/// of the supervisor's own process cwd. It is a pure function of
+/// `(args, worktree_root)` and does not read `std::env::current_dir()`.
+///
+/// A no-op unless `args` is a `gh run download` invocation.
+pub fn reject_external_gh_download_destination_in(
+    args: &[String],
+    worktree_root: &std::path::Path,
+) -> Result<()> {
+    if args.first().map(String::as_str) != Some("run")
+        || first_positional_after(&args[1..]) != Some("download")
+    {
+        return Ok(());
+    }
+    for dest in gh_run_download_dirs(args)? {
+        // First gate: the pure-string check rejects absolute / `..` / drive /
+        // UNC spellings.
+        reject_external_path(Some(dest), "gh run download destination")?;
+        // Second gate: a plain relative name can still be (or traverse) a
+        // symlink that escapes the worktree. Resolve it against the real
+        // worktree root fail-closed.
+        reject_symlinked_download_destination_in(dest, worktree_root)?;
+    }
+    Ok(())
+}
+
+/// Reject a `gh run download --dir` destination that escapes `worktree_root` via
+/// a symlink, which the pure-string [`reject_external_path`] gate cannot see.
+///
+/// The destination may not exist yet, so this resolves the nearest existing
+/// ancestor (walking up component by component), canonicalizes it, and confirms
+/// it stays within the canonicalized `worktree_root` (the directory the child
+/// `gh` process runs in). It also rejects when any existing leading component is
+/// itself a symlink. Fails closed on any IO error that prevents validating an
+/// existing component.
+///
+/// `worktree_root` is passed explicitly (not read from `std::env::current_dir()`)
+/// so the gate inspects the directory the child actually extracts into even when
+/// the supervisor's process cwd differs from the worktree.
+fn reject_symlinked_download_destination_in(
+    dest: &str,
+    worktree_root: &std::path::Path,
+) -> Result<()> {
+    use std::path::Path;
+
+    let root = worktree_root.canonicalize().map_err(|e| Error::Io {
+        context: "canonicalize worktree root for gh run download destination",
+        source: e,
+    })?;
+
+    let joined = root.join(Path::new(dest));
+
+    let Some((existing, metadata)) = nearest_existing_download_ancestor(&joined)? else {
+        return Ok(());
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(symlinked_download_escape(dest));
+    }
+    let canonical = existing.canonicalize().map_err(|e| Error::Io {
+        context: "canonicalize gh run download destination ancestor",
+        source: e,
+    })?;
+    if !canonical.starts_with(&root) {
+        return Err(symlinked_download_escape(dest));
+    }
+    Ok(())
+}
+
+fn nearest_existing_download_ancestor(
+    path: &std::path::Path,
+) -> Result<Option<(std::path::PathBuf, std::fs::Metadata)>> {
+    for candidate in path.ancestors() {
+        match std::fs::symlink_metadata(candidate) {
+            Ok(metadata) => return Ok(Some((candidate.to_path_buf(), metadata))),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(Error::Io {
+                    context: "inspect gh run download destination",
+                    source,
+                });
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn symlinked_download_escape(dest: &str) -> Error {
+    Error::PolicyViolation {
+        code: PolicyCode::PathNotAllowed,
+        message: format!(
+            "`gh run download destination` `{dest}` resolves outside the worktree via a symlink"
+        ),
+    }
+}
+
+enum DownloadStep<'a> {
+    Done,
+    Advance(usize),
+    Dir(&'a str, usize),
+}
+
+/// Collect `--dir` / `-D` values. One step per token keeps the scan flat.
+fn gh_run_download_dirs(args: &[String]) -> Result<Vec<&str>> {
+    let mut dirs = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match download_argv_step(args, i)? {
+            DownloadStep::Done => break,
+            DownloadStep::Advance(next) => i = next,
+            DownloadStep::Dir(value, next) => {
+                dirs.push(value);
+                i = next;
+            }
+        }
+    }
+    Ok(dirs)
+}
+
+fn download_argv_step(args: &[String], i: usize) -> Result<DownloadStep<'_>> {
+    let arg = args[i].as_str();
+    if arg == "--" {
+        return Ok(DownloadStep::Done);
+    }
+    let next = args.get(i + 1).map(String::as_str);
+    if let Some(step) = download_dir_step(arg, next, i)? {
+        return Ok(step);
+    }
+    if let Some(next_i) = download_known_skip(arg, i) {
+        return Ok(DownloadStep::Advance(next_i));
+    }
+    if arg.starts_with('-') {
+        return Err(Error::PolicyViolation {
+            code: PolicyCode::GhFlagNotAllowed,
+            message: format!("`gh run download` flag `{arg}` is not allowed"),
+        });
+    }
+    Ok(DownloadStep::Advance(i + 1))
+}
+
+fn download_dir_step<'a>(
+    arg: &'a str,
+    next: Option<&'a str>,
+    i: usize,
+) -> Result<Option<DownloadStep<'a>>> {
+    let Some((value, consume_next)) = gh_download_dir_flag(arg, next) else {
+        return Ok(None);
+    };
+    if value.is_empty() {
+        return Err(missing_download_destination());
+    }
+    let next_i = if consume_next { i + 2 } else { i + 1 };
+    Ok(Some(DownloadStep::Dir(value, next_i)))
+}
+
+fn missing_download_destination() -> Error {
+    Error::PolicyViolation {
+        code: PolicyCode::PathNotAllowed,
+        message: "`gh run download destination` requires a relative path under the worktree"
+            .to_owned(),
+    }
+}
+
+fn gh_download_dir_flag<'a>(arg: &'a str, next: Option<&'a str>) -> Option<(&'a str, bool)> {
+    if arg == "--dir" || arg == "-D" {
+        return Some((next.unwrap_or(""), true));
+    }
+    if let Some(value) = arg.strip_prefix("--dir=") {
+        return Some((value, false));
+    }
+    if let Some(value) = arg.strip_prefix("-D=") {
+        return Some((value, false));
+    }
+    attached_short_d(arg).map(|value| (value, false))
+}
+
+fn attached_short_d(arg: &str) -> Option<&str> {
+    let value = arg.strip_prefix("-D")?;
+    (!value.is_empty() && !value.starts_with('-')).then_some(value)
+}
+
+/// Advance past a known non-destination download flag and its value, if any.
+fn download_known_skip(arg: &str, i: usize) -> Option<usize> {
+    if is_download_bool_flag(arg) || is_attached_download_value(arg) {
+        return Some(i + 1);
+    }
+    if is_separate_download_value(arg) {
+        return Some(i + 2);
+    }
+    None
+}
+
+fn is_download_bool_flag(arg: &str) -> bool {
+    matches!(arg, "--help" | "-h")
+}
+
+fn is_separate_download_value(arg: &str) -> bool {
+    if arg.contains('=') || !arg.starts_with('-') {
+        return false;
+    }
+    matches!(arg, "--name" | "-n" | "--pattern" | "-p")
+        || GH_VALUE_TAKING_OPTIONS.contains(&arg)
+        || matches!(gh_repo_flag(arg, Some("x")), Some((_, true)))
+}
+
+fn is_attached_download_value(arg: &str) -> bool {
+    arg.starts_with("--name=")
+        || arg.starts_with("--pattern=")
+        || attached_nonempty_short(arg, "-n")
+        || attached_nonempty_short(arg, "-p")
+        || matches!(gh_repo_flag(arg, None), Some((_, false)))
+}
+
+fn attached_nonempty_short(arg: &str, flag: &str) -> bool {
+    arg.strip_prefix(flag).is_some_and(|rest| !rest.is_empty())
 }
 
 /// `gh repo clone <repo> [<dir>]` can write outside the worktree; reject an
@@ -345,19 +644,32 @@ pub fn first_positional_after(args: &[String]) -> Option<&str> {
     None
 }
 
-/// Whether a validated `gh` command mutates local checkout/worktree state.
+/// Whether a validated `gh` command mutates local checkout/worktree state (or an
+/// Actions run on a remote repo), so the supervisor must bind it to the verified
+/// origin and gate it behind the expected branch.
+///
+/// Covers mutating `gh pr` sub-subcommands and the mutating / worktree-affecting
+/// `gh run` verbs. `gh run rerun` re-triggers an Actions run and `gh run
+/// download` writes artifacts into the worktree; both must be origin-bound so a
+/// job cannot rerun or extract into a *different* allowed-owner repository
+/// without the branch gate. `cancel` / `delete` are treated as mutating for
+/// defense in depth even though [`ALLOWED_GH_RUN_SUBSUBCOMMANDS`] blocks them.
+/// Read-only `run view` / `list` / `watch` do not mutate and stay ungated.
 #[must_use]
 pub fn gh_requires_branch_check(args: &[String]) -> bool {
-    if args.first().map(String::as_str) != Some("pr") {
-        return false;
+    match args.first().map(String::as_str) {
+        Some("pr") => matches!(
+            first_positional_after(&args[1..]),
+            Some(
+                "checkout" | "create" | "close" | "reopen" | "edit" | "ready" | "merge" | "review"
+            )
+        ),
+        Some("run") => matches!(
+            first_positional_after(&args[1..]),
+            Some("rerun" | "download" | "cancel" | "delete")
+        ),
+        _ => false,
     }
-    let Some(pr_sub) = first_positional_after(&args[1..]) else {
-        return false;
-    };
-    matches!(
-        pr_sub,
-        "checkout" | "create" | "close" | "reopen" | "edit" | "ready" | "merge" | "review"
-    )
 }
 const GH_REPO_CLONE_VALUE_OPTIONS: &[&str] = &["-u", "--upstream-remote-name"];
 

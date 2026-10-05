@@ -1,6 +1,7 @@
 //! `writ watchlist` CLI: collaboration view over `leases.db`.
 
 use std::io::{self, Write};
+use std::path::Path;
 use std::process::ExitCode;
 
 use clap::Subcommand;
@@ -165,7 +166,7 @@ fn render_view(
     let path = lease_store_path();
     let query = request.query();
     // A view never creates the store: a missing leases.db is an empty view.
-    let data = if path.exists() {
+    let data = if store_exists(&path)? {
         let store = LeaseStore::open_read_only(&path)?;
         let probe = GhPrProbe::new(request.allowlist.clone());
         let github = query.probe_github.then_some(&probe as _);
@@ -180,6 +181,50 @@ fn render_view(
     };
     write_output(request.json, request.command(), &data, stdout)?;
     Ok(ExitCode::SUCCESS)
+}
+
+fn store_exists(path: &Path) -> io::Result<bool> {
+    if path.try_exists()? {
+        return Ok(true);
+    }
+    if path.is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("lease store path is a dangling symlink: {}", path.display()),
+        ));
+    }
+    validate_store_ancestors(path)?;
+    Ok(false)
+}
+
+fn validate_store_ancestors(path: &Path) -> io::Result<()> {
+    // Windows can report NotFound when an ancestor is a regular file. Only
+    // treat the store as absent after reaching an existing directory. Inspect
+    // links first so a dangling ancestor cannot masquerade as a missing path.
+    for ancestor in path.ancestors().skip(1) {
+        match ancestor.symlink_metadata() {
+            Ok(metadata) => {
+                let metadata = if metadata.is_symlink() {
+                    ancestor.metadata()?
+                } else {
+                    metadata
+                };
+                if metadata.is_dir() {
+                    return Ok(());
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::NotADirectory,
+                    format!(
+                        "lease store ancestor is not a directory: {}",
+                        ancestor.display()
+                    ),
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 fn write_output(
@@ -251,10 +296,43 @@ fn blockers_cell(blockers: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
     use writ_core::owners::OwnerAllowlist;
     use writ_core::watchlist::{
         CollabStatus, CoordOverlay, RecoveryStatus, WatchEntry, WatchlistData,
     };
+
+    #[test]
+    fn missing_store_ancestor_validation_rejects_regular_files() {
+        let root = tempdir().unwrap();
+        let file = root.path().join("file");
+        std::fs::write(&file, b"preserve me").unwrap();
+        // Exercise the ancestor contract directly: Unix can reject these paths
+        // in the initial stat, while Windows may first report them as absent.
+        for path in [file.join("leases.db"), file.join("nested/leases.db")] {
+            assert_eq!(
+                validate_store_ancestors(&path).unwrap_err().kind(),
+                io::ErrorKind::NotADirectory
+            );
+        }
+        assert_eq!(std::fs::read(file).unwrap(), b"preserve me");
+    }
+
+    #[test]
+    fn missing_store_ancestor_validation_accepts_absent_paths_without_creating_them() {
+        let root = tempdir().unwrap();
+        let relative = format!("writ-absent-store-{}.db", std::process::id());
+        assert!(!Path::new(&relative).exists());
+        for path in [
+            root.path().join("leases.db"),
+            root.path().join("missing/nested/leases.db"),
+            std::path::PathBuf::from(&relative),
+        ] {
+            validate_store_ancestors(&path).unwrap();
+            assert!(!path.exists());
+        }
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
 
     fn sample_entry() -> WatchEntry {
         WatchEntry {
