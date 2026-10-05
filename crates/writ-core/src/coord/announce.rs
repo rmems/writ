@@ -9,6 +9,7 @@ use super::access::{
     NewMessage, insert_message, list_other_claims_tx, load_claim_tx, require_active_lease_tx,
     upsert_agent,
 };
+use super::clear_pending_overlaps;
 use super::declared_paths::encode_paths;
 use super::types::{
     AckRequest, AnnounceRequest, CoordClaim, CoordMessage, MessageKind, PathOverlap, SendRequest,
@@ -157,18 +158,14 @@ fn clear_obsolete_overlaps(
     tx: &rusqlite::Transaction<'_>,
     request: &AnnounceRequest<'_>,
 ) -> Result<()> {
-    tx.execute(
-        "
-        DELETE FROM coord_messages
-        WHERE kind = 'overlap' AND acked_at IS NULL AND (
-            (from_owner = ?1 AND from_repo_name = ?2 AND from_job_id = ?3)
-            OR (to_owner = ?1 AND to_repo_name = ?2 AND to_job_id = ?3)
-        )
-        ",
-        params![request.owner, request.repo_name, request.job_id],
+    clear_pending_overlaps(
+        tx,
+        JobKey {
+            owner: request.owner,
+            repo_name: request.repo_name,
+            job_id: request.job_id,
+        },
     )
-    .map_err(|e| coord_err("clear obsolete coord overlaps", e))?;
-    Ok(())
 }
 
 pub(super) struct IntentInsert<'a> {
@@ -269,26 +266,8 @@ pub(super) fn advisory_overlap_with(
     if shared.is_empty() {
         return Ok(None);
     }
-    let request = scan.request;
-    insert_message(
-        tx,
-        NewMessage {
-            kind: MessageKind::Overlap,
-            from_agent_id: request.agent_id,
-            from_owner: request.owner,
-            from_repo_name: request.repo_name,
-            from_job_id: request.job_id,
-            to_agent_id: Some(other.agent_id.as_str()),
-            to_owner: Some(other.owner.as_str()),
-            to_repo_name: Some(other.repo_name.as_str()),
-            to_job_id: Some(other.job_id.as_str()),
-            owner_generation: scan.generation,
-            body: "advisory declared-path overlap",
-            paths: &shared,
-            ack_of: None,
-            now: scan.now,
-        },
-    )?;
+    insert_message(tx, overlap_from_request(scan, other, &shared))?;
+    insert_message(tx, overlap_from_existing_claim(scan, other, &shared))?;
     Ok(Some(PathOverlap {
         owner: other.owner.clone(),
         repo_name: other.repo_name.clone(),
@@ -298,6 +277,54 @@ pub(super) fn advisory_overlap_with(
         paths: shared,
         advisory: true,
     }))
+}
+
+fn overlap_from_request<'a>(
+    scan: &'a OverlapScan<'a>,
+    other: &'a CoordClaim,
+    shared: &'a [String],
+) -> NewMessage<'a> {
+    let request = scan.request;
+    NewMessage {
+        kind: MessageKind::Overlap,
+        from_agent_id: request.agent_id,
+        from_owner: request.owner,
+        from_repo_name: request.repo_name,
+        from_job_id: request.job_id,
+        to_agent_id: Some(other.agent_id.as_str()),
+        to_owner: Some(other.owner.as_str()),
+        to_repo_name: Some(other.repo_name.as_str()),
+        to_job_id: Some(other.job_id.as_str()),
+        owner_generation: scan.generation,
+        body: "advisory declared-path overlap",
+        paths: shared,
+        ack_of: None,
+        now: scan.now,
+    }
+}
+
+fn overlap_from_existing_claim<'a>(
+    scan: &'a OverlapScan<'a>,
+    other: &'a CoordClaim,
+    shared: &'a [String],
+) -> NewMessage<'a> {
+    let request = scan.request;
+    NewMessage {
+        kind: MessageKind::Overlap,
+        from_agent_id: &other.agent_id,
+        from_owner: &other.owner,
+        from_repo_name: &other.repo_name,
+        from_job_id: &other.job_id,
+        to_agent_id: Some(request.agent_id),
+        to_owner: Some(request.owner),
+        to_repo_name: Some(request.repo_name),
+        to_job_id: Some(request.job_id),
+        owner_generation: other.owner_generation,
+        body: "advisory declared-path overlap",
+        paths: shared,
+        ack_of: None,
+        now: scan.now,
+    }
 }
 
 pub(super) fn paths_overlap(left: &str, right: &str) -> bool {

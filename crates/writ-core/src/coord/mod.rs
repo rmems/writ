@@ -320,6 +320,24 @@ fn coord_table_exists(conn: &rusqlite::Connection, table: &str) -> Result<bool> 
     .map_err(|e| coord_err("inspect coord schema", e))
 }
 
+pub(crate) fn clear_pending_overlaps(
+    tx: &rusqlite::Transaction<'_>,
+    key: JobKey<'_>,
+) -> Result<()> {
+    tx.execute(
+        "
+        DELETE FROM coord_messages
+        WHERE kind = 'overlap' AND acked_at IS NULL AND (
+            (from_owner = ?1 AND from_repo_name = ?2 AND from_job_id = ?3)
+            OR (to_owner = ?1 AND to_repo_name = ?2 AND to_job_id = ?3)
+        )
+        ",
+        params![key.owner, key.repo_name, key.job_id],
+    )
+    .map_err(|e| coord_err("clear pending coord overlaps", e))?;
+    Ok(())
+}
+
 fn pause_context(
     tx: &rusqlite::Transaction<'_>,
     request: &PauseRequest<'_>,

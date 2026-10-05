@@ -187,7 +187,7 @@ Two layers, one binary.
 | Layer | Owns | Does not own |
 | --- | --- | --- |
 | **Enforcement** (per-repo) | Exact base, branch/path identity, path sandbox, git/gh allowlists, local feature-branch merge, no GitHub PR merge path, force-with-lease only, process containment | Which agent does what |
-| **Coordination state** (cross-repo) *(planned, M1)* | Agents, leases with path scopes, ownership, blockers, freeze modes. SQLite, single file, derived from `git`/`gh`/disk. Not implemented yet | Task decomposition or scheduling |
+| **Coordination state** (same host) | Agents, leases, declared paths, overlaps, messages, and handoffs in one SQLite store | Cross-host transport, task decomposition, or scheduling |
 | `git`, `gh`, OS | Version-control, GitHub, and process primitives, invoked through allowlists | Policy |
 
 Leases are the join: coordination state that the enforcement layer checks at write time. Phase 1 ships SQLite (`leases.db`, `WRIT_LEASE_PATH`) with a prepare/inspect/reconcile protocol so a crash between checkout registration and the lease row can be classified without adopting unproven ownership. Budget columns are reserved; `fix_cycles` is the only accumulated counter and uses the same prepare/commit journal. Enforcement of budgets is [#167](https://github.com/rmems/writ/issues/167).

@@ -97,7 +97,14 @@ impl CheckoutRegistry {
             return Ok(false);
         };
         match existing.allocation_state {
-            AllocationState::Active | AllocationState::Released => {
+            AllocationState::Active => {
+                if !registration_matches_lease(info, &existing) {
+                    return Err(registration_identity_error(info, job_id, &existing));
+                }
+                self.leases.grant(registration_grant(info, job_id))?;
+                Ok(true)
+            }
+            AllocationState::Released => {
                 self.leases.grant(registration_grant(info, job_id))?;
                 Ok(true)
             }
@@ -117,7 +124,7 @@ impl CheckoutRegistry {
         existing: &Lease,
     ) -> Result<bool> {
         if !registration_matches_lease(info, existing) {
-            return Err(interrupted_identity_error(info, job_id, existing));
+            return Err(registration_identity_error(info, job_id, existing));
         }
         let expected_operation_id = existing.operation_id.clone();
         let Some(outcome) = self
@@ -162,7 +169,7 @@ impl CheckoutRegistry {
         }
         Err(current.as_ref().map_or_else(
             || changed_during_reconcile_error(info, job_id, expected_operation_id),
-            |lease| interrupted_identity_error(info, job_id, lease),
+            |lease| registration_identity_error(info, job_id, lease),
         ))
     }
 
@@ -233,11 +240,11 @@ fn reconciled_identity_matches(
     lease.operation_id == expected_operation_id && registration_matches_lease(info, lease)
 }
 
-fn interrupted_identity_error(info: &CheckoutInfo, job_id: &str, existing: &Lease) -> Error {
+fn registration_identity_error(info: &CheckoutInfo, job_id: &str, existing: &Lease) -> Error {
     Error::PolicyViolation {
         code: PolicyCode::LeaseConflict,
         message: format!(
-            "interrupted lease for {}/{}/{job_id} protects `{}` on `{}`; refusing to resume it for `{}` on `{}`",
+            "lease for {}/{}/{job_id} protects `{}` on `{}`; refusing to register it for `{}` on `{}`",
             info.owner,
             info.repo_name,
             existing.worktree_path,
@@ -634,6 +641,44 @@ mod tests {
             &repo,
             &["show-ref", "--verify", "--quiet", "refs/heads/job/a"],
         );
+    }
+
+    #[test]
+    fn active_registration_rejects_a_branch_switch() {
+        let (tmp, repo) = init_repo();
+        let wt = tmp.path().join("elsewhere/wt-a");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "job/a",
+                wt.to_str().unwrap(),
+            ],
+        );
+        let store = LeaseStore::open(tmp.path().join("leases.db")).unwrap();
+        let registry = CheckoutRegistry::with_store(store).unwrap();
+        registry.register(&wt, "job-a").unwrap();
+        git(&wt, &["switch", "--quiet", "-c", "job/b"]);
+
+        let err = registry.register(&wt, "job-a").unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::LeaseConflict,
+                ..
+            }
+        ));
+        let info = inspect_checkout(&wt).unwrap();
+        let lease = registry
+            .leases
+            .find_job(registration_job_key(&info, "job-a"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(lease.branch, "job/a");
     }
 
     #[test]

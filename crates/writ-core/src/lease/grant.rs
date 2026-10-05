@@ -66,6 +66,14 @@ impl LeaseStore {
                 .map_err(|e| lease_err("commit lease finalize", e))?;
             return Ok(None);
         };
+        crate::coord::clear_pending_overlaps(
+            &tx,
+            JobKey {
+                owner: &lease.owner,
+                repo_name: &lease.repo_name,
+                job_id: &lease.job_id,
+            },
+        )?;
         if lease.allocation_state == AllocationState::Tombstoned || lease.allocation_state == state
         {
             tx.commit()
@@ -209,11 +217,22 @@ fn clear_released_claim(
     if !existing.is_some_and(|lease| lease.allocation_state == AllocationState::Released) {
         return Ok(());
     }
+    clear_coord_state(
+        tx,
+        JobKey {
+            owner: grant.owner,
+            repo_name: grant.repo_name,
+            job_id: grant.job_id,
+        },
+    )
+}
+
+fn clear_coord_state(tx: &rusqlite::Transaction<'_>, key: JobKey<'_>) -> Result<()> {
     tx.execute(
         "DELETE FROM coord_claims WHERE owner = ?1 AND repo_name = ?2 AND job_id = ?3",
-        params![grant.owner, grant.repo_name, grant.job_id],
+        params![key.owner, key.repo_name, key.job_id],
     )
-    .map_err(|e| lease_err("clear stale coord claim on regrant", e))?;
+    .map_err(|e| lease_err("clear finalized coord claim", e))?;
     tx.execute(
         "
         DELETE FROM coord_messages
@@ -223,9 +242,9 @@ fn clear_released_claim(
             OR (to_owner = ?1 AND to_repo_name = ?2 AND to_job_id = ?3)
         )
         ",
-        params![grant.owner, grant.repo_name, grant.job_id],
+        params![key.owner, key.repo_name, key.job_id],
     )
-    .map_err(|e| lease_err("clear stale coord messages on regrant", e))?;
+    .map_err(|e| lease_err("clear finalized coord messages", e))?;
     Ok(())
 }
 
