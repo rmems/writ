@@ -285,11 +285,11 @@ A lease row joins a task, an agent/session, and a checkout path — the "who own
 
 ### Overlap and handoff
 
-Planned declared-path claims provide early overlap visibility; current status reads the existing lease store. Overlap on separate branches is advisory: the colliding worker identifies the owner and negotiates a split, a sequence, or a handoff. Duplicate live ownership of one task is a detected collision, not silent divergence. A stale lease is a recovery/handoff event — not permission to kill a worker or discard its changes.
+Declared-path claims provide early overlap visibility through the existing lease store. Overlap on separate branches is advisory: the colliding worker identifies the owner and negotiates a split, a sequence, or a handoff. Duplicate live ownership of one task is a detected collision, not silent divergence. A stale lease is a recovery/handoff event — not permission to kill a worker or discard its changes.
 
 ### Communication
 
-The planned coordination extension adds intent, dependency-ready, blocker, overlap, help-request, handoff, and completion records to the existing store, with identity/version information to distinguish stale messages from live state. A manager can split scope or pick one integration owner without turning every message into a human approval gate.
+Same-host coordination records intent, dependency, blocker, overlap, help, handoff, and acknowledgement messages in the existing store, with owner generations to distinguish stale handoffs from live state. A manager can split scope or pick one integration owner without turning every message into a human approval gate. Cross-host transport remains out of scope.
 
 ### Local integration
 
