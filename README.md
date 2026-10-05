@@ -89,7 +89,7 @@ Canonical command names live in [`SKILL.md`](SKILL.md) and `writ --help`. This R
 
 ## Install
 
-Two pieces: the **binary** (coordination + safety core) and the **skill** (portable agent procedure). Install both. Neither is a substitute for the other.
+Install the **binary** for coordination and process helpers. The **skill** is optional portable agent guidance; ordinary contribution does not require installing either helper.
 
 ### Prerequisites
 
@@ -146,9 +146,9 @@ Skill directories are not standardized. Common roots include `~/.agents/skills`,
 
 ## Quick start
 
-Until M1 hooks land, git and GitHub commands that `writ` can admit must go through `writ` on purpose. Local `git merge` on an assigned feature branch is allowlisted; `gh pr merge`, auto-merge, and merge queues are not. GitHub owns remote PR merges ([`AGENTS.md`](AGENTS.md#remote-github-merges)).
+Use the host's authorized native tools, or opt into writ helpers for shared ownership visibility, local integrity checks and bounded execution. Local integration is routine. Remote PR readiness, updates and merges follow GitHub permissions and operator authorization ([`AGENTS.md`](AGENTS.md#remote-github-merges)).
 
-1. Install the binary and skill as above.
+1. Install the binary when using these coordination helpers; the skill is optional.
 2. The harness creates the isolated checkout (native worktree support, or plain git):
 
    ```bash
@@ -164,7 +164,7 @@ Until M1 hooks land, git and GitHub commands that `writ` can admit must go throu
 
    Registration is coordination-state only: no creation, relocation, rename, fetch, or reset. A branch ahead of its base registers as-is.
 
-3. Route git and GitHub mutations through the allowlists:
+3. If using the optional command helpers:
 
    ```bash
    writ git-safe --expected-branch hive/issue-42-example --repo <worktree> status
@@ -177,7 +177,7 @@ Until M1 hooks land, git and GitHub commands that `writ` can admit must go throu
    writ --json status
    ```
 
-Do not expect a `discover` → `add` → `check-all` → `list` hive loop. Those were scaffold-era skill stubs and were removed with the Python orchestrator. Current operator flow is: the harness isolates a worktree, `writ worktree register` joins it to the coordination store, the worker integrates compatible peer work locally when needed, implements in that tree, opens a PR, optionally hands it to `babysit-pr`, and leaves the GitHub PR merge to a human.
+Do not expect a `discover` → `add` → `check-all` → `list` hive loop. Those were scaffold-era skill stubs and were removed with the Python orchestrator. Current operator flow is: the harness isolates a worktree, `writ worktree register` joins it to the coordination store, the worker integrates compatible peer work locally when needed, implements in that tree, opens a PR, optionally hands it to `babysit-pr`, and reports readiness. A remote merge requires operator authorization and GitHub permission.
 
 
 ## Architecture
@@ -186,7 +186,7 @@ Two layers, one binary.
 
 | Layer | Owns | Does not own |
 | --- | --- | --- |
-| **Enforcement** (per-repo) | Exact base, branch/path identity, path sandbox, git/gh allowlists, local feature-branch merge, no GitHub PR merge path, force-with-lease only, process containment | Which agent does what |
+| **Local integrity helpers** | Checkout/branch identity, WIP preservation, force-with-lease-only pushes, explicit repository targeting, process containment | Task assignment, harness checkout placement, remote merge permissions |
 | **Coordination state** (same host) | Agents, leases, declared paths, overlaps, messages, and handoffs in one SQLite store | Cross-host transport, task decomposition, or scheduling |
 | `git`, `gh`, OS | Version-control, GitHub, and process primitives, invoked through allowlists | Policy |
 
@@ -217,13 +217,13 @@ Leases are the join: coordination state that the enforcement layer checks at wri
 Call-outs:
 
 - **Isolation:** workers must not share a dirty worktree. One writable worker per assigned worktree and branch.
-- **Babysit:** success means merge-ready (CI green, mergeable, reviews clean, threads resolved). The human still merges.
+- **Babysit:** success means merge-ready (CI green, mergeable, reviews clean, threads resolved). Readiness does not itself authorize a merge.
 - **Stacks:** handle from the bottom of the stack upward. Do not run parallel writers on one stack.
 - **State location:** collaboration status reads the SQLite lease store (`WRIT_LEASE_PATH`, else platform user-data `writ/leases.db`). `watched.json` (`WRIT_STATE_PATH`) is a leftover reader only and is not the status authority.
 
 ### Why hooks
 
-Enforcement runs as [Claude Code hooks](https://code.claude.com/docs/en/hooks): `writ install` writes the hook block into `.claude/settings.json`, and `writ hook` dispatches the JSON payloads. This repo's own `.claude/settings.json` still registers only `SessionStart` and `PreCompact` — hooks are opt-in until the [#124](https://github.com/rmems/writ/issues/124) burn-in completes.
+Enforcement runs as [Claude Code hooks](https://code.claude.com/docs/en/hooks): `writ install` writes the hook block into `.claude/settings.json`, and `writ hook` dispatches the JSON payloads. The checked-in `.claude/settings.json` has no startup hooks or tracker dependency. Writ hooks are opt-in; validate them in a throwaway repository before installing into shared settings.
 
 - **`PreToolUse`** — "Exit 2 means a blocking error… exit 2 blocks whether or not you print JSON: even a JSON `permissionDecision` of `allow` can't override it."
 - **`SubagentStart`/`SubagentStop`** — agent registry.
@@ -237,11 +237,11 @@ Register with `writ install`. Matcher scope starts at `Bash(git *)` and `Bash(gh
 | Term | Meaning |
 | --- | --- |
 | **Orchestrator** | The host agent session that loads [`SKILL.md`](SKILL.md), calls `writ`, and spawns workers. It is not a `writ` subcommand. |
-| **Worker** | A subagent bound to one assigned worktree and branch. Workers may integrate peer work locally; they never merge a GitHub pull request. |
+| **Worker** | A subagent bound to one assigned worktree and branch. Workers integrate peer work locally and perform remote actions only within operator authorization. |
 | **Worktree** | An isolated git checkout created by the harness (or plain `git worktree add`), registered with `writ worktree register`. Any path; no writ-specific root required. |
 
 | **Watchlist / hive** | Legacy name. Live visibility is `writ status` / `writ worktree list` over the SQLite lease store. |
-| **Merge-ready** | CI green, conflict-free, required checks successful, review threads resolved. Report it; do not merge. |
+| **Merge-ready** | CI green, conflict-free, required checks successful, review threads resolved. Report it; merge only when authorized. |
 | **Lease** | SQLite coordination row for a registered checkout (`WRITER_LOCKED` / `UNASSIGNED` today). |
 
 ## Commands
@@ -253,7 +253,7 @@ Implemented `writ` surface (`writ --help` is authoritative):
 | `writ status` / `writ jobs` | Implemented (read-only) | Collaboration snapshot from the SQLite lease store. See [`docs/status-schema.md`](docs/status-schema.md). |
 | `writ ci classify` | Implemented | Classify `gh pr checks` / `statusCheckRollup` JSON. Emits residual codes plus a compact `collaboration` view for status consumers. Does not write state. |
 | `writ git-safe …` | Implemented | Run a git command after the allowlist and, for mutations, expected-branch checks. |
-| `writ gh-safe …` | Implemented | Run a `gh` command after the allowlist. GitHub PR merge operations are rejected. |
+| `writ gh-safe …` | Implemented | Run a `gh` command with configured repository-target and local-checkout checks. GitHub decides remote permissions. |
 | `writ supervisor run --timeout <secs> …` | Implemented | Spawn a child with wall-clock, idle, and grace recovery (`--idle`/`--stall`, `--grace`, `--progress-secs`, env `WRIT_SUPERVISOR_*`; see [`docs/timeout-policy.md`](docs/timeout-policy.md)). Timeout is a handoff residual: Unix SIGTERM-then-SIGKILL on the process group; Windows kills only the direct child (grandchildren may survive). Never deletes a harness checkout. |
 | `writ watchlist list\|check\|check-all` | Implemented (view) | Collaboration status over `leases.db` plus optional live GitHub overlay. Does not persist a watchlist file. |
 | `writ worktree register\|unregister\|inspect\|list` | Implemented | Coordination records for harness-owned checkouts. Register/unregister never touch files or branches. |
@@ -285,15 +285,15 @@ A lease row joins a task, an agent/session, and a checkout path — the "who own
 
 ### Overlap and handoff
 
-Declared intended paths give early overlap visibility. Overlap on separate branches is advisory: the colliding worker identifies the owner and negotiates a split, a sequence, or a handoff. Duplicate live ownership of one task is a detected collision, not silent divergence. A stale lease is a recovery/handoff event — not permission to kill a worker or discard its changes.
+Planned declared-path claims provide early overlap visibility; current status reads the existing lease store. Overlap on separate branches is advisory: the colliding worker identifies the owner and negotiates a split, a sequence, or a handoff. Duplicate live ownership of one task is a detected collision, not silent divergence. A stale lease is a recovery/handoff event — not permission to kill a worker or discard its changes.
 
 ### Communication
 
-The shared store carries intent, dependency-ready, blocker, overlap, help-request, handoff, and completion records, with enough identity/version information to distinguish stale messages from live state. A manager can split scope or pick one integration owner without turning every message into a human approval gate.
+The planned coordination extension adds intent, dependency-ready, blocker, overlap, help-request, handoff, and completion records to the existing store, with identity/version information to distinguish stale messages from live state. A manager can split scope or pick one integration owner without turning every message into a human approval gate.
 
 ### Local integration
 
-`git merge`, `git rebase`, and `git cherry-pick` of peer branches into the assigned branch are routine; conflict repair is expected. Resolve the contended files, validate the combined result, and publish the resulting head/dependencies for other workers. A merge that would overwrite uncommitted WIP must be refused first — commit, stash, or abort. Default-branch integration belongs to GitHub policy.
+`git merge`, `git rebase`, and `git cherry-pick` of peer branches into the assigned branch are routine; conflict repair is expected. Resolve the contended files, validate the combined result, and publish the resulting head/dependencies for other workers. A merge that would overwrite uncommitted WIP must be refused first — commit, stash, or abort. GitHub controls remote protected-branch integration; a local branch name is not a separate permission gate.
 
 ### GitHub vs Linear
 
@@ -303,25 +303,27 @@ The shared store carries intent, dependency-ready, blocker, overlap, help-reques
 | **GitHub** | Source of truth for code, PRs, reviews, checks, and protected-branch merges. |
 | **writ** | Same-host coordination state only. No task-tracker clone, no merge authority. |
 
-GitHub issue twins or Beads mirrors are not a required workflow.
+Use the task context already supplied; no tracker account, issue twin or mirror is required.
 
 ## Safety invariants
 
-Coordination integrity and WIP protection are enforced in Rust at the binary boundary, where a malformed prompt cannot bypass them:
+Rust helpers enforce their own local integrity checks:
 
 - Force pushes may use only `--force-with-lease`; bare `--force` and `-f` are forbidden.
-- Each job edits only its assigned branch and isolated checkout; mutating operations verify the expected branch and stay inside the configured path sandbox.
+- Each job edits only its assigned branch and isolated checkout; direct supervised git mutations verify the expected branch. The harness chooses checkout placement.
 - One writable worker per assigned worktree and branch; stacked PRs are handled bottom-up.
 - Unbounded fix loops are a named failure class (F2); lease budgets are planned in [#167](https://github.com/rmems/writ/issues/167).
 
-`writ` enforces these rules only for commands routed through it deliberately — it is **opt-in, not unbypassable** — until the remaining hook burn-in lands ([#124](https://github.com/rmems/writ/issues/124)).
+Helpers and hooks are opt-in. Supervision accepts host scripts and interpreters; it does not recursively inspect their subprocesses or opaque API payloads. Harness permissions and GitHub authorization remain authoritative. Deprecated managed-create commands retain their own path sandbox.
 
 ## Owner allowlist
 
-Repository access is controlled by a configured owner allowlist, not a built-in org list.
+Writ's GitHub helpers check supported explicit target selectors against a configured owner allowlist. GitHub permissions authorize remote access.
 
 - Set `WRIT_ALLOWED_OWNERS=acme,example-org` (comma-separated), or pass `--allowed-owners` / explicit owners at the API boundary.
 - An empty allowlist denies owner-taking operations (`writ worktree create` and `gh` commands that select a repository via `-R` / `--repo` in any pflag spelling, or via `GH_REPO`) rather than permitting them.
+- `gh api` checks literal owners in `repos/OWNER/REPO/...`, `orgs/OWNER/repos`, and `users/OWNER/repos`, including `api.github.com` URLs. Other API endpoint families and owners hidden in placeholder expansion, GraphQL node IDs or opaque request bodies are outside that inference; configured explicit repository selectors remain checked.
+- HTTP(S) URL scheme and DNS hostname matching are case-insensitive. Numeric ports, userinfo and a trailing DNS dot do not hide the target host. REST URL inference matches `api.github.com` exactly; PR/issue URLs retain owner checks on valid public and enterprise DNS hosts. Extracting an owner does not authorize the host. Malformed HTTP authorities are rejected.
 - Comparison uses the same host/case normalization as `github_repo_slugs_match`, so `Acme/Repo` and `github.com/acme/repo` cannot diverge.
 
 Examples use generic owners such as `acme` and `example-org`.
@@ -335,7 +337,7 @@ Examples use generic owners such as `acme` and `example-org`.
 
 ## Build and gates
 
-Contributor quality gates — these are canonical, and external analyzers are advisory until reproduced:
+Run focused checks while working. Use these native gates and appropriate independent review before claiming readiness; checkpoints report their narrower evidence. External findings need actionable evidence:
 
 ```bash
 cargo fmt --all -- --check
@@ -363,7 +365,7 @@ This is not `writ install`, which writes the `writ` hook block into `.claude/set
 
 | Purpose | Default | Override |
 | --- | --- | --- |
-| Worktree root | platform user-data `writ/worktrees` | `WRIT_WORKTREE_BASE`, else `WH_WORKTREE_BASE` |
+| Deprecated managed-worktree root (not a supervisor constraint) | platform user-data `writ/worktrees` | `WRIT_WORKTREE_BASE`, else `WH_WORKTREE_BASE` |
 | Job worktree | `{worktree root}/{owner}/{repo}/{job_id}` | Deprecated managed lifecycle only; `register` accepts any path |
 | Lease store | platform user-data `writ/leases.db` | `WRIT_LEASE_PATH` |
 | Watched state (legacy reader) | platform user-data `writ/watched.json` | `WRIT_STATE_PATH`, else `WH_STATE_PATH` |
@@ -379,7 +381,7 @@ If the new `writ` data root is absent and a pre-rename `worktrees-hives` root st
 | `writ: command not found` | `cargo install --path crates/writ` from the clone, or set `WRIT_BIN`. |
 
 | `writ status` / `writ jobs` is empty | Expected until a checkout is registered. Register with `writ worktree register`. See [`docs/status-schema.md`](docs/status-schema.md); for the live GitHub overlay use `writ watchlist` ([`docs/watchlist-schema.md`](docs/watchlist-schema.md)). |
-| `policy violation [BARE_FORCE_PUSH]` or `[MERGE_BLOCKED]` | Exit 2 is the safety boundary working. Use `--force-with-lease` only when allowed. `MERGE_BLOCKED` covers `gh pr merge`, `git mergetool`, default-branch local merge, and dirty-WIP merge — not routine feature-branch integration. |
+| `policy violation [BARE_FORCE_PUSH]` or `[MERGE_BLOCKED]` | Exit 2 is the safety boundary working. Use `--force-with-lease` only when allowed. `MERGE_BLOCKED` covers local checkout/WIP protections, not GitHub merge authorization. Preserve WIP before local integration. |
 | Owner allowlist did not block another org | Confirm `WRIT_ALLOWED_OWNERS` / `--allowed-owners` is set. Empty lists deny. The gate covers worktree create and `gh` repo selectors, not host MCP calls. |
 
 ## Issue labels and templates
