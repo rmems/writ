@@ -1,3 +1,4 @@
+use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -5,6 +6,9 @@ use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
 
+mod coord;
+mod lease;
+mod store;
 mod watchlist;
 
 /// Manage isolated issue-to-PR jobs and their durable state.
@@ -67,6 +71,24 @@ enum Command {
         action: WorktreeAction,
     },
 
+    /// Crash-consistent lease inspection and reconciliation.
+    Lease {
+        #[command(subcommand)]
+        action: lease::LeaseAction,
+    },
+
+    /// Same-host coordination claims and overlap/help/handoff messages.
+    Coord {
+        #[command(subcommand)]
+        action: coord::CoordAction,
+    },
+
+    /// Classify PR status checks (Class A/B/C) for companion-skill monitoring.
+    Ci {
+        #[command(subcommand)]
+        action: CiAction,
+    },
+
     /// Format an attributed PR thread reply or summary comment.
     Attribution {
         #[command(subcommand)]
@@ -90,6 +112,16 @@ enum Command {
     Watchlist {
         #[command(subcommand)]
         action: watchlist::WatchlistAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum CiAction {
+    /// Classify `gh pr checks` JSON or a GraphQL `statusCheckRollup` payload.
+    Classify {
+        /// JSON file to classify. Reads stdin when omitted.
+        #[arg(long)]
+        file: Option<PathBuf>,
     },
 }
 
@@ -289,11 +321,11 @@ enum SupervisorAction {
         #[command(flatten)]
         timeouts: SupervisorTimeouts,
 
-        /// Expected branch for mutating supervised `git` / `gh pr` commands.
+        /// Expected branch for direct mutating Git commands; remote GitHub operations do not require one.
         #[arg(long)]
         expected_branch: Option<String>,
 
-        /// Repository working tree for supervised git branch checks (default: `.`).
+        /// Child working directory; direct Git checks its branch here (default: `.`).
         #[arg(long)]
         repo: Option<PathBuf>,
 
@@ -407,6 +439,31 @@ fn worktree_error_data(error: &writ_core::error::Error) -> serde_json::Value {
             postcondition_failure_data(failure)
         }
         writ_core::error::Error::PrImportFailed(failure) => import_failure_data(failure),
+        writ_core::error::Error::LeaseAttention(failure) => {
+            let writ_core::error::LeaseAttentionFailure {
+                operation_id,
+                allocation_state,
+                classification,
+                conflicts,
+                path,
+                path_exists,
+                branch_commit,
+                head_commit,
+                worktree_registered,
+            } = failure.as_ref();
+            serde_json::json!({
+                "operation_id": operation_id,
+                "allocation_state": allocation_state,
+                "classification": classification,
+                "conflicts": conflicts,
+                "path": path,
+                "path_exists": path_exists,
+                "branch_commit": branch_commit,
+                "head_commit": head_commit,
+                "worktree_registered": worktree_registered,
+                "cleanup_performed": false,
+            })
+        }
         _ => serde_json::json!({}),
     }
 }
@@ -468,6 +525,11 @@ fn worktree_command_name(cli: &Cli) -> Option<&'static str> {
             WorktreeAction::Remove { .. } => "worktree.remove",
             WorktreeAction::Prune { .. } => "worktree.prune",
         }),
+        Some(Command::Lease { action }) => Some(match action {
+            lease::LeaseAction::Inspect { .. } => "lease.inspect",
+            lease::LeaseAction::Reconcile { .. } => "lease.reconcile",
+        }),
+        Some(Command::Coord { action }) => Some(action.envelope_command()),
         _ => None,
     }
 }
@@ -884,7 +946,10 @@ fn emit_install_output(
     )
 }
 
-fn write_json_line(stdout: &mut impl Write, value: &impl serde::Serialize) -> io::Result<()> {
+pub(crate) fn write_json_line(
+    stdout: &mut (impl Write + ?Sized),
+    value: &impl serde::Serialize,
+) -> io::Result<()> {
     serde_json::to_writer(&mut *stdout, value).map_err(io::Error::other)?;
     stdout.write_all(b"\n")
 }
@@ -902,66 +967,111 @@ fn writ_command(writ_bin: Option<PathBuf>) -> String {
 }
 
 async fn run(cli: Cli, stdout: &mut impl Write) -> writ_core::error::Result<ExitCode> {
+    let json = cli.json;
     let allowlist =
         writ_core::owners::OwnerAllowlist::from_cli_or_env(cli.allowed_owners.as_deref());
     match cli.command {
-        Some(Command::Status) => {
-            run_status(cli.json, "cli.status", writ_core::status::load(), stdout)?;
-            Ok(ExitCode::SUCCESS)
-        }
-        Some(Command::Jobs) => {
-            run_status(cli.json, "cli.jobs", writ_core::status::load(), stdout)?;
-            Ok(ExitCode::SUCCESS)
-        }
+        Some(Command::Status) => run_snapshot("cli.status", json, stdout),
+        Some(Command::Jobs) => run_snapshot("cli.jobs", json, stdout),
         Some(Command::GitSafe {
             expected_branch,
             repo,
             args,
-        }) => run_git_safe(&args, expected_branch.as_deref(), repo, cli.json, stdout),
-        Some(Command::GhSafe { args }) => run_gh_safe(&args, &allowlist, cli.json, stdout),
-        Some(Command::Supervisor { action }) => match action {
-            SupervisorAction::Run {
-                timeouts,
-                expected_branch,
-                repo,
-                max_parallel,
-                cmd,
-            } => {
-                run_supervisor(
-                    cli.json,
-                    &timeouts,
-                    max_parallel,
-                    cmd,
-                    writ_core::supervisor::RunOptions {
-                        expected_branch,
-                        repo,
-                        allowlist: Some(allowlist),
-                        ..Default::default()
-                    },
+        }) => run_git_safe(&args, expected_branch.as_deref(), repo, json, stdout),
+        Some(Command::GhSafe { args }) => run_gh_safe(&args, &allowlist, json, stdout),
+        Some(Command::Supervisor { action }) => {
+            run_supervisor_action(
+                action,
+                SupervisorCli {
+                    allowlist,
+                    json,
                     stdout,
-                )
-                .await
-            }
-        },
-        Some(Command::Worktree { action }) => run_worktree(action, &allowlist, cli.json, stdout),
-        Some(Command::Attribution { action }) => run_attribution(action, cli.json, stdout),
+                },
+            )
+            .await
+        }
+        Some(Command::Worktree { action }) => run_worktree(action, &allowlist, json, stdout),
+        Some(Command::Lease { action }) => lease::run(
+            action,
+            lease::LeaseCli {
+                allowlist: &allowlist,
+                json,
+                stdout,
+            },
+        ),
+        Some(Command::Coord { action }) => coord::run(
+            action,
+            coord::CoordCli {
+                allowlist: &allowlist,
+                json,
+                stdout,
+            },
+        ),
+        Some(Command::Attribution { action }) => run_attribution(action, json, stdout),
+        Some(Command::Ci {
+            action: CiAction::Classify { file },
+        }) => run_ci_classify(file, json, stdout),
         Some(Command::Hook) => run_hook(&allowlist, stdout),
         Some(Command::Install { settings, writ_bin }) => {
-            run_install(settings, writ_bin, cli.json, stdout)
+            run_install(settings, writ_bin, json, stdout)
         }
-        Some(Command::Watchlist { action }) => watchlist::run(action, &allowlist, cli.json, stdout),
-        None => {
-            if cli.json {
-                serde_json::to_writer(
-                    &mut *stdout,
-                    &writ_core::contract::Response::bootstrap_success(),
-                )
-                .map_err(io::Error::other)?;
-                stdout.write_all(b"\n")?;
-            }
-            Ok(ExitCode::SUCCESS)
-        }
+        Some(Command::Watchlist { action }) => watchlist::run(action, &allowlist, json, stdout),
+        None => run_bootstrap(json, stdout),
     }
+}
+
+fn run_snapshot(
+    command: &'static str,
+    json: bool,
+    stdout: &mut impl Write,
+) -> writ_core::error::Result<ExitCode> {
+    run_status(json, command, writ_core::status::load(), stdout)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+fn run_bootstrap(json: bool, stdout: &mut impl Write) -> writ_core::error::Result<ExitCode> {
+    if json {
+        serde_json::to_writer(
+            &mut *stdout,
+            &writ_core::contract::Response::bootstrap_success(),
+        )
+        .map_err(io::Error::other)?;
+        stdout.write_all(b"\n")?;
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+struct SupervisorCli<'a> {
+    allowlist: writ_core::owners::OwnerAllowlist,
+    json: bool,
+    stdout: &'a mut dyn Write,
+}
+
+async fn run_supervisor_action(
+    action: SupervisorAction,
+    ctx: SupervisorCli<'_>,
+) -> writ_core::error::Result<ExitCode> {
+    let SupervisorAction::Run {
+        timeouts,
+        expected_branch,
+        repo,
+        max_parallel,
+        cmd,
+    } = action;
+    run_supervisor(
+        ctx.json,
+        &timeouts,
+        max_parallel,
+        cmd,
+        writ_core::supervisor::RunOptions {
+            expected_branch,
+            repo,
+            allowlist: Some(ctx.allowlist),
+            ..Default::default()
+        },
+        ctx.stdout,
+    )
+    .await
 }
 
 fn secs_opt(secs: u64) -> Option<Duration> {
@@ -975,7 +1085,7 @@ async fn run_supervisor(
     max_parallel: usize,
     cmd: Vec<String>,
     mut options: writ_core::supervisor::RunOptions,
-    stdout: &mut impl Write,
+    stdout: &mut (impl Write + ?Sized),
 ) -> writ_core::error::Result<ExitCode> {
     let program = match cmd.first() {
         Some(p) => p.as_str(),
@@ -1022,7 +1132,7 @@ async fn run_supervisor(
 fn write_supervisor_result(
     json: bool,
     result: Result<&writ_core::supervisor::SupervisedOutput, &writ_core::error::Error>,
-    stdout: &mut impl Write,
+    stdout: &mut (impl Write + ?Sized),
 ) -> io::Result<()> {
     if !json {
         if let Ok(output) = result {
@@ -1206,8 +1316,144 @@ fn exit_code_from_i32(code: i32) -> ExitCode {
     }
 }
 
+/// Cap `ci classify` input so a missing file, a huge file, or a never-ending
+/// stdin pipe fails as `CLASSIFY_INPUT_INVALID` instead of growing without bound.
+const MAX_CLASSIFY_INPUT_BYTES: u64 = 4 * 1024 * 1024;
+
+fn run_ci_classify(
+    file: Option<PathBuf>,
+    json: bool,
+    stdout: &mut impl Write,
+) -> writ_core::error::Result<ExitCode> {
+    let bytes = match read_classify_input(file.as_deref()) {
+        Ok(bytes) => bytes,
+        Err(err) => return classify_input_error(json, stdout, err.to_string()),
+    };
+    match writ_core::ci_taxonomy::classify_from_slice(&bytes) {
+        Ok(report) => {
+            write_classify_result(&report, json, stdout)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(message) => classify_input_error(json, stdout, message),
+    }
+}
+
+fn classify_input_error(
+    json: bool,
+    stdout: &mut impl Write,
+    message: String,
+) -> writ_core::error::Result<ExitCode> {
+    if json {
+        let response = writ_core::contract::Response {
+            ok: false,
+            schema_version: writ_core::contract::SCHEMA_VERSION,
+            command: "ci.classify",
+            data: serde_json::json!({}),
+            error: Some(writ_core::contract::ErrorData {
+                code: "CLASSIFY_INPUT_INVALID".to_owned(),
+                message: message.clone(),
+            }),
+        };
+        serde_json::to_writer(&mut *stdout, &response).map_err(io::Error::other)?;
+        stdout.write_all(b"\n")?;
+    }
+    Err(io::Error::other(message).into())
+}
+
+fn read_classify_input(file: Option<&std::path::Path>) -> io::Result<Vec<u8>> {
+    match file {
+        Some(path) => {
+            let reader = File::open(path).map_err(|err| {
+                io::Error::new(
+                    err.kind(),
+                    format!("failed to read {}: {err}", path.display()),
+                )
+            })?;
+            read_bounded(reader, MAX_CLASSIFY_INPUT_BYTES, "classify input")
+        }
+        None => read_bounded(io::stdin(), MAX_CLASSIFY_INPUT_BYTES, "classify input"),
+    }
+}
+
+/// Read at most `max_bytes`. One extra byte distinguishes "exactly the cap"
+/// from "still more input", including a pipe that never reaches EOF.
+fn read_bounded(mut reader: impl Read, max_bytes: u64, label: &str) -> io::Result<Vec<u8>> {
+    let mut limited = (&mut reader).take(max_bytes.saturating_add(1));
+    let mut buf = Vec::new();
+    limited.read_to_end(&mut buf)?;
+    if u64::try_from(buf.len()).unwrap_or(u64::MAX) > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{label} exceeds {max_bytes} bytes"),
+        ));
+    }
+    Ok(buf)
+}
+
+fn write_classify_result(
+    report: &writ_core::ci_taxonomy::ClassificationReport,
+    json: bool,
+    stdout: &mut impl Write,
+) -> io::Result<()> {
+    if json {
+        let response = writ_core::contract::Response::success(
+            "ci.classify",
+            writ_core::ci_taxonomy::classify_response_data(report),
+        );
+        serde_json::to_writer(&mut *stdout, &response).map_err(io::Error::other)?;
+        stdout.write_all(b"\n")?;
+        return Ok(());
+    }
+
+    writeln!(
+        stdout,
+        "prefer real fixes or `gh run rerun` over empty CI-kick commits"
+    )?;
+    writeln!(
+        stdout,
+        "all_passed={} required_failures={} residual_codes={}",
+        report.all_passed(),
+        report.required_failures().len(),
+        report.residual_codes().join(",")
+    )?;
+    let collab = report.collaboration_status();
+    writeln!(
+        stdout,
+        "collaboration ci_class={} blocks_unrelated_workers={} continue_other_work={}",
+        collab.ci_class, collab.blocks_unrelated_workers, collab.continue_other_work
+    )?;
+    writeln!(
+        stdout,
+        "github is the required-check authority; unknown/advisory/pending/skipped/cancelled/external-access are not writ merge gates"
+    )?;
+    for check in &report.checks {
+        let residual = check.residual_code.as_deref().unwrap_or("-");
+        writeln!(
+            stdout,
+            "{} {} {} action={:?} residual={residual}",
+            check.check_class.as_str(),
+            match check.entry.conclusion {
+                writ_core::ci_taxonomy::CheckConclusion::Success => "pass",
+                writ_core::ci_taxonomy::CheckConclusion::Failure => "fail",
+                writ_core::ci_taxonomy::CheckConclusion::Pending => "pending",
+                writ_core::ci_taxonomy::CheckConclusion::Skipped => "skipping",
+                writ_core::ci_taxonomy::CheckConclusion::Cancelled => "cancel",
+                writ_core::ci_taxonomy::CheckConclusion::TimedOut => "timed_out",
+                writ_core::ci_taxonomy::CheckConclusion::ActionRequired => "action_required",
+                writ_core::ci_taxonomy::CheckConclusion::Neutral => "neutral",
+                writ_core::ci_taxonomy::CheckConclusion::Stale => "stale",
+                writ_core::ci_taxonomy::CheckConclusion::StartupFailure => "startup_failure",
+            },
+            check.entry.name,
+            check.recommended_action,
+        )?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
     use std::process::ExitCode;
     use std::str;
 
@@ -1281,6 +1527,160 @@ mod tests {
     #[test]
     fn command_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    fn classify_input(body: &[u8]) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("checks.json");
+        std::fs::write(&path, body).unwrap();
+        (dir, path)
+    }
+
+    fn classify_cli(path: PathBuf) -> Cli {
+        Cli {
+            json: true,
+            allowed_owners: None,
+            command: Some(super::Command::Ci {
+                action: super::CiAction::Classify { file: Some(path) },
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn ci_classify_emits_v1_envelope() {
+        let (_dir, path) = classify_input(
+            br#"[{"name":"Build & Test","workflow":"CI","bucket":"fail","link":"https://github.com/acme/example-org/actions/runs/1"},{"name":"Kilo Code Review","bucket":"pending","link":"https://app.kilo.ai/r/1"}]"#,
+        );
+        let cli = classify_cli(path);
+        let mut stdout = Vec::new();
+        let code = run(cli, &mut stdout).await.unwrap();
+        assert_eq!(code, ExitCode::SUCCESS);
+        let v: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+        assert_eq!(v.get("command").expect("command"), "ci.classify");
+        assert_eq!(v.get("ok").expect("ok"), true);
+        let checks = v
+            .get("data")
+            .expect("data")
+            .get("checks")
+            .expect("checks")
+            .as_array()
+            .expect("array");
+        assert_eq!(checks[0].get("check_class").expect("class"), "A");
+        assert_eq!(checks[1].get("check_class").expect("class"), "C");
+        assert_eq!(
+            v.pointer("/data/residual_codes")
+                .and_then(|c| c.as_array())
+                .expect("residual_codes")[0],
+            "class_c:kilo_pending"
+        );
+        assert_eq!(
+            v.pointer("/data/required_failure_count")
+                .and_then(|c| c.as_u64())
+                .expect("required_failure_count"),
+            0
+        );
+        assert_eq!(
+            v.pointer("/data/unknown_requiredness_is_not_a_writ_merge_gate")
+                .expect("unknown_requiredness_is_not_a_writ_merge_gate"),
+            true
+        );
+        assert_eq!(
+            v.pointer("/data/collaboration/ci_class")
+                .expect("collaboration.ci_class"),
+            "pending"
+        );
+        assert_eq!(
+            v.pointer("/data/collaboration/blocks_unrelated_workers")
+                .expect("blocks_unrelated_workers"),
+            false
+        );
+    }
+
+    #[tokio::test]
+    async fn ci_classify_invalid_json_sets_ok_false() {
+        let (_dir, path) = classify_input(b"not-json");
+        let cli = classify_cli(path);
+        let mut stdout = Vec::new();
+        let err = run(cli, &mut stdout).await.unwrap_err();
+        assert_eq!(err.exit_code(), 1);
+        let v: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+        assert_eq!(v.get("ok").expect("ok"), false);
+        assert_eq!(v.get("command").expect("command"), "ci.classify");
+        assert_eq!(
+            v.pointer("/error/code").expect("code"),
+            "CLASSIFY_INPUT_INVALID"
+        );
+    }
+
+    #[tokio::test]
+    async fn ci_classify_missing_file_sets_classify_input_invalid() {
+        let cli = classify_cli(PathBuf::from(
+            "/tmp/writ-ci-classify-missing-does-not-exist.json",
+        ));
+        let mut stdout = Vec::new();
+        let err = run(cli, &mut stdout).await.unwrap_err();
+        assert_eq!(err.exit_code(), 1);
+        let v: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+        assert_eq!(v.get("ok").expect("ok"), false);
+        assert_eq!(v.get("command").expect("command"), "ci.classify");
+        assert_eq!(
+            v.pointer("/error/code").expect("code"),
+            "CLASSIFY_INPUT_INVALID"
+        );
+        let message = v
+            .pointer("/error/message")
+            .and_then(|m| m.as_str())
+            .expect("message");
+        assert!(
+            message.contains("failed to read"),
+            "missing-file message should name the read failure, got {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ci_classify_oversized_file_sets_classify_input_invalid() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge.json");
+        std::fs::write(
+            &path,
+            vec![b'x'; (super::MAX_CLASSIFY_INPUT_BYTES as usize) + 1],
+        )
+        .unwrap();
+        let cli = classify_cli(path);
+        let mut stdout = Vec::new();
+        let err = run(cli, &mut stdout).await.unwrap_err();
+        assert_eq!(err.exit_code(), 1);
+        let v: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+        assert_eq!(
+            v.pointer("/error/code").expect("code"),
+            "CLASSIFY_INPUT_INVALID"
+        );
+        let message = v
+            .pointer("/error/message")
+            .and_then(|m| m.as_str())
+            .expect("message");
+        assert!(
+            message.contains("exceeds"),
+            "oversized input should report the byte cap, got {message}"
+        );
+    }
+
+    #[test]
+    fn read_bounded_stops_a_never_ending_reader() {
+        struct Forever;
+        impl std::io::Read for Forever {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if buf.is_empty() {
+                    return Ok(0);
+                }
+                buf.fill(b'x');
+                Ok(buf.len())
+            }
+        }
+
+        let err = super::read_bounded(Forever, 32, "classify input").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("exceeds 32 bytes"));
     }
 
     fn parse_format(args: &[&str]) -> super::AttributionAction {
@@ -1835,6 +2235,86 @@ mod tests {
         assert_eq!(source_remote.as_deref(), None);
     }
 
+    #[test]
+    fn lease_inspect_parser_accepts_identity() {
+        let inspect = Cli::try_parse_from([
+            "writ",
+            "lease",
+            "inspect",
+            "--repo",
+            ".",
+            "--branch",
+            "hive/job",
+            "--path",
+            "/tmp/checkout",
+            "acme",
+            "sample",
+            "job",
+        ])
+        .unwrap();
+        let Some(super::Command::Lease {
+            action: super::lease::LeaseAction::Inspect { job_id, .. },
+        }) = inspect.command
+        else {
+            panic!("expected lease inspect")
+        };
+        assert_eq!(job_id, "job");
+
+        let reconcile = Cli::try_parse_from([
+            "writ",
+            "lease",
+            "reconcile",
+            "--repo",
+            ".",
+            "acme",
+            "sample",
+            "job",
+        ])
+        .unwrap();
+        assert!(matches!(
+            reconcile.command,
+            Some(super::Command::Lease {
+                action: super::lease::LeaseAction::Reconcile { .. },
+            })
+        ));
+    }
+
+    #[test]
+    fn coord_announce_parser_accepts_identity_and_paths() {
+        let parsed = Cli::try_parse_from([
+            "writ",
+            "coord",
+            "announce",
+            "acme",
+            "sample",
+            "job",
+            "--agent",
+            "agent-a",
+            "--session",
+            "sess-1",
+            "--intent",
+            "edit coord",
+            "--path",
+            "crates/writ-core/src/coord.rs",
+        ])
+        .unwrap();
+        let Some(super::Command::Coord {
+            action:
+                super::coord::CoordAction::Announce {
+                    agent,
+                    job_id,
+                    paths,
+                    ..
+                },
+        }) = parsed.command
+        else {
+            panic!("expected coord announce")
+        };
+        assert_eq!(agent, "agent-a");
+        assert_eq!(job_id, "job");
+        assert_eq!(paths, vec!["crates/writ-core/src/coord.rs"]);
+    }
+
     #[tokio::test]
     async fn json_mode_writes_v1_envelope_to_stdout() {
         let cli = Cli {
@@ -2156,9 +2636,7 @@ mod tests {
                     cmd: {
                         #[cfg(windows)]
                         {
-                            // `false` may not exist; use powershell is forbidden. Use `cmd` is forbidden.
-                            // Use git with invalid args for non-zero? Prefer `python` - not guaranteed.
-                            // Use `ping` with bad args returns non-zero on Windows.
+                            // `false` may not exist; invalid ping arguments return non-zero on Windows.
                             vec![
                                 "ping".to_owned(),
                                 "/n".to_owned(),
@@ -2208,7 +2686,7 @@ mod tests {
                     expected_branch: None,
                     repo: None,
                     max_parallel: 1,
-                    cmd: vec!["gh".to_owned(), "pr".to_owned(), "merge".to_owned()],
+                    cmd: vec!["gh".to_owned(), "pr".to_owned(), "checkout".to_owned()],
                 },
             }),
         };
@@ -2390,12 +2868,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gh_safe_pr_merge_blocked() {
+    async fn gh_safe_pr_checkout_blocked() {
         let cli = Cli {
             json: false,
             allowed_owners: None,
             command: Some(super::Command::GhSafe {
-                args: vec!["pr".to_owned(), "merge".to_owned()],
+                args: vec!["pr".to_owned(), "checkout".to_owned()],
             }),
         };
         let mut stdout = Vec::new();
@@ -2411,12 +2889,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gh_safe_api_blocked() {
+    async fn gh_safe_api_rejects_disallowed_rest_owner() {
         let cli = Cli {
             json: false,
-            allowed_owners: None,
+            allowed_owners: Some("acme".to_owned()),
             command: Some(super::Command::GhSafe {
-                args: vec!["api".to_owned(), "repos/acme/example-org".to_owned()],
+                args: vec!["api".to_owned(), "repos/other/example-org".to_owned()],
             }),
         };
         let mut stdout = Vec::new();
@@ -2425,7 +2903,7 @@ mod tests {
         assert!(matches!(
             err,
             writ_core::error::Error::PolicyViolation {
-                code: writ_core::error::PolicyCode::GhSubcommandNotAllowed,
+                code: writ_core::error::PolicyCode::OwnerNotAllowed,
                 ..
             }
         ));

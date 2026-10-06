@@ -297,13 +297,15 @@ mod tests {
     fn pre_tool_use_blocks_git_and_gh_policy_violations() {
         assert_bash_hook_blocks("git push --force", "BARE_FORCE_PUSH");
         assert_bash_hook_blocks("FOO=bar git mergetool", "MERGE_BLOCKED");
-        assert_bash_hook_blocks("gh pr merge 1", "MERGE_BLOCKED");
-        assert_bash_hook_blocks("gh api repos/acme/example", "GH_SUBCOMMAND_NOT_ALLOWED");
+        assert_bash_hook_blocks("gh pr checkout 1", "MERGE_BLOCKED");
+        assert_bash_hook_blocks("gh codespace list", "GH_SUBCOMMAND_NOT_ALLOWED");
     }
 
     #[test]
     fn pre_tool_use_allows_safe_git_and_ignores_non_git() {
         validate_bash_command("git status").unwrap();
+        validate_bash_command("gh pr merge 1 --squash").unwrap();
+        validate_bash_command("gh api graphql").unwrap();
         validate_bash_command("git push --force-with-lease origin HEAD").unwrap();
         // No cwd to verify against: merge/pull fail closed in the hook.
         validate_bash_command("git merge feature").unwrap_err();

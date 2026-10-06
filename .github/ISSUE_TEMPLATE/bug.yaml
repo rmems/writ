@@ -7,8 +7,7 @@ body:
       value: |
         Report a failure in worktree isolation, safety gates, CI, or agent
         process. Include commands and exit codes when a CLI path is involved.
-        Use only the canonical labels in CONTRIBUTING.md. Runtime merge,
-        auto-merge, merge queues, and bare `--force` are forbidden.
+        Use only the canonical labels in CONTRIBUTING.md. Protect existing work and follow the repository contribution contract.
 
   - type: textarea
     id: summary
@@ -62,8 +61,7 @@ body:
     id: linear
     attributes:
       label: Linear
-      description: Planning twin. Keep this footer even when no twin exists yet; replace the placeholders when it does.
-      value: |
-        Linear: <url> (`RM-N`)
+      description: Optional existing task link. Leave blank when no Linear task exists; contributors need no Linear account.
+      placeholder: "https://linear.app/your-team/issue/TEAM-123"
     validations:
-      required: true
+      required: false

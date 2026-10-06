@@ -1,0 +1,32 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+# CodeRabbit review configuration.
+language: en-US
+reviews:
+  profile: chill
+  request_changes_workflow: false
+  fail_commit_status: false
+  auto_review:
+    enabled: true
+    drafts: false
+  path_filters:
+    - '!**/target/**'
+  path_instructions:
+    - path: crates/**/*.rs
+      instructions: 'Follow AGENTS.md for shared safety, state-ownership, and review policy. Rust edition 2024; `rust-version = "1.97.1"`; `rust-toolchain.toml` pins 1.97.1. Do not suggest downgrading the edition or using std/language APIs newer than the pinned toolchain/MSRV. Flag anything that would fail `cargo fmt --check` or clippy `-D warnings`.'
+    - path: '**/Cargo.toml'
+      instructions: Cargo manifest. Call out new dependencies and feature changes, and keep `rust-version` / `edition` consistent with CI.
+    - path: .github/workflows/**
+      instructions: GitHub Actions workflows. Keep `permissions:` least-privilege and job commands in sync with the local gates documented in the repo. Every `uses:` is pinned to a full commit SHA today; new or bumped actions must be too. actionlint 1.7.12 runs in CI (`actionlint.yml`).
+  tools:
+    clippy:
+      enabled: true
+    shellcheck:
+      enabled: true
+    actionlint:
+      enabled: true
+    yamllint:
+      enabled: true
+    markdownlint:
+      enabled: true
+    biome:
+      enabled: false

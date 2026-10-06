@@ -15,7 +15,7 @@ Neither `PolicyForcePushForbidden` nor `PolicyMergeForbidden` exists in
 
 ## Which commands emit an envelope
 
-All of them, under `--json`:
+Dispatched commands use these envelope names under `--json`; hook protocol and pre-dispatch failures are exceptions:
 
 | Command | Envelope `command` |
 | --- | --- |
@@ -24,8 +24,11 @@ All of them, under `--json`:
 | `watchlist list\|check\|check-all` | `cli.watchlist.list` / `cli.watchlist.check` / `cli.watchlist.check_all` |
 | `watchlist add\|remove` | `cli.watchlist.add` / `cli.watchlist.remove` (never persist) |
 | `git-safe` / `gh-safe` | `git.safe` / `gh.safe` |
+| `ci classify` | `ci.classify` |
 | `worktree register\|unregister\|inspect\|list` | `worktree.register` etc. |
 | `worktree create\|remove\|prune` | `worktree.create` etc. (deprecated) |
+| `lease inspect\|reconcile` | `lease.inspect` / `lease.reconcile` |
+| `coord announce\|show\|list\|inbox\|send\|ack\|pause\|handoff` | `coord.announce` etc. |
 | `attribution format` | `attribution.format` |
 | `supervisor run` | `supervisor.run` (also `--idle`/`--stall`, `--grace`, `--progress-secs`, `WRIT_SUPERVISOR_*`; see [timeout-policy.md](../timeout-policy.md)) |
 | `install` | `cli.install` |
@@ -38,8 +41,8 @@ with exit code 2 instead of an envelope:
 $ writ --json git-safe push --force
 writ: policy violation [BARE_FORCE_PUSH]: bare --force/-f is not allowed; use --force-with-lease only
 
-$ writ --json gh-safe pr merge 1
-writ: policy violation [MERGE_BLOCKED]: `gh pr merge` is not allowed
+$ writ --json gh-safe pr checkout 1
+writ: policy violation [MERGE_BLOCKED]: gh command changes the local checkout; use assigned-branch git operations
 ```
 
 So `git-safe` and `gh-safe` *do* emit `git.safe` / `gh.safe` envelopes on success —
@@ -57,6 +60,7 @@ cargo build
 writ --json                                   # cli.bootstrap
 writ --json status                            # cli.status
 writ --json git-safe --repo <repo> rev-parse --is-inside-work-tree   # git.safe
+writ --json ci classify --file docs/examples/ci-classify-input.json  # ci.classify
 writ --json worktree list                     # worktree.list
 writ --json worktree register <path>          # worktree.register
 writ --json attribution format --body "Looks good!"   # attribution.format

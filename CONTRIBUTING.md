@@ -17,16 +17,15 @@ forms; blank issues stay enabled):
 
 Each template asks for **Summary**, **Problem / context** (or a repro),
 **Acceptance criteria** (checkboxes), a **canonical label**, and a **Linear**
-footer. Keep the write-up short. Do not add extra required fields.
+link when one already exists. Task trackers are optional; a direct request or PR can carry the scope. Keep the write-up short.
 
-Footer pattern (replace the placeholders when a twin exists):
+Optional link pattern (omit when no Linear task exists):
 
 ```text
 Linear: <url> (`RM-N`)
 ```
 
-GitHub is the execution surface. Linear stays the planning twin via that
-footer. Do not invent a second Linear issue when one is already linked.
+GitHub holds source and review. Maintainers may use Linear for planning; contributors need no private tracker account. Do not create issue twins or mirrors.
 
 ## Canonical labels
 
@@ -42,35 +41,17 @@ GitHub’s default `documentation`.
 | `orchestrator` | Multi-subagent scheduling, caps, join/report |
 | `docs` | README, SKILL.md, templates, operator docs |
 | `platform` | Install paths, multi-agent-host packaging, validation on second host |
-| `safety` | Never-merge, force-with-lease, fix caps, owner allowlist, hang recovery |
+| `safety` | WIP preservation, force-with-lease, owner targeting, hang recovery |
 
-Those description strings are the GitHub label descriptions. Apply the same
-label you selected in the template dropdown.
-
-Typical use: `epic` for umbrellas; `core` for loop primitives; `orchestrator`
-for multi-worker scheduling; `docs` for operator docs and templates;
-`platform` for install and multi-host packaging; `safety` for merge/force/
-allowlist/hang-recovery boundaries.
-
-The labels already exist on the repository. After this table changes, keep
-GitHub in sync (this does not create extra labels or delete GitHub defaults):
-
-```bash
-gh label edit epic --description "Multi-issue umbrella / milestone grouping"
-gh label edit core --description "Skill loop primitives (discover, claim, PR, babysit, state)"
-gh label edit orchestrator --description "Multi-subagent scheduling, caps, join/report"
-gh label edit docs --description "README, SKILL.md, templates, operator docs"
-gh label edit platform --description "Install paths, multi-agent-host packaging, validation on second host"
-gh label edit safety --description "Never-merge, force-with-lease, fix caps, owner allowlist, hang recovery"
-```
+Use an existing label matching the changed area. Label metadata helps people find work; it is not an implementation prerequisite or a reason to create a duplicate tracker record.
 
 ## Pull requests
 
 Follow [Safe Issue → Verified Commit](docs/workflows/safe-issue-verified-commit.md)
 then [Safe Verified Commit → PR](docs/workflows/safe-verified-commit-to-pr.md).
-Never merge from those workflows. Review checklist: [`REVIEW.md`](REVIEW.md).
+Remote merges follow GitHub permissions and explicit operator authorization. Review checklist: [`REVIEW.md`](REVIEW.md).
 
-Native gates (canonical; see README):
+Use focused checks for checkpoints. Before a readiness claim, run the relevant native gates (see README):
 
 ```bash
 cargo fmt --all -- --check

@@ -2,8 +2,7 @@
 //!
 //! Hang recovery lives here (RM-15 remaining supervisor contract): hard wall-clock,
 //! idle (no-output) detection, lost-child classification, soft-cancel then kill,
-//! and stderr progress ticks. The supervisor **never retries**, never merges, and
-//! never force-pushes. Named defaults: [`crate::timeout_policy`].
+//! and stderr progress ticks. Recovery never retries or initiates Git operations. Named defaults: [`crate::timeout_policy`].
 //!
 //! # Concurrency model
 //!
@@ -69,77 +68,6 @@ pub fn normalize_program_name(program: &str) -> String {
         .to_owned()
 }
 
-const FORBIDDEN_WRAPPERS: &[&str] = &[
-    "bash",
-    "bun",
-    "chroot",
-    "cmd",
-    "curl",
-    "dash",
-    "deno",
-    "doas",
-    "env",
-    "fish",
-    "http",
-    "httpie",
-    "ipython",
-    "ipython3",
-    "lua",
-    "nc",
-    "ncat",
-    "netcat",
-    "nice",
-    "node",
-    "nodejs",
-    "nohup",
-    "nsenter",
-    "open",
-    "perl",
-    "php",
-    "powershell",
-    "pwsh",
-    "py",
-    "python",
-    "python2",
-    "python3",
-    "rscript",
-    "ruby",
-    "script",
-    "setsid",
-    "sh",
-    "socat",
-    "stdbuf",
-    "su",
-    "sudo",
-    "time",
-    "timeout",
-    "unshare",
-    "wget",
-    "xargs",
-    "xdg-open",
-    "zsh",
-];
-
-const VERSIONED_WRAPPER_PREFIXES: &[&str] = &[
-    "python", "python2", "python3", "perl", "ruby", "node", "nodejs", "php", "lua", "ipython",
-];
-
-pub(super) fn program_is_path_qualified(program: &str) -> bool {
-    if program.contains('/') {
-        return true;
-    }
-    if program.contains('\\') {
-        return true;
-    }
-    if program.starts_with('.') {
-        return true;
-    }
-    if program.len() <= 2 {
-        return false;
-    }
-    program.as_bytes().get(1) == Some(&b':')
-}
-
 pub(super) fn reject_mismatched_checkout(expected: Option<&str>, args: &[String]) -> Result<()> {
     let Some(exp) = expected else {
         return Ok(());
@@ -158,21 +86,6 @@ pub(super) fn reject_mismatched_checkout(expected: Option<&str>, args: &[String]
         message: format!(
             "git checkout/switch target `{target}` must equal --expected-branch `{exp}`"
         ),
-    })
-}
-
-pub(super) fn is_forbidden_wrapper(name: &str) -> bool {
-    FORBIDDEN_WRAPPERS.contains(&name) || versioned_wrapper_name(name)
-}
-
-fn versioned_wrapper_name(name: &str) -> bool {
-    VERSIONED_WRAPPER_PREFIXES.iter().any(|prefix| {
-        let Some(rest) = name.strip_prefix(prefix) else {
-            return false;
-        };
-        rest.is_empty()
-            || rest.starts_with('.')
-            || rest.chars().next().is_some_and(|c| c.is_ascii_digit())
     })
 }
 
@@ -309,7 +222,7 @@ impl SupervisedOutput {
 pub struct RunOptions {
     /// When supervising `git` mutations, require this branch (verified before spawn).
     pub expected_branch: Option<String>,
-    /// Repository working tree for git branch verification and `git -C` (default: `.`).
+    /// Optional child working directory; direct Git uses it for branch verification (default: `.`).
     pub repo: Option<PathBuf>,
     /// Optional progress sink (stderr diagnostics). Never writes JSON stdout.
     pub on_progress: Option<ProgressCallback>,
@@ -400,8 +313,8 @@ impl Supervisor {
     ///
     /// - Validates git/gh (including path-qualified names like `/usr/bin/git`) via
     ///   [`crate::git_safe::SafeGitCommand`] / [`crate::git_safe::SafeGhCommand`].
-    /// - **Rejects shells and launchers** (`sh`, `bash`, `cmd`, `env`, `xargs`, …) so policy
-    ///   cannot be bypassed by quoting or wrappers; invoke binaries directly.
+    /// - Host scripts and interpreters run with the same timeout containment. Their
+    ///   nested commands are not recursively validated; this is not a universal sandbox.
     /// - For mutating git, requires [`RunOptions::expected_branch`], verifies the branch
     ///   **after** acquiring a permit (and immediately before spawn), and runs with
     ///   `current_dir` set to the verified repo.
@@ -454,9 +367,9 @@ impl Supervisor {
         };
 
         // Branch check immediately before spawn, while holding the permit.
-        // Always verify via git HEAD, for both supervised git and mutating gh.
+        // Direct Git mutations verify identity and WIP; remote gh has no branch gate.
         if let Some(ref check) = prepared.branch_check {
-            verify_repo_branch(&check.repo, &check.expected_branch)?;
+            verify_repo_branch(&check.repo, &check.expected_branch, &prepared.args)?;
         }
 
         let guard = ActiveGuard::arm(self);
@@ -1146,36 +1059,62 @@ async fn read_pipe_probed<R: AsyncReadExt + Unpin>(
     spawn_at: Instant,
     last_activity_ms: Arc<AtomicU64>,
 ) -> Vec<u8> {
-    match pipe.as_mut() {
-        Some(reader) => {
-            let mut buf = Vec::new();
-            let mut chunk = [0u8; 8192];
-            let mut capped = false;
-            loop {
-                match reader.read(&mut chunk).await {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        let elapsed =
-                            u64::try_from(spawn_at.elapsed().as_millis()).unwrap_or(u64::MAX);
-                        last_activity_ms.store(elapsed, Ordering::Relaxed);
-                        if !capped {
-                            let room = MAX_CAPTURE_BYTES.saturating_sub(buf.len());
-                            if room > 0 {
-                                buf.extend_from_slice(&chunk[..n.min(room)]);
-                            }
-                            if n > room || buf.len() >= MAX_CAPTURE_BYTES {
-                                capped = true;
-                            }
-                        }
-                        // When capped, keep draining so the child does not get SIGPIPE/EPIPE.
-                    }
-                    Err(_) => break,
-                }
-            }
-            buf
-        }
-        None => Vec::new(),
+    let Some(reader) = pipe.as_mut() else {
+        return Vec::new();
+    };
+    read_captured_pipe(reader, spawn_at, &last_activity_ms).await
+}
+
+/// Drain one child pipe, recording activity and retaining bytes up to the cap.
+///
+/// The read loop stays flat: end-of-stream and I/O errors return, and each
+/// captured chunk is handled by [`retain_capped_chunk`]. Once capped, the pipe
+/// is still drained so the child does not see SIGPIPE/EPIPE.
+enum PipeRead {
+    Eof,
+    Bytes(usize),
+}
+
+async fn read_chunk<R: AsyncReadExt + Unpin>(reader: &mut R, chunk: &mut [u8]) -> PipeRead {
+    match reader.read(chunk).await {
+        Ok(0) | Err(_) => PipeRead::Eof,
+        Ok(n) => PipeRead::Bytes(n),
     }
+}
+
+async fn read_captured_pipe<R: AsyncReadExt + Unpin>(
+    reader: &mut R,
+    spawn_at: Instant,
+    last_activity_ms: &AtomicU64,
+) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    let mut capped = false;
+    loop {
+        let PipeRead::Bytes(n) = read_chunk(reader, &mut chunk).await else {
+            return buf;
+        };
+        note_pipe_activity(spawn_at, last_activity_ms);
+        capped = retain_capped_chunk(&mut buf, &chunk[..n], capped);
+    }
+}
+
+fn note_pipe_activity(spawn_at: Instant, last_activity_ms: &AtomicU64) {
+    let elapsed = u64::try_from(spawn_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+    // Stdout and stderr readers share this stamp. Keep the newer observation
+    // so a slower pipe cannot rewind idle detection.
+    last_activity_ms.fetch_max(elapsed, Ordering::Relaxed);
+}
+
+/// Append `chunk` until [`MAX_CAPTURE_BYTES`]. Returns whether the cap is now hit.
+///
+/// A capped pipe still accepts the call so the reader can keep draining; no
+/// further bytes are retained.
+fn retain_capped_chunk(buf: &mut Vec<u8>, chunk: &[u8], capped: bool) -> bool {
+    let room = MAX_CAPTURE_BYTES.saturating_sub(buf.len());
+    let kept = if capped { 0 } else { room.min(chunk.len()) };
+    buf.extend_from_slice(&chunk[..kept]);
+    capped || chunk.len() > room || buf.len() >= MAX_CAPTURE_BYTES
 }
 
 #[cfg(unix)]
