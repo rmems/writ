@@ -27,6 +27,8 @@ Dispatched commands use these envelope names under `--json`; hook protocol and p
 | `ci classify` | `ci.classify` |
 | `worktree register\|unregister\|inspect\|list` | `worktree.register` etc. |
 | `worktree create\|remove\|prune` | `worktree.create` etc. (deprecated) |
+| `lease inspect\|reconcile` | `lease.inspect` / `lease.reconcile` |
+| `coord announce\|show\|list\|inbox\|send\|ack\|pause\|handoff` | `coord.announce` etc. |
 | `attribution format` | `attribution.format` |
 | `supervisor run` | `supervisor.run` (also `--idle`/`--stall`, `--grace`, `--progress-secs`, `WRIT_SUPERVISOR_*`; see [timeout-policy.md](../timeout-policy.md)) |
 | `install` | `cli.install` |

@@ -79,8 +79,9 @@ Workers keep their harness-native isolation. `writ` is the shared memory and mes
 | `writ` CLI (`git-safe`, `gh-safe`, `worktree`, `supervisor`, `status`, `attribution`) | Implemented | Envelope-compatible additions only |
 | Checkout registration (`worktree register/unregister/inspect/list`) | Implemented | Managed lifecycle (`create`/`remove`/`prune`) is deprecated |
 | Claude Code hook dispatcher / `writ install` | Implemented | Live burn-in outstanding ([#124](https://github.com/rmems/writ/issues/124)) |
-| SQLite lease store, agent registry | Skeleton (grant/release + registration) | Crash-consistency + same-host claims/messages/handoff (in flight) |
-| Declared paths / overlap visibility, handoff protocol | Planned | Reuses the lease store — no second database |
+| SQLite lease store, agent registry, crash consistency | Implemented | Additional lease policies remain additive |
+| Same-host claims / messages | Implemented | Additional transports are out of scope |
+| Declared paths / overlap visibility, handoff protocol | Implemented | Reuses the lease store — no second database |
 | Path-scoped admission, lease budgets | Planned | [#167](https://github.com/rmems/writ/issues/167) |
 | Owner-allowlist enforcement | Enforced in `writ-core` | [#146](https://github.com/rmems/writ/issues/146) |
 
@@ -186,10 +187,10 @@ Two layers, one binary.
 | Layer | Owns | Does not own |
 | --- | --- | --- |
 | **Local integrity helpers** | Checkout/branch identity, WIP preservation, force-with-lease-only pushes, explicit repository targeting, process containment | Task assignment, harness checkout placement, remote merge permissions |
-| **Coordination state** (same host) | Existing agent/lease registration and status; claims, messages and handoff build on the same SQLite store | Task decomposition, scheduling, cross-host transport |
+| **Coordination state** (same host) | Agents, leases, declared paths, overlaps, messages, and handoffs in one SQLite store | Cross-host transport, task decomposition, or scheduling |
 | `git`, `gh`, OS | Version-control, GitHub, and process primitives, invoked through allowlists | Policy |
 
-Leases are the join: coordination state that the enforcement layer checks at write time. Phase 1 ships a SQLite skeleton (`leases.db`) so create/remove is not a Markdown-only control plane. Budget columns are reserved and unused; enforcement is [#167](https://github.com/rmems/writ/issues/167).
+Leases are the join: coordination state that the enforcement layer checks at write time. Phase 1 ships SQLite (`leases.db`, `WRIT_LEASE_PATH`) with a prepare/inspect/reconcile protocol so a crash between checkout registration and the lease row can be classified without adopting unproven ownership. Budget columns are reserved; `fix_cycles` is the only accumulated counter and uses the same prepare/commit journal. Enforcement of budgets is [#167](https://github.com/rmems/writ/issues/167).
 
 ```text
                     ┌─────────────────────────┐
@@ -256,6 +257,8 @@ Implemented `writ` surface (`writ --help` is authoritative):
 | `writ supervisor run --timeout <secs> …` | Implemented | Spawn a child with wall-clock, idle, and grace recovery (`--idle`/`--stall`, `--grace`, `--progress-secs`, env `WRIT_SUPERVISOR_*`; see [`docs/timeout-policy.md`](docs/timeout-policy.md)). Timeout is a handoff residual: Unix SIGTERM-then-SIGKILL on the process group; Windows kills only the direct child (grandchildren may survive). Never deletes a harness checkout. |
 | `writ watchlist list\|check\|check-all` | Implemented (view) | Collaboration status over `leases.db` plus optional live GitHub overlay. Does not persist a watchlist file. |
 | `writ worktree register\|unregister\|inspect\|list` | Implemented | Coordination records for harness-owned checkouts. Register/unregister never touch files or branches. |
+| `writ lease inspect\|reconcile` | Implemented | Read-only identity report and crash recovery for interrupted registration. Never deletes unproven checkouts. |
+| `writ coord announce\|show\|list\|inbox\|send\|ack\|pause\|handoff` | Implemented | Same-host claims/messages on `leases.db`. Path overlap is advisory; pause does not seize WIP. |
 | `writ worktree create\|remove\|prune` | Deprecated | Managed lifecycle kept for caller compatibility during the transition. `create` requires `--schema-version 2` and `--start-point`. |
 | `writ attribution format` | Implemented | Render review and collaboration replies with real agent/task/branch/session identity. Include a SHA only when one exists; never invent one. |
 | `writ --json` | Implemented | Envelope-producing commands emit versioned JSON on stdout (generic v1; status/jobs v2); diagnostics on stderr. Exceptions: `hook --json` has no envelope; `git-safe`/`gh-safe` validation failures and `install` failures emit stderr only. See the [`CLI contract`](docs/cli-contract.md) and [`fixtures`](docs/examples/). |
@@ -282,11 +285,11 @@ A lease row joins a task, an agent/session, and a checkout path — the "who own
 
 ### Overlap and handoff
 
-Planned declared-path claims provide early overlap visibility; current status reads the existing lease store. Overlap on separate branches is advisory: the colliding worker identifies the owner and negotiates a split, a sequence, or a handoff. Duplicate live ownership of one task is a detected collision, not silent divergence. A stale lease is a recovery/handoff event — not permission to kill a worker or discard its changes.
+Declared-path claims provide early overlap visibility through the existing lease store. Overlap on separate branches is advisory: the colliding worker identifies the owner and negotiates a split, a sequence, or a handoff. Duplicate live ownership of one task is a detected collision, not silent divergence. A stale lease is a recovery/handoff event — not permission to kill a worker or discard its changes.
 
 ### Communication
 
-The planned coordination extension adds intent, dependency-ready, blocker, overlap, help-request, handoff, and completion records to the existing store, with identity/version information to distinguish stale messages from live state. A manager can split scope or pick one integration owner without turning every message into a human approval gate.
+Same-host coordination records intent, dependency, blocker, overlap, help, handoff, and acknowledgement messages in the existing store, with owner generations to distinguish stale handoffs from live state. A manager can split scope or pick one integration owner without turning every message into a human approval gate. Cross-host transport remains out of scope.
 
 ### Local integration
 
