@@ -208,8 +208,11 @@ codex-sessions/
 *.codex
 
 # Cursor
-.cursor/
-**/.cursor/
+.cursor/*
+**/.cursor/*
+# Cursor Cloud Agent environment: committed on purpose.
+!.cursor/environment.json
+!.cursor/install.sh
 .cursorignore
 .cursorindexingignore
 # local Cursor rules/state sometimes appear under project

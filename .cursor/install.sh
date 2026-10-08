@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+# Cursor Cloud Agent install script for writ (`install` in .cursor/environment.json).
+#
+# Cursor runs this from the repository root during every Build, on its default
+# Ubuntu base image (CPU only: cloud agents have no GPU), then snapshots the disk.
+# It must be idempotent. Shell exports don't survive into agent runs, so the tools
+# it installs are exposed through /etc/profile.d and /usr/local/bin.
+# See https://cursor.com/docs/cloud-agent/setup
+#
+# Installs only what this repo's CI and manifests need:
+#   - apt: build-essential, pkg-config, curl, ca-certificates
+#   - Rust 1.97.1 (+rustfmt, clippy) [default]
+#   - cargo fetch --locked
+#   - tool directories exposed to later shells (/etc/profile.d + /usr/local/bin links)
+#
+# It ends with a dependency fetch, not a build or test run.
+set -euo pipefail
+
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+
+started=$SECONDS
+step() { printf '==> %s\n' "$*"; }
+
+# Intentionally unquoted wherever it is used: an empty $SUDO must expand to no
+# word at all, so the command runs directly instead of failing on "".
+SUDO=""
+if [ "$(id -u)" -ne 0 ]; then
+  SUDO="sudo"
+fi
+
+# Install apt packages that are not already present.
+apt_install() {
+  local missing=() pkg
+  for pkg in "$@"; do
+    if ! dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok installed"; then
+      missing+=("$pkg")
+    fi
+  done
+  if [ "${#missing[@]}" -gt 0 ]; then
+    $SUDO apt-get -o Acquire::Retries=5 update -qq
+    $SUDO env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 install -y --no-install-recommends "${missing[@]}"
+  fi
+}
+
+# --- System packages (C toolchain/linker for rustc and build scripts; curl for the installers) ---
+step "system packages: build-essential, pkg-config, curl, ca-certificates"
+apt_install build-essential pkg-config curl ca-certificates
+
+# --- Rust (rustup) ---
+export PATH="$HOME/.cargo/bin:$PATH"
+if ! command -v rustup >/dev/null 2>&1; then
+  step "install rustup"
+  # Download the installer first: piping curl into sh can execute a truncated
+  # installer when the download fails partway through.
+  rustup_installer="$(mktemp)"
+  trap 'rm -f "$rustup_installer"' EXIT
+  curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
+    --output "$rustup_installer" https://sh.rustup.rs
+  sh "$rustup_installer" -y --default-toolchain none --profile minimal
+  rm -f "$rustup_installer"
+  trap - EXIT
+  if ! command -v rustup >/dev/null 2>&1; then
+    echo "rustup installation failed: rustup is not on PATH" >&2
+    exit 1
+  fi
+fi
+# rust-toolchain.toml (minimal + clippy, rustfmt) and CI pin 1.97.1.
+step "rust toolchain 1.97.1 with rustfmt and clippy"
+rustup toolchain install 1.97.1 --profile minimal --component rustfmt --component clippy
+rustup default 1.97.1
+
+# --- Prefetch crates (no build, no tests) ---
+step "cargo fetch --locked"
+cargo fetch --locked
+
+# --- Expose the tools to later shells ---
+# The PATH exports above last only for this script; Cursor starts the agent's shells
+# separately. Login shells get this directory from /etc/profile.d, and every other
+# shell finds the entry points through symlinks in /usr/local/bin (on the default PATH).
+step "expose Rust tools to later shells"
+tool_dirs=("$HOME/.cargo/bin")
+# shellcheck disable=SC2016 # $PATH must expand when the profile is sourced, not now.
+printf 'export PATH="%s:$PATH"\n' "$(IFS=:; echo "${tool_dirs[*]}")" |
+  $SUDO tee /etc/profile.d/cursor-env-writ.sh >/dev/null
+for dir in "${tool_dirs[@]}"; do
+  [ -d "$dir" ] || continue
+  for tool in "$dir"/*; do
+    name="${tool##*/}"
+    dest="/usr/local/bin/$name"
+    # Never replace an existing entry: setup can run again on a prepared
+    # Build, and a name collision must not shadow a base-image command.
+    if [ -f "$tool" ] && [ -x "$tool" ] && [ ! -e "$dest" ] && [ ! -L "$dest" ]; then
+      $SUDO ln -s "$tool" "$dest"
+    fi
+  done
+done
+
+step "Cursor install for writ finished in $((SECONDS - started))s"
