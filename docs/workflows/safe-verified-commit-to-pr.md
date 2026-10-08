@@ -10,3 +10,5 @@ Open or update a reviewable PR for the authorized task. Follow [`AGENTS.md`](../
 6. Handoff includes the PR URL, actual head SHA, local/hosted validation, review state and precise residuals. Update only the task record already used. No duplicated report is required.
 
 Remote merge modes, readiness and update-branch operations are governed by GitHub and operator authorization, not an extra writ gate. This workflow itself does not authorize a merge, release or repository-settings change. A rejected push is not delivery, and an empty PR is not a way to retrigger CI.
+
+Configured owner allowlist is enforced on writ-supervised `git`/`gh` and on `writ hook`. GitHub MCP and other PR transports outside writ still require explicit owner verification before mutation.
