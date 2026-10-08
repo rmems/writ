@@ -100,6 +100,7 @@ engines:
       # Security engines stay enabled.
       - "crates/*/src/supervisor.rs"
       - "crates/*/src/supervisor_cmd.rs"
+      - "crates/*/src/supervisor_cancellation_tests.rs"
       - "crates/*/src/supervisor_tests.rs"
       - "crates/*/src/supervisor_policy_tests.rs"
       - "crates/*/src/timeout_policy.rs"
@@ -121,6 +122,7 @@ engines:
       - "crates/*/src/pr_import.rs"
       - "crates/*/src/supervisor.rs"
       - "crates/*/src/supervisor_cmd.rs"
+      - "crates/*/src/supervisor_cancellation_tests.rs"
       - "crates/*/src/supervisor_tests.rs"
       - "crates/*/src/supervisor_policy_tests.rs"
       - "crates/*/src/timeout_policy.rs"
@@ -142,6 +144,7 @@ engines:
       - "crates/*/src/pr_import.rs"
       - "crates/*/src/supervisor.rs"
       - "crates/*/src/supervisor_cmd.rs"
+      - "crates/*/src/supervisor_cancellation_tests.rs"
       - "crates/*/src/supervisor_tests.rs"
       - "crates/*/src/supervisor_policy_tests.rs"
       - "crates/*/src/timeout_policy.rs"

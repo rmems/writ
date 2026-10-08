@@ -174,25 +174,6 @@ async fn timeout_kills_process_group() {
     );
 }
 
-#[cfg(unix)]
-#[tokio::test]
-async fn timeout_remains_active_while_draining_inherited_pipes() {
-    let supervisor = Supervisor::new(1);
-    let started = Instant::now();
-    let output = supervisor
-        .run_unchecked(
-            shell_program(),
-            &[shell_flag(), "sleep 60 &"],
-            Some(Duration::from_millis(200)),
-        )
-        .await;
-
-    assert!(
-        output.timed_out && output.killed && started.elapsed() < Duration::from_secs(5),
-        "supervisor hung or failed to kill while draining inherited pipes: {output:?}"
-    );
-}
-
 #[tokio::test]
 async fn propagates_nonzero_exit_code() {
     let supervisor = Supervisor::new(4);
@@ -414,76 +395,6 @@ async fn wall_clock_includes_permit_wait() {
         "queued run should time out without waiting for the holder: {output:?}"
     );
     let _ = holder.await;
-}
-
-#[cfg(unix)]
-struct GraceCase {
-    worker_ms: u64,
-    grace_ms: u64,
-    script: &'static str,
-    stage: RecoveryStage,
-    killed: bool,
-    bound: Option<Duration>,
-}
-
-#[cfg(unix)]
-fn grace_case_matches(case: &GraceCase, output: &SupervisedOutput, elapsed: Duration) -> bool {
-    let within_bound = case.bound.is_none_or(|limit| elapsed < limit);
-    let killed_timeout = if case.killed {
-        is_killed_timeout(output, TimeoutClass::Hard, SupervisorErrorCode::TimedOut)
-    } else {
-        output.timed_out && output.timeout_class == Some(TimeoutClass::Hard) && !output.killed
-    };
-    killed_timeout && output.recovery_stage == Some(case.stage) && within_bound
-}
-
-/// TERM-ignored children escalate to kill; TERM-sensitive children exit in grace.
-///
-/// One scenario runner covers both so the two scripts are not duplicated tests.
-#[cfg(unix)]
-#[tokio::test]
-async fn graceful_cancel_follows_term_sensitivity() {
-    let cases = [
-        GraceCase {
-            worker_ms: 200,
-            grace_ms: 200,
-            script: "trap '' TERM; while true; do :; done",
-            stage: RecoveryStage::Kill,
-            killed: true,
-            bound: None,
-        },
-        GraceCase {
-            worker_ms: 150,
-            grace_ms: 800,
-            script: "trap 'exit 0' TERM; sleep 60",
-            stage: RecoveryStage::GracefulCancel,
-            killed: false,
-            bound: Some(Duration::from_secs(3)),
-        },
-    ];
-    for case in cases {
-        let policy = TimeoutPolicy {
-            worker: Some(Duration::from_millis(case.worker_ms)),
-            grace: Duration::from_millis(case.grace_ms),
-            progress_every: None,
-            ..TimeoutPolicy::from_worker_timeout(None)
-        };
-        let started = Instant::now();
-        let output = Supervisor::new(1)
-            .run_unchecked_with_policy(
-                shell_program(),
-                &[shell_flag(), case.script],
-                &policy,
-                &RunOptions::default(),
-            )
-            .await;
-        let elapsed = started.elapsed();
-        assert!(
-            grace_case_matches(&case, &output, elapsed),
-            "grace case mismatch script={} output={output:?}",
-            case.script
-        );
-    }
 }
 
 #[tokio::test]
