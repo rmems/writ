@@ -591,6 +591,12 @@ pub fn checkout_or_switch_target(args: &[String]) -> Option<&str> {
             ) {
                 return args.get(i + 1).map(String::as_str);
             }
+            // Attached create value inside a short cluster (`switch -cd`,
+            // `checkout -bfoo`): the created branch HEAD lands on is inside
+            // the token, not the next positional.
+            if let Some(v) = cluster_create_value(sub, a, args.get(i + 1)) {
+                return Some(v);
+            }
             if a.starts_with("--") && a.contains('=') {
                 i += 1;
                 continue;
@@ -599,6 +605,51 @@ pub fn checkout_or_switch_target(args: &[String]) -> Option<&str> {
             continue;
         }
         return Some(a);
+    }
+    None
+}
+
+/// Short-option letters that take a value on `checkout` (`-b`/`-B`) and
+/// `switch` (`-c`/`-C`): inside a cluster, the first such letter ends the
+/// flag scan and its remainder is that option's value.
+fn create_option_letters(subcommand: &str) -> &'static [char] {
+    if subcommand == "switch" {
+        &['c', 'C']
+    } else {
+        &['b', 'B']
+    }
+}
+
+/// Attached create-branch value inside a short cluster: `switch -cd` → `d`,
+/// `checkout -bfoo` → `foo`, `switch -tc fix` → `fix` (create letter last, so
+/// the next argv token is the value). A leading `=` in the attached value is
+/// tolerated (`-c=name`).
+fn cluster_create_value<'a>(
+    subcommand: &str,
+    arg: &'a str,
+    next: Option<&'a String>,
+) -> Option<&'a str> {
+    if arg.len() <= 2 {
+        return None;
+    }
+    if !arg.starts_with('-') {
+        return None;
+    }
+    if arg.starts_with("--") {
+        return None;
+    }
+    let letters = create_option_letters(subcommand);
+    for (idx, c) in arg[1..].char_indices() {
+        if letters.contains(&c) {
+            let rest = &arg[1 + idx + c.len_utf8()..];
+            if rest.is_empty() {
+                return next.map(String::as_str);
+            }
+            return Some(rest.strip_prefix('=').unwrap_or(rest));
+        }
+        if !c.is_ascii_alphabetic() {
+            return None;
+        }
     }
     None
 }
@@ -755,14 +806,9 @@ fn smuggled_cluster_flag(subcommand: &str, arg: &str, flag: char) -> bool {
     if arg.starts_with("--") {
         return false;
     }
-    let value_taking: &[char] = if subcommand == "switch" {
-        &['c', 'C']
-    } else {
-        &['b', 'B']
-    };
     arg[1..]
         .chars()
-        .take_while(|c| !value_taking.contains(c) && c.is_ascii_alphabetic())
+        .take_while(|c| !create_option_letters(subcommand).contains(c) && c.is_ascii_alphabetic())
         .any(|c| c == flag)
 }
 

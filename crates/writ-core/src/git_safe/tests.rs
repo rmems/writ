@@ -286,6 +286,35 @@ fn switch_create_equals_form_target() {
 }
 
 #[test]
+fn switch_attached_create_cluster_returns_new_branch() {
+    // `switch -cd <point>` creates branch `d`: the start point is not the
+    // branch HEAD lands on, so the expected-branch check must compare `d`.
+    let args = vec!["switch".to_owned(), "-cd".to_owned(), "feature".to_owned()];
+    assert_eq!(checkout_or_switch_target(&args), Some("d"));
+    let args = vec!["checkout".to_owned(), "-bfoo".to_owned(), "main".to_owned()];
+    assert_eq!(checkout_or_switch_target(&args), Some("foo"));
+    // Create letter last: the next argv token is the value.
+    let args = vec!["switch".to_owned(), "-tc".to_owned(), "fix".to_owned()];
+    assert_eq!(checkout_or_switch_target(&args), Some("fix"));
+}
+
+#[test]
+fn switch_attached_create_cluster_is_pinned_to_new_branch() {
+    // `switch -cd <point>` creates branch `d`: the supervisor's branch-pinning
+    // check must compare `d` against --expected-branch, not the start point.
+    let args = vec!["switch".to_owned(), "-cd".to_owned(), "feature".to_owned()];
+    assert!(matches!(
+        crate::supervisor::reject_mismatched_checkout(Some("feature"), &args),
+        Err(Error::PolicyViolation {
+            code: PolicyCode::BranchMismatch,
+            ..
+        })
+    ));
+    // Admitted when `d` IS the expected branch.
+    crate::supervisor::reject_mismatched_checkout(Some("d"), &args).unwrap();
+}
+
+#[test]
 fn gh_pr_update_branch_is_remote_policy() {
     SafeGhCommand::new(&[
         "pr".into(),
