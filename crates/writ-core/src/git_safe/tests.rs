@@ -301,16 +301,17 @@ fn switch_attached_create_cluster_returns_new_branch() {
 #[test]
 fn cluster_create_covers_equals_and_force_create_forms() {
     // `-b`/`-B` (checkout) and `-c`/`-C` (switch) are force-create variants of
-    // each other; both take their branch name attached or after `=`.
+    // each other. git keeps `=` in short-option values: `-c=foo` creates
+    // branch `=foo` (verified against git), so the pin sees the literal name.
     for (sub, arg, want) in [
         ("checkout", "-bfoo", "foo"),
-        ("checkout", "-b=foo", "foo"),
+        ("checkout", "-b=foo", "=foo"),
         ("checkout", "-Bfix", "fix"),
-        ("checkout", "-B=fix", "fix"),
+        ("checkout", "-B=fix", "=fix"),
         ("switch", "-cfoo", "foo"),
-        ("switch", "-c=foo", "foo"),
+        ("switch", "-c=foo", "=foo"),
         ("switch", "-Cfix", "fix"),
-        ("switch", "-C=fix", "fix"),
+        ("switch", "-C=fix", "=fix"),
     ] {
         let args = vec![sub.to_owned(), arg.to_owned()];
         assert_eq!(checkout_or_switch_target(&args), Some(want), "{sub} {arg}");

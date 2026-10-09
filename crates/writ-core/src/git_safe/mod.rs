@@ -621,9 +621,11 @@ fn create_option_letters(subcommand: &str) -> &'static [char] {
 }
 
 /// Create-branch value carried by a short cluster: attached (`switch -cd` →
-/// `d`, `checkout -bfoo` → `foo`), attached-with-`=` (`-c=name` → `name`), or
-/// — when the value-taking letter ends the cluster — the next argv token
-/// (`switch -tc fix` → `fix`).
+/// `d`, `checkout -bfoo` → `foo`) or — when the value-taking letter ends the
+/// cluster — the next argv token (`switch -tc fix` → `fix`). The attached
+/// remainder is returned verbatim: git does NOT strip `=` from short-option
+/// values, so `-c=name` creates branch `=name` — an unusual but legal ref
+/// name the pin must compare literally.
 fn cluster_create_value<'a>(
     subcommand: &str,
     arg: &'a str,
@@ -645,7 +647,7 @@ fn cluster_create_value<'a>(
             if rest.is_empty() {
                 return next.map(String::as_str);
             }
-            return Some(rest.strip_prefix('=').unwrap_or(rest));
+            return Some(rest);
         }
         if !c.is_ascii_alphabetic() {
             return None;
