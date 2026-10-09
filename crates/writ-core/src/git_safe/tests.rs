@@ -670,6 +670,20 @@ fn switch_create_cluster_letters_are_values_not_detach() {
 }
 
 #[test]
+fn checkout_branch_cluster_letters_are_values_not_force() {
+    // `checkout -bf` gives `f` to `-b` as its attached value, so the cluster
+    // must not be read as force; a non-alphabetic cluster tail stops scanning
+    // rather than inventing flags.
+    SafeGitCommand::new(&[
+        "checkout".to_owned(),
+        "-bf".to_owned(),
+        "feature".to_owned(),
+    ])
+    .unwrap();
+    SafeGitCommand::new(&["checkout".to_owned(), "-1".to_owned(), "feature".to_owned()]).unwrap();
+}
+
+#[test]
 fn branch_rename_rejected() {
     let err = SafeGitCommand::new(&["branch".to_owned(), "-m".to_owned(), "main".to_owned()])
         .unwrap_err();
