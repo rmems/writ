@@ -256,15 +256,7 @@ impl SafeGitCommand {
             });
         }
 
-        // Detach leaves HEAD off the assigned branch even when the target name matches.
-        if matches!(subcommand.as_str(), "checkout" | "switch")
-            && args.iter().skip(1).any(|a| is_detach_flag(subcommand, a))
-        {
-            return Err(Error::PolicyViolation {
-                code: PolicyCode::BranchMismatch,
-                message: "git checkout/switch --detach is not allowed under hive policy".to_owned(),
-            });
-        }
+        reject_checkout_switch_escape(subcommand, args)?;
 
         reject_external_write_targets(subcommand, &args[1..])?;
 
@@ -599,6 +591,12 @@ pub fn checkout_or_switch_target(args: &[String]) -> Option<&str> {
             ) {
                 return args.get(i + 1).map(String::as_str);
             }
+            // Attached create value inside a short cluster (`switch -cd`,
+            // `checkout -bfoo`): the created branch HEAD lands on is inside
+            // the token, not the next positional.
+            if let Some(v) = cluster_create_value(sub, a, args.get(i + 1)) {
+                return Some(v);
+            }
             if a.starts_with("--") && a.contains('=') {
                 i += 1;
                 continue;
@@ -611,26 +609,74 @@ pub fn checkout_or_switch_target(args: &[String]) -> Option<&str> {
     None
 }
 
+/// Short-option letters that take a value on `checkout` (`-b`/`-B`) and
+/// `switch` (`-c`/`-C`): inside a cluster, the first such letter ends the
+/// flag scan and its remainder is that option's value.
+fn create_option_letters(subcommand: &str) -> &'static [char] {
+    if subcommand == "switch" {
+        &['c', 'C']
+    } else {
+        &['b', 'B']
+    }
+}
+
+/// Create-branch value carried by a short cluster: attached (`switch -cd` →
+/// `d`, `checkout -bfoo` → `foo`) or — when the value-taking letter ends the
+/// cluster — the next argv token (`switch -tc fix` → `fix`). The attached
+/// remainder is returned verbatim: git does NOT strip `=` from short-option
+/// values, so `-c=name` creates branch `=name` — an unusual but legal ref
+/// name the pin must compare literally.
+fn cluster_create_value<'a>(
+    subcommand: &str,
+    arg: &'a str,
+    next: Option<&'a String>,
+) -> Option<&'a str> {
+    if arg.len() <= 2 {
+        return None;
+    }
+    if !arg.starts_with('-') {
+        return None;
+    }
+    if arg.starts_with("--") {
+        return None;
+    }
+    let letters = create_option_letters(subcommand);
+    for (idx, c) in arg[1..].char_indices() {
+        if letters.contains(&c) {
+            let rest = &arg[1 + idx + c.len_utf8()..];
+            if rest.is_empty() {
+                return next.map(String::as_str);
+            }
+            return Some(rest);
+        }
+        if !c.is_ascii_alphabetic() {
+            return None;
+        }
+    }
+    None
+}
+
 /// Whether `git pull` uses a non-merge history strategy.
 ///
 /// Accepts bare `--rebase`, `--rebase=true|merges|interactive`, or `--ff-only`.
-/// Rejects `--rebase=false` and `--no-rebase` (merge-style pulls).
+/// Rejects `--rebase=false` and `--no-rebase` (merge-style pulls). git applies
+/// the last rebase option, so `pull --rebase --rebase=false` is still a merge
+/// pull that must be rejected.
 fn pull_uses_safe_history_strategy(args: &[String]) -> bool {
     if args.iter().any(|a| a == "--ff-only") {
         return true;
     }
-    if args.iter().any(|a| a == "--no-rebase") {
-        return false;
-    }
+    let mut rebase = false;
     for a in args {
         if a == "--rebase" {
-            return true;
-        }
-        if let Some(v) = a.strip_prefix("--rebase=") {
-            return matches!(v, "true" | "merges" | "interactive");
+            rebase = true;
+        } else if a == "--no-rebase" {
+            rebase = false;
+        } else if let Some(v) = a.strip_prefix("--rebase=") {
+            rebase = matches!(v, "true" | "merges" | "interactive");
         }
     }
-    false
+    rebase
 }
 
 fn is_rebase_exec_option(arg: &str) -> bool {
@@ -693,6 +739,79 @@ fn is_detach_flag(subcommand: &str, arg: &str) -> bool {
     // `git switch -d` is --detach; do not treat bare `-d` on checkout (unused/rare).
     subcommand == "switch"
         && (arg == "-d" || (arg.starts_with("-d") && arg.len() > 2 && !arg.starts_with("--")))
+}
+
+/// `checkout`/`switch` local-side gates: every detach spelling and every
+/// force/detach flag smuggled inside a combined short cluster.
+fn reject_checkout_switch_escape(subcommand: &str, args: &[String]) -> Result<()> {
+    if !matches!(subcommand, "checkout" | "switch") {
+        return Ok(());
+    }
+    // Options end at `--`; anything after it is a pathspec, never a flag.
+    let options = args
+        .iter()
+        .skip(1)
+        .map(String::as_str)
+        .take_while(|a| *a != "--")
+        .collect::<Vec<_>>();
+    // Detach leaves HEAD off the assigned branch even when the target name matches.
+    if options
+        .iter()
+        .copied()
+        .any(|a| is_detach_flag(subcommand, a))
+    {
+        return Err(Error::PolicyViolation {
+            code: PolicyCode::BranchMismatch,
+            message: "git checkout/switch --detach is not allowed under hive policy".to_owned(),
+        });
+    }
+    // Combined short clusters carry the same flags: `checkout -fb` discards
+    // uncommitted work like `-f`, `switch -fd`/`-td` discard work and detach.
+    if options
+        .iter()
+        .any(|a| smuggled_cluster_flag(subcommand, a, 'f'))
+    {
+        return Err(Error::PolicyViolation {
+            code: PolicyCode::BareForcePush,
+            message: "bare --force/-f is not allowed; use --force-with-lease only".to_owned(),
+        });
+    }
+    if subcommand != "switch" {
+        return Ok(());
+    }
+    if options
+        .iter()
+        .any(|a| smuggled_cluster_flag(subcommand, a, 'd'))
+    {
+        return Err(Error::PolicyViolation {
+            code: PolicyCode::BranchMismatch,
+            message: "git checkout/switch --detach is not allowed under hive policy".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Whether a `-xyz` short-option cluster on `checkout`/`switch` smuggles `flag`
+/// in as a real flag rather than a value-taking option's payload.
+///
+/// Scanning stops at the first value-taking letter (`checkout -b/-B`,
+/// `switch -c/-C`): the remainder of the token is that option's value, so the
+/// `d` in `switch -cd <name>` is the new branch name, not `--detach`. Scanning
+/// also stops at any non-alphabetic character.
+fn smuggled_cluster_flag(subcommand: &str, arg: &str, flag: char) -> bool {
+    if arg.len() <= 2 {
+        return false;
+    }
+    if !arg.starts_with('-') {
+        return false;
+    }
+    if arg.starts_with("--") {
+        return false;
+    }
+    arg[1..]
+        .chars()
+        .take_while(|c| !create_option_letters(subcommand).contains(c) && c.is_ascii_alphabetic())
+        .any(|c| c == flag)
 }
 
 /// First config key name in `git config` args (after flags), if present.
@@ -951,6 +1070,15 @@ fn working_tree_is_dirty(repo_dir: &Path) -> Result<bool> {
 /// `git clean -fd` / `git rm -f` are not false-positives.
 fn is_bare_force_flag(arg: &str) -> bool {
     if arg == "-f" || arg == "--force" {
+        return true;
+    }
+    // `--discard-changes` is the `git switch` long spelling of `-f`. As a
+    // parse-options boolean it also takes `--discard-changes=<bool>`; the
+    // falsy spellings disable discarding, so only the truthy ones count.
+    if let Some(v) = arg.strip_prefix("--discard-changes=") {
+        return !matches!(v, "false" | "0" | "no" | "off");
+    }
+    if arg == "--discard-changes" {
         return true;
     }
     // Reject `--force=...` but not `--force-with-lease` / `--force-with-lease=...`.
