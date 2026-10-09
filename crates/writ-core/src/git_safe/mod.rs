@@ -256,41 +256,7 @@ impl SafeGitCommand {
             });
         }
 
-        // Detach leaves HEAD off the assigned branch even when the target name matches.
-        if matches!(subcommand.as_str(), "checkout" | "switch")
-            && args.iter().skip(1).any(|a| is_detach_flag(subcommand, a))
-        {
-            return Err(Error::PolicyViolation {
-                code: PolicyCode::BranchMismatch,
-                message: "git checkout/switch --detach is not allowed under hive policy".to_owned(),
-            });
-        }
-
-        // Combined short clusters carry the same flags: `checkout -fb` discards
-        // uncommitted work like `-f`, and `switch -fd`/`-td` discard work and
-        // detach HEAD. The exact-flag and push-scoped cluster checks miss these.
-        if matches!(subcommand.as_str(), "checkout" | "switch")
-            && args
-                .iter()
-                .skip(1)
-                .any(|a| smuggled_cluster_flag(subcommand, a, 'f'))
-        {
-            return Err(Error::PolicyViolation {
-                code: PolicyCode::BareForcePush,
-                message: "bare --force/-f is not allowed; use --force-with-lease only".to_owned(),
-            });
-        }
-        if subcommand == "switch"
-            && args
-                .iter()
-                .skip(1)
-                .any(|a| smuggled_cluster_flag(subcommand, a, 'd'))
-        {
-            return Err(Error::PolicyViolation {
-                code: PolicyCode::BranchMismatch,
-                message: "git checkout/switch --detach is not allowed under hive policy".to_owned(),
-            });
-        }
+        reject_checkout_switch_escape(subcommand, args)?;
 
         reject_external_write_targets(subcommand, &args[1..])?;
 
@@ -722,6 +688,47 @@ fn is_detach_flag(subcommand: &str, arg: &str) -> bool {
         && (arg == "-d" || (arg.starts_with("-d") && arg.len() > 2 && !arg.starts_with("--")))
 }
 
+/// `checkout`/`switch` local-side gates: every detach spelling and every
+/// force/detach flag smuggled inside a combined short cluster.
+fn reject_checkout_switch_escape(subcommand: &str, args: &[String]) -> Result<()> {
+    if !matches!(subcommand, "checkout" | "switch") {
+        return Ok(());
+    }
+    // Detach leaves HEAD off the assigned branch even when the target name matches.
+    if args.iter().skip(1).any(|a| is_detach_flag(subcommand, a)) {
+        return Err(Error::PolicyViolation {
+            code: PolicyCode::BranchMismatch,
+            message: "git checkout/switch --detach is not allowed under hive policy".to_owned(),
+        });
+    }
+    // Combined short clusters carry the same flags: `checkout -fb` discards
+    // uncommitted work like `-f`, `switch -fd`/`-td` discard work and detach.
+    if args
+        .iter()
+        .skip(1)
+        .any(|a| smuggled_cluster_flag(subcommand, a, 'f'))
+    {
+        return Err(Error::PolicyViolation {
+            code: PolicyCode::BareForcePush,
+            message: "bare --force/-f is not allowed; use --force-with-lease only".to_owned(),
+        });
+    }
+    if subcommand != "switch" {
+        return Ok(());
+    }
+    if args
+        .iter()
+        .skip(1)
+        .any(|a| smuggled_cluster_flag(subcommand, a, 'd'))
+    {
+        return Err(Error::PolicyViolation {
+            code: PolicyCode::BranchMismatch,
+            message: "git checkout/switch --detach is not allowed under hive policy".to_owned(),
+        });
+    }
+    Ok(())
+}
+
 /// Whether a `-xyz` short-option cluster on `checkout`/`switch` smuggles `flag`
 /// in as a real flag rather than a value-taking option's payload.
 ///
@@ -730,7 +737,13 @@ fn is_detach_flag(subcommand: &str, arg: &str) -> bool {
 /// `d` in `switch -cd <name>` is the new branch name, not `--detach`. Scanning
 /// also stops at any non-alphabetic character.
 fn smuggled_cluster_flag(subcommand: &str, arg: &str, flag: char) -> bool {
-    if !arg.starts_with('-') || arg.starts_with("--") || arg.len() <= 2 {
+    if arg.len() <= 2 {
+        return false;
+    }
+    if !arg.starts_with('-') {
+        return false;
+    }
+    if arg.starts_with("--") {
         return false;
     }
     let value_taking: &[char] = if subcommand == "switch" {
@@ -1002,11 +1015,12 @@ fn is_bare_force_flag(arg: &str) -> bool {
     if arg == "-f" || arg == "--force" {
         return true;
     }
-    // Reject `--force=...` but not `--force-with-lease` / `--force-with-lease=...`.
     // `--discard-changes` is the `git switch` long spelling of `-f`.
-    arg.starts_with("--force=")
-        || arg == "--discard-changes"
-        || arg.starts_with("--discard-changes=")
+    if arg == "--discard-changes" {
+        return true;
+    }
+    // Reject `--force=...` but not `--force-with-lease` / `--force-with-lease=...`.
+    arg.starts_with("--force=") || arg.starts_with("--discard-changes=")
 }
 
 /// Combined short options containing `f` (e.g. `-fu`, `-uf`) used with `git push`.
