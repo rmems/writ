@@ -620,10 +620,10 @@ fn create_option_letters(subcommand: &str) -> &'static [char] {
     }
 }
 
-/// Attached create-branch value inside a short cluster: `switch -cd` → `d`,
-/// `checkout -bfoo` → `foo`, `switch -tc fix` → `fix` (create letter last, so
-/// the next argv token is the value). A leading `=` in the attached value is
-/// tolerated (`-c=name`).
+/// Create-branch value carried by a short cluster: attached (`switch -cd` →
+/// `d`, `checkout -bfoo` → `foo`), attached-with-`=` (`-c=name` → `name`), or
+/// — when the value-taking letter ends the cluster — the next argv token
+/// (`switch -tc fix` → `fix`).
 fn cluster_create_value<'a>(
     subcommand: &str,
     arg: &'a str,

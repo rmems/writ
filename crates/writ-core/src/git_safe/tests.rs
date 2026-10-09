@@ -299,6 +299,25 @@ fn switch_attached_create_cluster_returns_new_branch() {
 }
 
 #[test]
+fn cluster_create_covers_equals_and_force_create_forms() {
+    // `-b`/`-B` (checkout) and `-c`/`-C` (switch) are force-create variants of
+    // each other; both take their branch name attached or after `=`.
+    for (sub, arg, want) in [
+        ("checkout", "-bfoo", "foo"),
+        ("checkout", "-b=foo", "foo"),
+        ("checkout", "-Bfix", "fix"),
+        ("checkout", "-B=fix", "fix"),
+        ("switch", "-cfoo", "foo"),
+        ("switch", "-c=foo", "foo"),
+        ("switch", "-Cfix", "fix"),
+        ("switch", "-C=fix", "fix"),
+    ] {
+        let args = vec![sub.to_owned(), arg.to_owned()];
+        assert_eq!(checkout_or_switch_target(&args), Some(want), "{sub} {arg}");
+    }
+}
+
+#[test]
 fn switch_attached_create_cluster_is_pinned_to_new_branch() {
     // `switch -cd <point>` creates branch `d`: the supervisor's branch-pinning
     // check must compare `d` against --expected-branch, not the start point.
