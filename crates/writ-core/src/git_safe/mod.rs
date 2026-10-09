@@ -694,8 +694,19 @@ fn reject_checkout_switch_escape(subcommand: &str, args: &[String]) -> Result<()
     if !matches!(subcommand, "checkout" | "switch") {
         return Ok(());
     }
+    // Options end at `--`; anything after it is a pathspec, never a flag.
+    let options = args
+        .iter()
+        .skip(1)
+        .map(String::as_str)
+        .take_while(|a| *a != "--")
+        .collect::<Vec<_>>();
     // Detach leaves HEAD off the assigned branch even when the target name matches.
-    if args.iter().skip(1).any(|a| is_detach_flag(subcommand, a)) {
+    if options
+        .iter()
+        .copied()
+        .any(|a| is_detach_flag(subcommand, a))
+    {
         return Err(Error::PolicyViolation {
             code: PolicyCode::BranchMismatch,
             message: "git checkout/switch --detach is not allowed under hive policy".to_owned(),
@@ -703,9 +714,8 @@ fn reject_checkout_switch_escape(subcommand: &str, args: &[String]) -> Result<()
     }
     // Combined short clusters carry the same flags: `checkout -fb` discards
     // uncommitted work like `-f`, `switch -fd`/`-td` discard work and detach.
-    if args
+    if options
         .iter()
-        .skip(1)
         .any(|a| smuggled_cluster_flag(subcommand, a, 'f'))
     {
         return Err(Error::PolicyViolation {
@@ -716,9 +726,8 @@ fn reject_checkout_switch_escape(subcommand: &str, args: &[String]) -> Result<()
     if subcommand != "switch" {
         return Ok(());
     }
-    if args
+    if options
         .iter()
-        .skip(1)
         .any(|a| smuggled_cluster_flag(subcommand, a, 'd'))
     {
         return Err(Error::PolicyViolation {
@@ -1015,12 +1024,17 @@ fn is_bare_force_flag(arg: &str) -> bool {
     if arg == "-f" || arg == "--force" {
         return true;
     }
-    // `--discard-changes` is the `git switch` long spelling of `-f`.
+    // `--discard-changes` is the `git switch` long spelling of `-f`. As a
+    // parse-options boolean it also takes `--discard-changes=<bool>`; the
+    // falsy spellings disable discarding, so only the truthy ones count.
+    if let Some(v) = arg.strip_prefix("--discard-changes=") {
+        return !matches!(v, "false" | "0" | "no" | "off");
+    }
     if arg == "--discard-changes" {
         return true;
     }
     // Reject `--force=...` but not `--force-with-lease` / `--force-with-lease=...`.
-    arg.starts_with("--force=") || arg.starts_with("--discard-changes=")
+    arg.starts_with("--force=")
 }
 
 /// Combined short options containing `f` (e.g. `-fu`, `-uf`) used with `git push`.

@@ -670,6 +670,36 @@ fn switch_create_cluster_letters_are_values_not_detach() {
 }
 
 #[test]
+fn checkout_pathspec_after_end_of_options_is_not_scanned() {
+    // `checkout -- -fd` restores a file literally named `-fd`; args after `--`
+    // are pathspecs, never option clusters.
+    SafeGitCommand::new(&["checkout".to_owned(), "--".to_owned(), "-fd".to_owned()]).unwrap();
+}
+
+#[test]
+fn switch_discard_changes_falsy_values_are_noops() {
+    // `--discard-changes=<falsy>` disables discarding like a bare boolean
+    // negation; only the truthy spellings carry `-f` semantics.
+    for arg in ["--discard-changes=false", "--discard-changes=0"] {
+        SafeGitCommand::new(&["switch".to_owned(), arg.to_owned(), "feature".to_owned()])
+            .unwrap_or_else(|err| panic!("{arg} unexpectedly rejected: {err:?}"));
+    }
+    let err = SafeGitCommand::new(&[
+        "switch".to_owned(),
+        "--discard-changes=yes".to_owned(),
+        "feature".to_owned(),
+    ])
+    .unwrap_err();
+    assert!(matches!(
+        err,
+        Error::PolicyViolation {
+            code: PolicyCode::BareForcePush,
+            ..
+        }
+    ));
+}
+
+#[test]
 fn checkout_branch_cluster_letters_are_values_not_force() {
     // `checkout -bf` gives `f` to `-b` as its attached value, so the cluster
     // must not be read as force; a non-alphabetic cluster tail stops scanning
