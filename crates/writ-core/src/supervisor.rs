@@ -2,8 +2,7 @@
 //!
 //! Hang recovery lives here (RM-15 remaining supervisor contract): hard wall-clock,
 //! idle (no-output) detection, lost-child classification, soft-cancel then kill,
-//! and stderr progress ticks. The supervisor **never retries**, never merges, and
-//! never force-pushes. Named defaults: [`crate::timeout_policy`].
+//! and stderr progress ticks. Recovery never retries or initiates Git operations. Named defaults: [`crate::timeout_policy`].
 //!
 //! # Concurrency model
 //!
@@ -69,77 +68,6 @@ pub fn normalize_program_name(program: &str) -> String {
         .to_owned()
 }
 
-const FORBIDDEN_WRAPPERS: &[&str] = &[
-    "bash",
-    "bun",
-    "chroot",
-    "cmd",
-    "curl",
-    "dash",
-    "deno",
-    "doas",
-    "env",
-    "fish",
-    "http",
-    "httpie",
-    "ipython",
-    "ipython3",
-    "lua",
-    "nc",
-    "ncat",
-    "netcat",
-    "nice",
-    "node",
-    "nodejs",
-    "nohup",
-    "nsenter",
-    "open",
-    "perl",
-    "php",
-    "powershell",
-    "pwsh",
-    "py",
-    "python",
-    "python2",
-    "python3",
-    "rscript",
-    "ruby",
-    "script",
-    "setsid",
-    "sh",
-    "socat",
-    "stdbuf",
-    "su",
-    "sudo",
-    "time",
-    "timeout",
-    "unshare",
-    "wget",
-    "xargs",
-    "xdg-open",
-    "zsh",
-];
-
-const VERSIONED_WRAPPER_PREFIXES: &[&str] = &[
-    "python", "python2", "python3", "perl", "ruby", "node", "nodejs", "php", "lua", "ipython",
-];
-
-pub(super) fn program_is_path_qualified(program: &str) -> bool {
-    if program.contains('/') {
-        return true;
-    }
-    if program.contains('\\') {
-        return true;
-    }
-    if program.starts_with('.') {
-        return true;
-    }
-    if program.len() <= 2 {
-        return false;
-    }
-    program.as_bytes().get(1) == Some(&b':')
-}
-
 pub(super) fn reject_mismatched_checkout(expected: Option<&str>, args: &[String]) -> Result<()> {
     let Some(exp) = expected else {
         return Ok(());
@@ -158,21 +86,6 @@ pub(super) fn reject_mismatched_checkout(expected: Option<&str>, args: &[String]
         message: format!(
             "git checkout/switch target `{target}` must equal --expected-branch `{exp}`"
         ),
-    })
-}
-
-pub(super) fn is_forbidden_wrapper(name: &str) -> bool {
-    FORBIDDEN_WRAPPERS.contains(&name) || versioned_wrapper_name(name)
-}
-
-fn versioned_wrapper_name(name: &str) -> bool {
-    VERSIONED_WRAPPER_PREFIXES.iter().any(|prefix| {
-        let Some(rest) = name.strip_prefix(prefix) else {
-            return false;
-        };
-        rest.is_empty()
-            || rest.starts_with('.')
-            || rest.chars().next().is_some_and(|c| c.is_ascii_digit())
     })
 }
 
@@ -214,7 +127,7 @@ pub struct SupervisedOutput {
     pub exit_code: Option<i32>,
     /// Whether the process was killed due to timeout.
     pub timed_out: bool,
-    /// Whether the process was killed (by timeout or signal).
+    /// Whether kill containment was attempted, or the child exited by signal.
     pub killed: bool,
     /// Captured stdout.
     pub stdout: String,
@@ -309,7 +222,7 @@ impl SupervisedOutput {
 pub struct RunOptions {
     /// When supervising `git` mutations, require this branch (verified before spawn).
     pub expected_branch: Option<String>,
-    /// Repository working tree for git branch verification and `git -C` (default: `.`).
+    /// Optional child working directory; direct Git uses it for branch verification (default: `.`).
     pub repo: Option<PathBuf>,
     /// Optional progress sink (stderr diagnostics). Never writes JSON stdout.
     pub on_progress: Option<ProgressCallback>,
@@ -400,8 +313,8 @@ impl Supervisor {
     ///
     /// - Validates git/gh (including path-qualified names like `/usr/bin/git`) via
     ///   [`crate::git_safe::SafeGitCommand`] / [`crate::git_safe::SafeGhCommand`].
-    /// - **Rejects shells and launchers** (`sh`, `bash`, `cmd`, `env`, `xargs`, …) so policy
-    ///   cannot be bypassed by quoting or wrappers; invoke binaries directly.
+    /// - Host scripts and interpreters run with the same timeout containment. Their
+    ///   nested commands are not recursively validated; this is not a universal sandbox.
     /// - For mutating git, requires [`RunOptions::expected_branch`], verifies the branch
     ///   **after** acquiring a permit (and immediately before spawn), and runs with
     ///   `current_dir` set to the verified repo.
@@ -454,9 +367,9 @@ impl Supervisor {
         };
 
         // Branch check immediately before spawn, while holding the permit.
-        // Always verify via git HEAD, for both supervised git and mutating gh.
+        // Direct Git mutations verify identity and WIP; remote gh has no branch gate.
         if let Some(ref check) = prepared.branch_check {
-            verify_repo_branch(&check.repo, &check.expected_branch)?;
+            verify_repo_branch(&check.repo, &check.expected_branch, &prepared.args)?;
         }
 
         let guard = ActiveGuard::arm(self);
@@ -552,7 +465,6 @@ impl Supervisor {
                 run_started,
                 spawn_at: spawned.spawn_at,
                 last_activity_ms: spawned.last_activity_ms,
-                pid: spawned.pid,
             },
         )
         .await
@@ -562,7 +474,6 @@ impl Supervisor {
 
 struct SpawnedChild {
     child: ProcessGroupChild,
-    pid: Option<u32>,
     spawn_at: Instant,
     last_activity_ms: Arc<AtomicU64>,
     stdout_handle: JoinHandle<Vec<u8>>,
@@ -599,7 +510,6 @@ fn spawn_supervised_child(
     let stderr_last = Arc::clone(&last_activity_ms);
     Ok(SpawnedChild {
         child,
-        pid,
         spawn_at,
         last_activity_ms,
         stdout_handle: tokio::spawn(async move {
@@ -741,7 +651,6 @@ struct ChildWait<'a> {
     run_started: Instant,
     spawn_at: Instant,
     last_activity_ms: Arc<AtomicU64>,
-    pid: Option<u32>,
 }
 
 impl ChildWait<'_> {
@@ -781,7 +690,7 @@ enum WaitTick {
     Recover(TimeoutClass),
     Progress,
     Continue,
-    Finished(std::io::Result<std::process::ExitStatus>),
+    Finished(std::io::Result<()>),
 }
 
 async fn next_wait_tick(
@@ -800,7 +709,7 @@ async fn next_wait_tick(
             }
         }
         _ = sleep_until_opt(wait.progress_deadline()) => WaitTick::Progress,
-        status = child.wait() => WaitTick::Finished(status),
+        status = child.wait_for_exit() => WaitTick::Finished(status),
     }
 }
 
@@ -833,9 +742,6 @@ async fn await_supervised_child(
             WaitTick::Progress => wait.emit(supervisor, SupervisorStep::Running),
             WaitTick::Continue => {}
             WaitTick::Finished(status) => {
-                if status.is_ok() {
-                    child.disarm();
-                }
                 return complete_child_wait(
                     ChildFinish {
                         supervisor,
@@ -855,6 +761,15 @@ async fn await_supervised_child(
 struct PipePair {
     stdout: JoinHandle<Vec<u8>>,
     stderr: JoinHandle<Vec<u8>>,
+}
+
+impl Drop for PipePair {
+    fn drop(&mut self) {
+        // Dropping JoinHandle alone detaches its task, retaining inherited pipe
+        // handles after run cancellation or a bounded drain expires.
+        self.stdout.abort();
+        self.stderr.abort();
+    }
 }
 
 struct ChildFinish<'a> {
@@ -879,17 +794,16 @@ async fn recover_classified(finish: ChildFinish<'_>, class: TimeoutClass) -> Sup
 async fn complete_child_wait(
     finish: ChildFinish<'_>,
     hard_deadline: Option<Instant>,
-    status: std::io::Result<std::process::ExitStatus>,
+    status: std::io::Result<()>,
 ) -> SupervisedOutput {
     match status {
-        Ok(s) => {
+        Ok(()) => {
             finish
                 .wait
                 .emit(finish.supervisor, SupervisorStep::Draining);
             drain_exited_child(
-                s,
+                finish.child,
                 hard_deadline,
-                finish.wait.pid,
                 finish.pipes,
                 finish.wait.policy,
                 finish.wait.run_started,
@@ -918,22 +832,40 @@ async fn complete_child_wait(
 /// records a hard residual. Captured bytes are kept. The harness checkout is
 /// not deleted.
 async fn drain_exited_child(
-    status: std::process::ExitStatus,
+    child: &mut ProcessGroupChild,
     hard_deadline: Option<Instant>,
-    pid: Option<u32>,
     pipes: PipePair,
     policy: &TimeoutPolicy,
     run_started: Instant,
     last_activity_ms: &AtomicU64,
 ) -> SupervisedOutput {
-    let PipePair {
-        stdout: stdout_handle,
-        stderr: stderr_handle,
-    } = pipes;
     let deadline_at = hard_deadline.unwrap_or_else(|| Instant::now() + ORPHAN_DRAIN_TIMEOUT);
-    match drain_pipes_until(deadline_at, pid, stdout_handle, stderr_handle).await {
-        Ok((stdout, stderr)) => output_to_supervised(status, &stdout, &stderr),
-        Err((stdout, stderr)) => {
+    let drained = drain_pipes_until(deadline_at, child.pid, pipes).await;
+    // Unix keeps the exited group leader unreaped through drain/containment,
+    // reserving its PID so cancellation cannot signal a reused process group.
+    let status = child.wait().await;
+    match (status, drained) {
+        (Ok(status), Ok((stdout, stderr))) => output_to_supervised(status, &stdout, &stderr),
+        (Err(error), Ok((stdout, stderr))) => SupervisedOutput {
+            stdout: String::from_utf8_lossy(&stdout).into_owned(),
+            stderr: if stderr.is_empty() {
+                format!("process error: {error}")
+            } else {
+                String::from_utf8_lossy(&stderr).into_owned()
+            },
+            stdout_truncated: stdout.len() >= MAX_CAPTURE_BYTES,
+            stderr_truncated: stderr.len() >= MAX_CAPTURE_BYTES,
+            error_code: Some(SupervisorErrorCode::LostChild),
+            ..SupervisedOutput::default()
+        }
+        .with_hang_residual(
+            policy,
+            TimeoutClass::LostChild,
+            RecoveryStage::None,
+            nonzero_ms(last_activity_ms),
+            run_started,
+        ),
+        (_, Err((stdout, stderr))) => {
             // Direct child already exited; leftover group members held the pipes.
             // Kill is process containment only — the harness checkout is left intact.
             SupervisedOutput {
@@ -960,10 +892,8 @@ async fn drain_exited_child(
 /// Recover a child whose `wait()` failed (a lost/errored process), attaching the
 /// process error to stderr when no captured stderr is available.
 struct RecoverIo<'a> {
-    stdout_handle: JoinHandle<Vec<u8>>,
-    stderr_handle: JoinHandle<Vec<u8>>,
+    pipes: PipePair,
     policy: &'a TimeoutPolicy,
-    pid: Option<u32>,
     run_started: Instant,
     last_activity_ms: Arc<AtomicU64>,
 }
@@ -971,10 +901,8 @@ struct RecoverIo<'a> {
 impl<'a> RecoverIo<'a> {
     fn from_wait(pipes: PipePair, wait: &'a ChildWait<'a>) -> Self {
         Self {
-            stdout_handle: pipes.stdout,
-            stderr_handle: pipes.stderr,
+            pipes,
             policy: wait.policy,
-            pid: wait.pid,
             run_started: wait.run_started,
             last_activity_ms: Arc::clone(&wait.last_activity_ms),
         }
@@ -999,10 +927,8 @@ async fn recover_child(
     class: TimeoutClass,
 ) -> SupervisedOutput {
     let RecoverIo {
-        stdout_handle,
-        stderr_handle,
+        mut pipes,
         policy,
-        pid,
         run_started,
         last_activity_ms,
     } = io;
@@ -1014,11 +940,11 @@ async fn recover_child(
         }
     };
 
-    let stage = cancel_supervised_child(child, pid, policy.grace).await;
+    let stage = cancel_supervised_child(child, policy.grace).await;
     child.disarm();
 
-    let stdout = join_with_timeout(stdout_handle).await;
-    let stderr = join_with_timeout(stderr_handle).await;
+    let stdout = join_with_timeout(&mut pipes.stdout).await;
+    let stderr = join_with_timeout(&mut pipes.stderr).await;
     let last_output_ms = nonzero_ms(&last_activity_ms);
     let timed_out = class != TimeoutClass::LostChild;
     let killed = stage == RecoveryStage::Kill;
@@ -1035,24 +961,25 @@ async fn recover_child(
     .with_hang_residual(policy, class, stage, last_output_ms, run_started)
 }
 
-async fn cancel_supervised_child(
-    child: &mut ProcessGroupChild,
-    pid: Option<u32>,
-    grace: Duration,
-) -> RecoveryStage {
+async fn cancel_supervised_child(child: &mut ProcessGroupChild, grace: Duration) -> RecoveryStage {
     if grace == Duration::ZERO {
         let _ = child.kill().await;
         let _ = tokio::time::timeout(POST_KILL_JOIN_TIMEOUT, child.wait()).await;
         return RecoveryStage::Kill;
     }
-    terminate_process_group(pid);
-    match tokio::time::timeout(grace, child.wait()).await {
-        Ok(Ok(_)) => {
-            // Parent exited after SIGTERM; SIGKILL remaining group members
-            // while the original pgid is still this pid, then disarm so Drop
-            // cannot SIGKILL a reused PID.
-            kill_process_group(pid);
-            RecoveryStage::GracefulCancel
+    terminate_process_group(child.pid);
+    match tokio::time::timeout(grace, child.wait_for_exit()).await {
+        Ok(Ok(())) => {
+            // Keep the exited Unix leader unreaped until group containment.
+            kill_process_group(child.pid);
+            let _ = tokio::time::timeout(POST_KILL_JOIN_TIMEOUT, child.wait()).await;
+            // On Unix, report the strongest containment action issued to the
+            // group: descendants may have survived the leader's graceful exit.
+            if cfg!(unix) {
+                RecoveryStage::Kill
+            } else {
+                RecoveryStage::GracefulCancel
+            }
         }
         Ok(Err(_)) | Err(_) => {
             let _ = child.kill().await;
@@ -1070,10 +997,38 @@ struct ProcessGroupChild {
 }
 
 impl ProcessGroupChild {
+    #[cfg(unix)]
+    async fn wait_for_exit(&mut self) -> std::io::Result<()> {
+        let result = wait_for_unreaped_exit(self.pid).await;
+        if result
+            .as_ref()
+            .is_err_and(|error| error.raw_os_error() == Some(libc::ECHILD))
+        {
+            // An external reaper took ownership; the old PID is no longer safe
+            // for process-group signalling.
+            self.disarm();
+        }
+        result
+    }
+
+    #[cfg(not(unix))]
+    async fn wait_for_exit(&mut self) -> std::io::Result<()> {
+        self.wait().await.map(|_| ())
+    }
+
     async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
-        let status = self.child.wait().await?;
-        self.disarm();
-        Ok(status)
+        let status = self.child.wait().await;
+        #[cfg(unix)]
+        if status
+            .as_ref()
+            .is_err_and(|error| error.raw_os_error() == Some(libc::ECHILD))
+        {
+            self.disarm();
+        }
+        if status.is_ok() {
+            self.disarm();
+        }
+        status
     }
 
     fn disarm(&mut self) {
@@ -1086,7 +1041,8 @@ impl ProcessGroupChild {
             return Ok(());
         }
         kill_process_group(self.pid);
-        self.child.kill().await
+        self.child.start_kill()?;
+        self.wait().await.map(|_| ())
     }
 }
 
@@ -1107,14 +1063,13 @@ fn nonzero_ms(stamp: &AtomicU64) -> Option<u64> {
 async fn drain_pipes_until(
     deadline_at: Instant,
     pid: Option<u32>,
-    stdout_handle: JoinHandle<Vec<u8>>,
-    stderr_handle: JoinHandle<Vec<u8>>,
+    mut pipes: PipePair,
 ) -> std::result::Result<(Vec<u8>, Vec<u8>), (Vec<u8>, Vec<u8>)> {
     // Keep the original deadline active while draining: descendants that inherit
     // stdout/stderr (e.g. `sh -c 'sleep 60 &'`) must not hang the supervisor forever.
     let drain = async {
-        let stdout = stdout_handle.await.unwrap_or_default();
-        let stderr = stderr_handle.await.unwrap_or_default();
+        let stdout = (&mut pipes.stdout).await.unwrap_or_default();
+        let stderr = (&mut pipes.stderr).await.unwrap_or_default();
         (stdout, stderr)
     };
     tokio::pin!(drain);
@@ -1133,7 +1088,7 @@ async fn drain_pipes_until(
     }
 }
 
-async fn join_with_timeout(handle: JoinHandle<Vec<u8>>) -> Vec<u8> {
+async fn join_with_timeout(handle: &mut JoinHandle<Vec<u8>>) -> Vec<u8> {
     match tokio::time::timeout(POST_KILL_JOIN_TIMEOUT, handle).await {
         Ok(Ok(buf)) => buf,
         Ok(Err(_)) => Vec::new(),
@@ -1251,6 +1206,91 @@ fn output_to_supervised(
 }
 
 #[cfg(unix)]
+async fn wait_for_unreaped_exit(pid: Option<u32>) -> std::io::Result<()> {
+    // pidfd readiness observes Linux exits even when the host masks SIGCHLD.
+    // Unsupported kernels or denied descriptors retain the portable fallback.
+    #[cfg(target_os = "linux")]
+    if let Some(pid) = pid
+        && let Ok(fd) = child_exit_fd(pid)
+    {
+        return wait_for_pidfd_exit(pid, fd).await;
+    }
+    wait_for_child_signal(pid).await
+}
+
+#[cfg(target_os = "linux")]
+async fn wait_for_pidfd_exit(
+    pid: u32,
+    fd: tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>,
+) -> std::io::Result<()> {
+    loop {
+        let mut ready = fd.readable().await?;
+        match observe_child_exit(Some(pid)) {
+            Ok(true) => return Ok(()),
+            Ok(false) => ready.clear_ready(),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn child_exit_fd(pid: u32) -> std::io::Result<tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>> {
+    use rustix::process::{Pid, PidfdFlags, pidfd_open};
+
+    let pid = i32::try_from(pid)
+        .ok()
+        .and_then(Pid::from_raw)
+        .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ECHILD))?;
+    let fd = pidfd_open(pid, PidfdFlags::empty())?;
+    tokio::io::unix::AsyncFd::new(fd)
+}
+
+#[cfg(unix)]
+async fn wait_for_child_signal(pid: Option<u32>) -> std::io::Result<()> {
+    // Subscribe before observing state so exit cannot be lost between the
+    // nonblocking check and waiting for SIGCHLD. Periodic observation also
+    // handles hosts that block delivery of that signal.
+    let mut exits = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child())?;
+    loop {
+        match observe_child_exit(pid) {
+            Ok(true) => return Ok(()),
+            Ok(false) => {
+                tokio::select! {
+                    _ = exits.recv() => {},
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => {},
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Observe terminal status without releasing the leader PID/PGID reservation.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn observe_child_exit(pid: Option<u32>) -> std::io::Result<bool> {
+    let pid = pid.ok_or_else(|| std::io::Error::from_raw_os_error(libc::ECHILD))?;
+    // SAFETY: zeroed siginfo_t is valid, waitid writes only into that value,
+    // and P_PID selects this owned child. WNOWAIT deliberately leaves reaping
+    // to Tokio after drain or process-group containment has finished.
+    unsafe {
+        let mut info: libc::siginfo_t = std::mem::zeroed();
+        if libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        ) == -1
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(info.si_pid() != 0)
+    }
+}
+
+#[cfg(unix)]
 #[allow(unsafe_code)]
 fn signal_process_group(pid: Option<u32>, signal: i32) {
     if let Some(pid) = pid {
@@ -1289,3 +1329,7 @@ mod tests;
 #[cfg(test)]
 #[path = "supervisor_policy_tests.rs"]
 mod policy_tests;
+
+#[cfg(test)]
+#[path = "supervisor_cancellation_tests.rs"]
+mod cancellation_tests;

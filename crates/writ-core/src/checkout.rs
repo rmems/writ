@@ -11,7 +11,10 @@ use std::process::Output;
 
 use crate::error::{Error, PolicyCode, Result};
 use crate::git_cmd::git_in;
-use crate::lease::{Lease, LeaseGrant, LeaseStore};
+use crate::lease::{
+    AllocateRequest, AllocationState, JobKey, Lease, LeaseGrant, LeaseStore, ReconcileOutcome,
+    attention_error,
+};
 
 /// Sentinel branch value recorded for a checkout on a detached HEAD.
 ///
@@ -81,16 +84,115 @@ impl CheckoutRegistry {
     /// common dir with other worktrees, or may be a standalone clone.
     pub fn register(&self, path: &Path, job_id: &str) -> Result<CheckoutInfo> {
         let info = inspect_checkout(path)?;
-        self.leases.grant(LeaseGrant {
+        if self.resume_or_refresh(&info, job_id)? {
+            return Ok(info);
+        }
+        self.commit_new_registration(&info, job_id)?;
+        Ok(info)
+    }
+
+    fn resume_or_refresh(&self, info: &CheckoutInfo, job_id: &str) -> Result<bool> {
+        let key = registration_job_key(info, job_id);
+        let Some(existing) = self.leases.find_job(key)? else {
+            return Ok(false);
+        };
+        match existing.allocation_state {
+            AllocationState::Active => {
+                if !registration_matches_lease(info, &existing) {
+                    return Err(registration_identity_error(info, job_id, &existing));
+                }
+                self.leases.grant(registration_grant(info, job_id))?;
+                Ok(true)
+            }
+            AllocationState::Released => {
+                self.leases.grant(registration_grant(info, job_id))?;
+                Ok(true)
+            }
+            AllocationState::Tombstoned => Err(tombstoned_job_error(info, job_id)),
+            AllocationState::Prepared
+            | AllocationState::Mutating
+            | AllocationState::NeedsAttention
+            | AllocationState::Aborted
+            | AllocationState::Unknown => self.resume_interrupted(info, job_id, &existing),
+        }
+    }
+
+    fn resume_interrupted(
+        &self,
+        info: &CheckoutInfo,
+        job_id: &str,
+        existing: &Lease,
+    ) -> Result<bool> {
+        if !registration_matches_lease(info, existing) {
+            return Err(registration_identity_error(info, job_id, existing));
+        }
+        let expected_operation_id = existing.operation_id.clone();
+        let Some(outcome) = self
+            .leases
+            .reconcile(registration_job_key(info, job_id), &info.common_dir)?
+        else {
+            return Ok(false);
+        };
+        match outcome {
+            ReconcileOutcome::Promoted { lease, .. }
+            | ReconcileOutcome::AlreadyActive { lease, .. } => {
+                self.ensure_reconciled_identity(info, &expected_operation_id, &lease)?;
+                Ok(true)
+            }
+            ReconcileOutcome::Retry { .. } => Ok(false),
+            ReconcileOutcome::NeedsAttention { lease, inspection } => {
+                Err(attention_error(&lease, &inspection))
+            }
+            ReconcileOutcome::Released { lease, .. } => {
+                self.ensure_reconciled_identity(info, &expected_operation_id, &lease)?;
+                self.leases.grant(registration_grant(info, job_id))?;
+                Ok(true)
+            }
+            ReconcileOutcome::Tombstoned { lease, .. } => Err(tombstoned_op_error(&lease)),
+        }
+    }
+
+    fn ensure_reconciled_identity(
+        &self,
+        info: &CheckoutInfo,
+        expected_operation_id: &str,
+        outcome_lease: &Lease,
+    ) -> Result<()> {
+        let job_id = &outcome_lease.job_id;
+        let current = self.leases.find_job(registration_job_key(info, job_id))?;
+        if reconciled_identity_matches(info, expected_operation_id, outcome_lease)
+            && current.as_ref().is_some_and(|lease| {
+                reconciled_identity_matches(info, expected_operation_id, lease)
+            })
+        {
+            return Ok(());
+        }
+        Err(current.as_ref().map_or_else(
+            || changed_during_reconcile_error(info, job_id, expected_operation_id),
+            |lease| registration_identity_error(info, job_id, lease),
+        ))
+    }
+
+    fn commit_new_registration(&self, info: &CheckoutInfo, job_id: &str) -> Result<()> {
+        let requested_start_point = info
+            .branch
+            .as_deref()
+            .map(|name| format!("refs/heads/{name}"))
+            .unwrap_or_else(|| "HEAD".to_owned());
+        let prepared = self.leases.prepare_allocate(AllocateRequest {
             repo: &info.common_dir,
             owner: &info.owner,
             repo_name: &info.repo_name,
             job_id,
             branch: info.branch.as_deref().unwrap_or(DETACHED_BRANCH),
             worktree_path: &info.path,
+            requested_start_point: &requested_start_point,
             start_commit: info.head_commit.as_deref().unwrap_or(""),
+            ttl: None,
         })?;
-        Ok(info)
+        self.leases.mark_mutating(&prepared.operation_id)?;
+        self.leases.commit_allocate(&prepared.operation_id)?;
+        Ok(())
     }
 
     /// Release the coordination record for `path` without touching the
@@ -105,6 +207,99 @@ impl CheckoutRegistry {
     /// Currently held (unreleased) registrations.
     pub fn registered(&self) -> Result<Vec<Lease>> {
         self.leases.list_active()
+    }
+}
+
+fn registration_job_key<'a>(info: &'a CheckoutInfo, job_id: &'a str) -> JobKey<'a> {
+    JobKey {
+        owner: &info.owner,
+        repo_name: &info.repo_name,
+        job_id,
+    }
+}
+
+fn registration_matches_lease(info: &CheckoutInfo, lease: &Lease) -> bool {
+    let branch = info.branch.as_deref().unwrap_or(DETACHED_BRANCH);
+    let path_matches =
+        crate::paths::same_existing_path(Path::new(&lease.worktree_path), &info.path)
+            || lease.worktree_path == info.path.to_string_lossy();
+    let repo_matches = crate::paths::same_existing_path(Path::new(&lease.repo), &info.common_dir)
+        || lease.repo == info.common_dir.to_string_lossy();
+    path_matches && repo_matches && lease.branch == branch
+}
+
+/// A reconciled outcome still authorizes success only when it carries the
+/// interrupted operation the caller validated and still describes this
+/// checkout. Operation binding catches a replacement row that happens to
+/// share the same path/branch.
+fn reconciled_identity_matches(
+    info: &CheckoutInfo,
+    expected_operation_id: &str,
+    lease: &Lease,
+) -> bool {
+    lease.operation_id == expected_operation_id && registration_matches_lease(info, lease)
+}
+
+fn registration_identity_error(info: &CheckoutInfo, job_id: &str, existing: &Lease) -> Error {
+    Error::PolicyViolation {
+        code: PolicyCode::LeaseConflict,
+        message: format!(
+            "lease for {}/{}/{job_id} protects `{}` on `{}`; refusing to register it for `{}` on `{}`",
+            info.owner,
+            info.repo_name,
+            existing.worktree_path,
+            existing.branch,
+            info.path.display(),
+            info.branch.as_deref().unwrap_or(DETACHED_BRANCH)
+        ),
+    }
+}
+
+fn changed_during_reconcile_error(
+    info: &CheckoutInfo,
+    job_id: &str,
+    expected_operation_id: &str,
+) -> Error {
+    Error::PolicyViolation {
+        code: PolicyCode::LeaseConflict,
+        message: format!(
+            "interrupted lease for {}/{}/{job_id} changed during reconcile (expected operation `{expected_operation_id}`); refusing to report success for `{}`",
+            info.owner,
+            info.repo_name,
+            info.path.display(),
+        ),
+    }
+}
+
+fn registration_grant<'a>(info: &'a CheckoutInfo, job_id: &'a str) -> LeaseGrant<'a> {
+    LeaseGrant {
+        repo: &info.common_dir,
+        owner: &info.owner,
+        repo_name: &info.repo_name,
+        job_id,
+        branch: info.branch.as_deref().unwrap_or(DETACHED_BRANCH),
+        worktree_path: &info.path,
+        start_commit: info.head_commit.as_deref().unwrap_or(""),
+    }
+}
+
+fn tombstoned_job_error(info: &CheckoutInfo, job_id: &str) -> Error {
+    Error::PolicyViolation {
+        code: PolicyCode::LeaseTombstoned,
+        message: format!(
+            "refusing to resurrect tombstoned lease for {}/{}/{job_id}",
+            info.owner, info.repo_name
+        ),
+    }
+}
+
+fn tombstoned_op_error(lease: &Lease) -> Error {
+    Error::PolicyViolation {
+        code: PolicyCode::LeaseTombstoned,
+        message: format!(
+            "refusing to resurrect tombstoned lease {}",
+            lease.operation_id
+        ),
     }
 }
 
@@ -449,6 +644,44 @@ mod tests {
     }
 
     #[test]
+    fn active_registration_rejects_a_branch_switch() {
+        let (tmp, repo) = init_repo();
+        let wt = tmp.path().join("elsewhere/wt-a");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "job/a",
+                wt.to_str().unwrap(),
+            ],
+        );
+        let store = LeaseStore::open(tmp.path().join("leases.db")).unwrap();
+        let registry = CheckoutRegistry::with_store(store).unwrap();
+        registry.register(&wt, "job-a").unwrap();
+        git(&wt, &["switch", "--quiet", "-c", "job/b"]);
+
+        let err = registry.register(&wt, "job-a").unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::LeaseConflict,
+                ..
+            }
+        ));
+        let info = inspect_checkout(&wt).unwrap();
+        let lease = registry
+            .leases
+            .find_job(registration_job_key(&info, "job-a"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(lease.branch, "job/a");
+    }
+
+    #[test]
     fn two_independent_checkouts_share_one_store() {
         let (tmp, repo) = init_repo();
         let store = LeaseStore::open(tmp.path().join("leases.db")).unwrap();
@@ -575,6 +808,114 @@ mod tests {
     }
 
     #[test]
+    fn register_does_not_resume_interrupted_lease_for_a_different_checkout() {
+        let (tmp, repo) = init_repo();
+        let wt1 = tmp.path().join("wts/one");
+        let wt2 = tmp.path().join("wts/two");
+        for (wt, branch) in [(&wt1, "job/one"), (&wt2, "job/two")] {
+            git(
+                &repo,
+                &[
+                    "worktree",
+                    "add",
+                    "--quiet",
+                    "-b",
+                    branch,
+                    wt.to_str().unwrap(),
+                ],
+            );
+        }
+
+        let store_path = tmp.path().join("leases.db");
+        let registry =
+            CheckoutRegistry::with_store(LeaseStore::open(&store_path).unwrap()).unwrap();
+        registry.register(&wt1, "shared-job").unwrap();
+        let conn = rusqlite::Connection::open(&store_path).unwrap();
+        conn.execute(
+            "UPDATE leases SET allocation_state = 'PREPARED', mode = 'UNASSIGNED' WHERE job_id = 'shared-job'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let err = registry.register(&wt2, "shared-job").unwrap_err();
+        assert!(matches!(
+            err,
+            crate::error::Error::PolicyViolation {
+                code: crate::error::PolicyCode::LeaseConflict,
+                ..
+            }
+        ));
+        let info = inspect_checkout(&wt1).unwrap();
+        let stored = LeaseStore::open(&store_path)
+            .unwrap()
+            .find_job(JobKey {
+                owner: &info.owner,
+                repo_name: &info.repo_name,
+                job_id: "shared-job",
+            })
+            .unwrap()
+            .unwrap();
+        assert!(
+            std::path::Path::new(&stored.worktree_path)
+                .ends_with(std::path::Path::new("wts").join("one")),
+            "stored path should remain the original checkout, got {}",
+            stored.worktree_path
+        );
+        assert_eq!(stored.allocation_state, AllocationState::Prepared);
+    }
+
+    #[test]
+    fn replacement_operation_does_not_authorize_reconcile_success() {
+        let (tmp, repo) = init_repo();
+        let wt = tmp.path().join("wts/one");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "job/one",
+                wt.to_str().unwrap(),
+            ],
+        );
+        let store_path = tmp.path().join("leases.db");
+        let registry =
+            CheckoutRegistry::with_store(LeaseStore::open(&store_path).unwrap()).unwrap();
+        registry.register(&wt, "shared-job").unwrap();
+        let info = inspect_checkout(&wt).unwrap();
+        let stored = registry
+            .leases
+            .find_job(registration_job_key(&info, "shared-job"))
+            .unwrap()
+            .unwrap();
+        let replacement = rusqlite::Connection::open(&store_path).unwrap();
+        replacement
+            .execute(
+                "UPDATE leases SET operation_id = 'replacement-operation' WHERE job_id = 'shared-job'",
+                [],
+            )
+            .unwrap();
+        drop(replacement);
+        let replacement = registry
+            .leases
+            .find_job(registration_job_key(&info, "shared-job"))
+            .unwrap()
+            .unwrap();
+        let err = registry
+            .ensure_reconciled_identity(&info, &stored.operation_id, &replacement)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyViolation {
+                code: PolicyCode::LeaseConflict,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn register_second_active_path_for_same_job_fails() {
         let (tmp, repo) = init_repo();
         let wt1 = tmp.path().join("wts/one");
@@ -650,6 +991,36 @@ mod tests {
         let active = registry.registered().unwrap();
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].job_id, "job-b");
+    }
+
+    #[test]
+    fn register_keeps_unknown_allocation_state_non_retryable() {
+        let (tmp, repo) = init_repo();
+        let store_path = tmp.path().join("leases.db");
+        let registry =
+            CheckoutRegistry::with_store(LeaseStore::open(&store_path).unwrap()).unwrap();
+        registry.register(&repo, "job-a").unwrap();
+        let conn = rusqlite::Connection::open(&store_path).unwrap();
+        conn.execute(
+            "UPDATE leases SET allocation_state = 'FUTURE_STATE' WHERE job_id = 'job-a'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(matches!(
+            registry.register(&repo, "job-a"),
+            Err(Error::LeaseAttention(_))
+        ));
+        let conn = rusqlite::Connection::open(&store_path).unwrap();
+        let stored: String = conn
+            .query_row(
+                "SELECT allocation_state FROM leases WHERE job_id = 'job-a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, "FUTURE_STATE");
     }
 
     #[test]

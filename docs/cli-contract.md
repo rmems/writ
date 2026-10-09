@@ -2,7 +2,7 @@
 
 This reference records the command surface observed at commit
 `9537f6703b52cd770aa643f1e0938bfa02ca32f4` (2026-09-22). It is a compatibility
-snapshot, not a promise that future releases will retain deprecated commands.
+snapshot, updated for the collaboration-policy removal on 2026-10-02. Deprecated commands remain compatibility paths.
 The inventory was checked against `writ --help`, each subcommand's help, the
 Rust dispatch in `crates/writ/src/main.rs`, and the native CLI/contract tests.
 
@@ -26,9 +26,10 @@ version of every payload.
 | --- | --- | --- | --- | --- | --- |
 | `writ` (no subcommand) | Current | Human: no output. JSON: bootstrap envelope. | `cli.bootstrap`; v1 / n/a | 0 | Read-only; no store is opened. |
 | `status`, `jobs` | Current | Human collaboration summary or JSON snapshot. | `cli.status`, `cli.jobs`; **v2 / v2** | 0 on a readable or missing store; 1 on load/query failure. | Read-only view of the same-host SQLite lease store. A missing store is an empty view and is not created. |
+| `ci classify [--file PATH]` | Current | Human classification summary or JSON report. Reads stdin when `--file` is omitted. | `ci.classify`; v1 / v1 with `CLASSIFY_INPUT_INVALID`. | 0 success; 1 for invalid JSON, missing/unreadable input, or input over 4 MiB. | Read-only classification of `gh pr checks` or `statusCheckRollup` JSON; does not write `watched.json`, the lease store, git, or GitHub. |
 | `git-safe …` | Current | Human execution summary plus child streams; JSON v1 result including child stdout, stderr, and exit code. | `git.safe`; v1 on an executed command; validation failures have no envelope. | Propagates child 1–255; maps other nonzero values to 1. Policy rejection is 2. | Runs the validated `git` subprocess. Effects are those of the admitted git command; writ adds no state store. |
-| `gh-safe …` | Current | Same shape as `git-safe`. | `gh.safe`; v1 on an executed command; validation failures have no envelope. | Same child-code mapping; policy rejection is 2. | Runs the validated `gh` subprocess. GitHub owns remote PR/review/check/merge policy; `gh pr merge` is rejected. No local writ persistence. |
-| `supervisor run …` | Current | Human mode emits the supervised result JSON (without an envelope); JSON mode emits an envelope. | `supervisor.run`; v1. Runtime/policy failures use v1 when the supervisor writes a response. | Human mode propagates a child code, uses 124 for timeout/kill, and 1 for spawn/unknown failure. JSON mode returns 0 for a completed supervised run even when its payload records child failure/timeout; boundary errors remain nonzero and policy errors are 2. | Owns child/process-group supervision and in-process concurrency only. It does not persist coordination state, retry, merge, push, or delete a checkout. |
+| `gh-safe …` | Current | Same shape as `git-safe`. | `gh.safe`; v1 on an executed command; validation failures have no envelope. | Same child-code mapping; policy rejection is 2. | Runs the validated `gh` subprocess. GitHub owns remote PR/review/check/merge policy. Remote actions do not require a local checkout. Local checkout/deletion forms retain ownership safeguards. No local writ persistence. |
+| `supervisor run …` | Current | Human mode emits the supervised result JSON (without an envelope); JSON mode emits an envelope. | `supervisor.run`; v1. Runtime/policy failures use v1 when the supervisor writes a response. | Human mode propagates a child code, uses 124 for timeout/kill, and 1 for spawn/unknown failure. JSON mode returns 0 for a completed supervised run even when its payload records child failure/timeout; boundary errors remain nonzero and policy errors are 2. | Owns child/process-group supervision and in-process concurrency only. It does not persist coordination state or schedule retries/actions. It executes the requested command, including host scripts; direct git commands retain local integrity checks. Checkout paths are harness-selected and need not be under `WRIT_WORKTREE_BASE`. |
 | `worktree register PATH`, `unregister PATH` | Current | Human `ok=… command=…` summary or JSON. | `worktree.register`, `worktree.unregister`; v1 / v1. | 0 success; 1 operational error; **2** when `register` hits an active lease held by another checkout path (`LEASE_CONFLICT`). | Mutate lease rows in the same-host SQLite store. They record/release an existing harness-owned checkout and never create/delete its files or branch. |
 | `worktree inspect PATH` | Current | Human summary or JSON. | `worktree.inspect`; v1 / v1. | 0 success; 1 operational error; **2** when the path is not a git checkout (`GIT_DIR_UNAVAILABLE`). | Read-only checkout metadata; does not open the lease store or register the checkout. |
 | `worktree list` | Current | Human summary or JSON. | `worktree.list`; v1 / v1. | 0 success; 1 operational error. | Reads lease rows, but when `WRIT_LEASE_PATH` is missing, `CheckoutRegistry::new()` opens the store **writable** and creates the parent directory, SQLite file, and schema before listing. |
@@ -61,6 +62,18 @@ register and inspect those checkouts; the managed `create`, `remove`, and `prune
 commands remain only for compatibility. GitHub remains authoritative for remote
 source, pull requests, reviews, checks, repository rules, and protected-branch
 merges.
+
+Direct `git-safe` branch pinning is opt-in through `--expected-branch` (or
+`SafeGitCommand::run(..., Some(branch))`). Mutating commands reject a mismatch
+when that pin is supplied. Omitting it (`None` in the library) provides no
+runtime proof of assignment; no registration or special `main`/`master` rule
+is implied. Local merge/pull WIP checks still apply without a branch pin.
+
+For a direct mutating Git command under `supervisor run`, `--expected-branch`
+is required. After acquiring the concurrency permit, supervision checks local
+merge/pull WIP first and the expected branch last, immediately before spawning
+Git. Direct nonmutating Git commands do not require that pin. These checks do
+not recursively inspect Git calls inside host scripts.
 
 There is **no `writ coord` command in this snapshot**. Planned claim, overlap,
 message, handoff, and lease-reconciliation capabilities belong to RM-825 and must
