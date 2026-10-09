@@ -428,6 +428,57 @@ fn pull_rebase_true_allowed() {
 }
 
 #[test]
+fn pull_rebase_last_option_wins() {
+    // `pull --rebase --rebase=false` is a merge pull: git applies the last
+    // rebase option, so the earlier --rebase must not admit it.
+    let err = SafeGitCommand::new(&[
+        "pull".to_owned(),
+        "--rebase".to_owned(),
+        "--rebase=false".to_owned(),
+    ])
+    .unwrap_err();
+    assert!(matches!(
+        err,
+        Error::PolicyViolation {
+            code: PolicyCode::MergeBlocked,
+            ..
+        }
+    ));
+
+    // The inverse order is an actual rebase pull.
+    SafeGitCommand::new(&[
+        "pull".to_owned(),
+        "--rebase=false".to_owned(),
+        "--rebase".to_owned(),
+    ])
+    .unwrap();
+}
+
+#[test]
+fn pull_no_rebase_last_option_wins() {
+    let err = SafeGitCommand::new(&[
+        "pull".to_owned(),
+        "--rebase".to_owned(),
+        "--no-rebase".to_owned(),
+    ])
+    .unwrap_err();
+    assert!(matches!(
+        err,
+        Error::PolicyViolation {
+            code: PolicyCode::MergeBlocked,
+            ..
+        }
+    ));
+
+    SafeGitCommand::new(&[
+        "pull".to_owned(),
+        "--no-rebase".to_owned(),
+        "--rebase".to_owned(),
+    ])
+    .unwrap();
+}
+
+#[test]
 fn rebase_attached_exec_rejected() {
     let err = SafeGitCommand::new(&["rebase".to_owned(), "-xtrue".to_owned(), "main".to_owned()])
         .unwrap_err();
@@ -540,6 +591,82 @@ fn checkout_detach_rejected() {
             ..
         }
     ));
+}
+
+#[test]
+fn checkout_force_in_short_cluster_rejected() {
+    // `checkout -fb` smuggles `-f` past the exact-flag check and discards
+    // uncommitted work; `-tf` carries the same payload behind a boolean.
+    for args in [
+        vec!["checkout", "-fb", "feature"],
+        vec!["checkout", "-tf", "feature"],
+    ] {
+        let args: Vec<String> = args.into_iter().map(str::to_owned).collect();
+        let err = SafeGitCommand::new(&args).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::PolicyViolation {
+                    code: PolicyCode::BareForcePush,
+                    ..
+                }
+            ),
+            "{args:?}: {err:?}"
+        );
+    }
+}
+
+#[test]
+fn switch_force_in_short_cluster_rejected() {
+    // `switch -fd` discards worktree changes AND detaches HEAD in one cluster.
+    let err = SafeGitCommand::new(&["switch".to_owned(), "-fd".to_owned(), "feature".to_owned()])
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        Error::PolicyViolation {
+            code: PolicyCode::BareForcePush,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn switch_detach_in_short_cluster_rejected() {
+    // `-td` hides a detach flag behind a boolean in the same cluster.
+    let err = SafeGitCommand::new(&["switch".to_owned(), "-td".to_owned(), "feature".to_owned()])
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        Error::PolicyViolation {
+            code: PolicyCode::BranchMismatch,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn switch_discard_changes_long_form_rejected() {
+    for arg in ["--discard-changes", "--discard-changes=true"] {
+        let err = SafeGitCommand::new(&["switch".to_owned(), arg.to_owned(), "feature".to_owned()])
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::PolicyViolation {
+                    code: PolicyCode::BareForcePush,
+                    ..
+                }
+            ),
+            "{arg}: {err:?}"
+        );
+    }
+}
+
+#[test]
+fn switch_create_cluster_letters_are_values_not_detach() {
+    // `switch -cd <name>` gives `d` to `-c` as its attached value, so the
+    // cluster must not be read as `--detach`.
+    SafeGitCommand::new(&["switch".to_owned(), "-cd".to_owned(), "feature".to_owned()]).unwrap();
 }
 
 #[test]

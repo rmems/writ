@@ -266,6 +266,32 @@ impl SafeGitCommand {
             });
         }
 
+        // Combined short clusters carry the same flags: `checkout -fb` discards
+        // uncommitted work like `-f`, and `switch -fd`/`-td` discard work and
+        // detach HEAD. The exact-flag and push-scoped cluster checks miss these.
+        if matches!(subcommand.as_str(), "checkout" | "switch")
+            && args
+                .iter()
+                .skip(1)
+                .any(|a| smuggled_cluster_flag(subcommand, a, 'f'))
+        {
+            return Err(Error::PolicyViolation {
+                code: PolicyCode::BareForcePush,
+                message: "bare --force/-f is not allowed; use --force-with-lease only".to_owned(),
+            });
+        }
+        if subcommand == "switch"
+            && args
+                .iter()
+                .skip(1)
+                .any(|a| smuggled_cluster_flag(subcommand, a, 'd'))
+        {
+            return Err(Error::PolicyViolation {
+                code: PolicyCode::BranchMismatch,
+                message: "git checkout/switch --detach is not allowed under hive policy".to_owned(),
+            });
+        }
+
         reject_external_write_targets(subcommand, &args[1..])?;
 
         Ok(Self {
@@ -614,23 +640,24 @@ pub fn checkout_or_switch_target(args: &[String]) -> Option<&str> {
 /// Whether `git pull` uses a non-merge history strategy.
 ///
 /// Accepts bare `--rebase`, `--rebase=true|merges|interactive`, or `--ff-only`.
-/// Rejects `--rebase=false` and `--no-rebase` (merge-style pulls).
+/// Rejects `--rebase=false` and `--no-rebase` (merge-style pulls). git applies
+/// the last rebase option, so `pull --rebase --rebase=false` is still a merge
+/// pull that must be rejected.
 fn pull_uses_safe_history_strategy(args: &[String]) -> bool {
     if args.iter().any(|a| a == "--ff-only") {
         return true;
     }
-    if args.iter().any(|a| a == "--no-rebase") {
-        return false;
-    }
+    let mut rebase = false;
     for a in args {
         if a == "--rebase" {
-            return true;
-        }
-        if let Some(v) = a.strip_prefix("--rebase=") {
-            return matches!(v, "true" | "merges" | "interactive");
+            rebase = true;
+        } else if a == "--no-rebase" {
+            rebase = false;
+        } else if let Some(v) = a.strip_prefix("--rebase=") {
+            rebase = matches!(v, "true" | "merges" | "interactive");
         }
     }
-    false
+    rebase
 }
 
 fn is_rebase_exec_option(arg: &str) -> bool {
@@ -693,6 +720,28 @@ fn is_detach_flag(subcommand: &str, arg: &str) -> bool {
     // `git switch -d` is --detach; do not treat bare `-d` on checkout (unused/rare).
     subcommand == "switch"
         && (arg == "-d" || (arg.starts_with("-d") && arg.len() > 2 && !arg.starts_with("--")))
+}
+
+/// Whether a `-xyz` short-option cluster on `checkout`/`switch` smuggles `flag`
+/// in as a real flag rather than a value-taking option's payload.
+///
+/// Scanning stops at the first value-taking letter (`checkout -b/-B`,
+/// `switch -c/-C`): the remainder of the token is that option's value, so the
+/// `d` in `switch -cd <name>` is the new branch name, not `--detach`. Scanning
+/// also stops at any non-alphabetic character.
+fn smuggled_cluster_flag(subcommand: &str, arg: &str, flag: char) -> bool {
+    if !arg.starts_with('-') || arg.starts_with("--") || arg.len() <= 2 {
+        return false;
+    }
+    let value_taking: &[char] = if subcommand == "switch" {
+        &['c', 'C']
+    } else {
+        &['b', 'B']
+    };
+    arg[1..]
+        .chars()
+        .take_while(|c| !value_taking.contains(c) && c.is_ascii_alphabetic())
+        .any(|c| c == flag)
 }
 
 /// First config key name in `git config` args (after flags), if present.
@@ -954,7 +1003,10 @@ fn is_bare_force_flag(arg: &str) -> bool {
         return true;
     }
     // Reject `--force=...` but not `--force-with-lease` / `--force-with-lease=...`.
+    // `--discard-changes` is the `git switch` long spelling of `-f`.
     arg.starts_with("--force=")
+        || arg == "--discard-changes"
+        || arg.starts_with("--discard-changes=")
 }
 
 /// Combined short options containing `f` (e.g. `-fu`, `-uf`) used with `git push`.
