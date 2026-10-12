@@ -102,26 +102,30 @@ impl LeaseStore {
                 now,
             },
         )?;
-        // Re-read the finalized row by id inside the transaction. A path
-        // lookup after commit could return a lease another job registered on
-        // the same path in the meantime, or a different released row that
-        // ties on second-resolution `released_at`.
-        let finalized = lookup_lease(
-            &tx,
-            LeaseLookup {
-                where_sql: "WHERE id = ?1",
-                sql_params: params![lease.row_id],
-                context: "lookup finalized lease",
-            },
-        )?
-        .ok_or_else(|| Error::LeaseStore {
-            context: "finalize lease",
-            message: "lease row missing after finalize".to_owned(),
-        })?;
+        let finalized = read_finalized_row(&tx, lease.row_id)?;
         tx.commit()
             .map_err(|e| lease_err("commit lease finalize", e))?;
         Ok(Some(finalized))
     }
+}
+
+/// Re-read the finalized row by id inside the write transaction. A path
+/// lookup after commit could return a lease another job registered on the
+/// same path in the meantime, or a different released row that ties on
+/// second-resolution `released_at`.
+fn read_finalized_row(tx: &rusqlite::Transaction<'_>, row_id: i64) -> Result<Lease> {
+    lookup_lease(
+        tx,
+        LeaseLookup {
+            where_sql: "WHERE id = ?1",
+            sql_params: params![row_id],
+            context: "lookup finalized lease",
+        },
+    )?
+    .ok_or_else(|| Error::LeaseStore {
+        context: "finalize lease",
+        message: "lease row missing after finalize".to_owned(),
+    })
 }
 
 struct FinalizeWrite<'a> {
