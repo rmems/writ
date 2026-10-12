@@ -957,6 +957,43 @@ mod tests {
     }
 
     #[test]
+    fn register_second_job_for_same_path_fails() {
+        let (tmp, repo) = init_repo();
+        let wt = tmp.path().join("wts/one");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "job/one",
+                wt.to_str().unwrap(),
+            ],
+        );
+
+        let store = LeaseStore::open(tmp.path().join("leases.db")).unwrap();
+        let registry = CheckoutRegistry::with_store(store).unwrap();
+        registry.register(&wt, "job-a").unwrap();
+
+        let err = registry.register(&wt, "job-b").unwrap_err();
+        assert!(matches!(
+            err,
+            crate::error::Error::PolicyViolation {
+                code: crate::error::PolicyCode::LeaseConflict,
+                ..
+            }
+        ));
+        assert_eq!(registry.registered().unwrap().len(), 1);
+
+        registry.unregister(&wt).unwrap();
+        registry.register(&wt, "job-b").unwrap();
+        let active = registry.registered().unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].job_id, "job-b");
+    }
+
+    #[test]
     fn register_keeps_unknown_allocation_state_non_retryable() {
         let (tmp, repo) = init_repo();
         let store_path = tmp.path().join("leases.db");
@@ -1014,43 +1051,6 @@ mod tests {
             .expect("deleted checkout must still release its lease");
         assert_eq!(lease.job_id, "gone-job");
         assert!(registry.registered().unwrap().is_empty());
-    }
-
-    #[test]
-    fn register_second_job_for_same_path_fails() {
-        let (tmp, repo) = init_repo();
-        let wt = tmp.path().join("wts/one");
-        git(
-            &repo,
-            &[
-                "worktree",
-                "add",
-                "--quiet",
-                "-b",
-                "job/one",
-                wt.to_str().unwrap(),
-            ],
-        );
-
-        let store = LeaseStore::open(tmp.path().join("leases.db")).unwrap();
-        let registry = CheckoutRegistry::with_store(store).unwrap();
-        registry.register(&wt, "job-a").unwrap();
-
-        let err = registry.register(&wt, "job-b").unwrap_err();
-        assert!(matches!(
-            err,
-            crate::error::Error::PolicyViolation {
-                code: crate::error::PolicyCode::LeaseConflict,
-                ..
-            }
-        ));
-        assert_eq!(registry.registered().unwrap().len(), 1);
-
-        registry.unregister(&wt).unwrap();
-        registry.register(&wt, "job-b").unwrap();
-        let active = registry.registered().unwrap();
-        assert_eq!(active.len(), 1);
-        assert_eq!(active[0].job_id, "job-b");
     }
 
     #[test]
