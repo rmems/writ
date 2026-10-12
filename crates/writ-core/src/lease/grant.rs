@@ -30,10 +30,7 @@ impl LeaseStore {
                 job_id: grant.job_id,
             },
         )?
-        .ok_or_else(|| Error::LeaseStore {
-            context: "grant lease",
-            message: "lease row missing after grant".to_owned(),
-        })?;
+        .ok_or_else(|| missing_row_error("grant lease"))?;
         tx.commit().map_err(|e| lease_err("commit grant", e))?;
         Ok(lease)
     }
@@ -122,10 +119,16 @@ fn read_finalized_row(tx: &rusqlite::Transaction<'_>, row_id: i64) -> Result<Lea
             context: "lookup finalized lease",
         },
     )?
-    .ok_or_else(|| Error::LeaseStore {
-        context: "finalize lease",
-        message: "lease row missing after finalize".to_owned(),
-    })
+    .ok_or_else(|| missing_row_error("finalize lease"))
+}
+
+/// The row a grant or finalize just wrote inside its own transaction cannot
+/// be absent; surface that as a store error rather than a panic.
+pub(super) fn missing_row_error(context: &'static str) -> Error {
+    Error::LeaseStore {
+        context,
+        message: "lease row missing after write".to_owned(),
+    }
 }
 
 struct FinalizeWrite<'a> {

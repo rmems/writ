@@ -8,6 +8,7 @@ use tempfile::tempdir;
 mod crash;
 mod cycles;
 mod grant;
+mod row_identity;
 
 struct RepoHarness {
     _temp: tempfile::TempDir,
