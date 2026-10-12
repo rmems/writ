@@ -7,8 +7,8 @@ use rusqlite::{TransactionBehavior, params};
 use super::query::{LIVE_PATH_LOOKUP, LeaseLookup, lookup_lease};
 use super::{
     AllocationState, Error, JobKey, Lease, LeaseGrant, LeaseMode, LeaseStore, PolicyCode, Result,
-    lease_err, new_operation_id, now_secs, occupant, path_text, schema, stored_branch_ref,
-    terminal_error,
+    lease_err, lookup_job, new_operation_id, now_secs, occupant, path_text, schema,
+    stored_branch_ref, terminal_error,
 };
 
 impl LeaseStore {
@@ -19,17 +19,20 @@ impl LeaseStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| lease_err("begin grant", e))?;
         write_grant(&tx, grant, now)?;
+        // Read the granted row inside the same write transaction so the
+        // returned lease is the one this grant wrote, not whatever another
+        // connection does to the job between commit and a later lookup.
+        let lease = lookup_job(
+            &tx,
+            JobKey {
+                owner: grant.owner,
+                repo_name: grant.repo_name,
+                job_id: grant.job_id,
+            },
+        )?
+        .ok_or_else(|| missing_row_error("grant lease"))?;
         tx.commit().map_err(|e| lease_err("commit grant", e))?;
-        drop(conn);
-        self.find_job(JobKey {
-            owner: grant.owner,
-            repo_name: grant.repo_name,
-            job_id: grant.job_id,
-        })?
-        .ok_or_else(|| Error::LeaseStore {
-            context: "grant lease",
-            message: "lease row missing after grant".to_owned(),
-        })
+        Ok(lease)
     }
 
     /// Durable resume identity for an owner/repo/job/branch, including released rows.
@@ -78,8 +81,7 @@ impl LeaseStore {
         {
             tx.commit()
                 .map_err(|e| lease_err("commit lease finalize", e))?;
-            drop(conn);
-            return self.find_by_path(worktree_path);
+            return Ok(Some(lease));
         }
         let (released_at, tombstoned_at, kind) = if state == AllocationState::Tombstoned {
             (lease.released_at, Some(now), "TOMBSTONE")
@@ -97,10 +99,35 @@ impl LeaseStore {
                 now,
             },
         )?;
+        let finalized = read_finalized_row(&tx, lease.row_id)?;
         tx.commit()
             .map_err(|e| lease_err("commit lease finalize", e))?;
-        drop(conn);
-        self.find_by_path(worktree_path)
+        Ok(Some(finalized))
+    }
+}
+
+/// Re-read the finalized row by id inside the write transaction. A path
+/// lookup after commit could return a lease another job registered on the
+/// same path in the meantime, or a different released row that ties on
+/// second-resolution `released_at`.
+fn read_finalized_row(tx: &rusqlite::Transaction<'_>, row_id: i64) -> Result<Lease> {
+    lookup_lease(
+        tx,
+        LeaseLookup {
+            where_sql: "WHERE id = ?1",
+            sql_params: params![row_id],
+            context: "lookup finalized lease",
+        },
+    )?
+    .ok_or_else(|| missing_row_error("finalize lease"))
+}
+
+/// The row a grant or finalize just wrote inside its own transaction cannot
+/// be absent; surface that as a store error rather than a panic.
+pub(super) fn missing_row_error(context: &'static str) -> Error {
+    Error::LeaseStore {
+        context,
+        message: "lease row missing after write".to_owned(),
     }
 }
 
