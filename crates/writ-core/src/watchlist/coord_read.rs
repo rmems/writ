@@ -3,9 +3,12 @@
 //! Missing tables are not an error: this consumer never creates them.
 
 use std::collections::BTreeMap;
+#[cfg(test)]
 use std::path::Path;
 
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+#[cfg(test)]
+use rusqlite::OpenFlags;
+use rusqlite::{Connection, OptionalExtension, params};
 
 use super::types::CoordOverlay;
 
@@ -49,10 +52,9 @@ struct ClaimRow {
 struct MessageRow {
     kind: String,
     from_agent_id: String,
-    from_job_id: String,
-    to_owner: Option<String>,
-    to_repo_name: Option<String>,
-    to_job_id: Option<String>,
+    from: JobId,
+    to: Option<JobId>,
+    owner_generation: i64,
     body: String,
     acked_at: Option<i64>,
 }
@@ -60,7 +62,7 @@ struct MessageRow {
 impl CoordSnapshot {
     pub(crate) fn overlay_for(&self, key: &JobId) -> CoordOverlay {
         let claim = self.claims.get(key);
-        let waiting_on = waiting_on_for(&self.messages, key);
+        let waiting_on = waiting_on_for(&self.messages, key, &self.claims);
         let overlaps = overlaps_for(&self.messages, key);
         CoordOverlay {
             agent_id: claim.map(|c| c.agent_id.clone()),
@@ -75,15 +77,24 @@ impl CoordSnapshot {
     }
 }
 
-/// Open the lease DB read-only and load coord rows when the tables exist.
-pub(crate) fn load_coord_snapshot(path: &Path) -> CoordSnapshot {
+/// Load coord rows from an existing lease-store snapshot.
+pub(crate) fn load_coord_snapshot_on(conn: &Connection) -> CoordSnapshot {
+    load_coord_snapshot_from(conn)
+}
+
+#[cfg(test)]
+fn load_coord_snapshot(path: &Path) -> CoordSnapshot {
     let Ok(conn) = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY) else {
         return CoordSnapshot::default();
     };
-    if !table_exists(&conn, "coord_claims") {
+    load_coord_snapshot_from(&conn)
+}
+
+fn load_coord_snapshot_from(conn: &Connection) -> CoordSnapshot {
+    if !table_exists(conn, "coord_claims") {
         return CoordSnapshot::default();
     }
-    let claims = match load_claims(&conn) {
+    let claims = match load_claims(conn) {
         Ok(claims) => claims,
         Err(err) => {
             return CoordSnapshot {
@@ -93,8 +104,8 @@ pub(crate) fn load_coord_snapshot(path: &Path) -> CoordSnapshot {
             };
         }
     };
-    let messages = if table_exists(&conn, "coord_messages") {
-        match load_messages(&conn) {
+    let messages = if table_exists(conn, "coord_messages") {
+        match load_messages(conn) {
             Ok(messages) => messages,
             Err(err) => {
                 return CoordSnapshot {
@@ -159,23 +170,37 @@ fn claim_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(JobId, ClaimRow)
 
 fn load_messages(conn: &Connection) -> rusqlite::Result<Vec<MessageRow>> {
     let mut stmt = conn.prepare(
-        "SELECT kind, from_agent_id, from_job_id, to_owner, to_repo_name,
-                to_job_id, body, acked_at FROM coord_messages",
+        "SELECT kind, from_agent_id, from_owner, from_repo_name, from_job_id,
+                to_owner, to_repo_name,
+                to_job_id, body, acked_at, owner_generation FROM coord_messages",
     )?;
     let rows = stmt.query_map([], message_from_row)?;
     rows.collect()
 }
 
 fn message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageRow> {
+    let to_owner: Option<String> = row.get(5)?;
+    let to_repo_name: Option<String> = row.get(6)?;
+    let to_job_id: Option<String> = row.get(7)?;
     Ok(MessageRow {
         kind: row.get(0)?,
         from_agent_id: row.get(1)?,
-        from_job_id: row.get(2)?,
-        to_owner: row.get(3)?,
-        to_repo_name: row.get(4)?,
-        to_job_id: row.get(5)?,
-        body: row.get(6)?,
-        acked_at: row.get(7)?,
+        from: JobId {
+            owner: row.get(2)?,
+            repo_name: row.get(3)?,
+            job_id: row.get(4)?,
+        },
+        to: match (to_owner, to_repo_name, to_job_id) {
+            (Some(owner), Some(repo_name), Some(job_id)) => Some(JobId {
+                owner,
+                repo_name,
+                job_id,
+            }),
+            _ => None,
+        },
+        body: row.get(8)?,
+        acked_at: row.get(9)?,
+        owner_generation: row.get(10)?,
     })
 }
 
@@ -183,34 +208,49 @@ fn parse_paths(raw: &str) -> Vec<String> {
     serde_json::from_str::<Vec<String>>(raw).unwrap_or_default()
 }
 
-fn waiting_on_for(messages: &[MessageRow], key: &JobId) -> Option<String> {
+fn waiting_on_for(
+    messages: &[MessageRow],
+    key: &JobId,
+    claims: &BTreeMap<JobId, ClaimRow>,
+) -> Option<String> {
     messages.iter().find_map(|msg| {
         if msg.acked_at.is_some() || !msg.targets(key) {
             return None;
         }
-        match msg.kind.as_str() {
-            "help" | "handoff" | "dependency" => Some(format!(
-                "{}:{}:{}",
-                msg.kind, msg.from_agent_id, msg.from_job_id
-            )),
-            _ => None,
-        }
+        waiting_label(msg, claims)
     })
+}
+
+fn waiting_label(msg: &MessageRow, claims: &BTreeMap<JobId, ClaimRow>) -> Option<String> {
+    match msg.kind.as_str() {
+        // Handoffs are stamped with the source claim's generation; compare
+        // against the source claim so cross-job handoffs are not filtered by
+        // the recipient's unrelated generation. Same-job handoffs resolve to
+        // the same row, preserving the existing stale filter.
+        "handoff" if source_generation(claims, msg) != Some(msg.owner_generation) => None,
+        "help" | "handoff" | "dependency" | "blocker" => Some(format!(
+            "{}:{}:{}",
+            msg.kind, msg.from_agent_id, msg.from.job_id
+        )),
+        _ => None,
+    }
+}
+
+fn source_generation(claims: &BTreeMap<JobId, ClaimRow>, msg: &MessageRow) -> Option<i64> {
+    claims.get(&msg.from).map(|claim| claim.owner_generation)
 }
 
 fn overlaps_for(messages: &[MessageRow], key: &JobId) -> Vec<String> {
     messages
         .iter()
         .filter(|msg| msg.acked_at.is_none() && msg.kind == "overlap" && msg.targets(key))
-        .map(|msg| format!("overlap:{}:{}", msg.from_job_id, msg.body))
+        .map(|msg| format!("overlap:{}:{}", msg.from.job_id, msg.body))
         .collect()
 }
 
 impl MessageRow {
     fn targets(&self, key: &JobId) -> bool {
-        self.to_owner.as_deref() == Some(key.owner.as_str())
-            && self.to_repo_name.as_deref() == Some(key.repo_name.as_str())
-            && self.to_job_id.as_deref() == Some(key.job_id.as_str())
+        self.to.as_ref() == Some(key)
     }
 }
 
@@ -218,6 +258,59 @@ impl MessageRow {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    const COORD_SCHEMA: &str = "
+        CREATE TABLE coord_claims (
+            owner TEXT, repo_name TEXT, job_id TEXT, agent_id TEXT,
+            session_id TEXT, intent TEXT, declared_paths TEXT,
+            owner_generation INTEGER, paused_at INTEGER
+        );
+        CREATE TABLE coord_messages (
+            kind TEXT, from_agent_id TEXT, from_owner TEXT, from_repo_name TEXT,
+            from_job_id TEXT, to_owner TEXT, to_repo_name TEXT, to_job_id TEXT,
+            body TEXT, acked_at INTEGER, owner_generation INTEGER
+        );
+    ";
+
+    fn snapshot_with(rows: &str) -> CoordSnapshot {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("leases.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(COORD_SCHEMA).unwrap();
+        conn.execute_batch(rows).unwrap();
+        drop(conn);
+        load_coord_snapshot(&path)
+    }
+
+    fn claim(generation: i64) -> ClaimRow {
+        ClaimRow {
+            agent_id: "agent".to_owned(),
+            session_id: None,
+            intent: None,
+            owner_generation: generation,
+            paused_at: None,
+            declared_paths: Vec::new(),
+        }
+    }
+
+    fn cross_job_handoff(source_generation: i64, message_generation: i64) -> Option<String> {
+        let recipient = JobId::new("acme", "sample", "job-1");
+        let source = JobId::new("acme", "sample", "job-2");
+        let claims = BTreeMap::from([
+            (recipient.clone(), claim(7)),
+            (source.clone(), claim(source_generation)),
+        ]);
+        let message = MessageRow {
+            kind: "handoff".to_owned(),
+            from_agent_id: "agent-b".to_owned(),
+            from: source,
+            to: Some(recipient.clone()),
+            owner_generation: message_generation,
+            body: "take over".to_owned(),
+            acked_at: None,
+        };
+        waiting_on_for(&[message], &recipient, &claims)
+    }
 
     #[test]
     fn missing_tables_are_unavailable_not_an_error() {
@@ -233,42 +326,79 @@ mod tests {
 
     #[test]
     fn reads_paused_claim_and_unacked_help() {
-        let tmp = tempdir().unwrap();
-        let path = tmp.path().join("leases.db");
-        let conn = Connection::open(&path).unwrap();
-        conn.execute_batch(
+        let snap = snapshot_with(
             "
-            CREATE TABLE coord_claims (
-                owner TEXT, repo_name TEXT, job_id TEXT, agent_id TEXT,
-                session_id TEXT, intent TEXT, declared_paths TEXT,
-                owner_generation INTEGER, paused_at INTEGER
-            );
-            CREATE TABLE coord_messages (
-                kind TEXT, from_agent_id TEXT, from_job_id TEXT,
-                to_owner TEXT, to_repo_name TEXT, to_job_id TEXT,
-                body TEXT, acked_at INTEGER
-            );
             INSERT INTO coord_claims VALUES (
                 'acme','sample','job-1','agent-a','sess-1','fix',
                 '[\"crates/writ-core\"]', 2, 99
             );
             INSERT INTO coord_messages VALUES (
-                'help','agent-b','job-2','acme','sample','job-1','need review', NULL
+                'help','agent-b','acme','sample','job-2','acme','sample','job-1',
+                'need review', NULL, 2
             );
             INSERT INTO coord_messages VALUES (
-                'overlap','agent-b','job-2','acme','sample','job-1','crates/a', NULL
+                'overlap','agent-b','acme','sample','job-2','acme','sample','job-1',
+                'crates/a', NULL, 2
             );
             ",
-        )
-        .unwrap();
-        drop(conn);
-        let snap = load_coord_snapshot(&path);
+        );
         assert!(snap.available);
         let overlay = snap.overlay_for(&JobId::new("acme", "sample", "job-1"));
         assert_eq!(overlay.agent_id.as_deref(), Some("agent-a"));
         assert!(overlay.paused);
         assert_eq!(overlay.waiting_on.as_deref(), Some("help:agent-b:job-2"));
         assert_eq!(overlay.overlaps.len(), 1);
+    }
+
+    #[test]
+    fn messages_shape_waiting_state() {
+        let cases = [
+            (
+                "
+                INSERT INTO coord_claims VALUES (
+                    'acme','sample','job-1','agent-a',NULL,NULL,'[]', 1, NULL
+                );
+                INSERT INTO coord_messages VALUES (
+                    'blocker','agent-b','acme','sample','job-2','acme','sample','job-1',
+                    'blocked', NULL, 1
+                );
+                ",
+                Some("blocker:agent-b:job-2"),
+            ),
+            (
+                "
+                INSERT INTO coord_claims VALUES (
+                    'acme','sample','job-1','agent-a',NULL,NULL,'[]', 2, NULL
+                );
+                INSERT INTO coord_messages VALUES (
+                    'handoff','agent-a','acme','sample','job-1','acme','sample','job-1',
+                    'take over', NULL, 1
+                );
+                ",
+                None,
+            ),
+        ];
+
+        for (rows, expected) in cases {
+            let snap = snapshot_with(rows);
+            let overlay = snap.overlay_for(&JobId::new("acme", "sample", "job-1"));
+            assert_eq!(overlay.waiting_on.as_deref(), expected);
+        }
+    }
+
+    #[test]
+    fn cross_job_handoff_uses_source_generation() {
+        // Recipient generation (7) differs from the message (3), but the source
+        // claim generation matches, so the handoff stays visible.
+        assert_eq!(
+            cross_job_handoff(3, 3).as_deref(),
+            Some("handoff:agent-b:job-2")
+        );
+    }
+
+    #[test]
+    fn stale_source_generation_hides_cross_job_handoff() {
+        assert!(cross_job_handoff(4, 3).is_none());
     }
 
     #[test]

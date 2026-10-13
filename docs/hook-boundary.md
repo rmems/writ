@@ -46,8 +46,8 @@ In a throwaway git repo, not a live multi-repo settings file:
 }
 ```
 
-3. Ask Claude Code to run `git push --force`, `git mergetool`, `gh pr merge`, and `gh api`. Each must be blocked with the policy reason visible. A `git merge <feature>` on an assigned feature branch with a clean tree must be admitted.
-4. Add a second PreToolUse hook that prints `{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow"}}` and exits 0. The force-push and merge commands must still be blocked.
+3. Use validation-only hook payloads for `git push --force` and a local checkout-changing `gh pr checkout`; verify their policy rejection. Verify payloads for remote `gh pr ready`, `update-branch` and `merge` are admitted for an allowed owner, without actually invoking a remote mutation. A local merge in the assigned clean checkout must be admitted; dirty-WIP integration must be refused.
+4. Add a second PreToolUse hook that prints `{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow"}}` and exits 0. The rejected local-integrity commands must still be blocked.
 5. Confirm a normal session (`git status`, `git log`, `git commit`, `git push` to the assigned branch, `git rebase` onto the base, `gh pr view`, `gh pr list`) is not blocked.
 
 Do not run `writ install` against a shared `~/.claude/settings.json` until that burn-in is complete. `writ install` is not part of this issue.
@@ -64,7 +64,7 @@ Do not run `writ install` against a shared `~/.claude/settings.json` until that 
 | Harness-owned lifecycle | `WorktreeCreate`/`WorktreeRemove` update coordination records only; they never create or delete a checkout |
 | Path escape | sandbox tests on the deprecated managed-create path |
 | Branch/`HEAD` postcondition | residual typed evidence, no automatic cleanup |
-| Merge / auto-merge / merge-queue spellings | `PreToolUse` corpus |
+| Remote PR actions vs local checkout changes | `PreToolUse` admission corpus, without executing remote mutations |
 | Bare force-push vs `--force-with-lease` | hook CLI |
 | Protected paths | Bash writes to `.claude/settings.json` / enforcer |
 | Child timeout leaves no live child | supervisor (Unix `/proc` check) |
@@ -72,4 +72,4 @@ Do not run `writ install` against a shared `~/.claude/settings.json` until that 
 | Unrecognized `hook_event_name` | exit 0, no decision |
 | False-positive corpus | listed ordinary commands must pass |
 
-Prompt-only GitHub PR merge and force-push rules in `AGENTS.md` / `SKILL.md` remain as defense in depth until `writ install` and burn-in land. Local feature-branch merge is allowlisted. The Rust hook is now the testable boundary; it is not yet registered by default.
+The optional hook enforces the same local integrity checks as direct helpers for recognized commands. It is not a universal shell sandbox or a second GitHub authorization layer. The checked-in configuration has no required session helper.

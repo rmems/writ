@@ -307,7 +307,7 @@ impl WorktreeManager {
         if !canonical_path.exists() {
             if let Some(lease) = observed.as_ref() {
                 prune_stale_registration(Path::new(&lease.repo))?;
-                leases.release_if_current(lease)?;
+                leases.release_by_path(&canonical_path)?;
             }
             return Ok(());
         }
@@ -342,8 +342,8 @@ impl WorktreeManager {
 
         // Also clean up empty parent directories
         cleanup_empty_parents(&canonical_path, base);
-        if let Some(lease) = observed.as_ref() {
-            leases.release_if_current(lease)?;
+        if observed.is_some() {
+            leases.release_by_path(&canonical_path)?;
         }
 
         Ok(())
@@ -478,8 +478,8 @@ fn validate_repo_root(repo_root: &Path) -> Result<()> {
 /// owner. Repositories without a parseable GitHub `origin` that previously
 /// succeeded at `create` will now be rejected here. This is intended: without a
 /// verifiable origin the ownership claim cannot be proven, so the tighter check
-/// is required and must not be loosened. The equivalent mutating `gh pr` path
-/// applies the same origin binding via `git_safe::bind_gh_repo_selector_to_origin`.
+/// is required for this managed-worktree operation. Remote GitHub operations
+/// use repository owner checks without requiring a local checkout.
 fn bind_owner_to_origin(repo_root: &Path, requested_owner: &str) -> Result<()> {
     let origin_slug = crate::git_safe::origin_github_slug(repo_root)?;
     let origin_owner = crate::git_safe::github_owner_name(&origin_slug);

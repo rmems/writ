@@ -7,8 +7,7 @@ body:
       value: |
         Use this template for a new `writ` capability. Keep the write-up short
         enough that a worker can act without a second round trip. Use only the
-        canonical labels in CONTRIBUTING.md. Runtime merge, auto-merge, merge
-        queues, and bare `--force` are forbidden.
+        canonical labels in CONTRIBUTING.md. Protect existing work and follow the repository contribution contract.
 
   - type: textarea
     id: summary
@@ -59,8 +58,7 @@ body:
     id: linear
     attributes:
       label: Linear
-      description: Planning twin. Keep this footer even when no twin exists yet; replace the placeholders when it does.
-      value: |
-        Linear: <url> (`RM-N`)
+      description: Optional existing task link. Leave blank when no Linear task exists; contributors need no Linear account.
+      placeholder: "https://linear.app/your-team/issue/TEAM-123"
     validations:
-      required: true
+      required: false

@@ -318,3 +318,10 @@ qodana/
 .qlty/results
 .qlty/plugin_cachedir
 .qlty/tmp
+
+# -----------------------------------------------------------------------------
+# Amp orb runtime
+# -----------------------------------------------------------------------------
+# Portal registrations are written per orb. `.amp/services.yaml` is intentional
+# project configuration and stays tracked.
+.amp/portals/*
