@@ -149,6 +149,19 @@ impl OwnerAllowlist {
             message: format!("owner `{normalized}` is not on the configured allowlist"),
         })
     }
+
+    /// Reject unrestricted multi-owner discovery when the allowlist is empty.
+    pub fn enforce_discovery(&self) -> Result<()> {
+        if self.is_empty() {
+            return Err(Error::PolicyViolation {
+                code: PolicyCode::OwnerNotAllowed,
+                message:
+                    "owner allowlist is empty; set WRIT_ALLOWED_OWNERS or pass --allowed-owners"
+                        .to_owned(),
+            });
+        }
+        Ok(())
+    }
 }
 
 fn nonempty_env(key: &str) -> Option<String> {

@@ -1,6 +1,6 @@
 ---
 name: writ
-description: Use when discovering Linear or GitHub work, spawning isolated writers, publishing an honest checkpoint or pull request, or applying writ safety rules (assigned-worktree local integration, force-with-lease only). Portable procedure for the writ Rust coordination core; not a security boundary.
+description: Use when discovering GitHub or Linear work, spawning isolated worker agents, running Safe Issue → Verified Commit or PR handoff, or applying writ safety rules (assigned-worktree local integration, force-with-lease only). Portable procedure for the writ Rust coordination core; not a security boundary.
 ---
 
 # writ Skill
@@ -12,55 +12,27 @@ Installable agent skill for the `writ` Rust coordination core. Directory name an
 ## When to use
 
 Use this skill when:
-- Discovering a maintainer Linear task or a contributor GitHub issue
-- Spawning writable workers, or reviewing in the current checkout without one
+- Discovering work from GitHub or Linear issues
+- Spawning worker subagents for code changes
 - Integrating compatible peer work into an assigned feature-branch worktree
-- Running a [checkpoint push](docs/workflows/safe-issue-verified-commit.md) then a [pull request](docs/workflows/safe-verified-commit-to-pr.md)
+- Running [Safe Issue → Verified Commit](docs/workflows/safe-issue-verified-commit.md) then [Safe Verified Commit → PR](docs/workflows/safe-verified-commit-to-pr.md)
 - Formatting attributed PR review replies and peer coordination messages (`writ attribution format`; [Reply attribution](#reply-attribution))
 - Handing a pull request to the installed companion `babysit-pr` skill when interactive monitoring is needed
 - Reporting results back to the operator
 
-## Authoritative safety policy
+## Collaboration policy
 
-Before any mutation, read and apply the corresponding `AGENTS.md` sections:
-
-- [core prohibitions and deny-list](AGENTS.md#non-negotiable-safety)
-- [local collaboration](AGENTS.md#local-collaboration-allowed)
-- [remote GitHub merges](AGENTS.md#remote-github-merges)
-- [force-with-lease allow-list](AGENTS.md#allow-list-for-force-with-lease)
-- [attribution semantics](AGENTS.md#attribution-semantics)
-- [team-maintainer operating model](AGENTS.md#team-maintainer-operating-model)
-
-This skill never grants an exception to those rules. Local `git merge` / `rebase` / `cherry-pick` of peer work into the assigned feature branch is routine; conflict repair is expected. If the authoritative policy is unavailable, contradictory, or cannot be enforced by the Rust boundary -- `writ` itself, or an enforcing wrapper that routes the mutation through `writ-core`'s allowlist and branch verification -- stop the mutating flow and report the blocker.
+Read [`AGENTS.md`](AGENTS.md) for ownership, WIP protection, attribution and authorized publication. Reuse suitable harness-owned checkouts and existing task context. Independent writers need separate checkouts; read-only reviewers do not. No tracker installation, exact-base reset or writ binary is a prerequisite for working with the host's authorized tools.
 
 ### Branch/worktree pre-edit checklist
 
-Before making any code change, the agent MUST verify:
+Verify the assigned repository, checkout and branch. Inspect existing changes and peer ownership. Preserve WIP, negotiate overlapping work, and use merge/rebase/cherry-pick for normal integration. Register the checkout when using the shared lease store. The harness chooses its path; a managed writ root is unnecessary.
 
-1. **Worktree isolation:** `pwd` is inside the assigned checkout path (created by the harness or `git worktree add`, then joined via `writ worktree register`).
-2. **Branch correctness:** `git branch --show-current` matches the assigned feature branch.
-3. **Clean state:** `git status` shows no uncommitted changes from other work. A dirty or stale primary checkout is preserved and is not a reason to abort isolated work.
-4. **Remote alignment:** For a newly created, unpublished assigned branch, fetch the intended remote base and prove that the branch equals that exact remote-base commit before edits; it may lack an upstream only for this creation proof. For a published assigned branch, fetch and verify its expected upstream and the expected local/remote relationship instead of comparing the branch with the base. Stop on an unexpected upstream, unexpected remote commit, behind state, or divergence.
-5. **No cross-boundary edits:** No file outside the worktree is modified (no `../` paths, no absolute paths outside the worktree root).
+### Validation and publication
 
-Repair a clean bootstrap source or a newly created unpublished branch's verified-base alignment before editing. Abort and report an unsafe identity or path mismatch, a genuine ownership collision, or any other non-recoverable failure.
+Run focused tests while implementing. Publish useful checkpoints or drafts with their real test status. Before claiming readiness, review the change independently and run the relevant native gates on the submitted tree. Inspect current GitHub checks and report failures, pending work and unavailable platform coverage. A checkpoint is not merge readiness; no extra tracker or metadata gate is needed to save it.
 
-### Checkpoint and readiness
-
-Run focused, task-relevant checks while working. Scoped commits, checkpoint
-pushes, and draft pull requests are allowed when the test status is honest and
-the push is non-destructive and free of secrets. State which checks ran, which
-did not, and any failure. Do not describe an unrun or failing check as passed.
-
-Declare merge or release readiness only after the validation and review the
-change needs, and only when required GitHub checks are actually green. A full
-workspace suite or a separate audit is for that declaration, not for every
-checkpoint. Do not weaken GitHub's required checks.
-
-Before the first push of an unpublished assigned branch, fetch the verified
-remote base and align or rebase it. For a published branch, fetch and reconcile
-it with its expected upstream. Do not require equality with the base. A later
-tree change needs its own honest check status before the next push.
+GitHub owns remote merge permissions. Writ helpers admit remote operations without requiring a local branch; the operator's authorization still determines whether an agent should perform them. Local checkout-changing actions retain ownership safeguards. This skill does not authorize a merge merely because a PR is ready.
 
 ### Final status guidance
 
@@ -170,39 +142,43 @@ SHA policy: include `--commit-sha` only when referring to committed or pushed wo
 - **Recovery:** `live`, `released`, `stale_heartbeat`, `missing_checkout`.
 - **GitHub:** `check` / `check-all` probe PRs live (`gh pr list --head`). That overlay is not a merge gate. `--repo` / `--owner` filters are optional; probes still honour `WRIT_ALLOWED_OWNERS`.
 - **`add` / `remove`:** do not persist. Register or unregister a checkout instead.
-- Same-host SQLite is not cross-host coordination. Linear is the maintainers' task record, not a product requirement and not a second store.
+- Same-host SQLite is not cross-host coordination. Task tracking follows the operator; no tracker is required by the product.
 
 See [`docs/watchlist-schema.md`](docs/watchlist-schema.md).
 
+### CI taxonomy (Class A / B / C)
+
+When monitoring PR checks, classify each row from `gh pr checks --json name,state,bucket,workflow,link` (and `statusCheckRollup` when `ACTION_REQUIRED` is needed) using [`docs/ci-taxonomy.md`](docs/ci-taxonomy.md) or `writ --json ci classify`. Summary:
+
+| Class | Meaning | Do | Do not |
+| --- | --- | --- | --- |
+| **A** | GitHub Actions / Azure build-test | Fix source; **one** `gh run rerun` on flake | Empty “kick CI” commits |
+| **B** | Codacy (and similar quality gates) | Fix real file+line findings; residual human gate on `ACTION_REQUIRED` | Empty pushes to wake the dashboard |
+| **C** | Kilo, CodeRabbit, Gitar, unknown bots | Report residual (`class_c:kilo_pending`, …); continue Class A | Empty retrigger commits |
+
+`skipping` is non-blocking and is **not** a performed pass (skip-only is `unknown`, not `pass`). `pending` means continue other work without rerun spam. **Prefer a real fix or `gh run rerun` over noise commits.** Residual codes belong in watchlist notes and the final report.
+
+`writ --json ci classify` emits a compact `data.collaboration` object (`ci_class`, observation counts, `residual_codes`, `blocks_unrelated_workers: false`). Copy that into existing RM-139 / RM-127 status views. Do **not** write `watched.json`, a second store, or a lease row for CI. An externally blocked service must not freeze unrelated workers.
+
+Requiredness is **not** the Class A/B/C letter and is **not** inferred from a provider name. Pass `isRequired` from GraphQL when available. Count `required_failure` separately from advisory findings, pending results, `ACTION_REQUIRED` external-access/configuration problems, and unknown requiredness. Unknown is a report, not a writ merge gate and not a pass. Do not disable checks, fabricate success, or empty-commit to retrigger a bot.
+
 ### Platform-neutral worker prompt template
 
-When spawning a worker subagent, include these safety instructions in the prompt:
+Give each worker the task, owned files, checkout, branch, tests, dependencies and integration owner. A compact prompt is enough:
 
+```text
+Work only in your assigned checkout and scope; preserve existing WIP.
+Coordinate overlap and handoffs. Integrate compatible peer commits locally.
+Keep direct local mutations bound to the intended branch; never bare-force-push.
+Use focused tests, and report observed results and residuals truthfully.
+Publish checkpoints when authorized; distinguish them from reviewed readiness.
+Identify your agent and use the real pushed SHA when reporting a pushed fix.
 ```
-SAFETY RULES (non-negotiable):
-- Local `git merge` / `rebase` / `cherry-pick` of peer work into the assigned feature branch is allowed
-- NEVER merge into `main`/`master` locally; refuse a merge that would lose uncommitted WIP
-- NEVER use bare `git push --force` or `git push -f`
-- `git push --force-with-lease` is allowed only for rebasing your own branch
-- NEVER edit files outside your assigned worktree
-- One writable worker per assigned worktree and branch
-- Before editing, verify: worktree path, branch name, clean assigned state, and remote alignment; exact remote-base equality applies only to a newly created unpublished branch, while a published branch must match its expected upstream relationship
-- Repair a clean bootstrap source or unpublished verified-base alignment; abort on unsafe identity or path mismatch
-- Read-only helpers do not need a separate checkout, branch, or pull request
-- Focused checks while working. Checkpoint commits, pushes, and draft pull requests state which checks ran. Declare merge or release readiness only after the validation and review the change needs. Do not treat an unrun or failing check as passed
-- Use `writ attribution format` for automated replies. Intent/dependency/overlap/help/handoff/conflict messages need real agent/task/branch/session identity and must not invent a SHA. After a successful push, review-fix replies include that real SHA.
-```
-
-Local assigned-branch integration is allowed.
 
 ### Timeouts and hang recovery
 
 Long-running supervised commands use `writ supervisor run` with the named policy in [`docs/timeout-policy.md`](docs/timeout-policy.md). A timeout is a recovery and handoff event: the supervisor contains the child (hard/idle/lost-child/permit-wait) and never retries, merges, bare-force-pushes, deletes a harness checkout, or invents a SHA. Harness re-dispatch is capped by `RedispatchBudget` / `max_redispatch_per_item` (default 1). Timeout residuals do not increment `fix_count`.
 
-### Enforcement routing
+### Optional helpers
 
-This skill is portable procedure, not a security boundary. Route orchestrated
-mutations through `writ`, with Rust enforcing the runtime boundary as
-defined in [`AGENTS.md`](AGENTS.md#enforcement-layers). GitHub owns remote PR
-integration. Maintainers track tasks in Linear; contributors do not need that
-workspace.
+Use registration/status for shared ownership visibility, supervision for bounded execution, and git/gh helpers for their documented local integrity and repository-target checks. Host-native tools remain valid. Scripts and opaque API payloads are not recursively inspected. See [`AGENTS.md`](AGENTS.md#enforcement-layers).

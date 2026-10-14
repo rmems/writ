@@ -1,26 +1,3 @@
 {
-  "hooks": {
-    "PreCompact": [
-      {
-        "hooks": [
-          {
-            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/optional-bd-prime.sh",
-            "type": "command"
-          }
-        ],
-        "matcher": ""
-      }
-    ],
-    "SessionStart": [
-      {
-        "hooks": [
-          {
-            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/optional-bd-prime.sh",
-            "type": "command"
-          }
-        ],
-        "matcher": ""
-      }
-    ]
-  }
+  "hooks": {}
 }

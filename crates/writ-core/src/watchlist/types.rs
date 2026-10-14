@@ -43,6 +43,8 @@ pub enum RecoveryStatus {
     Released,
     StaleHeartbeat,
     MissingCheckout,
+    /// Interrupted PREPARE/MUTATE/NEEDS_ATTENTION registration.
+    NeedsReconcile,
 }
 
 impl fmt::Display for RecoveryStatus {
@@ -52,6 +54,7 @@ impl fmt::Display for RecoveryStatus {
             Self::Released => "released",
             Self::StaleHeartbeat => "stale_heartbeat",
             Self::MissingCheckout => "missing_checkout",
+            Self::NeedsReconcile => "needs_reconcile",
         })
     }
 }
@@ -163,6 +166,10 @@ mod tests {
         assert_eq!(
             RecoveryStatus::MissingCheckout.to_string(),
             "missing_checkout"
+        );
+        assert_eq!(
+            RecoveryStatus::NeedsReconcile.to_string(),
+            "needs_reconcile"
         );
     }
 }

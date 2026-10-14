@@ -49,7 +49,7 @@ impl BranchRef<'_> {
     /// (fork PRs from identically named branches do not match).
     #[must_use]
     pub fn matches(&self, pr: &PrSnapshot) -> bool {
-        if !pr.branch.eq_ignore_ascii_case(self.branch) {
+        if pr.branch != self.branch {
             return false;
         }
         let expected = self.repo.rsplit('/').nth(1);
@@ -397,6 +397,31 @@ mod tests {
         assert!(head.matches(&snap(Some("acme"))));
         assert!(!head.matches(&snap(Some("fork-owner"))));
         assert!(head.matches(&snap(None)));
+    }
+
+    #[test]
+    fn branch_ref_preserves_owner_case_tolerance() {
+        let head = BranchRef {
+            repo: "acme/sample",
+            branch: "feat",
+        };
+        let mut snap = parsed("[]");
+        snap.head_owner = Some("ACME".to_owned());
+        assert!(head.matches(&snap));
+    }
+
+    #[test]
+    fn branch_ref_rejects_case_only_branch_difference() {
+        let mut snap = parsed("[]");
+        snap.head_owner = Some("acme".to_owned());
+        for (branch, pr_branch) in [("feat", "Feat"), ("Feat", "feat"), ("feat", "FEAT")] {
+            let head = BranchRef {
+                repo: "acme/sample",
+                branch,
+            };
+            snap.branch = pr_branch.to_owned();
+            assert!(!head.matches(&snap), "{branch} must not match {pr_branch}");
+        }
     }
 
     #[test]
