@@ -66,8 +66,13 @@ fn json(output: &Output) -> serde_json::Value {
     })
 }
 
-#[test]
-fn inspect_reports_identity_without_mutating_after_create() {
+struct CreatedJob {
+    root: TestDir,
+    repo: PathBuf,
+    start: String,
+}
+
+fn create_lease_worktree() -> CreatedJob {
     let root = TestDir::new();
     let repo = init_repo(&root.0);
     let start = git(&repo, &["rev-parse", "HEAD"]);
@@ -90,15 +95,18 @@ fn inspect_reports_identity_without_mutating_after_create() {
         ],
     );
     assert!(created.status.success(), "{:?}", created.stderr);
+    CreatedJob { root, repo, start }
+}
 
+fn inspect_created(job: &CreatedJob) -> (Output, serde_json::Value) {
     let inspected = writ(
-        &root.0,
+        &job.root.0,
         &[
             "--json",
             "lease",
             "inspect",
             "--repo",
-            repo.to_str().unwrap(),
+            job.repo.to_str().unwrap(),
             "--branch",
             "hive/job-inspect",
             "acme",
@@ -107,33 +115,58 @@ fn inspect_reports_identity_without_mutating_after_create() {
         ],
     );
     let envelope = json(&inspected);
+    (inspected, envelope)
+}
+
+#[test]
+fn inspect_reports_identity_without_mutating_after_create() {
+    let job = create_lease_worktree();
+    let (inspected, envelope) = inspect_created(&job);
     assert!(inspected.status.success());
     assert_eq!(envelope["command"], "lease.inspect");
-    assert_eq!(
-        envelope["data"]["requested_start_point"],
-        "refs/heads/trunk"
-    );
-    assert_eq!(envelope["data"]["resolved_start_commit"], start);
-    assert_eq!(envelope["data"]["classification"], "matching");
-    assert_eq!(envelope["data"]["lease_present"], true);
-    assert_eq!(envelope["data"]["worktree_registered"], true);
     assert_ne!(
         envelope["data"]["requested_start_point"],
         envelope["data"]["resolved_start_commit"]
     );
     assert_eq!(
-        git(&repo, &["rev-parse", "refs/heads/hive/job-inspect"]),
-        start
+        git(&job.repo, &["rev-parse", "refs/heads/hive/job-inspect"]),
+        job.start
     );
+}
 
+#[test]
+fn inspect_reports_symbolic_and_resolved_identity() {
+    let job = create_lease_worktree();
+    let (inspected, envelope) = inspect_created(&job);
+    assert!(inspected.status.success());
+    assert_eq!(
+        envelope["data"]["requested_start_point"],
+        "refs/heads/trunk"
+    );
+    assert_eq!(envelope["data"]["resolved_start_commit"], job.start);
+}
+
+#[test]
+fn inspect_reports_matching_registered_lease_after_create() {
+    let job = create_lease_worktree();
+    let (inspected, envelope) = inspect_created(&job);
+    assert!(inspected.status.success());
+    assert_eq!(envelope["data"]["classification"], "matching");
+    assert_eq!(envelope["data"]["lease_present"], true);
+    assert_eq!(envelope["data"]["worktree_registered"], true);
+}
+
+#[test]
+fn reconcile_reports_already_active_after_create() {
+    let job = create_lease_worktree();
     let reconciled = writ(
-        &root.0,
+        &job.root.0,
         &[
             "--json",
             "lease",
             "reconcile",
             "--repo",
-            repo.to_str().unwrap(),
+            job.repo.to_str().unwrap(),
             "acme",
             "sample",
             "job-inspect",

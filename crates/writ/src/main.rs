@@ -204,77 +204,87 @@ fn worktree_error_data(error: &writ_core::error::Error) -> serde_json::Value {
         } => serde_json::json!({
             "required_schema_version": required_schema_version,
         }),
-        writ_core::error::Error::WorktreeCreationFailed(failure) => {
-            let writ_core::error::WorktreeCreationFailure {
-                path,
-                branch,
-                path_exists,
-                branch_commit,
-                head_commit,
-                worktree_registered,
-                ..
-            } = failure.as_ref();
-            serde_json::json!({
-            "path": path,
-            "branch": branch,
-            "path_exists": path_exists,
-            "branch_commit": branch_commit,
-            "head_commit": head_commit,
-            "worktree_registered": worktree_registered,
-            "cleanup_performed": false,
-            })
-        }
+        writ_core::error::Error::WorktreeCreationFailed(failure) => creation_failure_data(failure),
         writ_core::error::Error::WorktreePostconditionFailed(failure) => {
-            let writ_core::error::WorktreePostconditionFailure {
-                path,
-                branch,
-                expected_commit,
-                actual_branch,
-                path_exists,
-                branch_commit,
-                head_commit,
-                worktree_registered,
-                ..
-            } = failure.as_ref();
-            serde_json::json!({
-            "path": path,
-            "branch": branch,
-            "expected_commit": expected_commit,
-            "actual_branch": actual_branch,
-            "path_exists": path_exists,
-            "branch_commit": branch_commit,
-            "head_commit": head_commit,
-            "worktree_registered": worktree_registered,
-            "cleanup_performed": false,
-            })
+            postcondition_failure_data(failure)
         }
-        writ_core::error::Error::LeaseAttention(failure) => {
-            let writ_core::error::LeaseAttentionFailure {
-                operation_id,
-                allocation_state,
-                classification,
-                conflicts,
-                path,
-                path_exists,
-                branch_commit,
-                head_commit,
-                worktree_registered,
-            } = failure.as_ref();
-            serde_json::json!({
-            "operation_id": operation_id,
-            "allocation_state": allocation_state,
-            "classification": classification,
-            "conflicts": conflicts,
-            "path": path,
-            "path_exists": path_exists,
-            "branch_commit": branch_commit,
-            "head_commit": head_commit,
-            "worktree_registered": worktree_registered,
-            "cleanup_performed": false,
-            })
-        }
+        writ_core::error::Error::LeaseAttention(failure) => lease_attention_data(failure),
         _ => serde_json::json!({}),
     }
+}
+
+fn creation_failure_data(failure: &writ_core::error::WorktreeCreationFailure) -> serde_json::Value {
+    let writ_core::error::WorktreeCreationFailure {
+        path,
+        branch,
+        path_exists,
+        branch_commit,
+        head_commit,
+        worktree_registered,
+        ..
+    } = failure;
+    serde_json::json!({
+        "path": path,
+        "branch": branch,
+        "path_exists": path_exists,
+        "branch_commit": branch_commit,
+        "head_commit": head_commit,
+        "worktree_registered": worktree_registered,
+        "cleanup_performed": false,
+    })
+}
+
+fn postcondition_failure_data(
+    failure: &writ_core::error::WorktreePostconditionFailure,
+) -> serde_json::Value {
+    let writ_core::error::WorktreePostconditionFailure {
+        path,
+        branch,
+        expected_commit,
+        actual_branch,
+        path_exists,
+        branch_commit,
+        head_commit,
+        worktree_registered,
+        ..
+    } = failure;
+    serde_json::json!({
+        "path": path,
+        "branch": branch,
+        "expected_commit": expected_commit,
+        "actual_branch": actual_branch,
+        "path_exists": path_exists,
+        "branch_commit": branch_commit,
+        "head_commit": head_commit,
+        "worktree_registered": worktree_registered,
+        "cleanup_performed": false,
+    })
+}
+
+fn lease_attention_data(failure: &writ_core::error::LeaseAttentionFailure) -> serde_json::Value {
+    let writ_core::error::LeaseAttentionFailure {
+        operation_id,
+        allocation_state,
+        classification,
+        conflicts,
+        path,
+        path_exists,
+        branch_commit,
+        head_commit,
+        worktree_registered,
+    } = failure;
+    serde_json::json!({
+        "operation_id": operation_id,
+        "allocation_state": allocation_state,
+        "classification": classification,
+        "conflicts": conflicts,
+        "path": path,
+        "path_exists": path_exists,
+        "branch_commit": branch_commit,
+        "head_commit": head_commit,
+        "worktree_registered": worktree_registered,
+        "cleanup_performed": false,
+    })
 }
 
 fn worktree_schema_version(cli: &Cli) -> u8 {

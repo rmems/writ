@@ -23,16 +23,11 @@ impl Display for WorktreeCreationFailure {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "worktree creation failed for branch `{}` at `{}`: {}; residual_state \
-             path_exists={} registered={} branch_commit={} head_commit={}; automatic cleanup \
-             skipped because concurrent adoption cannot be disproven",
+            "worktree creation failed for branch `{}` at `{}`: {}; {}",
             self.branch,
             self.path.display(),
             self.stderr.trim(),
-            self.path_exists,
-            self.worktree_registered,
-            self.branch_commit.as_deref().unwrap_or("<absent>"),
-            self.head_commit.as_deref().unwrap_or("<absent>")
+            ResidualView::from_creation(self),
         )
     }
 }
@@ -55,17 +50,12 @@ impl Display for LeaseAttentionFailure {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "lease allocation `{}` needs attention (state={} class={}): {}; \
-             residual_state path_exists={} registered={} branch_commit={} head_commit={}; \
-             automatic cleanup skipped because concurrent adoption cannot be disproven",
+            "lease allocation `{}` needs attention (state={} class={}): {}; {}",
             self.operation_id,
             self.allocation_state,
             self.classification,
             self.conflicts.join("; "),
-            self.path_exists,
-            self.worktree_registered,
-            self.branch_commit.as_deref().unwrap_or("<absent>"),
-            self.head_commit.as_deref().unwrap_or("<absent>")
+            ResidualView::from_attention(self),
         )
     }
 }
@@ -89,18 +79,63 @@ impl Display for WorktreePostconditionFailure {
         write!(
             f,
             "worktree postcondition failed for branch `{}` at `{}`: expected_commit={} \
-             actual_branch={} reason={}; residual_state path_exists={} registered={} \
-             branch_commit={} head_commit={}; automatic cleanup skipped because concurrent \
-             adoption cannot be disproven",
+             actual_branch={} reason={}; {}",
             self.branch,
             self.path.display(),
             self.expected_commit,
             self.actual_branch.as_deref().unwrap_or("<unavailable>"),
             self.reason,
+            ResidualView::from_postcondition(self),
+        )
+    }
+}
+
+struct ResidualView<'a> {
+    path_exists: bool,
+    registered: bool,
+    branch_commit: Option<&'a str>,
+    head_commit: Option<&'a str>,
+}
+
+impl<'a> ResidualView<'a> {
+    fn from_creation(failure: &'a WorktreeCreationFailure) -> Self {
+        Self {
+            path_exists: failure.path_exists,
+            registered: failure.worktree_registered,
+            branch_commit: failure.branch_commit.as_deref(),
+            head_commit: failure.head_commit.as_deref(),
+        }
+    }
+
+    fn from_attention(failure: &'a LeaseAttentionFailure) -> Self {
+        Self {
+            path_exists: failure.path_exists,
+            registered: failure.worktree_registered,
+            branch_commit: failure.branch_commit.as_deref(),
+            head_commit: failure.head_commit.as_deref(),
+        }
+    }
+
+    fn from_postcondition(failure: &'a WorktreePostconditionFailure) -> Self {
+        Self {
+            path_exists: failure.path_exists,
+            registered: failure.worktree_registered,
+            branch_commit: failure.branch_commit.as_deref(),
+            head_commit: failure.head_commit.as_deref(),
+        }
+    }
+}
+
+impl Display for ResidualView<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "residual_state path_exists={} registered={} branch_commit={} head_commit={}; \
+             automatic cleanup skipped because concurrent adoption cannot be disproven",
             self.path_exists,
-            self.worktree_registered,
-            self.branch_commit.as_deref().unwrap_or("<absent>"),
-            self.head_commit.as_deref().unwrap_or("<absent>")
+            self.registered,
+            self.branch_commit.unwrap_or("<absent>"),
+            self.head_commit.unwrap_or("<absent>"),
         )
     }
 }
@@ -299,7 +334,10 @@ impl From<io::Error> for Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{Error, PolicyCode, WorktreePostconditionFailure};
+    use super::{
+        Error, LeaseAttentionFailure, PolicyCode, WorktreeCreationFailure,
+        WorktreePostconditionFailure,
+    };
     use std::path::PathBuf;
 
     #[test]
@@ -337,5 +375,68 @@ mod tests {
         }));
         assert_eq!(attention.exit_code(), 2);
         assert_eq!(attention.code(), "LEASE_NEEDS_ATTENTION");
+    }
+
+    #[test]
+    fn creation_failure_keeps_residual_state_text() {
+        let creation = WorktreeCreationFailure {
+            path: PathBuf::from("wt"),
+            branch: "feature".to_owned(),
+            path_exists: true,
+            branch_commit: None,
+            head_commit: Some("abc".to_owned()),
+            worktree_registered: false,
+            stderr: "boom\n".to_owned(),
+        };
+        assert_eq!(
+            creation.to_string(),
+            "worktree creation failed for branch `feature` at `wt`: boom; residual_state \
+             path_exists=true registered=false branch_commit=<absent> head_commit=abc; automatic \
+             cleanup skipped because concurrent adoption cannot be disproven"
+        );
+    }
+
+    #[test]
+    fn attention_failure_keeps_residual_state_text() {
+        let attention = LeaseAttentionFailure {
+            operation_id: "op-1".to_owned(),
+            allocation_state: "MUTATING".to_owned(),
+            classification: "needs_attention".to_owned(),
+            conflicts: vec!["branch commit is absent".to_owned()],
+            path: PathBuf::from("worktree"),
+            path_exists: true,
+            branch_commit: None,
+            head_commit: None,
+            worktree_registered: false,
+        };
+        assert_eq!(
+            attention.to_string(),
+            "lease allocation `op-1` needs attention (state=MUTATING class=needs_attention): \
+             branch commit is absent; residual_state path_exists=true registered=false \
+             branch_commit=<absent> head_commit=<absent>; automatic cleanup skipped because \
+             concurrent adoption cannot be disproven"
+        );
+    }
+
+    #[test]
+    fn postcondition_failure_keeps_residual_state_text() {
+        let postcondition = WorktreePostconditionFailure {
+            path: PathBuf::from("wt"),
+            branch: "feature".to_owned(),
+            expected_commit: "abc".to_owned(),
+            actual_branch: None,
+            path_exists: false,
+            branch_commit: None,
+            head_commit: None,
+            worktree_registered: false,
+            reason: "identity mismatch".to_owned(),
+        };
+        assert_eq!(
+            postcondition.to_string(),
+            "worktree postcondition failed for branch `feature` at `wt`: expected_commit=abc \
+             actual_branch=<unavailable> reason=identity mismatch; residual_state \
+             path_exists=false registered=false branch_commit=<absent> head_commit=<absent>; \
+             automatic cleanup skipped because concurrent adoption cannot be disproven"
+        );
     }
 }
