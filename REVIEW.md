@@ -18,7 +18,7 @@ For stacked pull requests, review and fix the bottom PR before its children. Re-
 
 ### Scope and traceability
 
-- [ ] The PR links its GitHub issue and, when present, the matching Linear `RM-*` issue.
+- [ ] The pull request identifies the task already in hand: a Linear id for maintainer work, a GitHub issue when one exists, or the pull request itself. No issue twin, child issue, or Beads record is required.
 - [ ] Changes satisfy the linked acceptance criteria without unrelated refactors.
 - [ ] Existing task context and delivered scope are represented accurately; no tracker mirror or extra ticket is required.
 - [ ] Generated replies identify the agent. Review-fix replies include the pushed commit SHA. Coordination messages and no-code-change replies do not invent a SHA.

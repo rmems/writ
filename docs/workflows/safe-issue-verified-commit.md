@@ -1,8 +1,8 @@
 # Task → tested commit
 
-Use the existing request, Linear task or GitHub issue. A tracker record is optional. Follow [`AGENTS.md`](../../AGENTS.md) for the contribution contract; this workflow is a helper, not an additional gate.
+Use the existing request, Linear task, GitHub issue, or pull request. A tracker record is optional. One record is enough. Follow [`AGENTS.md`](../../AGENTS.md) for the contribution contract; this workflow is a helper, not an additional gate.
 
-1. Read the task and actual source. Check peer ownership and existing PRs before implementing.
+1. Read that record and the actual source. Check peer ownership and existing PRs before implementing.
 2. Reuse a suitable assigned checkout and branch, or let the harness create isolation for an independent writer. Read-only helpers use the current checkout. Inspect branch identity, upstream and WIP; preserve useful history. No exact-base reset, managed directory or tracker bootstrap is required.
 3. Register the checkout if using writ's shared lease store. Missing optional helpers do not block the host's authorized native workflow.
 4. Add a failing regression for a bug or characterization before changing unclear behavior. Implement the bounded change, run focused checks, and integrate compatible peer work locally. Preserve uncommitted changes and never bare-force-push.
