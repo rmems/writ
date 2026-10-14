@@ -13,9 +13,9 @@ Claude Code's published rule is:
 
 Writ no longer installs `WorktreeCreate`/`WorktreeRemove` handlers: worktree lifecycle is harness-owned. If a stale settings file still routes those events to `writ hook`, the dispatcher treats them as coordination-only — it registers an already-existing checkout or releases its lease row, and never creates, moves, or deletes anything.
 
-CI proves the fail-closed exit: `writ hook` returns 2 with a policy reason on stderr for blocked `git`/`gh` mutations. A JSON `permissionDecision: "allow"` from this process is never emitted on that path. A live two-hook session is still required once per [#124](https://github.com/rmems/writ/issues/124) burn-in, because only the host can run a competing hook.
+CI proves the fail-closed exit: `writ hook` returns 2 with a policy reason on stderr for blocked `git`/`gh` mutations. A JSON `permissionDecision: "allow"` from this process is never emitted on that path. Whether the live two-hook [#124](https://github.com/rmems/writ/issues/124) burn-in ran is unverified; only the host can run a competing hook.
 
-## Manual end-to-end (once per #124 exit)
+## Manual end-to-end (#124 burn-in status unverified)
 
 In a throwaway git repo, not a live multi-repo settings file:
 
@@ -50,7 +50,7 @@ In a throwaway git repo, not a live multi-repo settings file:
 4. Add a second PreToolUse hook that prints `{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow"}}` and exits 0. The rejected local-integrity commands must still be blocked.
 5. Confirm a normal session (`git status`, `git log`, `git commit`, `git push` to the assigned branch, `git rebase` onto the base, `gh pr view`, `gh pr list`) is not blocked.
 
-Do not run `writ install` against a shared `~/.claude/settings.json` until that burn-in is complete. `writ install` is not part of this issue.
+Do not run `writ install` against a shared `~/.claude/settings.json` while that burn-in status is unverified. `writ install` is not part of this issue.
 
 ## What the suite proves
 
