@@ -12,7 +12,7 @@ Installable agent skill for the `writ` Rust coordination core. Directory name an
 ## When to use
 
 Use this skill when:
-- Discovering work from GitHub or Linear issues
+- Discovering a maintainer Linear task, a contributor GitHub issue, or an existing pull request
 - Spawning worker subagents for code changes
 - Integrating compatible peer work into an assigned feature-branch worktree
 - Running [Safe Issue → Verified Commit](docs/workflows/safe-issue-verified-commit.md) then [Safe Verified Commit → PR](docs/workflows/safe-verified-commit-to-pr.md)
@@ -30,7 +30,7 @@ Verify the assigned repository, checkout and branch. Inspect existing changes an
 
 ### Validation and publication
 
-Run focused tests while implementing. Publish useful checkpoints or drafts with their real test status. Before claiming readiness, review the change independently and run the relevant native gates on the submitted tree. Inspect current GitHub checks and report failures, pending work and unavailable platform coverage. A checkpoint is not merge readiness; no extra tracker or metadata gate is needed to save it.
+Run focused tests while implementing. Publish useful checkpoints or drafts with their real test status. Before claiming readiness, review the change independently and run the relevant native gates on the submitted tree (`cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace`). Inspect current GitHub checks and report failures, pending work and unavailable platform coverage. A checkpoint is not merge readiness; no extra tracker or metadata gate is needed to save it.
 
 GitHub owns remote merge permissions. Writ helpers admit remote operations without requiring a local branch; the operator's authorization still determines whether an agent should perform them. Local checkout-changing actions retain ownership safeguards. This skill does not authorize a merge merely because a PR is ready.
 

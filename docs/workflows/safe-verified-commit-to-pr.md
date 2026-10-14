@@ -1,6 +1,6 @@
 # Tested commit → PR handoff
 
-Open or update a reviewable PR for the authorized task. Follow [`AGENTS.md`](../../AGENTS.md); use the host's available GitHub tools. Interactive monitoring is an optional companion `babysit-pr` workflow.
+Open or update a reviewable PR for the authorized task. An existing pull request is enough: update it instead of creating a duplicate or a GitHub issue twin. Follow [`AGENTS.md`](../../AGENTS.md); use the host's available GitHub tools. Interactive monitoring is an optional companion `babysit-pr` workflow.
 
 1. Verify repository, base, assigned branch and the SHA accepted by the remote. Use the stack parent as base when appropriate and process stacks bottom-up.
 2. Update an existing PR for this branch. Otherwise create a focused PR explaining the problem, resulting behavior, compatibility impact and measured validation. A useful checkpoint may be a draft with explicit remaining work.
