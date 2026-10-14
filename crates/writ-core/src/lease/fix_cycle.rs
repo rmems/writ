@@ -55,7 +55,7 @@ impl LeaseStore {
 
     /// Record that the mutation authorized by a pending increment is in flight.
     pub fn mark_fix_cycle_mutating(&self, operation_id: &str) -> Result<()> {
-        self.set_fix_cycle_phase(operation_id, "MUTATE")
+        self.apply_pending_fix(operation_id, PendingFix::Phase("MUTATE"))
     }
 
     /// Commit a pending increment after the authorized mutation.
@@ -92,22 +92,12 @@ impl LeaseStore {
         Ok(authorized)
     }
 
-    fn set_fix_cycle_phase(&self, operation_id: &str, phase: &'static str) -> Result<()> {
+    fn apply_pending_fix(&self, operation_id: &str, action: PendingFix) -> Result<()> {
         let now = now_secs();
         let mut conn = self.lock()?;
-        let tx = begin_immediate(&mut conn, "begin fix-cycle phase")?;
-        let lease = load_pending(&tx, operation_id, "advance fix-cycle")?;
-        ensure_not_terminal(&lease)?;
-        update_op_phase(
-            &tx,
-            OpPhase {
-                operation_id,
-                phase,
-                status: "IN_PROGRESS",
-                now,
-            },
-        )?;
-        commit_tx(tx, "commit fix-cycle phase")
+        let tx = begin_immediate(&mut conn, action.begin())?;
+        apply_fix_action(&tx, operation_id, action, now)?;
+        commit_tx(tx, action.commit())
     }
 
     fn reconcile_pending_fix(
@@ -130,7 +120,7 @@ impl LeaseStore {
     }
 
     fn abort_unproven(&self, operation_id: &str, fix_cycles: i64) -> Result<FixCycleReconcile> {
-        self.abort_fix_cycle(operation_id)?;
+        self.apply_pending_fix(operation_id, PendingFix::Abort)?;
         Ok(FixCycleReconcile::Aborted { fix_cycles })
     }
 
@@ -149,23 +139,56 @@ impl LeaseStore {
             })
         }
     }
+}
 
-    fn abort_fix_cycle(&self, operation_id: &str) -> Result<()> {
-        let now = now_secs();
-        let mut conn = self.lock()?;
-        let tx = begin_immediate(&mut conn, "begin fix-cycle abort")?;
-        clear_pending_fix(&tx, operation_id, now)?;
-        update_op_phase(
-            &tx,
-            OpPhase {
-                operation_id,
-                phase: "PREPARE",
-                status: "ABORTED",
-                now,
-            },
-        )?;
-        commit_tx(tx, "commit fix-cycle abort")
+#[derive(Clone, Copy)]
+enum PendingFix {
+    Phase(&'static str),
+    Abort,
+}
+
+impl PendingFix {
+    fn begin(self) -> &'static str {
+        match self {
+            Self::Phase(_) => "begin fix-cycle phase",
+            Self::Abort => "begin fix-cycle abort",
+        }
     }
+
+    fn commit(self) -> &'static str {
+        match self {
+            Self::Phase(_) => "commit fix-cycle phase",
+            Self::Abort => "commit fix-cycle abort",
+        }
+    }
+}
+
+fn apply_fix_action(
+    tx: &Transaction<'_>,
+    operation_id: &str,
+    action: PendingFix,
+    now: i64,
+) -> Result<()> {
+    let (phase, status) = match action {
+        PendingFix::Phase(phase) => {
+            let lease = load_pending(tx, operation_id, "advance fix-cycle")?;
+            ensure_not_terminal(&lease)?;
+            (phase, "IN_PROGRESS")
+        }
+        PendingFix::Abort => {
+            clear_pending_fix(tx, operation_id, now)?;
+            ("PREPARE", "ABORTED")
+        }
+    };
+    update_op_phase(
+        tx,
+        OpPhase {
+            operation_id,
+            phase,
+            status,
+            now,
+        },
+    )
 }
 
 fn prepare_fix_in_tx(

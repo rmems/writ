@@ -38,32 +38,8 @@ const ATTENTION_SQL: &str = "
 enum OpenGate {
     Missing,
     Terminal(Lease),
-    Open(Lease),
-}
-
-enum PromoteGate {
-    Missing,
-    Terminal(Lease),
     Active(Lease),
     Open(Lease),
-}
-
-enum PromoteInTx {
-    Retry,
-    Terminal(Lease),
-    AlreadyActive(Lease),
-    Promoted,
-}
-
-enum AbortInTx {
-    Retry,
-    Terminal(Box<Lease>),
-}
-
-enum AttentionInTx {
-    Retry,
-    Terminal(Box<Lease>),
-    Marked,
 }
 
 enum Settle {
@@ -97,103 +73,47 @@ impl LeaseStore {
         lease: &Lease,
         inspection: AllocationInspection,
     ) -> Result<ReconcileOutcome> {
-        match inspection.classification {
-            EvidenceClass::Matching => self.promote_if_still_open(lease, inspection),
-            EvidenceClass::Retryable => self.abort_if_still_open(lease, inspection),
-            _ => self.attention_if_still_open(lease, inspection),
-        }
+        let write = match inspection.classification {
+            EvidenceClass::Matching => OpenWrite::Promote,
+            EvidenceClass::Retryable => OpenWrite::Abort,
+            _ => OpenWrite::Attention,
+        };
+        self.finish_open(lease, inspection, write)
     }
 
-    fn promote_if_still_open(
+    fn finish_open(
         &self,
         expected: &Lease,
         inspection: AllocationInspection,
+        write: OpenWrite,
     ) -> Result<ReconcileOutcome> {
-        match self.promote_in_tx(expected)? {
-            PromoteInTx::Retry => Ok(retry_with(expected, inspection)),
-            PromoteInTx::Terminal(lease) => Ok(terminal_outcome(lease, inspection)),
-            PromoteInTx::AlreadyActive(lease) => {
+        match self.settle_open(expected, write)? {
+            OpenEffect::Retry => Ok(retry_with(expected, inspection)),
+            OpenEffect::Terminal(lease) => Ok(terminal_outcome(lease, inspection)),
+            OpenEffect::AlreadyActive(lease) => {
                 Ok(ReconcileOutcome::AlreadyActive { lease, inspection })
             }
-            PromoteInTx::Promoted => self.promoted(expected, inspection),
+            OpenEffect::Reload(kind) => self.reload_outcome(expected, inspection, kind),
         }
     }
 
-    fn promote_in_tx(&self, expected: &Lease) -> Result<PromoteInTx> {
+    fn settle_open(&self, expected: &Lease, write: OpenWrite) -> Result<OpenEffect> {
         let now = now_secs();
         let mut conn = self.lock()?;
-        let tx = begin_immediate(&mut conn, "begin promote")?;
-        let current = reread_job(&tx, expected)?;
-        dispatch_promote(tx, expected, current, now)
+        let tx = begin_immediate(&mut conn, write.begin())?;
+        let current = reread_for(&tx, expected, write)?;
+        settle_current(tx, expected, current, now, write)
     }
 
-    fn promoted(
+    fn reload_outcome(
         &self,
         expected: &Lease,
         inspection: AllocationInspection,
+        kind: ReloadKind,
     ) -> Result<ReconcileOutcome> {
         let row = self.find_by_operation(&expected.operation_id)?;
-        let lease = require_lease(
-            row,
-            "promote lease",
-            "lease row missing after promote".to_owned(),
-        )?;
-        Ok(ReconcileOutcome::Promoted { lease, inspection })
-    }
-
-    fn abort_if_still_open(
-        &self,
-        expected: &Lease,
-        inspection: AllocationInspection,
-    ) -> Result<ReconcileOutcome> {
-        let decision = self.abort_in_tx(expected)?;
-        Ok(abort_outcome(decision, expected, inspection))
-    }
-
-    fn abort_in_tx(&self, expected: &Lease) -> Result<AbortInTx> {
-        let now = now_secs();
-        let mut conn = self.lock()?;
-        let tx = begin_immediate(&mut conn, "begin abort")?;
-        let current = reread_op(&tx, &expected.operation_id, "re-read lease before abort")?;
-        dispatch_abort(tx, &expected.operation_id, current, now)
-    }
-
-    fn attention_if_still_open(
-        &self,
-        expected: &Lease,
-        inspection: AllocationInspection,
-    ) -> Result<ReconcileOutcome> {
-        match self.attention_in_tx(expected)? {
-            AttentionInTx::Retry => Ok(retry_with(expected, inspection)),
-            AttentionInTx::Terminal(lease) => Ok(terminal_outcome(*lease, inspection)),
-            AttentionInTx::Marked => self.marked_attention(expected, inspection),
-        }
-    }
-
-    fn attention_in_tx(&self, expected: &Lease) -> Result<AttentionInTx> {
-        let now = now_secs();
-        let mut conn = self.lock()?;
-        let tx = begin_immediate(&mut conn, "begin attention")?;
-        let current = reread_op(
-            &tx,
-            &expected.operation_id,
-            "re-read lease before attention",
-        )?;
-        dispatch_attention(tx, &expected.operation_id, current, now)
-    }
-
-    fn marked_attention(
-        &self,
-        expected: &Lease,
-        inspection: AllocationInspection,
-    ) -> Result<ReconcileOutcome> {
-        let row = self.find_by_operation(&expected.operation_id)?;
-        let lease = require_lease(
-            row,
-            "mark needs attention",
-            "lease row missing after attention".to_owned(),
-        )?;
-        Ok(ReconcileOutcome::NeedsAttention { lease, inspection })
+        let lease = require_lease(row, kind.context(), kind.missing())?;
+        Ok(kind.outcome(lease, inspection))
     }
 }
 
@@ -233,33 +153,11 @@ fn retry_with(expected: &Lease, inspection: AllocationInspection) -> ReconcileOu
     }
 }
 
-fn abort_outcome(
-    decision: AbortInTx,
-    expected: &Lease,
-    inspection: AllocationInspection,
-) -> ReconcileOutcome {
-    match decision {
-        AbortInTx::Retry => retry_with(expected, inspection),
-        AbortInTx::Terminal(lease) => terminal_outcome(*lease, inspection),
-    }
-}
-
 fn gate_existing(current: Option<Lease>) -> OpenGate {
     match current {
         None => OpenGate::Missing,
         Some(lease) if lease.allocation_state.is_terminal() => OpenGate::Terminal(lease),
         Some(lease) => OpenGate::Open(lease),
-    }
-}
-
-fn gate_promote(current: Option<Lease>) -> PromoteGate {
-    match gate_existing(current) {
-        OpenGate::Missing => PromoteGate::Missing,
-        OpenGate::Terminal(lease) => PromoteGate::Terminal(lease),
-        OpenGate::Open(lease) if lease.allocation_state == AllocationState::Active => {
-            PromoteGate::Active(lease)
-        }
-        OpenGate::Open(lease) => PromoteGate::Open(lease),
     }
 }
 
@@ -285,153 +183,194 @@ fn reread_op(
     )
 }
 
-fn dispatch_promote(
+#[derive(Clone, Copy)]
+enum OpenWrite {
+    Promote,
+    Abort,
+    Attention,
+}
+
+enum OpenEffect {
+    Retry,
+    Terminal(Lease),
+    AlreadyActive(Lease),
+    Reload(ReloadKind),
+}
+
+#[derive(Clone, Copy)]
+enum ReloadKind {
+    Promoted,
+    Attention,
+}
+
+impl OpenWrite {
+    fn begin(self) -> &'static str {
+        match self {
+            Self::Promote => "begin promote",
+            Self::Abort => "begin abort",
+            Self::Attention => "begin attention",
+        }
+    }
+
+    fn commit_label(self) -> &'static str {
+        match self {
+            Self::Promote => "commit promote",
+            Self::Abort => "commit abort",
+            Self::Attention => "commit attention",
+        }
+    }
+
+    fn reread_context(self) -> &'static str {
+        match self {
+            Self::Promote => "re-read lease before promote",
+            Self::Abort => "re-read lease before abort",
+            Self::Attention => "re-read lease before attention",
+        }
+    }
+}
+
+impl ReloadKind {
+    fn context(self) -> &'static str {
+        match self {
+            Self::Promoted => "promote lease",
+            Self::Attention => "mark needs attention",
+        }
+    }
+
+    fn missing(self) -> String {
+        match self {
+            Self::Promoted => "lease row missing after promote".to_owned(),
+            Self::Attention => "lease row missing after attention".to_owned(),
+        }
+    }
+
+    fn outcome(self, lease: Lease, inspection: AllocationInspection) -> ReconcileOutcome {
+        match self {
+            Self::Promoted => ReconcileOutcome::Promoted { lease, inspection },
+            Self::Attention => ReconcileOutcome::NeedsAttention { lease, inspection },
+        }
+    }
+}
+
+fn reread_for(tx: &Transaction<'_>, expected: &Lease, write: OpenWrite) -> Result<Option<Lease>> {
+    if matches!(write, OpenWrite::Promote) {
+        return reread_job(tx, expected);
+    }
+    reread_op(tx, &expected.operation_id, write.reread_context())
+}
+
+fn settle_current(
     tx: Transaction<'_>,
     expected: &Lease,
     current: Option<Lease>,
     now: i64,
-) -> Result<PromoteInTx> {
-    match gate_promote(current) {
-        PromoteGate::Missing => commit_value(tx, "commit promote", PromoteInTx::Retry),
-        PromoteGate::Terminal(lease) => {
-            commit_value(tx, "commit promote", PromoteInTx::Terminal(lease))
-        }
-        PromoteGate::Active(lease) => {
-            commit_value(tx, "commit promote", PromoteInTx::AlreadyActive(lease))
-        }
-        PromoteGate::Open(lease) => write_promote(tx, expected, lease, now),
+    write: OpenWrite,
+) -> Result<OpenEffect> {
+    let label = write.commit_label();
+    match classify_open(write, current) {
+        OpenGate::Missing => commit_value(tx, label, OpenEffect::Retry),
+        OpenGate::Terminal(lease) => commit_value(tx, label, OpenEffect::Terminal(lease)),
+        OpenGate::Active(lease) => commit_value(tx, label, OpenEffect::AlreadyActive(lease)),
+        OpenGate::Open(lease) => apply_open_write(tx, expected, lease, now, write),
     }
 }
 
-fn write_promote(
+fn classify_open(write: OpenWrite, current: Option<Lease>) -> OpenGate {
+    match gate_existing(current) {
+        OpenGate::Open(lease)
+            if matches!(write, OpenWrite::Promote)
+                && lease.allocation_state == AllocationState::Active =>
+        {
+            OpenGate::Active(lease)
+        }
+        other => other,
+    }
+}
+
+fn apply_open_write(
     tx: Transaction<'_>,
     expected: &Lease,
     current: Lease,
     now: i64,
-) -> Result<PromoteInTx> {
-    if !promoted_row(&tx, &expected.operation_id, now)? {
-        return commit_value(tx, "commit promote", PromoteInTx::Terminal(current));
+    write: OpenWrite,
+) -> Result<OpenEffect> {
+    let label = write.commit_label();
+    if !wrote_open_row(&tx, &expected.operation_id, now, write)? {
+        return commit_value(tx, label, OpenEffect::Terminal(current));
     }
+    let (phase, status, effect) = write.success();
     update_op_phase(
         &tx,
         OpPhase {
             operation_id: &expected.operation_id,
-            phase: "COMMIT",
-            status: "COMMITTED",
+            phase,
+            status,
             now,
         },
     )?;
-    commit_value(tx, "commit promote", PromoteInTx::Promoted)
+    commit_value(tx, label, effect)
 }
 
-fn promoted_row(tx: &Transaction<'_>, operation_id: &str, now: i64) -> Result<bool> {
-    tx.execute(
-        PROMOTE_SQL,
-        params![
-            AllocationState::Active.as_str(),
-            LeaseMode::WriterLocked.as_str(),
-            now,
-            operation_id,
-        ],
-    )
-    .map_err(|e| lease_err("promote lease", e))?;
-    Ok(tx.changes() == 1)
-}
-
-fn dispatch_abort(
-    tx: Transaction<'_>,
-    operation_id: &str,
-    current: Option<Lease>,
-    now: i64,
-) -> Result<AbortInTx> {
-    match gate_existing(current) {
-        OpenGate::Missing => commit_value(tx, "commit abort", AbortInTx::Retry),
-        OpenGate::Terminal(lease) => {
-            commit_value(tx, "commit abort", AbortInTx::Terminal(Box::new(lease)))
+impl OpenWrite {
+    fn success(self) -> (&'static str, &'static str, OpenEffect) {
+        match self {
+            Self::Promote => (
+                "COMMIT",
+                "COMMITTED",
+                OpenEffect::Reload(ReloadKind::Promoted),
+            ),
+            Self::Abort => ("PREPARE", "ABORTED", OpenEffect::Retry),
+            Self::Attention => (
+                "MUTATE",
+                "NEEDS_ATTENTION",
+                OpenEffect::Reload(ReloadKind::Attention),
+            ),
         }
-        OpenGate::Open(lease) => delete_reservation(tx, operation_id, lease, now),
     }
 }
 
-fn delete_reservation(
-    tx: Transaction<'_>,
+fn wrote_open_row(
+    tx: &Transaction<'_>,
     operation_id: &str,
-    current: Lease,
     now: i64,
-) -> Result<AbortInTx> {
-    if !deleted_row(&tx, operation_id)? {
-        return commit_value(tx, "commit abort", AbortInTx::Terminal(Box::new(current)));
-    }
-    update_op_phase(
-        &tx,
-        OpPhase {
-            operation_id,
-            phase: "PREPARE",
-            status: "ABORTED",
-            now,
-        },
-    )?;
-    commit_value(tx, "commit abort", AbortInTx::Retry)
-}
-
-fn deleted_row(tx: &Transaction<'_>, operation_id: &str) -> Result<bool> {
-    tx.execute(ABORT_SQL, params![operation_id])
-        .map_err(|e| lease_err("abort reservation", e))?;
-    Ok(tx.changes() == 1)
-}
-
-fn dispatch_attention(
-    tx: Transaction<'_>,
-    operation_id: &str,
-    current: Option<Lease>,
-    now: i64,
-) -> Result<AttentionInTx> {
-    match gate_existing(current) {
-        OpenGate::Missing => commit_value(tx, "commit attention", AttentionInTx::Retry),
-        OpenGate::Terminal(lease) => commit_value(
+    write: OpenWrite,
+) -> Result<bool> {
+    match write {
+        OpenWrite::Promote => execute_changed(
             tx,
-            "commit attention",
-            AttentionInTx::Terminal(Box::new(lease)),
+            PROMOTE_SQL,
+            params![
+                AllocationState::Active.as_str(),
+                LeaseMode::WriterLocked.as_str(),
+                now,
+                operation_id,
+            ],
+            "promote lease",
         ),
-        OpenGate::Open(lease) => mark_attention(tx, operation_id, lease, now),
-    }
-}
-
-fn mark_attention(
-    tx: Transaction<'_>,
-    operation_id: &str,
-    current: Lease,
-    now: i64,
-) -> Result<AttentionInTx> {
-    if !attention_row(&tx, operation_id, now)? {
-        return commit_value(
+        OpenWrite::Abort => {
+            execute_changed(tx, ABORT_SQL, params![operation_id], "abort reservation")
+        }
+        OpenWrite::Attention => execute_changed(
             tx,
-            "commit attention",
-            AttentionInTx::Terminal(Box::new(current)),
-        );
+            ATTENTION_SQL,
+            params![
+                AllocationState::NeedsAttention.as_str(),
+                LeaseMode::NeedsHuman.as_str(),
+                now,
+                operation_id,
+            ],
+            "mark needs attention",
+        ),
     }
-    update_op_phase(
-        &tx,
-        OpPhase {
-            operation_id,
-            phase: "MUTATE",
-            status: "NEEDS_ATTENTION",
-            now,
-        },
-    )?;
-    commit_value(tx, "commit attention", AttentionInTx::Marked)
 }
 
-fn attention_row(tx: &Transaction<'_>, operation_id: &str, now: i64) -> Result<bool> {
-    tx.execute(
-        ATTENTION_SQL,
-        params![
-            AllocationState::NeedsAttention.as_str(),
-            LeaseMode::NeedsHuman.as_str(),
-            now,
-            operation_id,
-        ],
-    )
-    .map_err(|e| lease_err("mark needs attention", e))?;
+fn execute_changed(
+    tx: &Transaction<'_>,
+    sql: &str,
+    sql_params: impl rusqlite::Params,
+    context: &'static str,
+) -> Result<bool> {
+    tx.execute(sql, sql_params)
+        .map_err(|e| lease_err(context, e))?;
     Ok(tx.changes() == 1)
 }

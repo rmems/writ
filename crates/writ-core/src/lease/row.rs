@@ -72,10 +72,7 @@ pub(in crate::lease) fn query_lease_tx(
     sql_params: impl rusqlite::Params,
     context: &'static str,
 ) -> Result<Option<Lease>> {
-    let query = format!("{LEASE_SELECT} {where_sql}");
-    tx.query_row(&query, sql_params, lease_from_row)
-        .optional()
-        .map_err(|e| lease_err(context, e))
+    query_lease_locked(tx, where_sql, sql_params, context)
 }
 
 fn query_lease_locked(
