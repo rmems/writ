@@ -78,7 +78,7 @@ Workers keep their harness-native isolation. `writ` is the shared memory and mes
 | --- | --- | --- |
 | `writ` CLI (`git-safe`, `gh-safe`, `worktree`, `supervisor`, `status`, `attribution`) | Implemented | Envelope-compatible additions only |
 | Checkout registration (`worktree register/unregister/inspect/list`) | Implemented | Managed lifecycle (`create`/`remove`/`prune`) is deprecated |
-| Claude Code hook dispatcher / `writ install` | Implemented | Live burn-in outstanding ([#124](https://github.com/rmems/writ/issues/124)) |
+| Claude Code hook dispatcher / `writ install` | Implemented | Live burn-in status unverified ([#124](https://github.com/rmems/writ/issues/124)) |
 | SQLite lease store, agent registry, crash consistency | Implemented | Additional lease policies remain additive |
 | Same-host claims / messages | Implemented | Additional transports are out of scope |
 | Declared paths / overlap visibility, handoff protocol | Implemented | Reuses the lease store — no second database |
@@ -262,7 +262,7 @@ Implemented `writ` surface (`writ --help` is authoritative):
 | `writ worktree create\|remove\|prune` | Deprecated | Managed lifecycle kept for caller compatibility during the transition. `create` requires `--schema-version 2` and `--start-point`. |
 | `writ attribution format` | Implemented | Render review and collaboration replies with real agent/task/branch/session identity. Include a SHA only when one exists; never invent one. |
 | `writ --json` | Implemented | Envelope-producing commands emit versioned JSON on stdout (generic v1; status/jobs v2); diagnostics on stderr. Exceptions: `hook --json` has no envelope; `git-safe`/`gh-safe` validation failures and `install` failures emit stderr only. See the [`CLI contract`](docs/cli-contract.md) and [`fixtures`](docs/examples/). |
-| `writ install` / hook dispatcher | Implemented | Registers `writ hook` into `.claude/settings.json`; burn-in outstanding ([#124](https://github.com/rmems/writ/issues/124)). |
+| `writ install` / hook dispatcher | Implemented | Registers `writ hook` into `.claude/settings.json`; live burn-in status unverified ([#124](https://github.com/rmems/writ/issues/124)). |
 
 JSON envelopes look like:
 
@@ -359,7 +359,7 @@ test -f "$HOME/.agents/skills/writ/SKILL.md" && echo OK
 
 Full root table, uninstall, verification, and WSL notes: [`docs/install.md`](docs/install.md).
 
-This is not `writ install`, which writes the `writ` hook block into `.claude/settings.json` (implemented; do not run it against a shared settings file until the [#124](https://github.com/rmems/writ/issues/124) burn-in completes).
+This is not `writ install`, which writes the `writ` hook block into `.claude/settings.json` (implemented; live burn-in status unverified ([#124](https://github.com/rmems/writ/issues/124)); do not run it against a shared settings file while that status is unverified).
 
 ## Runtime paths
 
@@ -412,7 +412,7 @@ criteria checkboxes, and the Linear footer documented in
 - GitHub issues mirror actionable work items; they are optional, not a required workflow.
 - Open coordination work: crash-consistent lease/ownership records and the same-host claim/overlap/message/handoff layer build on the existing SQLite lease store.
 - Lease budgets (fix-loop bound): [#167](https://github.com/rmems/writ/issues/167)
-- Hook burn-in: [#124](https://github.com/rmems/writ/issues/124) · Install narrative: [#18](https://github.com/rmems/writ/issues/18) · Owner allowlist: [#146](https://github.com/rmems/writ/issues/146)
+- Hook burn-in status unverified: [#124](https://github.com/rmems/writ/issues/124) · Install narrative: [#18](https://github.com/rmems/writ/issues/18) · Owner allowlist: [#146](https://github.com/rmems/writ/issues/146)
 
 ## Project documentation
 
