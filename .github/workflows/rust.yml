@@ -56,7 +56,7 @@ jobs:
       # (which caches the workspace target dir, not ~/.cargo/bin). The sibling
       # `cargo audit` job in security.yml already installs this way.
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: cargo-llvm-cov
           fallback: none
