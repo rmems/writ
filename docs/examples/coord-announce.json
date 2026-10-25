@@ -1,0 +1,45 @@
+{
+    "ok": true,
+    "schema_version": 1,
+    "command": "coord.announce",
+    "data": {
+        "claim": {
+            "agent_id": "agent-a",
+            "allocation_state": "ACTIVE",
+            "branch": "hive/job-a",
+            "declared_paths": [
+                "src/a"
+            ],
+            "intent": "implement module a",
+            "job_id": "job-a",
+            "owner": "acme",
+            "owner_generation": 1,
+            "paused_at": null,
+            "repo_name": "sample",
+            "session_id": "sess-a",
+            "worktree_path": "/path/to/job-a"
+        },
+        "intent": {
+            "ack_of": null,
+            "acked_at": null,
+            "body": "implement module a",
+            "created_at": 1792918178,
+            "from_agent_id": "agent-a",
+            "from_job_id": "job-a",
+            "from_owner": "acme",
+            "from_repo_name": "sample",
+            "id": 1,
+            "kind": "intent",
+            "owner_generation": 1,
+            "paths": [
+                "src/a"
+            ],
+            "to_agent_id": null,
+            "to_job_id": null,
+            "to_owner": null,
+            "to_repo_name": null
+        },
+        "overlaps": []
+    },
+    "error": null
+}
