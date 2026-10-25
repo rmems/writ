@@ -257,9 +257,11 @@ impl LeaseStore {
 
     /// Offer a generation-bound handoff. The claim does not move until ACK.
     ///
-    /// The offer's `paths` list the changed paths that the current declaration
-    /// does not cover, so a stale declaration is visible to the target. When
-    /// the checkout cannot be inspected the list is empty; `scope_drift`
+    /// The offer's `paths` list the changed paths that the declaration locked
+    /// in the same transaction does not cover, so a stale declaration is
+    /// visible to the target. The git inspection runs before the write lock
+    /// is taken; the comparison against `declared_paths` happens inside it.
+    /// When the checkout cannot be inspected the list is empty; `scope_drift`
     /// reports that failure loudly.
     pub fn propose_handoff(&self, request: HandoffRequest<'_>) -> Result<CoordMessage> {
         let key = JobKey {
@@ -268,9 +270,15 @@ impl LeaseStore {
             job_id: request.job_id,
         };
         let to_job = request.to_job_id.unwrap_or(request.job_id);
-        let undeclared = self
-            .scope_drift(key)
-            .map(|drift| drift.undeclared_paths)
+        let changed = self
+            .find_job(key)?
+            .and_then(|lease| {
+                scope::changed_paths(
+                    std::path::Path::new(&lease.worktree_path),
+                    &lease.start_commit,
+                )
+                .ok()
+            })
             .unwrap_or_default();
         let now = now_secs();
         let mut conn = self.lock()?;
@@ -300,6 +308,7 @@ impl LeaseStore {
         if expected != claim.owner_generation {
             return Err(stale_error(&claim, expected));
         }
+        let undeclared = scope::undeclared(&claim.declared_paths, &changed);
         let message = insert_message(
             &tx,
             NewMessage {

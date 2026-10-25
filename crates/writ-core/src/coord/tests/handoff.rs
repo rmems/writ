@@ -70,6 +70,98 @@ fn scope_drift_is_clean_when_changes_stay_inside_the_declaration() {
 }
 
 #[test]
+fn scope_drift_reports_a_rename_as_both_paths() {
+    let harness = Harness::new();
+    let worktree = harness.seed_checkout_job("job-a", "hive/job-a");
+    announce(&harness.store, "job-a", "agent-a", &declared(&["src/a"]));
+    write_commit(
+        &worktree,
+        "src/b/x.rs",
+        "fn x() {}",
+        "lands outside the declaration",
+    );
+    fs::create_dir_all(worktree.join("src/a")).unwrap();
+    git(&worktree, &["mv", "src/b/x.rs", "src/a/x.rs"]);
+    git(&worktree, &["commit", "-q", "-m", "move it inside"]);
+
+    let drift = harness.store.scope_drift(job_key_a()).unwrap();
+
+    assert_eq!(drift.changed_paths, declared(&["src/a/x.rs", "src/b/x.rs"]));
+    assert_eq!(drift.undeclared_paths, declared(&["src/b/x.rs"]));
+}
+
+#[test]
+fn scope_drift_ignores_upstream_commits_merged_into_the_job_branch() {
+    let harness = Harness::new();
+    let worktree = harness.seed_checkout_job("job-a", "hive/job-a");
+    announce(&harness.store, "job-a", "agent-a", &declared(&["src/a"]));
+    write_commit(&worktree, "src/a/x.rs", "fn a() {}", "job work");
+    write_commit(
+        &harness.repo,
+        "src/upstream/u.rs",
+        "fn u() {}",
+        "peer work on main",
+    );
+    git(&worktree, &["merge", "--no-edit", "main"]);
+    assert!(worktree.join("src/upstream/u.rs").exists());
+
+    let drift = harness.store.scope_drift(job_key_a()).unwrap();
+
+    assert_eq!(drift.changed_paths, declared(&["src/a/x.rs"]));
+    assert!(drift.undeclared_paths.is_empty());
+}
+
+#[test]
+fn scope_drift_counts_a_fast_forward_until_the_checkout_is_reregistered() {
+    let harness = Harness::new();
+    let worktree = harness.seed_checkout_job("job-a", "hive/job-a");
+    announce(&harness.store, "job-a", "agent-a", &declared(&["src/a"]));
+    write_commit(
+        &harness.repo,
+        "src/upstream/u.rs",
+        "fn u() {}",
+        "peer work on main",
+    );
+    git(&worktree, &["merge", "--ff-only", "main"]);
+
+    // A fast-forward (like a rebase) moves the branch base, so the replayed
+    // upstream commit is on the first-parent history and is counted.
+    let drift = harness.store.scope_drift(job_key_a()).unwrap();
+    assert_eq!(drift.undeclared_paths, declared(&["src/upstream/u.rs"]));
+
+    // Re-registering the checkout refreshes the lease start commit to HEAD.
+    let head = git(&worktree, &["rev-parse", "HEAD"]);
+    harness
+        .store
+        .grant(crate::lease::LeaseGrant {
+            repo: &harness.repo,
+            owner: "acme",
+            repo_name: "sample",
+            job_id: "job-a",
+            branch: "hive/job-a",
+            worktree_path: &worktree,
+            start_commit: &head,
+        })
+        .unwrap();
+    let drift = harness.store.scope_drift(job_key_a()).unwrap();
+    assert_eq!(drift.start_commit, head);
+    assert!(drift.changed_paths.is_empty());
+}
+
+#[test]
+fn handoff_compares_against_the_declaration_locked_with_the_offer() {
+    let harness = Harness::new();
+    let worktree = harness.seed_checkout_job("job-a", "hive/job-a");
+    announce(&harness.store, "job-a", "agent-a", &declared(&["src/a"]));
+    write_only(&worktree, "src/b/y.rs", "fn b() {}");
+    announce(&harness.store, "job-a", "agent-a", &declared(&["src"]));
+
+    let offer = sample_handoff(&harness.store, "declaration widened first", Some("job-a"));
+
+    assert!(offer.paths.is_empty(), "got {:?}", offer.paths);
+}
+
+#[test]
 fn scope_drift_inspection_is_read_only() {
     let harness = Harness::new();
     let worktree = harness.seed_checkout_job("job-a", "hive/job-a");
