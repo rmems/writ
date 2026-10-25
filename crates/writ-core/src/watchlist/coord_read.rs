@@ -126,48 +126,49 @@ fn load_coord_snapshot(path: &Path) -> CoordSnapshot {
 }
 
 fn load_coord_snapshot_from(conn: &Connection) -> CoordSnapshot {
-    if !table_exists(conn, "coord_claims") {
+    let has_claims = table_exists(conn, "coord_claims");
+    let has_messages = table_exists(conn, "coord_messages");
+    match (has_claims, has_messages) {
+        (false, false) => CoordSnapshot::default(),
         // The coord schema creates both tables together; messages without
         // claims is drift that must not read as "no coordination data".
-        if table_exists(conn, "coord_messages") {
-            return CoordSnapshot {
-                available: true,
-                error: Some("coord_messages exists without coord_claims".to_owned()),
-                ..CoordSnapshot::default()
-            };
-        }
-        return CoordSnapshot::default();
+        (false, true) => failed_snapshot(
+            "coord_messages exists without coord_claims".to_owned(),
+            BTreeMap::new(),
+        ),
+        (true, _) => load_coord_tables(conn, has_messages),
     }
+}
+
+fn load_coord_tables(conn: &Connection, has_messages: bool) -> CoordSnapshot {
     let claims = match load_claims(conn) {
         Ok(claims) => claims,
-        Err(err) => {
-            return CoordSnapshot {
-                available: true,
-                error: Some(format!("coord_claims: {err}")),
-                ..CoordSnapshot::default()
-            };
-        }
+        Err(err) => return failed_snapshot(format!("coord_claims: {err}"), BTreeMap::new()),
     };
-    let messages = if table_exists(conn, "coord_messages") {
-        match load_messages(conn) {
-            Ok(messages) => messages,
-            Err(err) => {
-                return CoordSnapshot {
-                    available: true,
-                    error: Some(format!("coord_messages: {err}")),
-                    claims,
-                    ..CoordSnapshot::default()
-                };
-            }
-        }
+    let messages = if has_messages {
+        load_messages(conn)
     } else {
-        Vec::new()
+        Ok(Vec::new())
     };
+    match messages {
+        Ok(messages) => CoordSnapshot {
+            available: true,
+            error: None,
+            claims,
+            messages,
+        },
+        Err(err) => failed_snapshot(format!("coord_messages: {err}"), claims),
+    }
+}
+
+/// Tables exist but could not be read: the snapshot is available, carries
+/// whatever was read before the failure, and records why the rest is missing.
+fn failed_snapshot(error: String, claims: BTreeMap<JobId, ClaimRow>) -> CoordSnapshot {
     CoordSnapshot {
         available: true,
-        error: None,
+        error: Some(error),
         claims,
-        messages,
+        messages: Vec::new(),
     }
 }
 
