@@ -10,6 +10,8 @@ This is the repository contribution contract. `CLAUDE.md`, `SKILL.md`, `REVIEW.m
 
 ## Non-negotiable safety
 
+[`docs/safety-model.md`](docs/safety-model.md) separates the integrity invariants Rust enforces from the advisory collaboration signals, with the tests behind each.
+
 ### Core prohibitions
 
 - Preserve another worker's checkout, branch and uncommitted changes. Never seize a live assignment or discard WIP to make integration easier.
