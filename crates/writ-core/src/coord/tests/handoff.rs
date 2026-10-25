@@ -287,7 +287,10 @@ fn scope_drift_does_not_refresh_the_index_for_a_stat_only_change() {
         })
         .unwrap();
     let tracked = worktree.join("src/a/x.rs");
-    fs::File::open(&tracked)
+    // A writable handle: Windows refuses to set times through a read-only one.
+    fs::File::options()
+        .write(true)
+        .open(&tracked)
         .unwrap()
         .set_modified(SystemTime::now() - Duration::from_secs(30))
         .unwrap();

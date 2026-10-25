@@ -257,7 +257,6 @@ fn git_subcommand<'a>(args: &'a [&'a str]) -> &'a str {
 fn nul_separated(bytes: Vec<u8>) -> Result<Vec<String>> {
     bytes
         .split(|byte| *byte == 0)
-        .map(|entry| entry.strip_prefix(b"\n").unwrap_or(entry))
         .filter(|entry| !entry.is_empty())
         .map(changed_path)
         .collect()
