@@ -137,7 +137,7 @@ SHA policy: include `--commit-sha` only when referring to committed or pushed wo
 
 `writ watchlist list|check|check-all` reads the shared lease store (`WRIT_LEASE_PATH`, default `{user_data}/writ/leases.db`). It does **not** write `watchlist.json`, `watched.json`, or `pr-babysit` state.
 
-- **Source of ownership:** lease rows from `writ worktree register` (and later RM-825 `coord_claims` / `coord_messages` when those tables exist).
+- **Source of ownership:** lease rows from `writ worktree register`, plus the `coord_claims` / `coord_messages` tables that `writ coord announce` adds to the same store. `writ coord drift` shows where a checkout's actual changes left the declared paths; a `handoff` offer carries those undeclared paths.
 - **Local collab status:** `running`, `waiting`, `paused`, `conflicted`, `ready_for_integration`.
 - **Recovery:** `live`, `released`, `stale_heartbeat`, `missing_checkout`.
 - **GitHub:** `check` / `check-all` probe PRs live (`gh pr list --head`). That overlay is not a merge gate. `--repo` / `--owner` filters are optional; probes still honour `WRIT_ALLOWED_OWNERS`.

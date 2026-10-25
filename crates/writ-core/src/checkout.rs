@@ -101,7 +101,12 @@ impl CheckoutRegistry {
                 if !registration_matches_lease(info, &existing) {
                     return Err(registration_identity_error(info, job_id, &existing));
                 }
-                self.leases.grant(registration_grant(info, job_id))?;
+                // A live checkout keeps its baseline: `start_commit` is where the
+                // job's work began, not wherever HEAD is now, and scope drift is
+                // measured from it. Only a released lease starts over at HEAD.
+                let mut grant = registration_grant(info, job_id);
+                grant.start_commit = &existing.start_commit;
+                self.leases.grant(grant)?;
                 Ok(true)
             }
             AllocationState::Released => {
@@ -736,6 +741,41 @@ mod tests {
         let info = registry.register(&clone, "clone-job").unwrap();
         assert!(!info.linked_worktree);
         assert_eq!(info.common_dir, canonicalize(&clone.join(".git")).unwrap());
+    }
+
+    #[test]
+    fn reregistering_an_active_checkout_keeps_its_start_commit() {
+        let (tmp, repo) = init_repo();
+        let wt = tmp.path().join("wt-again");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "again",
+                wt.to_str().unwrap(),
+            ],
+        );
+        let store = LeaseStore::open(tmp.path().join("leases.db")).unwrap();
+        let registry = CheckoutRegistry::with_store(store).unwrap();
+        registry.register(&wt, "again-job").unwrap();
+        let start = head(&wt);
+        std::fs::write(wt.join("new.txt"), "job work\n").unwrap();
+        git(&wt, &["add", "new.txt"]);
+        git(&wt, &["commit", "--quiet", "-m", "job work"]);
+
+        // Re-registering (as an idempotent harness hook does) keeps the baseline.
+        registry.register(&wt, "again-job").unwrap();
+        let lease = registry.registered().unwrap().into_iter().next().unwrap();
+        assert_eq!(lease.start_commit, start);
+
+        // Releasing and registering again starts a new baseline at HEAD.
+        registry.unregister(&wt).unwrap();
+        registry.register(&wt, "again-job").unwrap();
+        let lease = registry.registered().unwrap().into_iter().next().unwrap();
+        assert_eq!(lease.start_commit, head(&wt));
     }
 
     #[test]

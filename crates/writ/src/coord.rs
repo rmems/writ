@@ -50,6 +50,12 @@ pub enum CoordAction {
         repo_name: String,
         job_id: String,
     },
+    /// Compare a job's declared paths with what its checkout actually changed.
+    Drift {
+        owner: String,
+        repo_name: String,
+        job_id: String,
+    },
     /// Send a help, overlap, intent, dependency, or ack message.
     Send {
         owner: String,
@@ -126,6 +132,7 @@ impl CoordAction {
             Self::Show { .. } => "coord.show",
             Self::List => "coord.list",
             Self::Inbox { .. } => "coord.inbox",
+            Self::Drift { .. } => "coord.drift",
             Self::Send { .. } => "coord.send",
             Self::Ack { .. } => "coord.ack",
             Self::Pause { .. } => "coord.pause",
@@ -181,7 +188,10 @@ fn dispatch(
 fn coord_is_read(action: &CoordAction) -> bool {
     matches!(
         action,
-        CoordAction::Show { .. } | CoordAction::List | CoordAction::Inbox { .. }
+        CoordAction::Show { .. }
+            | CoordAction::List
+            | CoordAction::Inbox { .. }
+            | CoordAction::Drift { .. }
     )
 }
 
@@ -206,7 +216,8 @@ fn absent_coord_read(
         CoordAction::List => ok("coord.list", serde_json::json!({ "claims": [] })),
         CoordAction::Show { .. } => ok("coord.show", serde_json::json!({ "claim": null })),
         CoordAction::Inbox { .. } => ok("coord.inbox", serde_json::json!({ "messages": [] })),
-        _ => unreachable!("absent_coord_read only handles show/list/inbox"),
+        CoordAction::Drift { .. } => ok("coord.drift", serde_json::json!({ "drift": null })),
+        _ => unreachable!("absent_coord_read only handles show/list/inbox/drift"),
     }
 }
 
@@ -229,6 +240,7 @@ fn enforce_coord_owners(
         CoordAction::Announce { owner, .. }
         | CoordAction::Show { owner, .. }
         | CoordAction::Inbox { owner, .. }
+        | CoordAction::Drift { owner, .. }
         | CoordAction::Ack { owner, .. }
         | CoordAction::Pause { owner, .. }
         | CoordAction::Handoff { owner, .. } => allowlist.enforce_owner(owner),
@@ -300,17 +312,30 @@ fn load_coord_read(
                 name: "messages",
             },
         ),
-        _ => unreachable!("load_coord_read only handles show/inbox"),
+        CoordAction::Drift {
+            owner,
+            repo_name,
+            job_id,
+        } => (
+            owner,
+            repo_name,
+            job_id,
+            JobField {
+                command: "coord.drift",
+                name: "drift",
+            },
+        ),
+        _ => unreachable!("load_coord_read only handles show/inbox/drift"),
     };
     let key = JobKey {
         owner: &owner,
         repo_name: &repo_name,
         job_id: &job_id,
     };
-    if field.name == "claim" {
-        job_field(key, field, |key| store.find_claim(key))
-    } else {
-        job_field(key, field, |key| store.inbox(key))
+    match field.name {
+        "claim" => job_field(key, field, |key| store.find_claim(key)),
+        "drift" => job_field(key, field, |key| store.scope_drift(key)),
+        _ => job_field(key, field, |key| store.inbox(key)),
     }
 }
 

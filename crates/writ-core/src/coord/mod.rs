@@ -14,12 +14,14 @@ mod access;
 mod ack;
 mod announce;
 mod declared_paths;
+mod scope;
 mod types;
 mod util;
 
 #[cfg(test)]
 mod tests;
 
+pub use scope::ScopeDrift;
 pub use types::{
     AckRequest, AnnounceRequest, AnnounceResult, CoordClaim, CoordMessage, HandoffRequest,
     MessageKind, PathOverlap, PauseRequest, SendRequest,
@@ -235,7 +237,33 @@ impl LeaseStore {
         Ok((paused, help))
     }
 
+    /// Compare the declared paths of a claim with what its checkout changed.
+    ///
+    /// Read-only. Fails when the job has no claim or the checkout cannot be
+    /// inspected with git; it never adopts, resets, or cleans anything.
+    pub fn scope_drift(&self, key: JobKey<'_>) -> Result<ScopeDrift> {
+        let claim = self
+            .find_claim(key)?
+            .ok_or_else(|| coord_missing("no coordination claim to compare against"))?;
+        let lease = self.find_job(key)?.ok_or_else(|| {
+            coord_missing("no lease exists for the coordination claim being compared")
+        })?;
+        let changed = scope::changed_paths(scope::Checkout {
+            worktree: std::path::Path::new(&lease.worktree_path),
+            branch: &lease.branch,
+            start_commit: &lease.start_commit,
+        })?;
+        Ok(ScopeDrift::build(&claim, &lease, changed))
+    }
+
     /// Offer a generation-bound handoff. The claim does not move until ACK.
+    ///
+    /// The offer's `paths` list the changed paths that the declaration locked
+    /// in the same transaction does not cover, so a stale declaration is
+    /// visible to the target. The git inspection runs before the write lock
+    /// is taken; the comparison against `declared_paths` happens inside it.
+    /// When the checkout cannot be inspected the list is empty; `scope_drift`
+    /// reports that failure loudly.
     pub fn propose_handoff(&self, request: HandoffRequest<'_>) -> Result<CoordMessage> {
         let key = JobKey {
             owner: request.owner,
@@ -243,6 +271,7 @@ impl LeaseStore {
             job_id: request.job_id,
         };
         let to_job = request.to_job_id.unwrap_or(request.job_id);
+        let changed = self.changed_paths_best_effort(key)?;
         let now = now_secs();
         let mut conn = self.lock()?;
         let tx = conn
@@ -250,27 +279,8 @@ impl LeaseStore {
             .map_err(|e| coord_err("begin coord handoff", e))?;
         let claim = load_claim_tx(&tx, key)?
             .ok_or_else(|| coord_missing("no coordination claim for handoff"))?;
-        if claim.agent_id != request.from_agent_id {
-            return Err(held_error(&claim));
-        }
-        if terminal_allocation(&claim.allocation_state) {
-            return Err(Error::PolicyViolation {
-                code: PolicyCode::CoordClaimMissing,
-                message: format!(
-                    "lease {}/{}/{} is {}; handoff stays on live assignments",
-                    claim.owner, claim.repo_name, claim.job_id, claim.allocation_state
-                ),
-            });
-        }
-        let expected = request
-            .expected_generation
-            .ok_or_else(|| Error::PolicyViolation {
-                code: PolicyCode::CoordStaleGeneration,
-                message: "handoff requires the current owner generation".to_owned(),
-            })?;
-        if expected != claim.owner_generation {
-            return Err(stale_error(&claim, expected));
-        }
+        require_handoff_source(&claim, request)?;
+        let undeclared = scope::undeclared(&claim.declared_paths, &changed);
         let message = insert_message(
             &tx,
             NewMessage {
@@ -285,7 +295,7 @@ impl LeaseStore {
                 to_job_id: Some(to_job),
                 owner_generation: claim.owner_generation,
                 body: request.body,
-                paths: &[],
+                paths: &undeclared,
                 ack_of: None,
                 now,
             },
@@ -293,6 +303,22 @@ impl LeaseStore {
         tx.commit()
             .map_err(|e| coord_err("commit coord handoff", e))?;
         Ok(message)
+    }
+
+    /// Changed paths of the job's checkout, or an empty list when there is no
+    /// lease or the checkout cannot be inspected. Store errors still surface.
+    fn changed_paths_best_effort(&self, key: JobKey<'_>) -> Result<Vec<String>> {
+        Ok(self
+            .find_job(key)?
+            .and_then(|lease| {
+                scope::changed_paths(scope::Checkout {
+                    worktree: std::path::Path::new(&lease.worktree_path),
+                    branch: &lease.branch,
+                    start_commit: &lease.start_commit,
+                })
+                .ok()
+            })
+            .unwrap_or_default())
     }
 
     /// Acknowledge a message. A matching handoff ACK transfers the claim.
@@ -335,6 +361,33 @@ pub(crate) fn clear_pending_overlaps(
         params![key.owner, key.repo_name, key.job_id],
     )
     .map_err(|e| coord_err("clear pending coord overlaps", e))?;
+    Ok(())
+}
+
+/// The offer must come from the live owner of a non-terminal claim and name
+/// its current generation.
+fn require_handoff_source(claim: &CoordClaim, request: HandoffRequest<'_>) -> Result<()> {
+    if claim.agent_id != request.from_agent_id {
+        return Err(held_error(claim));
+    }
+    if terminal_allocation(&claim.allocation_state) {
+        return Err(Error::PolicyViolation {
+            code: PolicyCode::CoordClaimMissing,
+            message: format!(
+                "lease {}/{}/{} is {}; handoff stays on live assignments",
+                claim.owner, claim.repo_name, claim.job_id, claim.allocation_state
+            ),
+        });
+    }
+    let expected = request
+        .expected_generation
+        .ok_or_else(|| Error::PolicyViolation {
+            code: PolicyCode::CoordStaleGeneration,
+            message: "handoff requires the current owner generation".to_owned(),
+        })?;
+    if expected != claim.owner_generation {
+        return Err(stale_error(claim, expected));
+    }
     Ok(())
 }
 
