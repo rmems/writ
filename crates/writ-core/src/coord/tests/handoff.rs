@@ -210,7 +210,7 @@ fn scope_drift_keeps_job_commits_when_a_stacked_child_branch_is_pushed() {
 }
 
 #[test]
-fn scope_drift_counts_a_fast_forward_until_the_checkout_is_reregistered() {
+fn scope_drift_counts_a_fast_forward_until_the_lease_starts_over() {
     let harness = Harness::new();
     let worktree = harness.seed_checkout_job("job-a", "hive/job-a");
     announce(&harness.store, "job-a", "agent-a", &declared(&["src/a"]));
@@ -223,7 +223,8 @@ fn scope_drift_counts_a_fast_forward_until_the_checkout_is_reregistered() {
     let drift = harness.store.scope_drift(job_key_a()).unwrap();
     assert_eq!(drift.undeclared_paths, declared(&["src/upstream/u.rs"]));
 
-    // Re-registering the checkout refreshes the lease start commit to HEAD.
+    // An explicit re-grant (what unregister + register does) moves the lease
+    // start commit to HEAD; re-registering a live checkout would keep it.
     let head = git(&worktree, &["rev-parse", "HEAD"]);
     harness
         .store

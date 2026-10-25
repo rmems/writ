@@ -94,8 +94,10 @@ child or copy is never a base, so the job's own commits stay attributed to it;
 renames count as both paths), plus staged and unstaged changes against `HEAD`
 and untracked, non-ignored files. Merging the base or rebasing onto a fetched
 base therefore attributes nothing upstream to the job; a fast-forward or rebase
-onto base commits that no base ref records counts them until the checkout is
-re-registered, which refreshes the start commit to the current `HEAD`. It runs
+onto base commits that no base ref records counts them until the lease starts
+over at a new start commit (`worktree unregister` then `register`); registering
+a live checkout again keeps its baseline, so a harness that re-attaches a
+worktree does not erase the job's committed drift. It runs
 read-only `git` in that checkout: `git log` and `git for-each-ref` for commits
 and base refs, and `git status --porcelain` with `--no-optional-locks` for
 staged and unstaged paths, so a stat-only refresh cannot take `index.lock`.

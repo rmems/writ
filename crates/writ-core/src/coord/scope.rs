@@ -84,8 +84,9 @@ pub(super) fn covers(declared: &str, path: &str) -> bool {
 ///   job's own commits stay attributed to it however far the branch moves on.
 ///   A fast-forward or rebase onto base commits that no base ref records
 ///   (local-only, or a remote without a default head or tracking config)
-///   still counts them until the checkout is re-registered (which refreshes
-///   `start_commit`);
+///   still counts them until the lease starts over at a new `start_commit`
+///   (unregister and register again, or an explicit grant); re-registering
+///   a live checkout keeps its baseline;
 /// - staged and unstaged changes relative to `HEAD`;
 /// - untracked files that are not ignored.
 ///
