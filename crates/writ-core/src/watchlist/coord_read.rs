@@ -60,6 +60,30 @@ struct MessageRow {
 }
 
 impl CoordSnapshot {
+    /// First unacknowledged handoff addressed to `key` whose source claim is
+    /// still at the offered generation, as `handoff:<agent>:<job>`.
+    pub(crate) fn pending_handoff_for(&self, key: &JobId) -> Option<String> {
+        self.pending_for(|msg| msg.kind == "handoff" && msg.targets(key))
+    }
+
+    /// First unacknowledged help/dependency/blocker addressed to `key`, or
+    /// broadcast by `key` itself, as `<kind>:<agent>:<job>`.
+    pub(crate) fn pending_blocker_for(&self, key: &JobId) -> Option<String> {
+        self.pending_for(|msg| {
+            matches!(msg.kind.as_str(), "help" | "dependency" | "blocker")
+                && (msg.targets(key) || (msg.to.is_none() && msg.from == *key))
+        })
+    }
+
+    fn pending_for(&self, keep: impl Fn(&MessageRow) -> bool) -> Option<String> {
+        self.messages.iter().find_map(|msg| {
+            if msg.acked_at.is_some() || !keep(msg) {
+                return None;
+            }
+            waiting_label(msg, &self.claims)
+        })
+    }
+
     pub(crate) fn overlay_for(&self, key: &JobId) -> CoordOverlay {
         let claim = self.claims.get(key);
         let waiting_on = waiting_on_for(&self.messages, key, &self.claims);

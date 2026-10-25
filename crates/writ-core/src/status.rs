@@ -11,9 +11,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::checkout::{CheckoutInfo, DETACHED_BRANCH, inspect_checkout_for_status};
 use crate::contract::Response;
-use crate::lease::{AgentRecord, AllocationState, Lease, LeaseMode, LeaseStore};
+use crate::lease::{
+    AgentRecord, AllocationState, Lease, LeaseMode, LeaseStore, list_agents_on, list_leases_on,
+};
 use crate::paths::lease_store_path;
 use crate::timeout_policy::{RecoveryStage, TimeoutClass};
+use crate::watchlist::coord_read::{CoordSnapshot, JobId, load_coord_snapshot_on};
 
 /// Lifecycle state of a watched job process.
 ///
@@ -187,22 +190,24 @@ pub struct JobStatus {
     /// Lease `updated_at` unix seconds.
     #[serde(default)]
     pub updated_at: Option<i64>,
-    /// Ownership generation. Not stored today; always `null`.
+    /// Coord claim `owner_generation`; `null` without a claim.
     #[serde(default)]
     pub ownership_generation: Option<i64>,
-    /// Agent id joined to this job. Not stored on the lease; always `null`.
+    /// Agent that owns the coord claim; `null` without a claim.
     #[serde(default)]
     pub agent_id: Option<String>,
-    /// Session id joined to this job. Not stored on the lease; always `null`.
+    /// Session recorded on the coord claim; `null` without a claim.
     #[serde(default)]
     pub session_id: Option<String>,
-    /// Declared path scopes. Not stored today; always `null`.
+    /// Declared paths from the latest `coord announce`; `null` without a claim.
     #[serde(default)]
     pub declared_paths: Option<Vec<String>>,
-    /// Latest blocker. Not stored today; always `null`.
+    /// First unacknowledged help/dependency/blocker for this job
+    /// (`<kind>:<agent>:<job>`); `null` when none.
     #[serde(default)]
     pub blocker: Option<String>,
-    /// Latest handoff. Not stored today; always `null`.
+    /// First unacknowledged live handoff offered to this job
+    /// (`handoff:<agent>:<job>`); `null` when none.
     #[serde(default)]
     pub handoff: Option<String>,
     /// `true` when an active lease cannot inspect its checkout.
@@ -309,17 +314,40 @@ pub fn load_from_path(path: &Path) -> Result<JobsData, String> {
 }
 
 /// Load collaboration status from an already-open store.
+///
+/// Leases, agents, and the optional coord overlay are read in one SQLite
+/// snapshot. Missing `coord_*` tables leave the ownership fields `null`;
+/// nothing is created or written.
 pub fn load_from_store(store: &LeaseStore) -> Result<JobsData, String> {
-    let (leases, agents) = store.snapshot().map_err(|e| e.to_string())?;
+    let conn = store.lock().map_err(|e| e.to_string())?;
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| format!("begin status snapshot: {e}"))?;
+    let leases = list_leases_on(&tx, "ORDER BY id", "list leases").map_err(|e| e.to_string())?;
+    let agents = list_agents_on(&tx).map_err(|e| e.to_string())?;
+    let coord = load_coord_snapshot_on(&tx);
+    tx.commit()
+        .map_err(|e| format!("commit status snapshot: {e}"))?;
+    drop(conn);
     Ok(JobsData {
         source: SOURCE_LEASE_STORE.to_owned(),
-        jobs: leases.iter().map(job_from_lease).collect(),
+        jobs: leases
+            .iter()
+            .map(|lease| job_from_lease(lease, &coord))
+            .collect(),
         agents: agents.into_iter().map(agent_status).collect(),
     })
 }
 
-fn job_from_lease(lease: &Lease) -> JobStatus {
+fn job_from_lease(lease: &Lease, coord: &CoordSnapshot) -> JobStatus {
     let (head, head_source, recovery_needed) = resolve_head(lease);
+    let key = JobId::new(&lease.owner, &lease.repo_name, &lease.job_id);
+    let overlay = coord.overlay_for(&key);
+    let claimed = overlay.agent_id.is_some();
+    let collaboration_state = match collaboration_state_from_lease(lease) {
+        CollaborationState::Running if overlay.paused => CollaborationState::Paused,
+        state => state,
+    };
     JobStatus {
         job_id: lease.job_id.clone(),
         owner: lease.owner.clone(),
@@ -338,18 +366,18 @@ fn job_from_lease(lease: &Lease) -> JobStatus {
         recovery_stage: None,
         last_output_ms: None,
         max_redispatch_per_item: None,
-        collaboration_state: collaboration_state_from_lease(lease),
+        collaboration_state,
         lease_mode: Some(lease.mode_raw.clone()),
         head,
         head_source,
         lease_row_id: Some(lease.row_id),
         updated_at: Some(lease.updated_at),
-        ownership_generation: None,
-        agent_id: None,
-        session_id: None,
-        declared_paths: None,
-        blocker: None,
-        handoff: None,
+        ownership_generation: overlay.owner_generation,
+        agent_id: overlay.agent_id,
+        session_id: overlay.session_id,
+        declared_paths: claimed.then_some(overlay.declared_paths),
+        blocker: coord.pending_blocker_for(&key),
+        handoff: coord.pending_handoff_for(&key),
         recovery_needed,
     }
 }
@@ -435,7 +463,7 @@ pub fn format_human(data: &JobsData) -> String {
 fn format_job_line(job: &JobStatus) -> String {
     let head = job.head.as_deref().unwrap_or("unknown");
     let mode = job.lease_mode.as_deref().unwrap_or("unknown");
-    format!(
+    let mut line = format!(
         "{} [{}] {}/{} path={} branch={} head={} lease={}",
         job.job_id,
         job.collaboration_state,
@@ -445,7 +473,17 @@ fn format_job_line(job: &JobStatus) -> String {
         job.branch,
         head,
         mode
-    )
+    );
+    if let (Some(agent), Some(generation)) = (&job.agent_id, job.ownership_generation) {
+        line.push_str(&format!(" agent={agent} gen={generation}"));
+    }
+    if let Some(handoff) = &job.handoff {
+        line.push_str(&format!(" handoff={handoff}"));
+    }
+    if let Some(blocker) = &job.blocker {
+        line.push_str(&format!(" blocker={blocker}"));
+    }
+    line
 }
 
 fn format_agent_line(agent: &AgentStatus) -> String {
@@ -847,6 +885,111 @@ mod tests {
             })
             .unwrap();
         (tmp, store)
+    }
+
+    fn announce_job(store: &LeaseStore, job_id: &str, agent: &str, paths: &[&str]) {
+        let paths = paths.iter().map(|p| String::from(*p)).collect::<Vec<_>>();
+        store
+            .announce(crate::coord::AnnounceRequest {
+                owner: "acme",
+                repo_name: "sample",
+                job_id,
+                agent_id: agent,
+                session_id: Some("session-x"),
+                agent_type: "worker",
+                intent: Some("status overlay"),
+                paths: &paths,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn coord_claim_populates_ownership_fields() {
+        let (_tmp, store) = seeded_store();
+        announce_job(&store, "job-a", "agent-a", &["src/a"]);
+        let data = load_from_store(&store).unwrap();
+        let (a, b) = (&data.jobs[0], &data.jobs[1]);
+        assert_eq!(
+            (
+                a.agent_id.as_deref(),
+                a.session_id.as_deref(),
+                a.ownership_generation,
+                a.declared_paths.clone(),
+            ),
+            (
+                Some("agent-a"),
+                Some("session-x"),
+                Some(1),
+                Some(vec![String::from("src/a")])
+            )
+        );
+        assert!(a.blocker.is_none() && a.handoff.is_none());
+        assert!(b.agent_id.is_none() && b.ownership_generation.is_none());
+        assert!(b.declared_paths.is_none());
+    }
+
+    #[test]
+    fn pending_handoff_help_and_pause_surface_on_status() {
+        let (_tmp, store) = seeded_store();
+        announce_job(&store, "job-a", "agent-a", &[]);
+        announce_job(&store, "job-b", "agent-b", &[]);
+        store
+            .pause_claim(crate::coord::PauseRequest {
+                key: crate::lease::JobKey {
+                    owner: "acme",
+                    repo_name: "sample",
+                    job_id: "job-a",
+                },
+                agent_id: "agent-a",
+                body: None,
+            })
+            .unwrap();
+        store
+            .propose_handoff(crate::coord::HandoffRequest {
+                owner: "acme",
+                repo_name: "sample",
+                job_id: "job-a",
+                from_agent_id: "agent-a",
+                to_agent_id: "agent-b",
+                to_job_id: Some("job-b"),
+                expected_generation: Some(1),
+                body: "take over",
+            })
+            .unwrap();
+        let data = load_from_store(&store).unwrap();
+        let (a, b) = (&data.jobs[0], &data.jobs[1]);
+        assert_eq!(a.collaboration_state, CollaborationState::Paused);
+        assert_eq!(a.blocker.as_deref(), Some("help:agent-a:job-a"));
+        assert_eq!(b.handoff.as_deref(), Some("handoff:agent-a:job-a"));
+        assert_eq!(b.collaboration_state, CollaborationState::Running);
+        let human = format_human(&data);
+        assert!(human.contains("agent=agent-a gen=1"), "{human}");
+        assert!(human.contains("handoff=handoff:agent-a:job-a"), "{human}");
+    }
+
+    #[test]
+    fn store_without_coord_tables_keeps_ownership_null() {
+        let (tmp, store) = seeded_store();
+        drop(store);
+        let path = tmp.path().join("leases.db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("DROP TABLE coord_messages; DROP TABLE coord_claims;")
+            .unwrap();
+        drop(conn);
+        let data = load_from_path(&path).unwrap();
+        assert_eq!(data.jobs.len(), 2);
+        assert!(data.jobs.iter().all(|job| {
+            job.agent_id.is_none() && job.declared_paths.is_none() && job.handoff.is_none()
+        }));
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let exists: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name = 'coord_claims'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 0, "status must not recreate coord tables");
     }
 
     #[test]

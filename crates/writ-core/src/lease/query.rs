@@ -69,7 +69,7 @@ pub(crate) fn list_leases_on(
         .map_err(|e| lease_err(context, e))
 }
 
-pub(super) fn list_agents_on(conn: &Connection) -> Result<Vec<AgentRecord>> {
+pub(crate) fn list_agents_on(conn: &Connection) -> Result<Vec<AgentRecord>> {
     let mut stmt = conn
         .prepare(
             "SELECT agent_id, agent_type, session_id, started_at, stopped_at
