@@ -24,6 +24,34 @@ fn write_only(worktree: &Path, rel: &str, body: &str) {
     fs::write(&file, body).unwrap();
 }
 
+/// Add a bare `origin` holding `main`, as a clone would see it. With
+/// `default_head`, `origin/HEAD` points at `origin/main` like a real clone;
+/// without it the remote records no default branch.
+fn add_origin(harness: &Harness, default_head: bool) {
+    let remote = harness._temp.path().join("origin.git");
+    git(
+        &harness.repo,
+        &["init", "-q", "--bare", remote.to_str().unwrap()],
+    );
+    git(
+        &harness.repo,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    git(&harness.repo, &["push", "-q", "origin", "main"]);
+    if default_head {
+        git(&harness.repo, &["remote", "set-head", "origin", "main"]);
+    }
+}
+
+fn peer_commit_on_main(harness: &Harness) {
+    write_commit(
+        &harness.repo,
+        "src/upstream/u.rs",
+        "fn u() {}",
+        "peer work on main",
+    );
+}
+
 #[test]
 fn scope_drift_separates_undeclared_changes_from_untouched_declarations() {
     let harness = Harness::new();
@@ -120,22 +148,8 @@ fn scope_drift_ignores_upstream_commits_after_a_rebase_onto_a_fetched_base() {
     let worktree = harness.seed_checkout_job("job-a", "hive/job-a");
     announce(&harness.store, "job-a", "agent-a", &declared(&["src/a"]));
     write_commit(&worktree, "src/a/x.rs", "fn a() {}", "job work");
-    write_commit(
-        &harness.repo,
-        "src/upstream/u.rs",
-        "fn u() {}",
-        "peer work on main",
-    );
-    let remote = harness._temp.path().join("origin.git");
-    git(
-        &harness.repo,
-        &["init", "-q", "--bare", remote.to_str().unwrap()],
-    );
-    git(
-        &harness.repo,
-        &["remote", "add", "origin", remote.to_str().unwrap()],
-    );
-    git(&harness.repo, &["push", "-q", "origin", "main"]);
+    peer_commit_on_main(&harness);
+    add_origin(&harness, true);
     git(&worktree, &["push", "-q", "origin", "hive/job-a"]);
     git(&worktree, &["rebase", "-q", "main"]);
     assert!(worktree.join("src/upstream/u.rs").exists());
@@ -143,10 +157,26 @@ fn scope_drift_ignores_upstream_commits_after_a_rebase_onto_a_fetched_base() {
     let drift = harness.store.scope_drift(job_key_a()).unwrap();
 
     // The upstream commit is on first-parent history now, but it is reachable
-    // from origin/main; the job's own pushed commit on origin/hive/job-a is
-    // not treated as upstream.
+    // from origin/main, the remote's default branch; the job's own pushed
+    // commit on origin/hive/job-a is not treated as upstream.
     assert_eq!(drift.changed_paths, declared(&["src/a/x.rs"]));
     assert!(drift.undeclared_paths.is_empty());
+}
+
+#[test]
+fn scope_drift_uses_the_configured_upstream_as_base_without_a_default_head() {
+    let harness = Harness::new();
+    let worktree = harness.seed_checkout_job("job-a", "hive/job-a");
+    announce(&harness.store, "job-a", "agent-a", &declared(&["src/a"]));
+    write_commit(&worktree, "src/a/x.rs", "fn a() {}", "job work");
+    peer_commit_on_main(&harness);
+    add_origin(&harness, false);
+    git(&worktree, &["branch", "--set-upstream-to=origin/main"]);
+    git(&worktree, &["rebase", "-q", "main"]);
+
+    let drift = harness.store.scope_drift(job_key_a()).unwrap();
+
+    assert_eq!(drift.changed_paths, declared(&["src/a/x.rs"]));
 }
 
 #[test]
@@ -154,17 +184,10 @@ fn scope_drift_keeps_job_commits_when_a_stacked_child_branch_is_pushed() {
     let harness = Harness::new();
     let worktree = harness.seed_checkout_job("job-a", "hive/job-a");
     announce(&harness.store, "job-a", "agent-a", &declared(&["src/a"]));
+    add_origin(&harness, true);
     write_commit(&worktree, "src/b/x.rs", "fn b() {}", "undeclared job work");
-    let remote = harness._temp.path().join("origin.git");
-    git(
-        &harness.repo,
-        &["init", "-q", "--bare", remote.to_str().unwrap()],
-    );
-    git(
-        &harness.repo,
-        &["remote", "add", "origin", remote.to_str().unwrap()],
-    );
-    git(&worktree, &["push", "-q", "origin", "hive/job-a"]);
+    // The branch tracks its own remote copy, which is not its base.
+    git(&worktree, &["push", "-q", "-u", "origin", "hive/job-a"]);
     // A stacked child pushed under another name contains job-a's commits.
     git(&worktree, &["branch", "hive/job-b", "hive/job-a"]);
     git(&worktree, &["push", "-q", "origin", "hive/job-b"]);
@@ -173,11 +196,16 @@ fn scope_drift_keeps_job_commits_when_a_stacked_child_branch_is_pushed() {
         &worktree,
         &["push", "-q", "origin", "hive/job-a:refs/heads/backup/job-a"],
     );
+    // The job moves on past the point where the child was cut, so neither
+    // pushed ref contains HEAD any more.
+    write_commit(&worktree, "src/c/y.rs", "fn c() {}", "later job work");
 
     let drift = harness.store.scope_drift(job_key_a()).unwrap();
 
-    assert_eq!(drift.changed_paths, declared(&["src/b/x.rs"]));
-    assert_eq!(drift.undeclared_paths, declared(&["src/b/x.rs"]));
+    assert_eq!(
+        drift.undeclared_paths,
+        declared(&["src/b/x.rs", "src/c/y.rs"])
+    );
 }
 
 #[test]
@@ -490,12 +518,16 @@ fn pending_and_accepted_handoff_state_survive_store_reopen() {
         ("agent-b", Some("session-b"), 2, None)
     );
     let inbox = again.inbox(job_key_a()).unwrap();
-    assert!(inbox
-        .iter()
-        .any(|m| m.id == offer.id && m.acked_at.is_some()));
-    assert!(inbox
-        .iter()
-        .any(|m| m.kind == MessageKind::Ack && m.ack_of == Some(offer.id)));
+    assert!(
+        inbox
+            .iter()
+            .any(|m| m.id == offer.id && m.acked_at.is_some())
+    );
+    assert!(
+        inbox
+            .iter()
+            .any(|m| m.kind == MessageKind::Ack && m.ack_of == Some(offer.id))
+    );
     let replay = sample_ack(&again, offer.id).unwrap_err();
     assert!(
         replay.to_string().contains("already acknowledged"),
