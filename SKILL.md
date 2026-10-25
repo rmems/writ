@@ -182,3 +182,17 @@ Long-running supervised commands use `writ supervisor run` with the named policy
 ### Optional helpers
 
 Use registration/status for shared ownership visibility, supervision for bounded execution, and git/gh helpers for their documented local integrity and repository-target checks. Host-native tools remain valid. Scripts and opaque API payloads are not recursively inspected. See [`AGENTS.md`](AGENTS.md#enforcement-layers).
+
+## Coordination quick reference
+
+`writ coord` subcommands share same-host claims and messages on `leases.db`; captured JSON envelopes live under `docs/examples/` (`coord-announce.json`, `coord-drift.json`, `coord-handoff.json`).
+
+- `writ coord announce <owner> <repo> <job> --agent <id> --session <id> --intent <text> --path <p>...` - claim a job, declare paths, and receive advisory overlaps (`docs/examples/coord-announce.json`).
+- `writ coord show <owner> <repo> <job>` - print one job's claim: owning agent, session, branch, `declared_paths`, `allocation_state`, and `owner_generation`.
+- `writ coord list` - list every live claim in the shared store; use it before announcing to see who already holds which paths.
+- `writ coord inbox <owner> <repo> <job>` - read the intent, overlap, help, dependency, handoff, and ack messages visible to a job; a handoff for job X is addressed to `to_job` X, so read the inbox of the job being transferred, not only your own.
+- `writ coord drift <owner> <repo> <job>` - compare `declared_paths` with `changed_paths` since the claim's `start_commit` (committed and uncommitted); `undeclared_paths` and `untouched_declared_paths` show where the declaration was wrong (`docs/examples/coord-drift.json`).
+- `writ coord send <owner> <repo> <job> --agent <id> --kind intent|dependency|help|overlap|ack --body <text> [--to-owner/--to-repo/--to-job/--to-agent ...] [--path <p>...]` - send a peer message; omit the `--to-*` flags to broadcast.
+- `writ coord ack <owner> <repo> <job> --id <msg> --agent <id> [--session <id>]` - acknowledge a message. Acking a handoff with the transferred job as the positional `<job>` moves ownership to you and bumps `owner_generation`; a second ack of the same id is rejected (`ok: false`, `LEASE_STORE_FAILED`).
+- `writ coord pause <owner> <repo> <job> --agent <id> --body <text>` - mark the owner paused and emit a `help` message without deleting WIP; the checkout and branch stay as they are.
+- `writ coord handoff <owner> <repo> <job> --agent <id> --to-agent <id> --generation <n> --body <text>` - offer a generation-bound handoff; its `paths` carry the current `undeclared_paths` from drift, and ownership moves only when the receiver acks (`docs/examples/coord-handoff.json`).
