@@ -127,6 +127,15 @@ fn load_coord_snapshot(path: &Path) -> CoordSnapshot {
 
 fn load_coord_snapshot_from(conn: &Connection) -> CoordSnapshot {
     if !table_exists(conn, "coord_claims") {
+        // The coord schema creates both tables together; messages without
+        // claims is drift that must not read as "no coordination data".
+        if table_exists(conn, "coord_messages") {
+            return CoordSnapshot {
+                available: true,
+                error: Some("coord_messages exists without coord_claims".to_owned()),
+                ..CoordSnapshot::default()
+            };
+        }
         return CoordSnapshot::default();
     }
     let claims = match load_claims(conn) {
@@ -207,7 +216,8 @@ fn load_messages(conn: &Connection) -> rusqlite::Result<Vec<MessageRow>> {
     let mut stmt = conn.prepare(
         "SELECT kind, from_agent_id, from_owner, from_repo_name, from_job_id,
                 to_owner, to_repo_name,
-                to_job_id, body, acked_at, owner_generation FROM coord_messages",
+                to_job_id, body, acked_at, owner_generation FROM coord_messages
+         ORDER BY id",
     )?;
     let rows = stmt.query_map([], message_from_row)?;
     rows.collect()
@@ -301,6 +311,7 @@ mod tests {
             owner_generation INTEGER, paused_at INTEGER
         );
         CREATE TABLE coord_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             kind TEXT, from_agent_id TEXT, from_owner TEXT, from_repo_name TEXT,
             from_job_id TEXT, to_owner TEXT, to_repo_name TEXT, to_job_id TEXT,
             body TEXT, acked_at INTEGER, owner_generation INTEGER
@@ -367,11 +378,11 @@ mod tests {
                 'acme','sample','job-1','agent-a','sess-1','fix',
                 '[\"crates/writ-core\"]', 2, 99
             );
-            INSERT INTO coord_messages VALUES (
+            INSERT INTO coord_messages VALUES (NULL,
                 'help','agent-b','acme','sample','job-2','acme','sample','job-1',
                 'need review', NULL, 2
             );
-            INSERT INTO coord_messages VALUES (
+            INSERT INTO coord_messages VALUES (NULL,
                 'overlap','agent-b','acme','sample','job-2','acme','sample','job-1',
                 'crates/a', NULL, 2
             );
@@ -393,7 +404,7 @@ mod tests {
                 INSERT INTO coord_claims VALUES (
                     'acme','sample','job-1','agent-a',NULL,NULL,'[]', 1, NULL
                 );
-                INSERT INTO coord_messages VALUES (
+                INSERT INTO coord_messages VALUES (NULL,
                     'blocker','agent-b','acme','sample','job-2','acme','sample','job-1',
                     'blocked', NULL, 1
                 );
@@ -405,7 +416,7 @@ mod tests {
                 INSERT INTO coord_claims VALUES (
                     'acme','sample','job-1','agent-a',NULL,NULL,'[]', 2, NULL
                 );
-                INSERT INTO coord_messages VALUES (
+                INSERT INTO coord_messages VALUES (NULL,
                     'handoff','agent-a','acme','sample','job-1','acme','sample','job-1',
                     'take over', NULL, 1
                 );
@@ -430,7 +441,7 @@ mod tests {
                 INSERT INTO coord_claims VALUES (
                     'acme','sample','job-1','agent-b',NULL,NULL,'[]', {claim_generation}, NULL
                 );
-                INSERT INTO coord_messages VALUES (
+                INSERT INTO coord_messages VALUES (NULL,
                     'help','agent-a','acme','sample','job-1',NULL,NULL,NULL,
                     'owner paused', NULL, 1
                 );
@@ -453,6 +464,23 @@ mod tests {
     #[test]
     fn stale_source_generation_hides_cross_job_handoff() {
         assert!(cross_job_handoff(4, 3).is_none());
+    }
+
+    #[test]
+    fn messages_table_without_claims_table_is_an_error() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("leases.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE coord_messages (kind TEXT, from_agent_id TEXT, from_owner TEXT,
+             from_repo_name TEXT, from_job_id TEXT, to_owner TEXT, to_repo_name TEXT,
+             to_job_id TEXT, body TEXT, acked_at INTEGER, owner_generation INTEGER);",
+        )
+        .unwrap();
+        drop(conn);
+        let snap = load_coord_snapshot(&path);
+        assert!(snap.available);
+        assert!(snap.error.is_some(), "{:?}", snap.error);
     }
 
     #[test]
