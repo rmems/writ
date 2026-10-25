@@ -79,7 +79,7 @@ When the lease store cannot be opened or queried:
 | `agent_id` | `string \| null` | yes | Agent owning the coord claim; `null` without a claim. |
 | `session_id` | `string \| null` | yes | Session recorded on the coord claim; `null` without a claim. |
 | `declared_paths` | `string[] \| null` | yes | Declared paths from the latest `coord announce`; `null` without a claim (empty list when the claim declared none). |
-| `blocker` | `string \| null` | yes | First unacknowledged `help`/`dependency`/`blocker` addressed to the job, or broadcast by it, as `<kind>:<agent>:<job>`; `null` when none. |
+| `blocker` | `string \| null` | yes | First unacknowledged `help`/`dependency`/`blocker` addressed to the job, or broadcast by it while its claim is still at the sending owner generation (an accepted handoff retires the previous owner's pause `help`), as `<kind>:<agent>:<job>`; `null` when none. |
 | `handoff` | `string \| null` | yes | First unacknowledged handoff offered to the job whose source claim is still at the offered generation, as `handoff:<agent>:<job>`; `null` when none. |
 | `recovery_needed` | `bool \| null` | yes | `true` when an **active** lease cannot inspect its checkout; `false` when inspect succeeds. |
 

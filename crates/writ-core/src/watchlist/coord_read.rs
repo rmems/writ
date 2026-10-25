@@ -67,12 +67,23 @@ impl CoordSnapshot {
     }
 
     /// First unacknowledged help/dependency/blocker addressed to `key`, or
-    /// broadcast by `key` itself, as `<kind>:<agent>:<job>`.
+    /// broadcast by `key` itself while its claim is still at the sending
+    /// generation, as `<kind>:<agent>:<job>`.
     pub(crate) fn pending_blocker_for(&self, key: &JobId) -> Option<String> {
         self.pending_for(|msg| {
             matches!(msg.kind.as_str(), "help" | "dependency" | "blocker")
-                && (msg.targets(key) || (msg.to.is_none() && msg.from == *key))
+                && (msg.targets(key) || self.is_live_self_broadcast(msg, key))
         })
+    }
+
+    /// A broadcast from `key` itself speaks for the owner generation that
+    /// sent it. An accepted handoff bumps the claim's generation, so the
+    /// previous owner's pause `help` stops counting as the new owner's blocker
+    /// even though nothing acknowledges that row.
+    fn is_live_self_broadcast(&self, msg: &MessageRow, key: &JobId) -> bool {
+        msg.to.is_none()
+            && msg.from == *key
+            && source_generation(&self.claims, msg) == Some(msg.owner_generation)
     }
 
     fn pending_for(&self, keep: impl Fn(&MessageRow) -> bool) -> Option<String> {
@@ -407,6 +418,25 @@ mod tests {
             let snap = snapshot_with(rows);
             let overlay = snap.overlay_for(&JobId::new("acme", "sample", "job-1"));
             assert_eq!(overlay.waiting_on.as_deref(), expected);
+        }
+    }
+
+    #[test]
+    fn self_broadcast_is_a_blocker_only_at_the_sending_generation() {
+        let key = JobId::new("acme", "sample", "job-1");
+        for (claim_generation, expected) in [(1, Some("help:agent-a:job-1")), (2, None)] {
+            let snap = snapshot_with(&format!(
+                "
+                INSERT INTO coord_claims VALUES (
+                    'acme','sample','job-1','agent-b',NULL,NULL,'[]', {claim_generation}, NULL
+                );
+                INSERT INTO coord_messages VALUES (
+                    'help','agent-a','acme','sample','job-1',NULL,NULL,NULL,
+                    'owner paused', NULL, 1
+                );
+                "
+            ));
+            assert_eq!(snap.pending_blocker_for(&key).as_deref(), expected);
         }
     }
 

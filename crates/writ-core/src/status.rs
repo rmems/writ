@@ -972,7 +972,7 @@ mod tests {
                 body: None,
             })
             .unwrap();
-        store
+        let offer = store
             .propose_handoff(crate::coord::HandoffRequest {
                 owner: "acme",
                 repo_name: "sample",
@@ -993,6 +993,28 @@ mod tests {
         let human = format_human(&data);
         assert!(human.contains("agent=agent-a gen=1"), "{human}");
         assert!(human.contains("handoff=handoff:agent-a:job-a"), "{human}");
+
+        // Accepting the handoff transfers job-a to agent-b at generation 2;
+        // the pause help from generation 1 is no longer the new owner's blocker.
+        store
+            .ack_message(crate::coord::AckRequest {
+                message_id: offer.id,
+                owner: "acme",
+                repo_name: "sample",
+                job_id: "job-a",
+                agent_id: "agent-b",
+                session_id: Some("session-b"),
+            })
+            .unwrap();
+        let data = load_from_store(&store).unwrap();
+        let (a, b) = (&data.jobs[0], &data.jobs[1]);
+        assert_eq!(a.collaboration_state, CollaborationState::Running);
+        assert_eq!(
+            (a.agent_id.as_deref(), a.ownership_generation),
+            (Some("agent-b"), Some(2))
+        );
+        assert!(a.blocker.is_none(), "{:?}", a.blocker);
+        assert!(b.handoff.is_none(), "{:?}", b.handoff);
     }
 
     #[test]
