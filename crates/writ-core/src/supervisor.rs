@@ -1247,8 +1247,10 @@ fn child_exit_fd(pid: u32) -> std::io::Result<tokio::io::unix::AsyncFd<std::os::
     // SAFETY: `fd` is an `OwnedFd` freshly returned by `pidfd_open`, so it is
     // a valid open descriptor that `AsyncFd` takes ownership of; it is closed
     // only when the `AsyncFd` drops and `as_raw_fd` always returns that same
-    // descriptor.
-    unsafe { tokio::io::unix::AsyncFd::register(fd) }.map_err(std::io::Error::from)
+    // descriptor. `AsyncFd::register` is `unsafe` by tokio's I/O-safety
+    // contract (tokio-rs/tokio#8587); the audited argument above is the whole
+    // obligation, the same way `waitid`/`kill` are audited below.
+    unsafe { tokio::io::unix::AsyncFd::register(fd) }.map_err(std::io::Error::from) // nosemgrep
 }
 
 #[cfg(unix)]
