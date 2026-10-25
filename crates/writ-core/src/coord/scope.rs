@@ -74,23 +74,34 @@ pub(super) fn covers(declared: &str, path: &str) -> bool {
 /// Paths this job touched in `worktree` since `start_commit`:
 ///
 /// - every path named by a commit on the branch's first-parent history after
-///   `start_commit`, merges excluded, so integrating the base branch does not
-///   attribute upstream changes to this job;
+///   `start_commit`, excluding merge commits and any commit already reachable
+///   from a remote-tracking ref other than this branch's own. Merging the
+///   base branch, or rebasing onto a fetched base, therefore does not
+///   attribute upstream changes to the job. A fast-forward or rebase onto
+///   local-only base commits still counts them until the checkout is
+///   re-registered (which refreshes `start_commit`);
 /// - staged and unstaged changes relative to `HEAD`;
 /// - untracked files that are not ignored.
 ///
-/// Renames are reported as the old and the new path. Read-only; never touches
-/// the index or the checkout. A path that is not valid UTF-8 is an error
-/// rather than a lossy guess, since declarations are UTF-8 strings.
-pub(super) fn changed_paths(worktree: &Path, start_commit: &str) -> Result<Vec<String>> {
+/// Renames are reported as the old and the new path. Read-only: optional
+/// index refreshes are disabled so inspection never takes `index.lock`. A
+/// path that is not valid UTF-8 is an error rather than a lossy guess, since
+/// declarations are UTF-8 strings.
+pub(super) fn changed_paths(
+    worktree: &Path,
+    branch: &str,
+    start_commit: &str,
+) -> Result<Vec<String>> {
     let range = if start_commit.is_empty() {
         "HEAD".to_owned()
     } else {
         format!("{start_commit}..HEAD")
     };
+    let own_remote_refs = format!("--exclude=*/{branch}");
     let mut paths = nul_separated(run(
         worktree,
         &[
+            "--no-optional-locks",
             "log",
             "--first-parent",
             "--no-merges",
@@ -99,16 +110,33 @@ pub(super) fn changed_paths(worktree: &Path, start_commit: &str) -> Result<Vec<S
             "--format=",
             "-z",
             &range,
+            "--not",
+            &own_remote_refs,
+            "--remotes",
             "--",
         ],
     )?)?;
     paths.extend(nul_separated(run(
         worktree,
-        &["diff", "--name-only", "--no-renames", "-z", "HEAD", "--"],
+        &[
+            "--no-optional-locks",
+            "diff",
+            "--name-only",
+            "--no-renames",
+            "-z",
+            "HEAD",
+            "--",
+        ],
     )?)?);
     paths.extend(nul_separated(run(
         worktree,
-        &["ls-files", "--others", "--exclude-standard", "-z"],
+        &[
+            "--no-optional-locks",
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "-z",
+        ],
     )?)?);
     paths.sort();
     paths.dedup();
@@ -127,7 +155,7 @@ pub(super) fn undeclared(declared: &[String], changed: &[String]) -> Vec<String>
 fn run(worktree: &Path, args: &[&str]) -> Result<Vec<u8>> {
     let output = git_in(worktree, args).map_err(|error| Error::LeaseStore {
         context: "inspect changed paths",
-        message: format!("git {} in {}: {error}", args[0], worktree.display()),
+        message: format!("git {} in {}: {error}", args[1], worktree.display()),
     })?;
     if output.status.success() {
         return Ok(output.stdout);
@@ -136,7 +164,7 @@ fn run(worktree: &Path, args: &[&str]) -> Result<Vec<u8>> {
         context: "inspect changed paths",
         message: format!(
             "git {} in {} failed: {}",
-            args[0],
+            args[1],
             worktree.display(),
             String::from_utf8_lossy(&output.stderr).trim()
         ),
@@ -150,7 +178,7 @@ fn nul_separated(bytes: Vec<u8>) -> Result<Vec<String>> {
         .filter(|entry| !entry.is_empty())
         .map(|entry| {
             std::str::from_utf8(entry)
-                .map(|path| path.replace('\\', "/"))
+                .map(str::to_owned)
                 .map_err(|_| Error::LeaseStore {
                     context: "inspect changed paths",
                     message: format!(

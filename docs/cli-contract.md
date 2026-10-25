@@ -86,14 +86,16 @@ they never create `leases.db`, and on an absent store they return an empty or
 (`COORD_*` policy errors cover duplicate live ownership and stale generations,
 not path collisions). `drift` compares the latest declaration with the paths
 the registered checkout actually changed: every path named by a commit on the
-branch's first-parent history after the lease start commit (merge commits and
-the upstream commits they bring in are excluded; renames count as both paths),
-plus staged and unstaged changes against `HEAD` and untracked, non-ignored
-files. A fast-forward or rebase onto a newer base moves those upstream commits
-onto the first-parent history, so they are counted until the checkout is
-re-registered, which refreshes the start commit to the current `HEAD`. It runs
-read-only `git` in that checkout and fails with exit 1 when the checkout cannot
-be inspected or a changed path is not valid UTF-8. A
+branch's first-parent history after the lease start commit, excluding merge
+commits and any commit already reachable from a remote-tracking ref other than
+the branch's own (renames count as both paths), plus staged and unstaged
+changes against `HEAD` and untracked, non-ignored files. Merging the base or
+rebasing onto a fetched base therefore attributes nothing upstream to the job;
+a fast-forward or rebase onto local-only base commits counts them until the
+checkout is re-registered, which refreshes the start commit to the current
+`HEAD`. It runs read-only `git` (`--no-optional-locks`) in that checkout and
+fails with exit 1 when the checkout cannot be inspected or a changed path is
+not valid UTF-8. A
 `handoff` offer records the same undeclared changed paths in its `paths` field
 so a stale declaration is visible to the target, and posts with empty `paths`
 when inspection is not possible. Ownership moves only when the target
