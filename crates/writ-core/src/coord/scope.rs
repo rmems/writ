@@ -75,14 +75,17 @@ pub(super) fn covers(declared: &str, path: &str) -> bool {
 ///
 /// - every path named by a commit on the branch's first-parent history after
 ///   `start_commit`, excluding merge commits and any commit already reachable
-///   from an upstream remote-tracking ref. A remote ref counts as upstream
-///   when it is not this branch's own and does not contain `HEAD`; a pushed
-///   stacked child or copy of the branch contains `HEAD` and is ignored, so
-///   the job's own commits stay attributed to it. Merging the base branch, or
-///   rebasing onto a fetched base, therefore does not attribute upstream
-///   changes to the job. A fast-forward or rebase onto local-only base
-///   commits still counts them until the checkout is re-registered (which
-///   refreshes `start_commit`);
+///   from a base ref. The base refs are the ones git itself records: each
+///   remote's default branch (`refs/remotes/<remote>/HEAD`) and the branch's
+///   configured upstream, unless that upstream is the remote copy of the
+///   branch itself. Merging the base, or rebasing onto a fetched base,
+///   therefore does not attribute upstream changes to the job, while a
+///   pushed copy or stacked child of the branch is never a base, so the
+///   job's own commits stay attributed to it however far the branch moves on.
+///   A fast-forward or rebase onto base commits that no base ref records
+///   (local-only, or a remote without a default head or tracking config)
+///   still counts them until the checkout is re-registered (which refreshes
+///   `start_commit`);
 /// - staged and unstaged changes relative to `HEAD`;
 /// - untracked files that are not ignored.
 ///
@@ -98,7 +101,7 @@ pub(super) fn changed_paths(checkout: Checkout<'_>) -> Result<Vec<String>> {
     } else {
         format!("{}..HEAD", checkout.start_commit)
     };
-    let upstream = upstream_remote_refs(checkout)?;
+    let upstream = base_refs(checkout)?;
     let mut log_args = vec![
         "--no-optional-locks",
         "log",
@@ -151,24 +154,59 @@ pub(super) struct Checkout<'a> {
     pub(super) start_commit: &'a str,
 }
 
-/// Remote-tracking refs that stand for upstream: every remote ref except the
-/// branch's own (`*/<branch>`) and any ref that already contains `HEAD`,
-/// which is a pushed copy or stacked child of this branch, not its base.
-fn upstream_remote_refs(checkout: Checkout<'_>) -> Result<Vec<String>> {
-    let own = format!("/{}", checkout.branch);
-    let refs = nul_separated(run(
+/// Remote-tracking refs that stand for the job's base: every remote's
+/// default branch (the `refs/remotes/<remote>/HEAD` symref target) and the
+/// branch's configured upstream, except when that upstream is the remote copy
+/// of the branch itself. Only refs that exist locally are returned, so a
+/// dangling default head or an unfetched upstream cannot fail the inspection.
+fn base_refs(checkout: Checkout<'_>) -> Result<Vec<String>> {
+    let remote_refs = ref_records(run(
         checkout.worktree,
         &[
             "--no-optional-locks",
             "for-each-ref",
-            "--format=%(refname)%00",
-            "--no-contains=HEAD",
+            "--format=%(refname)%00%(symref)",
             "refs/remotes",
         ],
     )?)?;
-    Ok(refs
-        .into_iter()
-        .filter(|name| !name.ends_with(&own))
+    let mut bases: Vec<String> = remote_refs
+        .iter()
+        .filter(|(name, symref)| name.ends_with("/HEAD") && !symref.is_empty())
+        .map(|(_, symref)| symref.clone())
+        .collect();
+    bases.extend(configured_upstream(checkout)?);
+    bases.retain(|base| remote_refs.iter().any(|(name, _)| name == base));
+    bases.sort();
+    bases.dedup();
+    Ok(bases)
+}
+
+/// The branch's configured upstream ref, unless it is `<remote>/<branch>`,
+/// which is the job's own pushed copy rather than its base.
+fn configured_upstream(checkout: Checkout<'_>) -> Result<Option<String>> {
+    let branch_ref = format!("refs/heads/{}", checkout.branch);
+    let records = ref_records(run(
+        checkout.worktree,
+        &[
+            "--no-optional-locks",
+            "for-each-ref",
+            "--format=%(upstream)%00%(upstream:remotename)",
+            branch_ref.as_str(),
+        ],
+    )?)?;
+    Ok(records.into_iter().find_map(|(upstream, remote)| {
+        let own_copy = format!("refs/remotes/{remote}/{}", checkout.branch);
+        (!upstream.is_empty() && upstream != own_copy).then_some(upstream)
+    }))
+}
+
+/// `for-each-ref` records of the form `<field>NUL<field>`, one per line.
+fn ref_records(bytes: Vec<u8>) -> Result<Vec<(String, String)>> {
+    let text = utf8(&bytes)?;
+    Ok(text
+        .lines()
+        .filter_map(|line| line.split_once('\0'))
+        .map(|(first, second)| (first.to_owned(), second.to_owned()))
         .collect())
 }
 
@@ -260,15 +298,17 @@ fn porcelain_paths(bytes: Vec<u8>) -> Result<Vec<String>> {
 }
 
 fn changed_path(entry: &[u8]) -> Result<String> {
-    std::str::from_utf8(entry)
-        .map(str::to_owned)
-        .map_err(|_| Error::LeaseStore {
-            context: "inspect changed paths",
-            message: format!(
-                "changed path is not valid UTF-8: {}",
-                String::from_utf8_lossy(entry)
-            ),
-        })
+    utf8(entry).map(str::to_owned)
+}
+
+fn utf8(bytes: &[u8]) -> Result<&str> {
+    std::str::from_utf8(bytes).map_err(|_| Error::LeaseStore {
+        context: "inspect changed paths",
+        message: format!(
+            "changed path is not valid UTF-8: {}",
+            String::from_utf8_lossy(bytes)
+        ),
+    })
 }
 
 #[cfg(test)]
