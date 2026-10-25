@@ -28,7 +28,7 @@ Dispatched commands use these envelope names under `--json`; hook protocol and p
 | `worktree register\|unregister\|inspect\|list` | `worktree.register` etc. |
 | `worktree create\|remove\|prune` | `worktree.create` etc. (deprecated) |
 | `lease inspect\|reconcile` | `lease.inspect` / `lease.reconcile` |
-| `coord announce\|show\|list\|inbox\|send\|ack\|pause\|handoff` | `coord.announce` etc. |
+| `coord announce\|show\|list\|inbox\|drift\|send\|ack\|pause\|handoff` | `coord.announce` etc. (see [Coord fixtures](#coord-fixtures)) |
 | `attribution format` | `attribution.format` |
 | `supervisor run` | `supervisor.run` (also `--idle`/`--stall`, `--grace`, `--progress-secs`, `WRIT_SUPERVISOR_*`; see [timeout-policy.md](../timeout-policy.md)) |
 | `install` | `cli.install` |
@@ -53,6 +53,19 @@ An earlier revision of this file claimed those two commands never emit an envelo
 at all, and that `cli.bootstrap` did not exist. Both were wrong: `writ --json` with
 no subcommand emits `cli.bootstrap`, which is what `bootstrap.json` records.
 
+## Coord fixtures
+
+Captured from a throwaway repository (`acme/sample`, one linked worktree `job-a`) with its own
+`WRIT_LEASE_PATH`, so the ids and generations start at 1. Two fields are redacted
+for portability: `worktree_path` is replaced with `/path/to/job-a` and
+`start_commit` with `<start-commit>`; everything else is verbatim binary output.
+
+| Fixture | Command | What it shows |
+| --- | --- | --- |
+| `coord-announce.json` | `coord announce acme sample job-a --agent agent-a --session sess-a --intent ... --path src/a` | the claim with its `declared_paths`, the broadcast `intent` message, and an empty `overlaps` array (a second claim on `src/a` would list it there, advisory only) |
+| `coord-drift.json` | `coord drift acme sample job-a` | `changed_paths` since `start_commit` (a committed `src/a/mod.rs` and an untracked `src/b/mod.rs`) compared with `declared_paths`; `src/b/mod.rs` lands in `undeclared_paths`, and `untouched_declared_paths` is empty because `src/a` was touched |
+| `coord-handoff.json` | `coord handoff acme sample job-a --agent agent-a --to-agent agent-b --generation 1 --body ...` | the `handoff` message whose `paths` carry exactly the undeclared changes from drift, so the receiver knows what the declaration missed |
+
 ## Regenerating
 
 ```bash
@@ -64,6 +77,12 @@ writ --json ci classify --file docs/examples/ci-classify-input.json  # ci.classi
 writ --json worktree list                     # worktree.list
 writ --json worktree register <path>          # worktree.register
 writ --json attribution format --body "Looks good!"   # attribution.format
+# coord fixtures (separate WRIT_LEASE_PATH, WRIT_ALLOWED_OWNERS=acme, see "Coord fixtures").
+# Before drift/handoff: commit src/a/mod.rs and leave src/b/mod.rs untracked in the
+# registered checkout, otherwise both report empty paths:
+writ --json coord announce acme sample job-a --agent agent-a --session sess-a --intent "implement module a" --path src/a   # coord.announce
+writ --json coord drift acme sample job-a                                                                              # coord.drift
+writ --json coord handoff acme sample job-a --agent agent-a --to-agent agent-b --generation 1 --body "handing off"     # coord.handoff
 # error envelope, no repository mutation:
 writ --json worktree create --schema-version 2 --repo <repo> <owner> <repo-name> <job> <branch>  # deprecated
 ```
