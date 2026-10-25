@@ -38,11 +38,7 @@ pub struct ScopeDrift {
 
 impl ScopeDrift {
     pub(super) fn build(claim: &CoordClaim, lease: &Lease, changed: Vec<String>) -> Self {
-        let undeclared = changed
-            .iter()
-            .filter(|path| !claim.declared_paths.iter().any(|d| covers(d, path)))
-            .cloned()
-            .collect();
+        let undeclared = undeclared(&claim.declared_paths, &changed);
         let untouched = claim
             .declared_paths
             .iter()
@@ -75,21 +71,57 @@ pub(super) fn covers(declared: &str, path: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('/'))
 }
 
-/// Paths changed in `worktree` relative to `start_commit`: tracked changes in
-/// the working tree (committed, staged, or unstaged) plus untracked files that
-/// are not ignored. Read-only; never touches the index or the checkout.
+/// Paths this job touched in `worktree` since `start_commit`:
+///
+/// - every path named by a commit on the branch's first-parent history after
+///   `start_commit`, merges excluded, so integrating the base branch does not
+///   attribute upstream changes to this job;
+/// - staged and unstaged changes relative to `HEAD`;
+/// - untracked files that are not ignored.
+///
+/// Renames are reported as the old and the new path. Read-only; never touches
+/// the index or the checkout. A path that is not valid UTF-8 is an error
+/// rather than a lossy guess, since declarations are UTF-8 strings.
 pub(super) fn changed_paths(worktree: &Path, start_commit: &str) -> Result<Vec<String>> {
+    let range = if start_commit.is_empty() {
+        "HEAD".to_owned()
+    } else {
+        format!("{start_commit}..HEAD")
+    };
     let mut paths = nul_separated(run(
         worktree,
-        &["diff", "--name-only", "-z", start_commit, "--"],
-    )?);
+        &[
+            "log",
+            "--first-parent",
+            "--no-merges",
+            "--no-renames",
+            "--name-only",
+            "--format=",
+            "-z",
+            &range,
+            "--",
+        ],
+    )?)?;
+    paths.extend(nul_separated(run(
+        worktree,
+        &["diff", "--name-only", "--no-renames", "-z", "HEAD", "--"],
+    )?)?);
     paths.extend(nul_separated(run(
         worktree,
         &["ls-files", "--others", "--exclude-standard", "-z"],
-    )?));
+    )?)?);
     paths.sort();
     paths.dedup();
     Ok(paths)
+}
+
+/// Changed paths that no declared path covers.
+pub(super) fn undeclared(declared: &[String], changed: &[String]) -> Vec<String> {
+    changed
+        .iter()
+        .filter(|path| !declared.iter().any(|d| covers(d, path)))
+        .cloned()
+        .collect()
 }
 
 fn run(worktree: &Path, args: &[&str]) -> Result<Vec<u8>> {
@@ -111,11 +143,22 @@ fn run(worktree: &Path, args: &[&str]) -> Result<Vec<u8>> {
     })
 }
 
-fn nul_separated(bytes: Vec<u8>) -> Vec<String> {
+fn nul_separated(bytes: Vec<u8>) -> Result<Vec<String>> {
     bytes
         .split(|byte| *byte == 0)
+        .map(|entry| entry.strip_prefix(b"\n").unwrap_or(entry))
         .filter(|entry| !entry.is_empty())
-        .map(|entry| String::from_utf8_lossy(entry).replace('\\', "/"))
+        .map(|entry| {
+            std::str::from_utf8(entry)
+                .map(|path| path.replace('\\', "/"))
+                .map_err(|_| Error::LeaseStore {
+                    context: "inspect changed paths",
+                    message: format!(
+                        "changed path is not valid UTF-8: {}",
+                        String::from_utf8_lossy(entry)
+                    ),
+                })
+        })
         .collect()
 }
 
