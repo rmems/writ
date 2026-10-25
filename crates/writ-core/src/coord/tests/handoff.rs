@@ -112,6 +112,41 @@ fn scope_drift_ignores_upstream_commits_merged_into_the_job_branch() {
 }
 
 #[test]
+fn scope_drift_ignores_upstream_commits_after_a_rebase_onto_a_fetched_base() {
+    let harness = Harness::new();
+    let worktree = harness.seed_checkout_job("job-a", "hive/job-a");
+    announce(&harness.store, "job-a", "agent-a", &declared(&["src/a"]));
+    write_commit(&worktree, "src/a/x.rs", "fn a() {}", "job work");
+    write_commit(
+        &harness.repo,
+        "src/upstream/u.rs",
+        "fn u() {}",
+        "peer work on main",
+    );
+    let remote = harness._temp.path().join("origin.git");
+    git(
+        &harness.repo,
+        &["init", "-q", "--bare", remote.to_str().unwrap()],
+    );
+    git(
+        &harness.repo,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    git(&harness.repo, &["push", "-q", "origin", "main"]);
+    git(&worktree, &["push", "-q", "origin", "hive/job-a"]);
+    git(&worktree, &["rebase", "-q", "main"]);
+    assert!(worktree.join("src/upstream/u.rs").exists());
+
+    let drift = harness.store.scope_drift(job_key_a()).unwrap();
+
+    // The upstream commit is on first-parent history now, but it is reachable
+    // from origin/main; the job's own pushed commit on origin/hive/job-a is
+    // not treated as upstream.
+    assert_eq!(drift.changed_paths, declared(&["src/a/x.rs"]));
+    assert!(drift.undeclared_paths.is_empty());
+}
+
+#[test]
 fn scope_drift_counts_a_fast_forward_until_the_checkout_is_reregistered() {
     let harness = Harness::new();
     let worktree = harness.seed_checkout_job("job-a", "hive/job-a");
@@ -124,8 +159,9 @@ fn scope_drift_counts_a_fast_forward_until_the_checkout_is_reregistered() {
     );
     git(&worktree, &["merge", "--ff-only", "main"]);
 
-    // A fast-forward (like a rebase) moves the branch base, so the replayed
-    // upstream commit is on the first-parent history and is counted.
+    // Without a remote-tracking ref for main, a fast-forward (like a rebase
+    // onto local-only commits) moves the branch base and the replayed
+    // upstream commit is counted.
     let drift = harness.store.scope_drift(job_key_a()).unwrap();
     assert_eq!(drift.undeclared_paths, declared(&["src/upstream/u.rs"]));
 

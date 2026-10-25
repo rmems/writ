@@ -250,6 +250,7 @@ impl LeaseStore {
         })?;
         let changed = scope::changed_paths(
             std::path::Path::new(&lease.worktree_path),
+            &lease.branch,
             &lease.start_commit,
         )?;
         Ok(ScopeDrift::build(&claim, &lease, changed))
@@ -275,6 +276,7 @@ impl LeaseStore {
             .and_then(|lease| {
                 scope::changed_paths(
                     std::path::Path::new(&lease.worktree_path),
+                    &lease.branch,
                     &lease.start_commit,
                 )
                 .ok()
