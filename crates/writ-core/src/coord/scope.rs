@@ -90,17 +90,14 @@ pub(super) fn covers(declared: &str, path: &str) -> bool {
 /// index refreshes are disabled so inspection never takes `index.lock`. A
 /// path that is not valid UTF-8 is an error rather than a lossy guess, since
 /// declarations are UTF-8 strings.
-pub(super) fn changed_paths(
-    worktree: &Path,
-    branch: &str,
-    start_commit: &str,
-) -> Result<Vec<String>> {
-    let range = if start_commit.is_empty() {
+pub(super) fn changed_paths(checkout: Checkout<'_>) -> Result<Vec<String>> {
+    let worktree = checkout.worktree;
+    let range = if checkout.start_commit.is_empty() {
         "HEAD".to_owned()
     } else {
-        format!("{start_commit}..HEAD")
+        format!("{}..HEAD", checkout.start_commit)
     };
-    let upstream = upstream_remote_refs(worktree, branch)?;
+    let upstream = upstream_remote_refs(checkout)?;
     let mut log_args = vec![
         "--no-optional-locks",
         "log",
@@ -145,13 +142,21 @@ pub(super) fn changed_paths(
     Ok(paths)
 }
 
+/// The registered checkout to inspect: its path, branch, and lease start.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Checkout<'a> {
+    pub(super) worktree: &'a Path,
+    pub(super) branch: &'a str,
+    pub(super) start_commit: &'a str,
+}
+
 /// Remote-tracking refs that stand for upstream: every remote ref except the
 /// branch's own (`*/<branch>`) and any ref that already contains `HEAD`,
 /// which is a pushed copy or stacked child of this branch, not its base.
-fn upstream_remote_refs(worktree: &Path, branch: &str) -> Result<Vec<String>> {
-    let own = format!("/{branch}");
+fn upstream_remote_refs(checkout: Checkout<'_>) -> Result<Vec<String>> {
+    let own = format!("/{}", checkout.branch);
     let refs = nul_separated(run(
-        worktree,
+        checkout.worktree,
         &[
             "--no-optional-locks",
             "for-each-ref",

@@ -248,11 +248,11 @@ impl LeaseStore {
         let lease = self.find_job(key)?.ok_or_else(|| {
             coord_missing("no lease exists for the coordination claim being compared")
         })?;
-        let changed = scope::changed_paths(
-            std::path::Path::new(&lease.worktree_path),
-            &lease.branch,
-            &lease.start_commit,
-        )?;
+        let changed = scope::changed_paths(scope::Checkout {
+            worktree: std::path::Path::new(&lease.worktree_path),
+            branch: &lease.branch,
+            start_commit: &lease.start_commit,
+        })?;
         Ok(ScopeDrift::build(&claim, &lease, changed))
     }
 
@@ -311,11 +311,11 @@ impl LeaseStore {
         Ok(self
             .find_job(key)?
             .and_then(|lease| {
-                scope::changed_paths(
-                    std::path::Path::new(&lease.worktree_path),
-                    &lease.branch,
-                    &lease.start_commit,
-                )
+                scope::changed_paths(scope::Checkout {
+                    worktree: std::path::Path::new(&lease.worktree_path),
+                    branch: &lease.branch,
+                    start_commit: &lease.start_commit,
+                })
                 .ok()
             })
             .unwrap_or_default())
