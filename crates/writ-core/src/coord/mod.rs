@@ -271,17 +271,7 @@ impl LeaseStore {
             job_id: request.job_id,
         };
         let to_job = request.to_job_id.unwrap_or(request.job_id);
-        let changed = self
-            .find_job(key)?
-            .and_then(|lease| {
-                scope::changed_paths(
-                    std::path::Path::new(&lease.worktree_path),
-                    &lease.branch,
-                    &lease.start_commit,
-                )
-                .ok()
-            })
-            .unwrap_or_default();
+        let changed = self.changed_paths_best_effort(key)?;
         let now = now_secs();
         let mut conn = self.lock()?;
         let tx = conn
@@ -289,27 +279,7 @@ impl LeaseStore {
             .map_err(|e| coord_err("begin coord handoff", e))?;
         let claim = load_claim_tx(&tx, key)?
             .ok_or_else(|| coord_missing("no coordination claim for handoff"))?;
-        if claim.agent_id != request.from_agent_id {
-            return Err(held_error(&claim));
-        }
-        if terminal_allocation(&claim.allocation_state) {
-            return Err(Error::PolicyViolation {
-                code: PolicyCode::CoordClaimMissing,
-                message: format!(
-                    "lease {}/{}/{} is {}; handoff stays on live assignments",
-                    claim.owner, claim.repo_name, claim.job_id, claim.allocation_state
-                ),
-            });
-        }
-        let expected = request
-            .expected_generation
-            .ok_or_else(|| Error::PolicyViolation {
-                code: PolicyCode::CoordStaleGeneration,
-                message: "handoff requires the current owner generation".to_owned(),
-            })?;
-        if expected != claim.owner_generation {
-            return Err(stale_error(&claim, expected));
-        }
+        require_handoff_source(&claim, request)?;
         let undeclared = scope::undeclared(&claim.declared_paths, &changed);
         let message = insert_message(
             &tx,
@@ -333,6 +303,22 @@ impl LeaseStore {
         tx.commit()
             .map_err(|e| coord_err("commit coord handoff", e))?;
         Ok(message)
+    }
+
+    /// Changed paths of the job's checkout, or an empty list when there is no
+    /// lease or the checkout cannot be inspected. Store errors still surface.
+    fn changed_paths_best_effort(&self, key: JobKey<'_>) -> Result<Vec<String>> {
+        Ok(self
+            .find_job(key)?
+            .and_then(|lease| {
+                scope::changed_paths(
+                    std::path::Path::new(&lease.worktree_path),
+                    &lease.branch,
+                    &lease.start_commit,
+                )
+                .ok()
+            })
+            .unwrap_or_default())
     }
 
     /// Acknowledge a message. A matching handoff ACK transfers the claim.
@@ -375,6 +361,33 @@ pub(crate) fn clear_pending_overlaps(
         params![key.owner, key.repo_name, key.job_id],
     )
     .map_err(|e| coord_err("clear pending coord overlaps", e))?;
+    Ok(())
+}
+
+/// The offer must come from the live owner of a non-terminal claim and name
+/// its current generation.
+fn require_handoff_source(claim: &CoordClaim, request: HandoffRequest<'_>) -> Result<()> {
+    if claim.agent_id != request.from_agent_id {
+        return Err(held_error(claim));
+    }
+    if terminal_allocation(&claim.allocation_state) {
+        return Err(Error::PolicyViolation {
+            code: PolicyCode::CoordClaimMissing,
+            message: format!(
+                "lease {}/{}/{} is {}; handoff stays on live assignments",
+                claim.owner, claim.repo_name, claim.job_id, claim.allocation_state
+            ),
+        });
+    }
+    let expected = request
+        .expected_generation
+        .ok_or_else(|| Error::PolicyViolation {
+            code: PolicyCode::CoordStaleGeneration,
+            message: "handoff requires the current owner generation".to_owned(),
+        })?;
+    if expected != claim.owner_generation {
+        return Err(stale_error(claim, expected));
+    }
     Ok(())
 }
 
