@@ -77,7 +77,9 @@ writ --json ci classify --file docs/examples/ci-classify-input.json  # ci.classi
 writ --json worktree list                     # worktree.list
 writ --json worktree register <path>          # worktree.register
 writ --json attribution format --body "Looks good!"   # attribution.format
-# coord fixtures (separate WRIT_LEASE_PATH, WRIT_ALLOWED_OWNERS=acme, see "Coord fixtures"):
+# coord fixtures (separate WRIT_LEASE_PATH, WRIT_ALLOWED_OWNERS=acme, see "Coord fixtures").
+# Before drift/handoff: commit src/a/mod.rs and leave src/b/mod.rs untracked in the
+# registered checkout, otherwise both report empty paths:
 writ --json coord announce acme sample job-a --agent agent-a --session sess-a --intent "implement module a" --path src/a   # coord.announce
 writ --json coord drift acme sample job-a                                                                              # coord.drift
 writ --json coord handoff acme sample job-a --agent agent-a --to-agent agent-b --generation 1 --body "handing off"     # coord.handoff
