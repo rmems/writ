@@ -1235,6 +1235,7 @@ async fn wait_for_pidfd_exit(
 }
 
 #[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
 fn child_exit_fd(pid: u32) -> std::io::Result<tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>> {
     use rustix::process::{Pid, PidfdFlags, pidfd_open};
 
@@ -1243,7 +1244,11 @@ fn child_exit_fd(pid: u32) -> std::io::Result<tokio::io::unix::AsyncFd<std::os::
         .and_then(Pid::from_raw)
         .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ECHILD))?;
     let fd = pidfd_open(pid, PidfdFlags::empty())?;
-    tokio::io::unix::AsyncFd::new(fd)
+    // SAFETY: `fd` is an `OwnedFd` freshly returned by `pidfd_open`, so it is
+    // a valid open descriptor that `AsyncFd` takes ownership of; it is closed
+    // only when the `AsyncFd` drops and `as_raw_fd` always returns that same
+    // descriptor.
+    unsafe { tokio::io::unix::AsyncFd::register(fd) }.map_err(std::io::Error::from)
 }
 
 #[cfg(unix)]
