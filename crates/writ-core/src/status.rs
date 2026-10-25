@@ -887,14 +887,24 @@ mod tests {
         (tmp, store)
     }
 
-    fn announce_job(store: &LeaseStore, job_id: &str, agent: &str, paths: &[&str]) {
-        let paths = paths.iter().map(|p| String::from(*p)).collect::<Vec<_>>();
+    struct Claim<'a> {
+        job_id: &'a str,
+        agent: &'a str,
+        paths: &'a [&'a str],
+    }
+
+    fn announce_job(store: &LeaseStore, claim: Claim<'_>) {
+        let paths = claim
+            .paths
+            .iter()
+            .map(|p| String::from(*p))
+            .collect::<Vec<_>>();
         store
             .announce(crate::coord::AnnounceRequest {
                 owner: "acme",
                 repo_name: "sample",
-                job_id,
-                agent_id: agent,
+                job_id: claim.job_id,
+                agent_id: claim.agent,
                 session_id: Some("session-x"),
                 agent_type: "worker",
                 intent: Some("status overlay"),
@@ -906,7 +916,14 @@ mod tests {
     #[test]
     fn coord_claim_populates_ownership_fields() {
         let (_tmp, store) = seeded_store();
-        announce_job(&store, "job-a", "agent-a", &["src/a"]);
+        announce_job(
+            &store,
+            Claim {
+                job_id: "job-a",
+                agent: "agent-a",
+                paths: &["src/a"],
+            },
+        );
         let data = load_from_store(&store).unwrap();
         let (a, b) = (&data.jobs[0], &data.jobs[1]);
         assert_eq!(
@@ -931,8 +948,16 @@ mod tests {
     #[test]
     fn pending_handoff_help_and_pause_surface_on_status() {
         let (_tmp, store) = seeded_store();
-        announce_job(&store, "job-a", "agent-a", &[]);
-        announce_job(&store, "job-b", "agent-b", &[]);
+        for (job_id, agent) in [("job-a", "agent-a"), ("job-b", "agent-b")] {
+            announce_job(
+                &store,
+                Claim {
+                    job_id,
+                    agent,
+                    paths: &[],
+                },
+            );
+        }
         store
             .pause_claim(crate::coord::PauseRequest {
                 key: crate::lease::JobKey {
