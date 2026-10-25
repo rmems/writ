@@ -949,9 +949,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn pending_handoff_help_and_pause_surface_on_status() {
-        let (_tmp, store) = seeded_store();
+    /// Two claimed jobs where agent-a paused job-a and offered it to agent-b.
+    fn paused_handoff_store() -> (tempfile::TempDir, LeaseStore, crate::coord::CoordMessage) {
+        let (tmp, store) = seeded_store();
         for (job_id, agent) in [("job-a", "agent-a"), ("job-b", "agent-b")] {
             announce_job(
                 &store,
@@ -985,6 +985,12 @@ mod tests {
                 body: "take over",
             })
             .unwrap();
+        (tmp, store, offer)
+    }
+
+    #[test]
+    fn pending_handoff_help_and_pause_surface_on_status() {
+        let (_tmp, store, _offer) = paused_handoff_store();
         let data = load_from_store(&store).unwrap();
         let (a, b) = (&data.jobs[0], &data.jobs[1]);
         assert_eq!(
@@ -1007,7 +1013,11 @@ mod tests {
                 && human.contains("handoff=handoff:agent-a:job-a"),
             "{human}"
         );
+    }
 
+    #[test]
+    fn accepted_handoff_retires_the_paused_owners_help() {
+        let (_tmp, store, offer) = paused_handoff_store();
         // Accepting the handoff transfers job-a to agent-b at generation 2;
         // the pause help from generation 1 is no longer the new owner's blocker.
         store
