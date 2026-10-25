@@ -7,6 +7,7 @@ use std::process::Command;
 use tempfile::tempdir;
 
 mod assignment;
+mod handoff;
 mod overlap;
 
 struct Harness {
@@ -64,6 +65,48 @@ impl Harness {
                 repo_name: spec.repo_name,
                 job_id: spec.job_id,
                 branch: spec.branch,
+                worktree_path: &worktree,
+                requested_start_point: "refs/heads/main",
+                start_commit: &self.start,
+                ttl: None,
+            })
+            .unwrap();
+        self.store.mark_mutating(&prepared.operation_id).unwrap();
+        self.store.commit_allocate(&prepared.operation_id).unwrap();
+        worktree
+    }
+
+    /// Seed a job whose worktree is a real git checkout so scope drift can
+    /// inspect it. The branch starts at the harness start commit.
+    fn seed_checkout_job(&self, job_id: &str, branch: &str) -> std::path::PathBuf {
+        let worktree = self
+            ._temp
+            .path()
+            .join("checkouts")
+            .join("acme")
+            .join("sample")
+            .join(job_id);
+        fs::create_dir_all(worktree.parent().unwrap()).unwrap();
+        git(
+            &self.repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                branch,
+                "--",
+                worktree.to_str().unwrap(),
+                &self.start,
+            ],
+        );
+        let prepared = self
+            .store
+            .prepare_allocate(AllocateRequest {
+                repo: &self.repo,
+                owner: "acme",
+                repo_name: "sample",
+                job_id,
+                branch,
                 worktree_path: &worktree,
                 requested_start_point: "refs/heads/main",
                 start_commit: &self.start,
