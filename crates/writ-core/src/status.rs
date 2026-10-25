@@ -944,8 +944,9 @@ mod tests {
             )
         );
         assert!(a.blocker.is_none() && a.handoff.is_none());
-        assert!(b.agent_id.is_none() && b.ownership_generation.is_none());
-        assert!(b.declared_paths.is_none());
+        assert!(
+            b.agent_id.is_none() && b.ownership_generation.is_none() && b.declared_paths.is_none()
+        );
     }
 
     #[test]
@@ -986,13 +987,26 @@ mod tests {
             .unwrap();
         let data = load_from_store(&store).unwrap();
         let (a, b) = (&data.jobs[0], &data.jobs[1]);
-        assert_eq!(a.collaboration_state, CollaborationState::Paused);
-        assert_eq!(a.blocker.as_deref(), Some("help:agent-a:job-a"));
-        assert_eq!(b.handoff.as_deref(), Some("handoff:agent-a:job-a"));
-        assert_eq!(b.collaboration_state, CollaborationState::Running);
+        assert_eq!(
+            (
+                a.collaboration_state,
+                a.blocker.as_deref(),
+                b.collaboration_state,
+                b.handoff.as_deref(),
+            ),
+            (
+                CollaborationState::Paused,
+                Some("help:agent-a:job-a"),
+                CollaborationState::Running,
+                Some("handoff:agent-a:job-a"),
+            )
+        );
         let human = format_human(&data);
-        assert!(human.contains("agent=agent-a gen=1"), "{human}");
-        assert!(human.contains("handoff=handoff:agent-a:job-a"), "{human}");
+        assert!(
+            human.contains("agent=agent-a gen=1")
+                && human.contains("handoff=handoff:agent-a:job-a"),
+            "{human}"
+        );
 
         // Accepting the handoff transfers job-a to agent-b at generation 2;
         // the pause help from generation 1 is no longer the new owner's blocker.
@@ -1008,13 +1022,20 @@ mod tests {
             .unwrap();
         let data = load_from_store(&store).unwrap();
         let (a, b) = (&data.jobs[0], &data.jobs[1]);
-        assert_eq!(a.collaboration_state, CollaborationState::Running);
         assert_eq!(
-            (a.agent_id.as_deref(), a.ownership_generation),
-            (Some("agent-b"), Some(2))
+            (
+                a.collaboration_state,
+                a.agent_id.as_deref(),
+                a.ownership_generation,
+            ),
+            (CollaborationState::Running, Some("agent-b"), Some(2))
         );
-        assert!(a.blocker.is_none(), "{:?}", a.blocker);
-        assert!(b.handoff.is_none(), "{:?}", b.handoff);
+        assert!(
+            a.blocker.is_none() && b.handoff.is_none(),
+            "{:?} {:?}",
+            a.blocker,
+            b.handoff
+        );
     }
 
     #[test]
