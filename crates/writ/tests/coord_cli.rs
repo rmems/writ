@@ -343,21 +343,19 @@ fn coord_reads_succeed_without_creating_a_store() {
     assert!(!root.path.join("leases.db").exists());
 }
 
-#[test]
-fn coord_drift_compares_declaration_with_actual_changes_and_handoff_carries_them() {
-    let root = TestDir::new("coord-cli-drift");
-    let repo = init_repo(&root.path);
-    add_origin(&repo);
+/// Register job-a, declare `src/a`, commit a declared change and leave an
+/// undeclared untracked one. Returns the checkout path.
+fn seed_drifted_job(root: &Path, repo: &Path) -> PathBuf {
     let checkout = create_job(
-        &root.path,
-        &repo,
+        root,
+        repo,
         JobSpec {
             job: "job-a",
             branch: "hive/job-a",
         },
     );
     let announced = announce(
-        &root.path,
+        root,
         AnnounceSpec {
             job: "job-a",
             agent: "agent-a",
@@ -373,38 +371,37 @@ fn coord_drift_compares_declaration_with_actual_changes_and_handoff_carries_them
     fs::write(checkout.join("src/b/y.rs"), "fn b() {}").unwrap();
     git(&checkout, &["add", "--", "src/a/x.rs"]);
     git(&checkout, &["commit", "-q", "-m", "declared change"]);
+    checkout
+}
 
+fn assert_drift_report(root: &Path) {
     let drift = writ(
-        &root.path,
+        root,
         &["--json", "coord", "drift", "acme", "sample", "job-a"],
     );
     assert!(drift.status.success(), "{:?}", drift.stderr);
     let drift = json(&drift);
     assert_eq!(drift["command"], "coord.drift");
+    let report = &drift["data"]["drift"];
     assert_eq!(
-        drift["data"]["drift"]["declared_paths"],
-        serde_json::json!(["src/a"])
+        (
+            &report["declared_paths"],
+            &report["changed_paths"],
+            &report["undeclared_paths"],
+            &report["untouched_declared_paths"],
+        ),
+        (
+            &serde_json::json!(["src/a"]),
+            &serde_json::json!(["src/a/x.rs", "src/b/y.rs"]),
+            &serde_json::json!(["src/b/y.rs"]),
+            &serde_json::json!([]),
+        )
     );
-    assert_eq!(
-        drift["data"]["drift"]["changed_paths"],
-        serde_json::json!(["src/a/x.rs", "src/b/y.rs"])
-    );
-    assert_eq!(
-        drift["data"]["drift"]["undeclared_paths"],
-        serde_json::json!(["src/b/y.rs"])
-    );
-    assert_eq!(
-        drift["data"]["drift"]["untouched_declared_paths"],
-        serde_json::json!([])
-    );
-    assert_eq!(
-        fs::read_to_string(checkout.join("src/b/y.rs")).unwrap(),
-        "fn b() {}",
-        "drift inspection must not touch the checkout"
-    );
+}
 
+fn offer_handoff(root: &Path) -> serde_json::Value {
     let handoff = writ(
-        &root.path,
+        root,
         &[
             "--json",
             "coord",
@@ -423,10 +420,25 @@ fn coord_drift_compares_declaration_with_actual_changes_and_handoff_carries_them
         ],
     );
     assert!(handoff.status.success(), "{:?}", handoff.stderr);
+    json(&handoff)
+}
+
+#[test]
+fn coord_drift_compares_declaration_with_actual_changes_and_handoff_carries_them() {
+    let root = TestDir::new("coord-cli-drift");
+    let repo = init_repo(&root.path);
+    add_origin(&repo);
+    let checkout = seed_drifted_job(&root.path, &repo);
+
+    assert_drift_report(&root.path);
     assert_eq!(
-        json(&handoff)["data"]["paths"],
-        serde_json::json!(["src/b/y.rs"])
+        fs::read_to_string(checkout.join("src/b/y.rs")).unwrap(),
+        "fn b() {}",
+        "drift inspection must not touch the checkout"
     );
+
+    let offer = offer_handoff(&root.path);
+    assert_eq!(offer["data"]["paths"], serde_json::json!(["src/b/y.rs"]));
 }
 
 #[test]
