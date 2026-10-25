@@ -10,28 +10,34 @@ fn declared(paths: &[&str]) -> Vec<String> {
     paths.iter().map(|p| String::from(*p)).collect()
 }
 
-/// Body written for `rel` by `commit_file` / `write_only`; the two differ so
-/// an edit after a commit is a content change, not a stat-only one.
-fn body(rel: &str, state: &str) -> String {
-    format!("// {rel} {state}\n")
+/// Which fixture body `place` writes. The two marks differ so an edit after
+/// a commit is a content change, not a stat-only one.
+#[derive(Clone, Copy)]
+enum FixtureMark {
+    Committed,
+    Edited,
 }
 
 /// Write `rel` with commit-marked content and commit it as `change <rel>`.
 fn commit_file(worktree: &Path, rel: &str) {
-    write(worktree, rel, &body(rel, "committed"));
+    place(worktree, rel, FixtureMark::Committed);
     git(worktree, &["add", "--", rel]);
     git(worktree, &["commit", "-q", "-m", &format!("change {rel}")]);
 }
 
 /// Write `rel` with edit-marked content without staging it.
 fn write_only(worktree: &Path, rel: &str) {
-    write(worktree, rel, &body(rel, "edited"));
+    place(worktree, rel, FixtureMark::Edited);
 }
 
-fn write(worktree: &Path, rel: &str, contents: &str) {
+fn place(worktree: &Path, rel: &str, mark: FixtureMark) {
     let file = worktree.join(rel);
     fs::create_dir_all(file.parent().unwrap()).unwrap();
-    fs::write(&file, contents).unwrap();
+    let state = match mark {
+        FixtureMark::Committed => "committed",
+        FixtureMark::Edited => "edited",
+    };
+    fs::write(&file, format!("// {rel} {state}\n")).unwrap();
 }
 
 /// Add a bare `origin` holding `main`, as a clone would see it. With
@@ -262,7 +268,7 @@ fn scope_drift_inspection_is_read_only() {
     assert_eq!(git(&worktree, &["rev-parse", "HEAD"]), head_before);
     assert_eq!(
         fs::read_to_string(worktree.join("wip.txt")).unwrap(),
-        body("wip.txt", "edited")
+        "// wip.txt edited\n"
     );
     assert!(git(&worktree, &["diff", "--cached", "--name-only"]).is_empty());
 }
@@ -416,7 +422,7 @@ fn accepted_transfer_leaves_exactly_one_live_owner_and_keeps_checkout_identity()
     assert_eq!(git(&worktree, &["rev-parse", "HEAD"]), head);
     assert_eq!(
         fs::read_to_string(worktree.join("wip.txt")).unwrap(),
-        body("wip.txt", "edited")
+        "// wip.txt edited\n"
     );
 }
 
