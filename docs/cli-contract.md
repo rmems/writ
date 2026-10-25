@@ -95,9 +95,11 @@ changes against `HEAD` and untracked, non-ignored files. Merging the base or
 rebasing onto a fetched base therefore attributes nothing upstream to the job;
 a fast-forward or rebase onto local-only base commits counts them until the
 checkout is re-registered, which refreshes the start commit to the current
-`HEAD`. It runs read-only `git` (`--no-optional-locks`) in that checkout and
-fails with exit 1 when the checkout cannot be inspected or a changed path is
-not valid UTF-8. A
+`HEAD`. It runs read-only `git` in that checkout: `git log` for commits, and
+`git status --porcelain` with `--no-optional-locks` for staged and unstaged
+paths, so a stat-only refresh cannot take `index.lock`. Inspection fails with
+exit 1 when the checkout cannot be inspected or a changed path is not valid
+UTF-8. A
 `handoff` offer records the same undeclared changed paths in its `paths` field
 so a stale declaration is visible to the target, and posts with empty `paths`
 when inspection is not possible. Ownership moves only when the target
