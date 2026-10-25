@@ -342,3 +342,101 @@ fn coord_reads_succeed_without_creating_a_store() {
     );
     assert!(!root.path.join("leases.db").exists());
 }
+
+#[test]
+fn coord_drift_compares_declaration_with_actual_changes_and_handoff_carries_them() {
+    let root = TestDir::new("coord-cli-drift");
+    let repo = init_repo(&root.path);
+    add_origin(&repo);
+    let checkout = create_job(
+        &root.path,
+        &repo,
+        JobSpec {
+            job: "job-a",
+            branch: "hive/job-a",
+        },
+    );
+    let announced = announce(
+        &root.path,
+        AnnounceSpec {
+            job: "job-a",
+            agent: "agent-a",
+            session: "sess-a",
+            intent: "own src/a",
+            path: "src/a",
+        },
+    );
+    assert!(announced.status.success(), "{:?}", announced.stderr);
+    fs::create_dir_all(checkout.join("src/a")).unwrap();
+    fs::create_dir_all(checkout.join("src/b")).unwrap();
+    fs::write(checkout.join("src/a/x.rs"), "fn a() {}").unwrap();
+    fs::write(checkout.join("src/b/y.rs"), "fn b() {}").unwrap();
+    git(&checkout, &["add", "--", "src/a/x.rs"]);
+    git(&checkout, &["commit", "-q", "-m", "declared change"]);
+
+    let drift = writ(
+        &root.path,
+        &["--json", "coord", "drift", "acme", "sample", "job-a"],
+    );
+    assert!(drift.status.success(), "{:?}", drift.stderr);
+    let drift = json(&drift);
+    assert_eq!(drift["command"], "coord.drift");
+    assert_eq!(
+        drift["data"]["drift"]["declared_paths"],
+        serde_json::json!(["src/a"])
+    );
+    assert_eq!(
+        drift["data"]["drift"]["changed_paths"],
+        serde_json::json!(["src/a/x.rs", "src/b/y.rs"])
+    );
+    assert_eq!(
+        drift["data"]["drift"]["undeclared_paths"],
+        serde_json::json!(["src/b/y.rs"])
+    );
+    assert_eq!(
+        drift["data"]["drift"]["untouched_declared_paths"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        fs::read_to_string(checkout.join("src/b/y.rs")).unwrap(),
+        "fn b() {}",
+        "drift inspection must not touch the checkout"
+    );
+
+    let handoff = writ(
+        &root.path,
+        &[
+            "--json",
+            "coord",
+            "handoff",
+            "acme",
+            "sample",
+            "job-a",
+            "--agent",
+            "agent-a",
+            "--to-agent",
+            "agent-b",
+            "--generation",
+            "1",
+            "--body",
+            "handing off with undeclared edits",
+        ],
+    );
+    assert!(handoff.status.success(), "{:?}", handoff.stderr);
+    assert_eq!(
+        json(&handoff)["data"]["paths"],
+        serde_json::json!(["src/b/y.rs"])
+    );
+}
+
+#[test]
+fn coord_drift_reads_do_not_create_a_store() {
+    let root = TestDir::new("coord-cli-drift-absent");
+    let drift = writ(
+        &root.path,
+        &["--json", "coord", "drift", "acme", "sample", "job-a"],
+    );
+    assert!(drift.status.success(), "{:?}", drift.stderr);
+    assert!(json(&drift)["data"]["drift"].is_null());
+    assert!(!root.path.join("leases.db").exists());
+}

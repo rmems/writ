@@ -14,12 +14,14 @@ mod access;
 mod ack;
 mod announce;
 mod declared_paths;
+mod scope;
 mod types;
 mod util;
 
 #[cfg(test)]
 mod tests;
 
+pub use scope::ScopeDrift;
 pub use types::{
     AckRequest, AnnounceRequest, AnnounceResult, CoordClaim, CoordMessage, HandoffRequest,
     MessageKind, PathOverlap, PauseRequest, SendRequest,
@@ -235,7 +237,30 @@ impl LeaseStore {
         Ok((paused, help))
     }
 
+    /// Compare the declared paths of a claim with what its checkout changed.
+    ///
+    /// Read-only. Fails when the job has no claim or the checkout cannot be
+    /// inspected with git; it never adopts, resets, or cleans anything.
+    pub fn scope_drift(&self, key: JobKey<'_>) -> Result<ScopeDrift> {
+        let claim = self
+            .find_claim(key)?
+            .ok_or_else(|| coord_missing("no coordination claim to compare against"))?;
+        let lease = self.find_job(key)?.ok_or_else(|| {
+            coord_missing("no lease exists for the coordination claim being compared")
+        })?;
+        let changed = scope::changed_paths(
+            std::path::Path::new(&lease.worktree_path),
+            &lease.start_commit,
+        )?;
+        Ok(ScopeDrift::build(&claim, &lease, changed))
+    }
+
     /// Offer a generation-bound handoff. The claim does not move until ACK.
+    ///
+    /// The offer's `paths` list the changed paths that the current declaration
+    /// does not cover, so a stale declaration is visible to the target. When
+    /// the checkout cannot be inspected the list is empty; `scope_drift`
+    /// reports that failure loudly.
     pub fn propose_handoff(&self, request: HandoffRequest<'_>) -> Result<CoordMessage> {
         let key = JobKey {
             owner: request.owner,
@@ -243,6 +268,10 @@ impl LeaseStore {
             job_id: request.job_id,
         };
         let to_job = request.to_job_id.unwrap_or(request.job_id);
+        let undeclared = self
+            .scope_drift(key)
+            .map(|drift| drift.undeclared_paths)
+            .unwrap_or_default();
         let now = now_secs();
         let mut conn = self.lock()?;
         let tx = conn
@@ -285,7 +314,7 @@ impl LeaseStore {
                 to_job_id: Some(to_job),
                 owner_generation: claim.owner_generation,
                 body: request.body,
-                paths: &[],
+                paths: &undeclared,
                 ack_of: None,
                 now,
             },
