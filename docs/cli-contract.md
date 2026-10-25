@@ -87,8 +87,10 @@ they never create `leases.db`, and on an absent store they return an empty or
 not path collisions). `drift` compares the latest declaration with the paths
 the registered checkout actually changed: every path named by a commit on the
 branch's first-parent history after the lease start commit, excluding merge
-commits and any commit already reachable from a remote-tracking ref other than
-the branch's own (renames count as both paths), plus staged and unstaged
+commits and any commit already reachable from an upstream remote-tracking ref
+(one that is neither the branch's own nor contains `HEAD`, so a pushed stacked
+child or copy is not treated as upstream; renames count as both paths), plus
+staged and unstaged
 changes against `HEAD` and untracked, non-ignored files. Merging the base or
 rebasing onto a fetched base therefore attributes nothing upstream to the job;
 a fast-forward or rebase onto local-only base commits counts them until the

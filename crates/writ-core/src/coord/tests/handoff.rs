@@ -147,6 +147,37 @@ fn scope_drift_ignores_upstream_commits_after_a_rebase_onto_a_fetched_base() {
 }
 
 #[test]
+fn scope_drift_keeps_job_commits_when_a_stacked_child_branch_is_pushed() {
+    let harness = Harness::new();
+    let worktree = harness.seed_checkout_job("job-a", "hive/job-a");
+    announce(&harness.store, "job-a", "agent-a", &declared(&["src/a"]));
+    write_commit(&worktree, "src/b/x.rs", "fn b() {}", "undeclared job work");
+    let remote = harness._temp.path().join("origin.git");
+    git(
+        &harness.repo,
+        &["init", "-q", "--bare", remote.to_str().unwrap()],
+    );
+    git(
+        &harness.repo,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    git(&worktree, &["push", "-q", "origin", "hive/job-a"]);
+    // A stacked child pushed under another name contains job-a's commits.
+    git(&worktree, &["branch", "hive/job-b", "hive/job-a"]);
+    git(&worktree, &["push", "-q", "origin", "hive/job-b"]);
+    // A stale copy of the branch pushed under another name does too.
+    git(
+        &worktree,
+        &["push", "-q", "origin", "hive/job-a:refs/heads/backup/job-a"],
+    );
+
+    let drift = harness.store.scope_drift(job_key_a()).unwrap();
+
+    assert_eq!(drift.changed_paths, declared(&["src/b/x.rs"]));
+    assert_eq!(drift.undeclared_paths, declared(&["src/b/x.rs"]));
+}
+
+#[test]
 fn scope_drift_counts_a_fast_forward_until_the_checkout_is_reregistered() {
     let harness = Harness::new();
     let worktree = harness.seed_checkout_job("job-a", "hive/job-a");

@@ -75,11 +75,14 @@ pub(super) fn covers(declared: &str, path: &str) -> bool {
 ///
 /// - every path named by a commit on the branch's first-parent history after
 ///   `start_commit`, excluding merge commits and any commit already reachable
-///   from a remote-tracking ref other than this branch's own. Merging the
-///   base branch, or rebasing onto a fetched base, therefore does not
-///   attribute upstream changes to the job. A fast-forward or rebase onto
-///   local-only base commits still counts them until the checkout is
-///   re-registered (which refreshes `start_commit`);
+///   from an upstream remote-tracking ref. A remote ref counts as upstream
+///   when it is not this branch's own and does not contain `HEAD`; a pushed
+///   stacked child or copy of the branch contains `HEAD` and is ignored, so
+///   the job's own commits stay attributed to it. Merging the base branch, or
+///   rebasing onto a fetched base, therefore does not attribute upstream
+///   changes to the job. A fast-forward or rebase onto local-only base
+///   commits still counts them until the checkout is re-registered (which
+///   refreshes `start_commit`);
 /// - staged and unstaged changes relative to `HEAD`;
 /// - untracked files that are not ignored.
 ///
@@ -97,25 +100,24 @@ pub(super) fn changed_paths(
     } else {
         format!("{start_commit}..HEAD")
     };
-    let own_remote_refs = format!("--exclude=*/{branch}");
-    let mut paths = nul_separated(run(
-        worktree,
-        &[
-            "--no-optional-locks",
-            "log",
-            "--first-parent",
-            "--no-merges",
-            "--no-renames",
-            "--name-only",
-            "--format=",
-            "-z",
-            &range,
-            "--not",
-            &own_remote_refs,
-            "--remotes",
-            "--",
-        ],
-    )?)?;
+    let upstream = upstream_remote_refs(worktree, branch)?;
+    let mut log_args = vec![
+        "--no-optional-locks",
+        "log",
+        "--first-parent",
+        "--no-merges",
+        "--no-renames",
+        "--name-only",
+        "--format=",
+        "-z",
+        range.as_str(),
+    ];
+    if !upstream.is_empty() {
+        log_args.push("--not");
+        log_args.extend(upstream.iter().map(String::as_str));
+    }
+    log_args.push("--");
+    let mut paths = nul_separated(run(worktree, &log_args)?)?;
     paths.extend(nul_separated(run(
         worktree,
         &[
@@ -141,6 +143,27 @@ pub(super) fn changed_paths(
     paths.sort();
     paths.dedup();
     Ok(paths)
+}
+
+/// Remote-tracking refs that stand for upstream: every remote ref except the
+/// branch's own (`*/<branch>`) and any ref that already contains `HEAD`,
+/// which is a pushed copy or stacked child of this branch, not its base.
+fn upstream_remote_refs(worktree: &Path, branch: &str) -> Result<Vec<String>> {
+    let own = format!("/{branch}");
+    let refs = nul_separated(run(
+        worktree,
+        &[
+            "--no-optional-locks",
+            "for-each-ref",
+            "--format=%(refname)%00",
+            "--no-contains=HEAD",
+            "refs/remotes",
+        ],
+    )?)?;
+    Ok(refs
+        .into_iter()
+        .filter(|name| !name.ends_with(&own))
+        .collect())
 }
 
 /// Changed paths that no declared path covers.
