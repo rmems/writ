@@ -1,6 +1,9 @@
 //! Handoff lifecycle: declared-vs-actual scope at offer time, single live
 //! owner after ACK, restart durability, and concurrent ACK races (#111/#112).
 
+use std::path::PathBuf;
+use std::time::{Duration, SystemTime};
+
 use super::*;
 
 fn declared(paths: &[&str]) -> Vec<String> {
@@ -247,6 +250,56 @@ fn scope_drift_inspection_is_read_only() {
 }
 
 #[test]
+fn scope_drift_does_not_refresh_the_index_for_a_stat_only_change() {
+    let harness = Harness::new();
+    let worktree = harness.seed_checkout_job("job-a", "hive/job-a");
+    announce(&harness.store, "job-a", "agent-a", &declared(&["src"]));
+    write_commit(&worktree, "src/a/x.rs", "fn a() {}", "tracked");
+    let head = git(&worktree, &["rev-parse", "HEAD"]);
+    harness
+        .store
+        .grant(crate::lease::LeaseGrant {
+            repo: &harness.repo,
+            owner: "acme",
+            repo_name: "sample",
+            job_id: "job-a",
+            branch: "hive/job-a",
+            worktree_path: &worktree,
+            start_commit: &head,
+        })
+        .unwrap();
+    let tracked = worktree.join("src/a/x.rs");
+    fs::File::open(&tracked)
+        .unwrap()
+        .set_modified(SystemTime::now() - Duration::from_secs(30))
+        .unwrap();
+    let index = {
+        let printed = git(&worktree, &["rev-parse", "--git-path", "index"]);
+        let path = PathBuf::from(&printed);
+        if path.is_absolute() {
+            path
+        } else {
+            worktree.join(path)
+        }
+    };
+    let before = fs::read(&index).unwrap();
+
+    let drift = harness.store.scope_drift(job_key_a()).unwrap();
+
+    assert_eq!(fs::read(&index).unwrap(), before, "index was rewritten");
+    assert!(
+        !drift.changed_paths.iter().any(|path| path == "src/a/x.rs"),
+        "stat-only change was reported: {:?}",
+        drift.changed_paths
+    );
+
+    fs::write(&tracked, "fn a() { /* edited */ }").unwrap();
+    let drift = harness.store.scope_drift(job_key_a()).unwrap();
+    assert_eq!(drift.changed_paths, declared(&["src/a/x.rs"]));
+    assert_eq!(fs::read(&index).unwrap(), before, "index was rewritten");
+}
+
+#[test]
 fn scope_drift_fails_loudly_without_an_inspectable_checkout() {
     let harness = Harness::new();
     harness.seed_job("job-a", "hive/job-a");
@@ -437,16 +490,12 @@ fn pending_and_accepted_handoff_state_survive_store_reopen() {
         ("agent-b", Some("session-b"), 2, None)
     );
     let inbox = again.inbox(job_key_a()).unwrap();
-    assert!(
-        inbox
-            .iter()
-            .any(|m| m.id == offer.id && m.acked_at.is_some())
-    );
-    assert!(
-        inbox
-            .iter()
-            .any(|m| m.kind == MessageKind::Ack && m.ack_of == Some(offer.id))
-    );
+    assert!(inbox
+        .iter()
+        .any(|m| m.id == offer.id && m.acked_at.is_some()));
+    assert!(inbox
+        .iter()
+        .any(|m| m.kind == MessageKind::Ack && m.ack_of == Some(offer.id)));
     let replay = sample_ack(&again, offer.id).unwrap_err();
     assert!(
         replay.to_string().contains("already acknowledged"),
