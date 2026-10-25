@@ -326,6 +326,9 @@ pub fn load_from_store(store: &LeaseStore) -> Result<JobsData, String> {
     let leases = list_leases_on(&tx, "ORDER BY id", "list leases").map_err(|e| e.to_string())?;
     let agents = list_agents_on(&tx).map_err(|e| e.to_string())?;
     let coord = load_coord_snapshot_on(&tx);
+    if let Some(error) = &coord.error {
+        return Err(format!("read coordination tables: {error}"));
+    }
     tx.commit()
         .map_err(|e| format!("commit status snapshot: {e}"))?;
     drop(conn);
@@ -1015,6 +1018,21 @@ mod tests {
             )
             .unwrap();
         assert_eq!(exists, 0, "status must not recreate coord tables");
+    }
+
+    #[test]
+    fn unreadable_coord_tables_are_an_error_not_missing_ownership() {
+        let (tmp, store) = seeded_store();
+        drop(store);
+        let path = tmp.path().join("leases.db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "DROP TABLE coord_claims; CREATE TABLE coord_claims (owner TEXT NOT NULL);",
+        )
+        .unwrap();
+        drop(conn);
+        let err = load_from_path(&path).unwrap_err();
+        assert!(err.contains("coord_claims"), "{err}");
     }
 
     #[test]

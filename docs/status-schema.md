@@ -69,7 +69,7 @@ When the lease store cannot be opened or queried:
 | `residual_blockers` | `string[]` | yes | Structured leftovers (e.g. `timeout:hard`). Omitted when empty. |
 | `redispatch_count` | `u32` | yes | Completed terminal runs (harness-owned). Supervisor runs always report `0` internally. |
 | `fix_count` | `u32` | yes | Successful fix attempts. Timeout residuals must not increment this. |
-| `collaboration_state` | `CollaborationState` | no | Mapped only from recorded `lease_mode`. |
+| `collaboration_state` | `CollaborationState` | no | Mapped from the recorded `lease_mode` (see below); an active writer whose coord claim is paused reports `paused`. |
 | `lease_mode` | `string \| null` | yes | Exact stored mode text; unrecognized values are kept (not rewritten to `UNKNOWN`). |
 | `head` | `string \| null` | yes | Live checkout `HEAD` when inspect matches lease identity, else lease `start_commit`. |
 | `head_source` | `string \| null` | yes | `checkout` or `lease`. |
