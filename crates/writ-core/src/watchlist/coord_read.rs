@@ -60,6 +60,41 @@ struct MessageRow {
 }
 
 impl CoordSnapshot {
+    /// First unacknowledged handoff addressed to `key` whose source claim is
+    /// still at the offered generation, as `handoff:<agent>:<job>`.
+    pub(crate) fn pending_handoff_for(&self, key: &JobId) -> Option<String> {
+        self.pending_for(|msg| msg.kind == "handoff" && msg.targets(key))
+    }
+
+    /// First unacknowledged help/dependency/blocker addressed to `key`, or
+    /// broadcast by `key` itself while its claim is still at the sending
+    /// generation, as `<kind>:<agent>:<job>`.
+    pub(crate) fn pending_blocker_for(&self, key: &JobId) -> Option<String> {
+        self.pending_for(|msg| {
+            matches!(msg.kind.as_str(), "help" | "dependency" | "blocker")
+                && (msg.targets(key) || self.is_live_self_broadcast(msg, key))
+        })
+    }
+
+    /// A broadcast from `key` itself speaks for the owner generation that
+    /// sent it. An accepted handoff bumps the claim's generation, so the
+    /// previous owner's pause `help` stops counting as the new owner's blocker
+    /// even though nothing acknowledges that row.
+    fn is_live_self_broadcast(&self, msg: &MessageRow, key: &JobId) -> bool {
+        msg.to.is_none()
+            && msg.from == *key
+            && source_generation(&self.claims, msg) == Some(msg.owner_generation)
+    }
+
+    fn pending_for(&self, keep: impl Fn(&MessageRow) -> bool) -> Option<String> {
+        self.messages.iter().find_map(|msg| {
+            if msg.acked_at.is_some() || !keep(msg) {
+                return None;
+            }
+            waiting_label(msg, &self.claims)
+        })
+    }
+
     pub(crate) fn overlay_for(&self, key: &JobId) -> CoordOverlay {
         let claim = self.claims.get(key);
         let waiting_on = waiting_on_for(&self.messages, key, &self.claims);
@@ -91,39 +126,49 @@ fn load_coord_snapshot(path: &Path) -> CoordSnapshot {
 }
 
 fn load_coord_snapshot_from(conn: &Connection) -> CoordSnapshot {
-    if !table_exists(conn, "coord_claims") {
-        return CoordSnapshot::default();
+    let has_claims = table_exists(conn, "coord_claims");
+    let has_messages = table_exists(conn, "coord_messages");
+    match (has_claims, has_messages) {
+        (false, false) => CoordSnapshot::default(),
+        // The coord schema creates both tables together; messages without
+        // claims is drift that must not read as "no coordination data".
+        (false, true) => failed_snapshot(
+            "coord_messages exists without coord_claims".to_owned(),
+            BTreeMap::new(),
+        ),
+        (true, _) => load_coord_tables(conn, has_messages),
     }
+}
+
+fn load_coord_tables(conn: &Connection, has_messages: bool) -> CoordSnapshot {
     let claims = match load_claims(conn) {
         Ok(claims) => claims,
-        Err(err) => {
-            return CoordSnapshot {
-                available: true,
-                error: Some(format!("coord_claims: {err}")),
-                ..CoordSnapshot::default()
-            };
-        }
+        Err(err) => return failed_snapshot(format!("coord_claims: {err}"), BTreeMap::new()),
     };
-    let messages = if table_exists(conn, "coord_messages") {
-        match load_messages(conn) {
-            Ok(messages) => messages,
-            Err(err) => {
-                return CoordSnapshot {
-                    available: true,
-                    error: Some(format!("coord_messages: {err}")),
-                    claims,
-                    ..CoordSnapshot::default()
-                };
-            }
-        }
+    let messages = if has_messages {
+        load_messages(conn)
     } else {
-        Vec::new()
+        Ok(Vec::new())
     };
+    match messages {
+        Ok(messages) => CoordSnapshot {
+            available: true,
+            error: None,
+            claims,
+            messages,
+        },
+        Err(err) => failed_snapshot(format!("coord_messages: {err}"), claims),
+    }
+}
+
+/// Tables exist but could not be read: the snapshot is available, carries
+/// whatever was read before the failure, and records why the rest is missing.
+fn failed_snapshot(error: String, claims: BTreeMap<JobId, ClaimRow>) -> CoordSnapshot {
     CoordSnapshot {
         available: true,
-        error: None,
+        error: Some(error),
         claims,
-        messages,
+        messages: Vec::new(),
     }
 }
 
@@ -172,7 +217,8 @@ fn load_messages(conn: &Connection) -> rusqlite::Result<Vec<MessageRow>> {
     let mut stmt = conn.prepare(
         "SELECT kind, from_agent_id, from_owner, from_repo_name, from_job_id,
                 to_owner, to_repo_name,
-                to_job_id, body, acked_at, owner_generation FROM coord_messages",
+                to_job_id, body, acked_at, owner_generation FROM coord_messages
+         ORDER BY id",
     )?;
     let rows = stmt.query_map([], message_from_row)?;
     rows.collect()
@@ -266,6 +312,7 @@ mod tests {
             owner_generation INTEGER, paused_at INTEGER
         );
         CREATE TABLE coord_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             kind TEXT, from_agent_id TEXT, from_owner TEXT, from_repo_name TEXT,
             from_job_id TEXT, to_owner TEXT, to_repo_name TEXT, to_job_id TEXT,
             body TEXT, acked_at INTEGER, owner_generation INTEGER
@@ -332,11 +379,11 @@ mod tests {
                 'acme','sample','job-1','agent-a','sess-1','fix',
                 '[\"crates/writ-core\"]', 2, 99
             );
-            INSERT INTO coord_messages VALUES (
+            INSERT INTO coord_messages VALUES (NULL,
                 'help','agent-b','acme','sample','job-2','acme','sample','job-1',
                 'need review', NULL, 2
             );
-            INSERT INTO coord_messages VALUES (
+            INSERT INTO coord_messages VALUES (NULL,
                 'overlap','agent-b','acme','sample','job-2','acme','sample','job-1',
                 'crates/a', NULL, 2
             );
@@ -358,7 +405,7 @@ mod tests {
                 INSERT INTO coord_claims VALUES (
                     'acme','sample','job-1','agent-a',NULL,NULL,'[]', 1, NULL
                 );
-                INSERT INTO coord_messages VALUES (
+                INSERT INTO coord_messages VALUES (NULL,
                     'blocker','agent-b','acme','sample','job-2','acme','sample','job-1',
                     'blocked', NULL, 1
                 );
@@ -370,7 +417,7 @@ mod tests {
                 INSERT INTO coord_claims VALUES (
                     'acme','sample','job-1','agent-a',NULL,NULL,'[]', 2, NULL
                 );
-                INSERT INTO coord_messages VALUES (
+                INSERT INTO coord_messages VALUES (NULL,
                     'handoff','agent-a','acme','sample','job-1','acme','sample','job-1',
                     'take over', NULL, 1
                 );
@@ -387,6 +434,25 @@ mod tests {
     }
 
     #[test]
+    fn self_broadcast_is_a_blocker_only_at_the_sending_generation() {
+        let key = JobId::new("acme", "sample", "job-1");
+        for (claim_generation, expected) in [(1, Some("help:agent-a:job-1")), (2, None)] {
+            let snap = snapshot_with(&format!(
+                "
+                INSERT INTO coord_claims VALUES (
+                    'acme','sample','job-1','agent-b',NULL,NULL,'[]', {claim_generation}, NULL
+                );
+                INSERT INTO coord_messages VALUES (NULL,
+                    'help','agent-a','acme','sample','job-1',NULL,NULL,NULL,
+                    'owner paused', NULL, 1
+                );
+                "
+            ));
+            assert_eq!(snap.pending_blocker_for(&key).as_deref(), expected);
+        }
+    }
+
+    #[test]
     fn cross_job_handoff_uses_source_generation() {
         // Recipient generation (7) differs from the message (3), but the source
         // claim generation matches, so the handoff stays visible.
@@ -399,6 +465,23 @@ mod tests {
     #[test]
     fn stale_source_generation_hides_cross_job_handoff() {
         assert!(cross_job_handoff(4, 3).is_none());
+    }
+
+    #[test]
+    fn messages_table_without_claims_table_is_an_error() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("leases.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE coord_messages (kind TEXT, from_agent_id TEXT, from_owner TEXT,
+             from_repo_name TEXT, from_job_id TEXT, to_owner TEXT, to_repo_name TEXT,
+             to_job_id TEXT, body TEXT, acked_at INTEGER, owner_generation INTEGER);",
+        )
+        .unwrap();
+        drop(conn);
+        let snap = load_coord_snapshot(&path);
+        assert!(snap.available);
+        assert!(snap.error.is_some(), "{:?}", snap.error);
     }
 
     #[test]

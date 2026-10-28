@@ -69,18 +69,18 @@ When the lease store cannot be opened or queried:
 | `residual_blockers` | `string[]` | yes | Structured leftovers (e.g. `timeout:hard`). Omitted when empty. |
 | `redispatch_count` | `u32` | yes | Completed terminal runs (harness-owned). Supervisor runs always report `0` internally. |
 | `fix_count` | `u32` | yes | Successful fix attempts. Timeout residuals must not increment this. |
-| `collaboration_state` | `CollaborationState` | no | Mapped only from recorded `lease_mode`. |
+| `collaboration_state` | `CollaborationState` | no | Mapped from the recorded `lease_mode` (see below); an active writer whose coord claim is paused reports `paused`. |
 | `lease_mode` | `string \| null` | yes | Exact stored mode text; unrecognized values are kept (not rewritten to `UNKNOWN`). |
 | `head` | `string \| null` | yes | Live checkout `HEAD` when inspect matches lease identity, else lease `start_commit`. |
 | `head_source` | `string \| null` | yes | `checkout` or `lease`. |
 | `lease_row_id` | `i64 \| null` | yes | SQLite row id. |
 | `updated_at` | `i64 \| null` | yes | Lease `updated_at` unix seconds. |
-| `ownership_generation` | `i64 \| null` | yes | Not stored today; always `null`. |
-| `agent_id` | `string \| null` | yes | Not joined on the lease; always `null`. |
-| `session_id` | `string \| null` | yes | Not joined on the lease; always `null`. |
-| `declared_paths` | `string[] \| null` | yes | Not stored today; always `null`. |
-| `blocker` | `string \| null` | yes | Not stored today; always `null`. |
-| `handoff` | `string \| null` | yes | Not stored today; always `null`. |
+| `ownership_generation` | `i64 \| null` | yes | `owner_generation` of the job's `coord_claims` row; `null` without a claim. |
+| `agent_id` | `string \| null` | yes | Agent owning the coord claim; `null` without a claim. |
+| `session_id` | `string \| null` | yes | Session recorded on the coord claim; `null` without a claim. |
+| `declared_paths` | `string[] \| null` | yes | Declared paths from the latest `coord announce`; `null` without a claim (empty list when the claim declared none). |
+| `blocker` | `string \| null` | yes | First unacknowledged `help`/`dependency`/`blocker` addressed to the job, or broadcast by it while its claim is still at the sending owner generation (an accepted handoff retires the previous owner's pause `help`), as `<kind>:<agent>:<job>`; `null` when none. |
+| `handoff` | `string \| null` | yes | First unacknowledged handoff offered to the job whose source claim is still at the offered generation, as `handoff:<agent>:<job>`; `null` when none. |
 | `recovery_needed` | `bool \| null` | yes | `true` when an **active** lease cannot inspect its checkout; `false` when inspect succeeds. |
 
 ## `CollaborationState`
@@ -92,7 +92,7 @@ Released or ready-for-integration is **not** GitHub merged/completed.
 | --- | --- | --- |
 | `running` | `WRITER_LOCKED` | Active writer lock. |
 | `waiting` | `NEEDS_HUMAN` | Recorded as needing a human. |
-| `paused` | `REVIEW_ONLY` | Review-only / paused writer. |
+| `paused` | `REVIEW_ONLY`, or `WRITER_LOCKED` with a paused coord claim | Review-only writer, or an active writer that ran `coord pause` (WIP preserved). |
 | `conflicted` | `BLOCKED` | Recorded blocked. |
 | `ready_for_integration` | `MERGE_READY` | Locally marked ready to integrate. |
 | `unassigned` | `UNASSIGNED` | Identity kept after release. |
