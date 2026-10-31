@@ -431,6 +431,7 @@ criteria checkboxes, and the Linear footer documented in
 - [`docs/watchlist-schema.md`](docs/watchlist-schema.md) — `watchlist` collaboration view
 - [`docs/examples/`](docs/examples/) — captured response envelopes
 - [`docs/hook-boundary.md`](docs/hook-boundary.md) — hook-boundary contract tests and two-hook burn-in (#81)
+- [`docs/safety-model.md`](docs/safety-model.md) — integrity invariants (fail closed) versus advisory collaboration policy (#22)
 
 ## License
 
