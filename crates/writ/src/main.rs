@@ -2315,6 +2315,60 @@ mod tests {
         assert_eq!(paths, vec!["crates/writ-core/src/coord.rs"]);
     }
 
+    #[test]
+    fn coord_drift_parser_accepts_job_key() {
+        let parsed =
+            Cli::try_parse_from(["writ", "coord", "drift", "acme", "sample", "job"]).unwrap();
+        let Some(super::Command::Coord {
+            action:
+                super::coord::CoordAction::Drift {
+                    owner,
+                    repo_name,
+                    job_id,
+                },
+        }) = parsed.command
+        else {
+            panic!("expected coord drift")
+        };
+        assert_eq!(owner, "acme");
+        assert_eq!(repo_name, "sample");
+        assert_eq!(job_id, "job");
+    }
+
+    #[test]
+    fn coord_handoff_parser_binds_generation() {
+        let parsed = Cli::try_parse_from([
+            "writ",
+            "coord",
+            "handoff",
+            "acme",
+            "sample",
+            "job",
+            "--agent",
+            "agent-a",
+            "--to-agent",
+            "agent-b",
+            "--generation",
+            "3",
+            "--body",
+            "move",
+        ])
+        .unwrap();
+        let Some(super::Command::Coord {
+            action:
+                super::coord::CoordAction::Handoff {
+                    to_agent,
+                    generation,
+                    ..
+                },
+        }) = parsed.command
+        else {
+            panic!("expected coord handoff")
+        };
+        assert_eq!(to_agent, "agent-b");
+        assert_eq!(generation, Some(3));
+    }
+
     #[tokio::test]
     async fn json_mode_writes_v1_envelope_to_stdout() {
         let cli = Cli {

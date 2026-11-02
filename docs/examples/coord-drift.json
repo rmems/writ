@@ -1,0 +1,29 @@
+{
+    "ok": true,
+    "schema_version": 1,
+    "command": "coord.drift",
+    "data": {
+        "drift": {
+            "agent_id": "agent-a",
+            "branch": "hive/job-a",
+            "changed_paths": [
+                "src/a/mod.rs",
+                "src/b/mod.rs"
+            ],
+            "declared_paths": [
+                "src/a"
+            ],
+            "job_id": "job-a",
+            "owner": "acme",
+            "owner_generation": 1,
+            "repo_name": "sample",
+            "start_commit": "<start-commit>",
+            "undeclared_paths": [
+                "src/b/mod.rs"
+            ],
+            "untouched_declared_paths": [],
+            "worktree_path": "/path/to/job-a"
+        }
+    },
+    "error": null
+}

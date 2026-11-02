@@ -1,0 +1,26 @@
+{
+    "ok": true,
+    "schema_version": 1,
+    "command": "coord.handoff",
+    "data": {
+        "ack_of": null,
+        "acked_at": null,
+        "body": "handing off",
+        "created_at": 1792918178,
+        "from_agent_id": "agent-a",
+        "from_job_id": "job-a",
+        "from_owner": "acme",
+        "from_repo_name": "sample",
+        "id": 2,
+        "kind": "handoff",
+        "owner_generation": 1,
+        "paths": [
+            "src/b/mod.rs"
+        ],
+        "to_agent_id": "agent-b",
+        "to_job_id": "job-a",
+        "to_owner": "acme",
+        "to_repo_name": "sample"
+    },
+    "error": null
+}
