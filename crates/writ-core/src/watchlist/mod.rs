@@ -5,7 +5,7 @@
 //! GitHub PR/check data is fetched live when requested and is not persisted.
 
 mod classify;
-mod coord_read;
+pub(crate) mod coord_read;
 mod github;
 mod types;
 mod view;
