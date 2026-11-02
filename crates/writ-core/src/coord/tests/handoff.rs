@@ -1,24 +1,66 @@
 //! Handoff lifecycle: declared-vs-actual scope at offer time, single live
 //! owner after ACK, restart durability, and concurrent ACK races (#111/#112).
 
+use std::path::PathBuf;
+use std::time::{Duration, SystemTime};
+
 use super::*;
 
 fn declared(paths: &[&str]) -> Vec<String> {
     paths.iter().map(|p| String::from(*p)).collect()
 }
 
-fn write_commit(worktree: &Path, rel: &str, body: &str, message: &str) {
-    let file = worktree.join(rel);
-    fs::create_dir_all(file.parent().unwrap()).unwrap();
-    fs::write(&file, body).unwrap();
-    git(worktree, &["add", "--", rel]);
-    git(worktree, &["commit", "-q", "-m", message]);
+/// Which fixture body `place` writes. The two marks differ so an edit after
+/// a commit is a content change, not a stat-only one.
+#[derive(Clone, Copy)]
+enum FixtureMark {
+    Committed,
+    Edited,
 }
 
-fn write_only(worktree: &Path, rel: &str, body: &str) {
+/// Write `rel` with commit-marked content and commit it as `change <rel>`.
+fn commit_file(worktree: &Path, rel: &str) {
+    place(worktree, rel, FixtureMark::Committed);
+    git(worktree, &["add", "--", rel]);
+    git(worktree, &["commit", "-q", "-m", &format!("change {rel}")]);
+}
+
+/// Write `rel` with edit-marked content without staging it.
+fn write_only(worktree: &Path, rel: &str) {
+    place(worktree, rel, FixtureMark::Edited);
+}
+
+fn place(worktree: &Path, rel: &str, mark: FixtureMark) {
     let file = worktree.join(rel);
     fs::create_dir_all(file.parent().unwrap()).unwrap();
-    fs::write(&file, body).unwrap();
+    let state = match mark {
+        FixtureMark::Committed => "committed",
+        FixtureMark::Edited => "edited",
+    };
+    fs::write(&file, format!("// {rel} {state}\n")).unwrap();
+}
+
+/// Add a bare `origin` holding `main`, as a clone would see it. With
+/// `default_head`, `origin/HEAD` points at `origin/main` like a real clone;
+/// without it the remote records no default branch.
+fn add_origin(harness: &Harness, default_head: bool) {
+    let remote = harness._temp.path().join("origin.git");
+    git(
+        &harness.repo,
+        &["init", "-q", "--bare", remote.to_str().unwrap()],
+    );
+    git(
+        &harness.repo,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    git(&harness.repo, &["push", "-q", "origin", "main"]);
+    if default_head {
+        git(&harness.repo, &["remote", "set-head", "origin", "main"]);
+    }
+}
+
+fn peer_commit_on_main(harness: &Harness) {
+    commit_file(&harness.repo, "src/upstream/u.rs");
 }
 
 #[test]
@@ -31,10 +73,10 @@ fn scope_drift_separates_undeclared_changes_from_untouched_declarations() {
         "agent-a",
         &declared(&["src/a", "docs"]),
     );
-    write_commit(&worktree, "src/a/x.rs", "fn a() {}", "declared change");
-    write_commit(&worktree, "src/b/y.rs", "fn b() {}", "undeclared change");
-    write_only(&worktree, "notes.txt", "untracked scratch");
-    write_only(&worktree, "src/a/x.rs", "fn a() { /* edited */ }");
+    commit_file(&worktree, "src/a/x.rs");
+    commit_file(&worktree, "src/b/y.rs");
+    write_only(&worktree, "notes.txt");
+    write_only(&worktree, "src/a/x.rs");
 
     let drift = harness.store.scope_drift(job_key_a()).unwrap();
 
@@ -60,7 +102,7 @@ fn scope_drift_is_clean_when_changes_stay_inside_the_declaration() {
     let harness = Harness::new();
     let worktree = harness.seed_checkout_job("job-a", "hive/job-a");
     announce(&harness.store, "job-a", "agent-a", &declared(&["src"]));
-    write_commit(&worktree, "src/lib.rs", "pub fn x() {}", "in scope");
+    commit_file(&worktree, "src/lib.rs");
 
     let drift = harness.store.scope_drift(job_key_a()).unwrap();
 
@@ -70,11 +112,156 @@ fn scope_drift_is_clean_when_changes_stay_inside_the_declaration() {
 }
 
 #[test]
+fn scope_drift_reports_a_rename_as_both_paths() {
+    let harness = Harness::new();
+    let worktree = harness.seed_checkout_job("job-a", "hive/job-a");
+    announce(&harness.store, "job-a", "agent-a", &declared(&["src/a"]));
+    commit_file(&worktree, "src/b/x.rs");
+    fs::create_dir_all(worktree.join("src/a")).unwrap();
+    git(&worktree, &["mv", "src/b/x.rs", "src/a/x.rs"]);
+    git(&worktree, &["commit", "-q", "-m", "move it inside"]);
+
+    let drift = harness.store.scope_drift(job_key_a()).unwrap();
+
+    assert_eq!(drift.changed_paths, declared(&["src/a/x.rs", "src/b/x.rs"]));
+    assert_eq!(drift.undeclared_paths, declared(&["src/b/x.rs"]));
+}
+
+#[test]
+fn scope_drift_ignores_upstream_commits_merged_into_the_job_branch() {
+    let harness = Harness::new();
+    let worktree = harness.seed_checkout_job("job-a", "hive/job-a");
+    announce(&harness.store, "job-a", "agent-a", &declared(&["src/a"]));
+    commit_file(&worktree, "src/a/x.rs");
+    commit_file(&harness.repo, "src/upstream/u.rs");
+    git(&worktree, &["merge", "--no-edit", "main"]);
+    assert!(worktree.join("src/upstream/u.rs").exists());
+
+    let drift = harness.store.scope_drift(job_key_a()).unwrap();
+
+    assert_eq!(drift.changed_paths, declared(&["src/a/x.rs"]));
+    assert!(drift.undeclared_paths.is_empty());
+}
+
+#[test]
+fn scope_drift_ignores_upstream_commits_after_a_rebase_onto_a_fetched_base() {
+    let harness = Harness::new();
+    let worktree = harness.seed_checkout_job("job-a", "hive/job-a");
+    announce(&harness.store, "job-a", "agent-a", &declared(&["src/a"]));
+    commit_file(&worktree, "src/a/x.rs");
+    peer_commit_on_main(&harness);
+    add_origin(&harness, true);
+    git(&worktree, &["push", "-q", "origin", "hive/job-a"]);
+    git(&worktree, &["rebase", "-q", "main"]);
+    assert!(worktree.join("src/upstream/u.rs").exists());
+
+    let drift = harness.store.scope_drift(job_key_a()).unwrap();
+
+    // The upstream commit is on first-parent history now, but it is reachable
+    // from origin/main, the remote's default branch; the job's own pushed
+    // commit on origin/hive/job-a is not treated as upstream.
+    assert_eq!(drift.changed_paths, declared(&["src/a/x.rs"]));
+    assert!(drift.undeclared_paths.is_empty());
+}
+
+#[test]
+fn scope_drift_uses_the_configured_upstream_as_base_without_a_default_head() {
+    let harness = Harness::new();
+    let worktree = harness.seed_checkout_job("job-a", "hive/job-a");
+    announce(&harness.store, "job-a", "agent-a", &declared(&["src/a"]));
+    commit_file(&worktree, "src/a/x.rs");
+    peer_commit_on_main(&harness);
+    add_origin(&harness, false);
+    git(&worktree, &["branch", "--set-upstream-to=origin/main"]);
+    git(&worktree, &["rebase", "-q", "main"]);
+
+    let drift = harness.store.scope_drift(job_key_a()).unwrap();
+
+    assert_eq!(drift.changed_paths, declared(&["src/a/x.rs"]));
+}
+
+#[test]
+fn scope_drift_keeps_job_commits_when_a_stacked_child_branch_is_pushed() {
+    let harness = Harness::new();
+    let worktree = harness.seed_checkout_job("job-a", "hive/job-a");
+    announce(&harness.store, "job-a", "agent-a", &declared(&["src/a"]));
+    add_origin(&harness, true);
+    commit_file(&worktree, "src/b/x.rs");
+    // The branch tracks its own remote copy, which is not its base.
+    git(&worktree, &["push", "-q", "-u", "origin", "hive/job-a"]);
+    // A stacked child pushed under another name contains job-a's commits.
+    git(&worktree, &["branch", "hive/job-b", "hive/job-a"]);
+    git(&worktree, &["push", "-q", "origin", "hive/job-b"]);
+    // A stale copy of the branch pushed under another name does too.
+    git(
+        &worktree,
+        &["push", "-q", "origin", "hive/job-a:refs/heads/backup/job-a"],
+    );
+    // The job moves on past the point where the child was cut, so neither
+    // pushed ref contains HEAD any more.
+    commit_file(&worktree, "src/c/y.rs");
+
+    let drift = harness.store.scope_drift(job_key_a()).unwrap();
+
+    assert_eq!(
+        drift.undeclared_paths,
+        declared(&["src/b/x.rs", "src/c/y.rs"])
+    );
+}
+
+#[test]
+fn scope_drift_counts_a_fast_forward_until_the_lease_starts_over() {
+    let harness = Harness::new();
+    let worktree = harness.seed_checkout_job("job-a", "hive/job-a");
+    announce(&harness.store, "job-a", "agent-a", &declared(&["src/a"]));
+    commit_file(&harness.repo, "src/upstream/u.rs");
+    git(&worktree, &["merge", "--ff-only", "main"]);
+
+    // Without a remote-tracking ref for main, a fast-forward (like a rebase
+    // onto local-only commits) moves the branch base and the replayed
+    // upstream commit is counted.
+    let drift = harness.store.scope_drift(job_key_a()).unwrap();
+    assert_eq!(drift.undeclared_paths, declared(&["src/upstream/u.rs"]));
+
+    // An explicit re-grant (what unregister + register does) moves the lease
+    // start commit to HEAD; re-registering a live checkout would keep it.
+    let head = git(&worktree, &["rev-parse", "HEAD"]);
+    harness
+        .store
+        .grant(crate::lease::LeaseGrant {
+            repo: &harness.repo,
+            owner: "acme",
+            repo_name: "sample",
+            job_id: "job-a",
+            branch: "hive/job-a",
+            worktree_path: &worktree,
+            start_commit: &head,
+        })
+        .unwrap();
+    let drift = harness.store.scope_drift(job_key_a()).unwrap();
+    assert_eq!(drift.start_commit, head);
+    assert!(drift.changed_paths.is_empty());
+}
+
+#[test]
+fn handoff_compares_against_the_declaration_locked_with_the_offer() {
+    let harness = Harness::new();
+    let worktree = harness.seed_checkout_job("job-a", "hive/job-a");
+    announce(&harness.store, "job-a", "agent-a", &declared(&["src/a"]));
+    write_only(&worktree, "src/b/y.rs");
+    announce(&harness.store, "job-a", "agent-a", &declared(&["src"]));
+
+    let offer = sample_handoff(&harness.store, "declaration widened first", Some("job-a"));
+
+    assert!(offer.paths.is_empty(), "got {:?}", offer.paths);
+}
+
+#[test]
 fn scope_drift_inspection_is_read_only() {
     let harness = Harness::new();
     let worktree = harness.seed_checkout_job("job-a", "hive/job-a");
     announce(&harness.store, "job-a", "agent-a", &[]);
-    write_only(&worktree, "wip.txt", "keep me");
+    write_only(&worktree, "wip.txt");
     let head_before = git(&worktree, &["rev-parse", "HEAD"]);
 
     harness.store.scope_drift(job_key_a()).unwrap();
@@ -82,9 +269,62 @@ fn scope_drift_inspection_is_read_only() {
     assert_eq!(git(&worktree, &["rev-parse", "HEAD"]), head_before);
     assert_eq!(
         fs::read_to_string(worktree.join("wip.txt")).unwrap(),
-        "keep me"
+        "// wip.txt edited\n"
     );
     assert!(git(&worktree, &["diff", "--cached", "--name-only"]).is_empty());
+}
+
+#[test]
+fn scope_drift_does_not_refresh_the_index_for_a_stat_only_change() {
+    let harness = Harness::new();
+    let worktree = harness.seed_checkout_job("job-a", "hive/job-a");
+    announce(&harness.store, "job-a", "agent-a", &declared(&["src"]));
+    commit_file(&worktree, "src/a/x.rs");
+    let head = git(&worktree, &["rev-parse", "HEAD"]);
+    harness
+        .store
+        .grant(crate::lease::LeaseGrant {
+            repo: &harness.repo,
+            owner: "acme",
+            repo_name: "sample",
+            job_id: "job-a",
+            branch: "hive/job-a",
+            worktree_path: &worktree,
+            start_commit: &head,
+        })
+        .unwrap();
+    let tracked = worktree.join("src/a/x.rs");
+    // A writable handle: Windows refuses to set times through a read-only one.
+    fs::File::options()
+        .write(true)
+        .open(&tracked)
+        .unwrap()
+        .set_modified(SystemTime::now() - Duration::from_secs(30))
+        .unwrap();
+    let index = {
+        let printed = git(&worktree, &["rev-parse", "--git-path", "index"]);
+        let path = PathBuf::from(&printed);
+        if path.is_absolute() {
+            path
+        } else {
+            worktree.join(path)
+        }
+    };
+    let before = fs::read(&index).unwrap();
+
+    let drift = harness.store.scope_drift(job_key_a()).unwrap();
+
+    assert_eq!(fs::read(&index).unwrap(), before, "index was rewritten");
+    assert!(
+        !drift.changed_paths.iter().any(|path| path == "src/a/x.rs"),
+        "stat-only change was reported: {:?}",
+        drift.changed_paths
+    );
+
+    fs::write(&tracked, "fn a() { /* edited */ }").unwrap();
+    let drift = harness.store.scope_drift(job_key_a()).unwrap();
+    assert_eq!(drift.changed_paths, declared(&["src/a/x.rs"]));
+    assert_eq!(fs::read(&index).unwrap(), before, "index was rewritten");
 }
 
 #[test]
@@ -118,8 +358,8 @@ fn handoff_offer_carries_changed_paths_outside_the_declaration() {
     let harness = Harness::new();
     let worktree = harness.seed_checkout_job("job-a", "hive/job-a");
     announce(&harness.store, "job-a", "agent-a", &declared(&["src/a"]));
-    write_commit(&worktree, "src/a/x.rs", "fn a() {}", "declared");
-    write_only(&worktree, "src/b/y.rs", "fn b() {}");
+    commit_file(&worktree, "src/a/x.rs");
+    write_only(&worktree, "src/b/y.rs");
 
     let offer = sample_handoff(&harness.store, "taking a break", Some("job-a"));
 
@@ -160,7 +400,7 @@ fn accepted_transfer_leaves_exactly_one_live_owner_and_keeps_checkout_identity()
     let harness = Harness::new();
     let worktree = harness.seed_checkout_job("job-a", "hive/job-a");
     announce(&harness.store, "job-a", "agent-a", &declared(&["src"]));
-    write_only(&worktree, "wip.txt", "uncommitted work");
+    write_only(&worktree, "wip.txt");
     let head = git(&worktree, &["rev-parse", "HEAD"]);
 
     let (before, after) = transfer_job_a(&harness);
@@ -183,7 +423,7 @@ fn accepted_transfer_leaves_exactly_one_live_owner_and_keeps_checkout_identity()
     assert_eq!(git(&worktree, &["rev-parse", "HEAD"]), head);
     assert_eq!(
         fs::read_to_string(worktree.join("wip.txt")).unwrap(),
-        "uncommitted work"
+        "// wip.txt edited\n"
     );
 }
 
