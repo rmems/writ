@@ -52,15 +52,15 @@ Wall-clock overlap: both workers were active from 08:48:55 to 08:53:25; the depe
 
 ## Findings (observed)
 
-1. **A handoff is only visible in the inbox of the job being transferred.** The offer for dogfood-b is addressed `to_job: dogfood-b, to_agent: agent-a`, so `coord inbox … dogfood-a` never shows it. agent-a's poller watched its own job and would not have fired; it found the offer by reading dogfood-b's inbox. The SKILL quick reference now says so. An `--agent` filter on `coord inbox` (messages addressed to an agent across jobs) would remove the trap.
-2. **`writ status` does not show coord ownership.** With dogfood-b at gen 2 owned by agent-a, `status` reported `agent_id`, `ownership_generation`, `declared_paths` and `handoff` as `null` for both jobs. Those fields exist in the v2 schema but are not populated from `coord_claims`; only `watchlist` overlays coord state. A manager reading `status` cannot see who owns what.
+1. **Without `--to-job`, a handoff is only visible in the inbox of the job being transferred.** The offer for dogfood-b is addressed `to_job: dogfood-b, to_agent: agent-a`, so `coord inbox … dogfood-a` never shows it. agent-a's poller watched its own job and would not have fired; it found the offer by reading dogfood-b's inbox. `coord handoff` already accepts `--to-job <receiver-job>`, and the handoff ACK checks only the source job and the target agent, so passing `--to-job dogfood-a` would have put the offer in agent-a's own inbox while the ACK still named dogfood-b. The run did not use it: the trap is a missing default and missing documentation, not a missing capability. The SKILL quick reference now documents both routes.
+2. **`writ status` did not show coord ownership** (addressed after this run by [#235](https://github.com/rmems/writ/pull/235)). With dogfood-b at gen 2 owned by agent-a, `status` reported `agent_id`, `ownership_generation`, `declared_paths` and `handoff` as `null` for both jobs. Those fields exist in the v2 schema but are not populated from `coord_claims`; only `watchlist` overlays coord state. A manager reading `status` cannot see who owns what.
 3. **Message ids are store-global.** Ids 5–6 from b landed between a's announce and a's first send. Harmless, but workers should not assume per-job numbering.
 4. **Rejections are observable in both channels.** Policy rejections exit 2 with a `COORD_CLAIM_HELD` envelope plus a stderr line; the already-acknowledged case is an `ok: false` envelope with `LEASE_STORE_FAILED`.
 5. **Drift was accurate for both jobs.** Both declarations covered every changed path, so `undeclared_paths` was empty and the handoff carried `paths: []`; the fixture run shows the non-empty case.
 
 ## Ideas, not observed
 
-- Deliver handoff offers to the target agent's inbox regardless of job (finding 1), or add `coord inbox --agent`.
-- Populate `status` ownership fields from `coord_claims` (finding 2) so `status` and `watchlist` agree.
+- Default `to_job` to the target agent's current job, or add `coord inbox --agent` (finding 1); until then, offer with `--to-job <receiver-job>`.
+- Populate `status` ownership fields from `coord_claims` (finding 2) so `status` and `watchlist` agree. Done in [#235](https://github.com/rmems/writ/pull/235).
 - Scope-growth budgets ([#167](https://github.com/rmems/writ/issues/167)) were not exercised; this run was too small to approach any threshold, so it does not yet justify them.
 - Timeouts, crashes and stale leases were not exercised; `pause` was a voluntary stall.
