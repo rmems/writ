@@ -78,6 +78,8 @@ writ --json worktree list                     # worktree.list
 writ --json worktree register <path>          # worktree.register
 writ --json attribution format --body "Looks good!"   # attribution.format
 # coord fixtures (separate WRIT_LEASE_PATH, WRIT_ALLOWED_OWNERS=acme, see "Coord fixtures").
+# Register job-a with that WRIT_LEASE_PATH set so announce finds its lease in the same store:
+writ --json worktree register /path/to/job-a  # worktree.register in the fixture store
 # Before drift/handoff: commit src/a/mod.rs and leave src/b/mod.rs untracked in the
 # registered checkout, otherwise both report empty paths:
 writ --json coord announce acme sample job-a --agent agent-a --session sess-a --intent "implement module a" --path src/a   # coord.announce
